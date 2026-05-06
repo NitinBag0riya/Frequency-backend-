@@ -774,14 +774,23 @@ app.get('/api/auth/google/callback', async (req, res) => {
     logToFile('[google-auth] Success! Tokens saved.')
     console.log('[google-auth] Success! Tokens saved.')
 
-    // Close the popup and notify parent
+    // Close the popup and notify parent.
+    // Shape MUST be { ok: true } for openOAuthPopup() to resolve — it polls
+    // for `e.data.ok` (see src/lib/connectors.ts openOAuthPopup).
+    const successPayload = { ok: true, connector: 'google', label: profile.email }
     res.send(`
+      <!doctype html><html><head><meta charset="utf-8"><title>Connected</title>
+      <style>body{font:14px/1.5 system-ui,sans-serif;text-align:center;padding:32px;color:#1a1a1a}</style>
+      </head><body>
+      <div style="font-size:42px">✅</div>
+      <h2 style="font-size:18px;margin:8px 0">Connected to Google</h2>
+      <p>${profile.email ?? ''}</p>
+      <p style="color:#6b7280;font-size:13px;margin-top:16px">You can close this window.</p>
       <script>
-        if (window.opener) {
-          window.opener.postMessage({ type: 'google-auth-success' }, '*');
-        }
-        window.close();
+        try { window.opener?.postMessage(${JSON.stringify(successPayload)}, '*'); } catch(e){}
+        setTimeout(() => { try { window.close(); } catch(e){} }, 1200);
       </script>
+      </body></html>
     `)
   } catch (err: any) {
     console.error('[google-auth] FATAL ERROR:', err.message)
