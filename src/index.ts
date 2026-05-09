@@ -14,6 +14,15 @@ import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
 import { createConnectorsRouter }  from './routes/connectors'
+import { createWaFeaturesRouter }  from './routes/wa-features'
+import { createTelegramRouter }    from './routes/telegram'
+import { createInstagramRouter }   from './routes/instagram'
+import { createMetaAdsRouter }     from './routes/meta-ads'
+import { createSuperAdminRouter }  from './routes/super-admin'
+import { createTeamsRouter }       from './routes/teams'
+import { createNotificationsRouter } from './routes/notifications'
+import { createApprovalsRouter, requireApproval } from './routes/approvals'
+import { createWorkflowRecosRouter } from './routes/workflow-recos'
 import { enqueueWorkflowExecution, workflowQueue, messageQueue, broadcastQueue, cronQueue, attachDebugListeners } from './queue'
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
@@ -167,52 +176,98 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
   res.status(403).json({ error: 'No active tenant found. Please complete onboarding to connect your WhatsApp account.' })
 }
 
+/**
+ * checkPermission — gates an API call against the layered permission stack:
+ *
+ *   1. **Tenant lifecycle**         — suspended / deleted tenants → 403
+ *   2. **User-level disable**       — user_role_assignments.disabled_at set → 403
+ *   3. **Per-tenant entitlement**   — explicit override (super-admin can disable a feature
+ *                                     for one tenant even if their plan includes it)
+ *   4. **Plan whitelist**           — feature must be in plans.features (or '*' for scale)
+ *   5. **Plan quota**               — for action='edit' on metered features, check
+ *                                     tenant_usage.count < plans.limits.<metric>
+ *   6. **Role permission matrix**   — role_definitions.permissions[feature][action]
+ *
+ * Falls back gracefully to the legacy `user_roles` + `role_permissions` schema if
+ * the user isn't yet in the new RBAC tables (migration 017 + auto-map happens lazily).
+ *
+ * Sets `req.userRoleKey` and `req.userPlan` for downstream handlers.
+ */
 function checkPermission(feature: string, action: 'view' | 'edit' | 'delete') {
   return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if ((req as any).isSuperAdmin) { next(); return }
 
+    const userId = (req as any).user?.id
     const tenantId = (req as any).tenantId
-    const role = (req as any).userRole
+    if (!userId || !tenantId) { res.status(401).json({ error: 'Auth required' }); return }
 
-    // 1. Entitlement Check (Repeat.works level) — table may not exist yet, treat missing table as "all enabled"
-    const { data: entitlement, error: entErr } = await supabase
-      .from('tenant_entitlements')
-      .select('is_enabled')
-      .eq('tenant_id', tenantId)
-      .eq('feature', feature)
+    // 1. Tenant lifecycle gate
+    const { data: tenant } = await supabase.from('tenants')
+      .select('status').eq('id', tenantId).maybeSingle()
+    if (tenant?.status === 'suspended') { res.status(403).json({ error: 'This account is suspended. Contact support.' }); return }
+    if (tenant?.status === 'deleted')   { res.status(403).json({ error: 'This account has been deleted.' }); return }
+
+    // 2. User-disabled gate (new RBAC) — falls through to legacy if no row
+    const { data: assignment } = await supabase.from('user_role_assignments')
+      .select(`disabled_at, role_definitions ( key, permissions, allowed_apps, data_scope )`)
+      .eq('user_id', userId).eq('tenant_id', tenantId)
       .maybeSingle()
-
-    if (!entErr && entitlement && !entitlement.is_enabled) {
-      res.status(403).json({ error: `Feature '${feature}' is not enabled for your account plan. Contact support.` })
-      return
+    if (assignment?.disabled_at) {
+      res.status(403).json({ error: 'Your account has been disabled by an administrator.' }); return
     }
 
-    // 2. Permission Check (Tenant Admin level)
-    const { data: perm } = await supabase
-      .from('role_permissions')
-      .select(`can_${action}`)
-      .eq('tenant_id', tenantId)
-      .eq('role', role)
-      .eq('feature', feature)
-      .maybeSingle()
+    // 3. Per-tenant entitlement override
+    const { data: ent } = await supabase.from('tenant_entitlements')
+      .select('is_enabled').eq('tenant_id', tenantId).eq('feature', feature).maybeSingle()
+    if (ent && ent.is_enabled === false) {
+      res.status(403).json({ error: `Feature '${feature}' is disabled for this account.` }); return
+    }
 
-    if (!perm || !(perm as any)[`can_${action}`]) {
-      // Fallback: system defaults
-      const { data: sysPerm } = await supabase
-        .from('role_permissions')
-        .select(`can_${action}`)
-        .is('tenant_id', null)
-        .eq('role', role)
-        .eq('feature', feature)
-        .maybeSingle()
-
-      if (!sysPerm || !(sysPerm as any)[`can_${action}`]) {
-        res.status(403).json({ error: `Your role (${role}) does not have ${action} access to ${feature}` })
-        return
+    // 4. Plan whitelist + 5. Plan quota
+    const { data: sub } = await supabase.from('tenant_subscriptions')
+      .select('plan_id, status, plans ( features, limits )')
+      .eq('tenant_id', tenantId).maybeSingle()
+    if (sub) {
+      const plan: any = (sub as any).plans
+      const features: string[] = plan?.features ?? []
+      if (!features.includes('*') && !features.includes(feature)) {
+        // Feature not in plan — suggest upgrade.
+        res.status(402).json({ error: `Feature '${feature}' is not in your ${sub.plan_id} plan. Upgrade to use.` }); return
       }
+      // (Quota check for metered features happens at write-points where the
+      // metric is known — handled by the workers, not this generic middleware.)
+      ;(req as any).userPlan = sub.plan_id
     }
 
-    next()
+    // 6. Role permission matrix — new RBAC path
+    if (assignment?.role_definitions) {
+      const rd: any = assignment.role_definitions
+      const fp = rd.permissions?.[feature]
+      ;(req as any).userRoleKey = rd.key
+      ;(req as any).userDataScope = rd.data_scope
+      ;(req as any).userAllowedApps = rd.allowed_apps
+      if (fp && fp[action]) { next(); return }
+      // Fall through to legacy check below — user might still be allowed via
+      // legacy role_permissions during migration period.
+    }
+
+    // 7. Legacy fallback — read role_permissions (pre-017)
+    const role = (req as any).userRole
+    if (!role) {
+      res.status(403).json({ error: `No role assignment found for this user/tenant.` }); return
+    }
+    const { data: perm } = await supabase
+      .from('role_permissions').select(`can_${action}`)
+      .eq('tenant_id', tenantId).eq('role', role).eq('feature', feature)
+      .maybeSingle()
+    if (perm && (perm as any)[`can_${action}`]) { next(); return }
+    const { data: sysPerm } = await supabase
+      .from('role_permissions').select(`can_${action}`)
+      .is('tenant_id', null).eq('role', role).eq('feature', feature)
+      .maybeSingle()
+    if (sysPerm && (sysPerm as any)[`can_${action}`]) { next(); return }
+
+    res.status(403).json({ error: `Your role (${role}) does not have ${action} access to ${feature}` })
   }
 }
 
@@ -760,8 +815,9 @@ app.get('/api/auth/google/callback', async (req, res) => {
       throw new Error('No tenant found for user. Complete WhatsApp onboarding first.')
     }
 
-    const { error: updErr, count } = await supabase.from('tenants')
-      .update(update).eq('id', resolvedTenantId).select('id', { count: 'exact', head: true })
+    const { error: updErr, count } = await (supabase.from('tenants')
+      .update(update).eq('id', resolvedTenantId) as any)
+      .select('id', { count: 'exact' })
     
     if (updErr) {
       logToFile(`DB Update failed: ${updErr.message}`)
@@ -1029,26 +1085,113 @@ app.get('/api/contacts/:phone/messages', requireAuth, identifyTenant, checkPermi
   res.json(data)
 })
 
-// Send message from inbox (agent reply)
+// Send message from inbox (agent reply) — channel-aware. Routes to the right
+// provider based on `channel` ('whatsapp' | 'instagram' | 'telegram'). Inserts
+// the outbound message with the correct `channel` column so the unified inbox
+// view filters correctly.
 app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox', 'edit'), validateBody(InboxSendSchema), async (req, res) => {
   const tenantId = (req as any).tenantId
-  const { phone, type, text, template_name, template_language, template_params } = req.body
-  
-  const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).single()
-  if (!tenant?.access_token) { res.status(404).json({ error: 'No active tenant or WhatsApp not connected' }); return }
+  const {
+    channel, phone, type,
+    text, template_name, template_language, template_params,
+    media_kind, media_url, caption, filename,
+    interactive,
+  } = req.body
+  const cleanPhone = String(phone).replace(/^\+/, '')
 
   try {
-    const cleanPhone = String(phone).replace(/^\+/, '')
-    if (type === 'text') {
-      await sendTextMessage(tenant, cleanPhone, text)
-    } else if (type === 'template') {
-      await sendTemplateMessage(tenant, cleanPhone, template_name, template_language ?? 'en_US', template_params ?? [])
+    if (channel === 'whatsapp') {
+      const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).single()
+      if (!tenant?.access_token) { res.status(404).json({ error: 'WhatsApp not connected for this tenant' }); return }
+      if (type === 'text')              await sendTextMessage(tenant, cleanPhone, text)
+      else if (type === 'template')     await sendTemplateMessage(tenant, cleanPhone, template_name, template_language ?? 'en_US', template_params ?? [])
+      else if (type === 'media')        await sendWAMedia(tenant, cleanPhone, media_kind, media_url, caption, filename)
+      else if (type === 'interactive')  await sendInteractiveMessage(tenant, cleanPhone, interactive)
+    } else if (channel === 'telegram') {
+      const { data: bot } = await supabase.from('tg_bots').select('*').eq('tenant_id', tenantId).maybeSingle()
+      if (!bot?.bot_token) { res.status(404).json({ error: 'Telegram bot not connected for this tenant' }); return }
+      const { decrypt } = await import('./crypto')
+      const token = decrypt(bot.bot_token)
+      if (type === 'text') {
+        await tgSend(token, 'sendMessage', { chat_id: cleanPhone, text })
+        await supabase.from('messages').insert({ tenant_id: tenantId, channel: 'telegram', direction: 'outbound', contact_phone: cleanPhone, content: { type: 'text', text }, status: 'sent' })
+      } else if (type === 'media') {
+        const method = ({ image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio', document: 'sendDocument' } as any)[media_kind!]
+        const fieldKey = ({ image: 'photo', video: 'video', audio: 'audio', document: 'document' } as any)[media_kind!]
+        await tgSend(token, method, { chat_id: cleanPhone, [fieldKey]: media_url, caption: caption ?? undefined })
+        await supabase.from('messages').insert({ tenant_id: tenantId, channel: 'telegram', direction: 'outbound', contact_phone: cleanPhone, content: { type: media_kind, url: media_url, caption, filename }, status: 'sent' })
+      } else {
+        res.status(400).json({ error: `Telegram does not support type=${type}` }); return
+      }
+    } else if (channel === 'instagram') {
+      const { data: ig } = await supabase.from('tenant_integrations')
+        .select('access_token, metadata').eq('tenant_id', tenantId).eq('key', 'instagram').maybeSingle()
+      if (!ig?.access_token) { res.status(404).json({ error: 'Instagram not connected for this tenant' }); return }
+      const { decrypt } = await import('./crypto')
+      const igToken = decrypt(ig.access_token)
+      const igUserId = (ig.metadata as any)?.ig_user_id
+      if (!igUserId) { res.status(400).json({ error: 'Instagram metadata missing ig_user_id; reconnect.' }); return }
+      const payload: any = { recipient: { id: cleanPhone } }
+      if (type === 'text') {
+        payload.message = { text }
+      } else if (type === 'media' && media_url && media_kind) {
+        payload.message = { attachment: { type: media_kind, payload: { url: media_url, is_reusable: true } } }
+      } else {
+        res.status(400).json({ error: `Instagram does not support type=${type}` }); return
+      }
+      const r1 = await fetch(`${GRAPH}/${igUserId}/messages?access_token=${igToken}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      })
+      const data = await r1.json() as any
+      if (!r1.ok || data.error) throw new Error(data.error?.message ?? `IG send failed (${r1.status})`)
+      await supabase.from('messages').insert({
+        tenant_id: tenantId, channel: 'instagram', direction: 'outbound',
+        contact_phone: cleanPhone,
+        platform_message_id: data.message_id ?? null,
+        content: type === 'text' ? { type: 'text', text } : { type: media_kind, url: media_url, caption, filename },
+        status: 'sent',
+      })
+    } else {
+      res.status(400).json({ error: `Unsupported channel: ${channel}` }); return
     }
     res.json({ success: true })
   } catch (err: any) {
     res.status(500).json({ error: err.message })
   }
 })
+
+// WhatsApp Cloud API media send — image / video / audio / document.
+async function sendWAMedia(tenant: any, to: string, kind: 'image'|'video'|'audio'|'document', url: string, caption?: string | null, filename?: string) {
+  const payload: any = { messaging_product: 'whatsapp', to, type: kind }
+  payload[kind] = { link: url }
+  if (caption && (kind === 'image' || kind === 'video' || kind === 'document')) payload[kind].caption = caption
+  if (filename && kind === 'document') payload[kind].filename = filename
+  const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const data = await r.json() as any
+  if (!r.ok || data.error) throw new Error(data.error?.message ?? `WA media send failed (${r.status})`)
+  if (data.messages?.[0]?.id) {
+    await supabase.from('messages').insert({
+      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound',
+      contact_phone: to, platform_message_id: data.messages[0].id,
+      content: payload, status: 'sent',
+    })
+  }
+  return data
+}
+
+// Telegram Bot API generic helper used by inbox/send for Telegram.
+async function tgSend(token: string, method: string, body: any): Promise<any> {
+  const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  })
+  const data = await r.json() as any
+  if (!data.ok) throw new Error(data.description ?? `Telegram API error (${r.status})`)
+  return data.result
+}
 
 // Toggle bot pause on a contact
 app.patch('/api/contacts/:id/bot-pause', requireAuth, identifyTenant, checkPermission('leads', 'edit'), async (req, res) => {
@@ -1171,7 +1314,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
         for (const status of value.statuses ?? []) {
           await supabase.from('messages')
             .update({ status: status.status })
-            .eq('wa_message_id', status.id)
+            .eq('platform_message_id', status.id)
         }
       }
     }
@@ -1187,9 +1330,10 @@ async function handleInboundMessage(tenant: any, msg: any, contact: any) {
   // Log the message (tenant-scoped)
   await supabase.from('messages').insert({
     tenant_id: tenant.id,
+    channel: 'whatsapp',
     direction: 'inbound',
     contact_phone: phone,
-    wa_message_id: msg.id,
+    platform_message_id: msg.id,
     content: msg,
   })
 
@@ -1282,9 +1426,10 @@ async function sendTextMessage(tenant: any, to: string, text: string) {
   if (data.messages?.[0]?.id) {
     await supabase.from('messages').insert({
       tenant_id: tenant.id,
+      channel: 'whatsapp',
       direction: 'outbound',
       contact_phone: to,
-      wa_message_id: data.messages[0].id,
+      platform_message_id: data.messages[0].id,
       content: payload,
       status: 'sent',
     })
@@ -1309,8 +1454,8 @@ async function sendTemplateMessage(tenant: any, to: string, templateName: string
   const data = await r.json() as any
   if (data.messages?.[0]?.id) {
     await supabase.from('messages').insert({
-      tenant_id: tenant.id, direction: 'outbound', contact_phone: to,
-      wa_message_id: data.messages[0].id, content: payload, status: 'sent',
+      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
+      platform_message_id: data.messages[0].id, content: payload, status: 'sent',
     })
   }
   return data
@@ -1563,11 +1708,11 @@ app.get('/api/google/spreadsheets/:id', requireAuth, identifyTenant, checkPermis
     res.status(400).json({ error: 'Google account not connected' }); return
   }
   try {
-    const meta = await sheetsGetMetadata(tenant, req.params.id)
+    const meta = await sheetsGetMetadata(tenant, String(req.params.id))
     const sheets = await Promise.all((meta.sheets ?? []).map(async (s: any) => {
       const name = s.properties.title
       // Read a larger chunk to ensure we get the data and headers correctly
-      const values = await sheetsReadRange(tenant, req.params.id, `${name}!1:1000`)
+      const values = await sheetsReadRange(tenant, String(req.params.id), `${name}!1:1000`)
       
       if (!values || values.length === 0) return { name, headers: [], rows: [] }
 
@@ -1620,7 +1765,7 @@ app.post('/api/integrations/razorpay', requireAuth, identifyTenant, checkPermiss
 
 app.delete('/api/integrations/:key', requireAuth, identifyTenant, async (req, res) => {
   const tenantId = (req as any).tenantId
-  const key = req.params.key
+  const key = String(req.params.key)
 
   if (key === 'whatsapp') {
     const { error } = await supabase.from('tenants')
@@ -1848,6 +1993,27 @@ app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPe
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
 app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Channel-specific feature endpoints (omnichannel) ─────────────────────────
+app.use(createWaFeaturesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+app.use(createTelegramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+app.use(createInstagramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+app.use(createMetaAdsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Super-admin API (platform-level operations) ──────────────────────────────
+app.use(createSuperAdminRouter({ supabase, requireAuth }))
+
+// ── Tenant team management (RBAC) ────────────────────────────────────────────
+app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── Notifications (in-app bell + preferences) ────────────────────────────────
+app.use(createNotificationsRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── Approval requests (broadcast >threshold, bulk delete, etc.) ──────────────
+app.use(createApprovalsRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── Workflow recommendations (AI-generated once, cached forever) ─────────────
+app.use(createWorkflowRecosRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Bull Board (queue dashboard) ──────────────────────────────────────────────
 // Mounted at /admin/queues. Guarded — only super_admin (or local dev) can view.

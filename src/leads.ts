@@ -522,7 +522,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
 
     if (error) { res.status(500).json({ error: error.message }); return }
 
-    const options = [...new Set(data.map(r => r.data?.[colKey]).filter(Boolean))].sort()
+    const options = [...new Set(data.map(r => r.data?.[String(colKey)]).filter(Boolean))].sort()
     res.json(options)
   })
 

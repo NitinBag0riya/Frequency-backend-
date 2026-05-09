@@ -74,17 +74,37 @@ export const RazorpayConnectSchema = z.object({
   key_secret: z.string().min(8),
 })
 
-// Inbox accepts the legacy FE shape: { phone, type, text|template_name }
+// Inbox accepts a channel-aware shape supporting text / media / template /
+// interactive replies across WhatsApp, Instagram, Telegram.
 export const InboxSendSchema = z.object({
-  phone:             z.string().min(6),
-  type:              z.enum(['text', 'template']),
+  channel:           z.enum(['whatsapp', 'instagram', 'telegram']).default('whatsapp'),
+  phone:             z.string().min(1),
+  type:              z.enum(['text', 'template', 'media', 'interactive']),
+  // text
   text:              z.string().max(4096).optional(),
+  // template (WhatsApp only)
   template_name:     z.string().optional(),
   template_language: z.string().optional(),
   template_params:   z.array(z.string()).optional(),
+  // media
+  media_kind:        z.enum(['image', 'video', 'audio', 'document']).optional(),
+  media_url:         z.string().url().optional(),
+  caption:           z.string().max(1024).optional().nullable(),
+  filename:          z.string().max(255).optional(),
+  // interactive
+  interactive:       z.object({}).passthrough().optional(),
 }).refine(
-  (v) => (v.type === 'text' ? !!v.text : !!v.template_name),
-  { message: 'text required for type=text; template_name required for type=template' }
+  (v) => {
+    if (v.type === 'text')        return !!v.text
+    if (v.type === 'template')    return !!v.template_name
+    if (v.type === 'media')       return !!v.media_kind && !!v.media_url
+    if (v.type === 'interactive') return !!v.interactive
+    return false
+  },
+  { message: 'Missing required fields for the specified message type' }
+).refine(
+  (v) => v.type !== 'template' || v.channel === 'whatsapp',
+  { message: 'Templates are only supported on WhatsApp' }
 )
 
 export const TeamInviteSchema = z.object({
