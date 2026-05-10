@@ -285,6 +285,101 @@ export function createInstagramRouter(deps: Deps): express.Router {
     res.json([])    // surface real tags once Catalog Commerce Manager is wired
   })
 
+  // ── Inbound webhook ──────────────────────────────────────────────────────
+  // Meta delivers IG DM events here. Configure in Meta App Dashboard →
+  // Instagram → Webhooks → Subscribe to `messages` (and `comments` if you
+  // want comment-trigger rules). Use these URLs:
+  //
+  //   Verify URL:  https://<your-domain>/webhook/instagram
+  //   Verify token: $META_VERIFY_TOKEN  (same env var WhatsApp uses)
+  //
+  // Tenant resolution: IG webhook payloads include the page id under
+  // `entry[].id`. We look up the tenant by `tenant_integrations.metadata->>page_id`.
+  // No `?tenant_id=` query param like Telegram needs — Meta won't route
+  // dynamic query strings through the dashboard config.
+  //
+  // Verification GET — Meta hits this once on subscribe.
+  r.get('/webhook/instagram', (req, res) => {
+    const mode      = req.query['hub.mode']
+    const token     = req.query['hub.verify_token']
+    const challenge = req.query['hub.challenge']
+    if (mode === 'subscribe' && token && token === (process.env.META_VERIFY_TOKEN ?? '')) {
+      res.status(200).send(String(challenge ?? ''))
+      return
+    }
+    res.sendStatus(403)
+  })
+
+  // Event POST. Each entry is per page (one IG account). Each entry may
+  // contain `messaging[]` (DMs) and/or `changes[]` (comments / mentions).
+  // Always 200 quickly — never let Meta retry on our processing errors,
+  // it just doubles the load.
+  r.post('/webhook/instagram', async (req, res) => {
+    res.sendStatus(200)
+    try {
+      const body: any = req.body
+      const entries: any[] = Array.isArray(body?.entry) ? body.entry : []
+      for (const entry of entries) {
+        // Resolve tenant by page_id stored in tenant_integrations metadata.
+        const pageId = String(entry?.id ?? '')
+        if (!pageId) continue
+        const { data: integration } = await supabase.from('tenant_integrations')
+          .select('tenant_id, metadata').eq('key', 'instagram')
+          .filter('metadata->>page_id', 'eq', pageId).maybeSingle()
+        if (!integration?.tenant_id) {
+          console.warn(`[ig-webhook] page_id ${pageId} not linked to any tenant`)
+          continue
+        }
+        const { data: tenant } = await supabase.from('tenants')
+          .select('*').eq('id', integration.tenant_id).maybeSingle()
+        if (!tenant) continue
+
+        // ── DMs ────────────────────────────────────────────────────────
+        for (const m of (entry.messaging ?? [])) {
+          // sender.id is the user PSID (page-scoped user id) — that's
+          // what you POST back to /messages.recipient.id when replying.
+          // Skip echoes (our own outbound messages mirrored back).
+          if (m.message?.is_echo) continue
+          const senderId = String(m.sender?.id ?? '')
+          const text     = m.message?.text ?? ''
+          if (!senderId) continue
+
+          // Log the inbound message + upsert contact.
+          await supabase.from('messages').insert({
+            tenant_id:           tenant.id,
+            channel:             'instagram',
+            direction:           'inbound',
+            contact_phone:       senderId,
+            platform_message_id: String(m.message?.mid ?? ''),
+            content:             { type: 'text', text, raw: m },
+          })
+          await supabase.from('contacts').upsert({
+            tenant_id:       tenant.id,
+            user_id:         tenant.user_id,
+            phone:           `ig:${senderId}`,
+            name:            `Instagram ${senderId.slice(0, 6)}…`,
+            channel_primary: 'instagram',
+          }, { onConflict: 'tenant_id,phone' })
+
+          // Workflow trigger + session resume (shared with WhatsApp + Telegram).
+          if (text) {
+            const { routeInboundToWorkflow } = await import('../engine/inbound-router')
+            await routeInboundToWorkflow(supabase, tenant, 'instagram', senderId, text, m)
+          }
+        }
+
+        // ── Comment events (auto-reply rules) ──────────────────────────
+        // We don't trigger workflows from comments yet — the existing
+        // comment_rules table handles keyword → DM/comment-reply.
+        // Future: route inbound comments through routeInboundToWorkflow
+        // with a separate trigger_inbound_comment node type.
+      }
+    } catch (err) {
+      console.error('[ig-webhook] processing error', err)
+      // Already 200'd; nothing more to do.
+    }
+  })
+
   return r
 }
 

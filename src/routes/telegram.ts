@@ -323,6 +323,19 @@ export function createTelegramRouter(deps: Deps): express.Router {
           platform_message_id: String(msg.message_id),
           content: { type: 'text', text, raw: msg },
         })
+
+        // Workflow trigger + session resume — same path as the WhatsApp
+        // webhook. Without this, inbound Telegram messages were silently
+        // logged + discarded; no workflow could ever fire on a TG keyword
+        // and no in-flight session could be resumed by a user reply.
+        if (text) {
+          const { data: tenantRow } = await supabase.from('tenants')
+            .select('*').eq('id', tenantId).maybeSingle()
+          if (tenantRow) {
+            const { routeInboundToWorkflow } = await import('../engine/inbound-router')
+            await routeInboundToWorkflow(supabase, tenantRow, 'telegram', fromId, text, msg)
+          }
+        }
       }
       // Pre-checkout for Stars invoices — must respond OK or Telegram cancels.
       if (update.pre_checkout_query) {

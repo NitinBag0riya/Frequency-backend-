@@ -272,7 +272,7 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         return { kind: 'advance', nextNodeId: pickDefault(node), variableUpdates: updates, output: { length: text.length } }
       }
 
-      // ── Email ───────────────────────────────────────────────────────────────
+      // ── Email — real Resend send via lib/email.ts ──────────────────────────
       case 'send_email':
       case 'forward_email': {
         await enqueueMessageSend({
@@ -283,11 +283,200 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
             to:       interpolate(cfg.to_email, vars),
             subject:  interpolate(cfg.subject ?? '(no subject)', vars),
             body:     interpolate(cfg.body_template ?? cfg.body ?? '', vars),
-            provider: cfg.smtp_provider ?? 'smtp',
+            // 'resend' is the only currently-implemented provider; smtp/sendgrid
+            // are reserved keys for future providers. Default to resend so
+            // legacy workflows that wrote `smtp_provider: 'smtp'` still send.
+            provider: 'resend',
           },
           sessionId: ctx.session.id,
         })
         return advance(node)
+      }
+
+      // ── Send media (image / video / audio / document) ───────────────────────
+      // Channel-aware via buildSendJob (uses session.channel). Either link
+      // (public https) or id (pre-uploaded media id) must be set.
+      case 'send_media': {
+        const mediaType = (cfg.media_type ?? cfg.type ?? 'image') as 'image' | 'video' | 'audio' | 'document'
+        const link      = cfg.link ? interpolate(cfg.link, vars) : undefined
+        const id        = cfg.media_id ?? cfg.id
+        if (!link && !id) {
+          return { kind: 'error', error: 'send_media: cfg.link OR cfg.media_id required' }
+        }
+        await enqueueMessageSend(buildSendJob(ctx, {
+          kind: 'media',
+          media: {
+            type:     mediaType,
+            link,
+            id,
+            caption:  cfg.caption  ? interpolate(cfg.caption, vars)  : undefined,
+            filename: cfg.filename ? interpolate(cfg.filename, vars) : undefined,
+          },
+        }))
+        return advance(node)
+      }
+
+      // ── Payment — Razorpay payment link sent via current channel ───────────
+      // Common SMB pattern: collect payment for an order via WhatsApp.
+      // Creates a Razorpay payment link, then sends the URL through the
+      // session's channel (WhatsApp/Telegram/Instagram).
+      //
+      // Required cfg:
+      //   amount        — INR amount (rupees, gets ×100 for paise)
+      //   description   — short order description
+      // Optional cfg:
+      //   currency      — default 'INR'
+      //   customer      — { name, email, contact }
+      //   message_template — message wrapping the link, default
+      //                      "Pay {{amount}} {{currency}}: {{link}}"
+      //   response_variable — store the payment_link object in session vars
+      case 'payment': {
+        const amountInr = Number(interpolate(String(cfg.amount ?? ''), vars))
+        if (!Number.isFinite(amountInr) || amountInr <= 0) {
+          return { kind: 'error', error: 'payment: cfg.amount (INR rupees) required' }
+        }
+        const description = interpolate(cfg.description ?? 'Order payment', vars)
+        // Pull tenant Razorpay credentials. Reuses the connector pattern.
+        const { data: row } = await supabase.from('tenant_integrations')
+          .select('access_token, refresh_token, metadata')
+          .eq('tenant_id', ctx.tenant.id).eq('key', 'razorpay').maybeSingle()
+        if (!row?.access_token) {
+          return { kind: 'advance', nextNodeId: pickDefault(node), output: { skipped: 'Razorpay not connected for this tenant' } }
+        }
+        try {
+          const { decrypt } = await import('../crypto')
+          const keyId  = decrypt(row.access_token)
+          const secret = decrypt(row.refresh_token)
+          const auth = 'Basic ' + Buffer.from(`${keyId}:${secret}`).toString('base64')
+          const r = await fetch('https://api.razorpay.com/v1/payment_links', {
+            method: 'POST',
+            headers: { Authorization: auth, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              amount:   Math.round(amountInr * 100),  // paise
+              currency: cfg.currency ?? 'INR',
+              description,
+              customer: interpolateDeep(cfg.customer ?? {}, vars),
+              notify:   { sms: false, email: false },  // we deliver the link ourselves
+            }),
+          })
+          const body = await r.json() as any
+          if (!r.ok || body.error) {
+            return { kind: 'error', error: `payment: razorpay ${r.status}: ${body.error?.description ?? 'failed'}` }
+          }
+          const link = body.short_url ?? body.url
+          // Send the link via the session's origin channel.
+          const messageTemplate = cfg.message_template ?? `Pay ₹${amountInr} for ${description}: ${link}`
+          const text = interpolate(messageTemplate, { ...vars, link, amount: String(amountInr), currency: cfg.currency ?? 'INR' })
+          await enqueueMessageSend(buildSendJob(ctx, { kind: 'text', text }))
+          const updates = cfg.response_variable
+            ? { [cfg.response_variable]: { id: body.id, link, amount: amountInr, currency: cfg.currency ?? 'INR' } }
+            : undefined
+          return { kind: 'advance', nextNodeId: pickDefault(node), variableUpdates: updates, output: { payment_link_id: body.id } }
+        } catch (err: any) {
+          return { kind: 'error', error: `payment: ${err?.message ?? err}` }
+        }
+      }
+
+      // ── Notify human — assign + pause bot + in-app/email notification ──────
+      // Hands the conversation off to a human agent. Three side effects:
+      //   1. Pause the bot for this contact (next inbound won't trigger workflow)
+      //   2. Optionally assign the contact to a specific agent
+      //   3. Fire a notification (in_app + email per recipient prefs) so the
+      //      assigned agent / billing-eligible roles see the handoff in the bell
+      //
+      // Optional cfg:
+      //   agent_id       — uuid; if set, contact.assigned_to = agent_id
+      //   reason         — short string included in the notification body
+      //   notify_event_key — defaults to 'inbox.assigned' if agent_id set,
+      //                      else 'inbox.new_message'
+      case 'notify_human': {
+        const agentId = cfg.agent_id ?? null
+        const reason  = interpolate(cfg.reason ?? 'Workflow requested human takeover', vars)
+        const phone   = `+${ctx.session.contact_phone}`.replace(/^\+\++/, '+')
+
+        // 1. Pause the bot so the next inbound doesn't re-trigger workflows.
+        // 2. Optionally assign the agent.
+        const update: any = { bot_paused: true, updated_at: new Date().toISOString() }
+        if (agentId) update.assigned_to = agentId
+        const { data: contact } = await supabase.from('contacts').update(update)
+          .eq('tenant_id', ctx.tenant.id).eq('phone', phone).select('id, name').maybeSingle()
+
+        // 3. Fire notification. If a specific agent was assigned, notify them;
+        // otherwise notify all users with inbox.view permission.
+        try {
+          const { emitNotification } = await import('../routes/notifications')
+          let recipients: string[] = []
+          if (agentId) {
+            recipients = [agentId]
+          } else {
+            const { data: roleRows } = await supabase.from('user_role_assignments')
+              .select('user_id, role_definitions!inner(permissions)')
+              .eq('tenant_id', ctx.tenant.id).is('disabled_at', null)
+            for (const rr of (roleRows ?? []) as any[]) {
+              const rd = Array.isArray(rr.role_definitions) ? rr.role_definitions[0] : rr.role_definitions
+              if (rd?.permissions?.inbox?.view === true && rr.user_id) recipients.push(rr.user_id)
+            }
+          }
+          if (recipients.length > 0) {
+            await emitNotification(supabase, {
+              tenant_id: ctx.tenant.id,
+              event_key: agentId ? 'inbox.assigned' : 'inbox.new_message',
+              recipient_user_ids: recipients,
+              data: { contact_name: contact?.name ?? phone, reason },
+              link: `/inbox?phone=${encodeURIComponent(phone)}`,
+            })
+          }
+        } catch (e: any) {
+          // Non-fatal — workflow continues even if notification dispatch fails.
+          console.warn(`[executor:notify_human] notification failed: ${e?.message ?? e}`)
+        }
+        return { kind: 'advance', nextNodeId: pickDefault(node), output: { paused: true, assigned_to: agentId } }
+      }
+
+      // ── Followup — schedule a delayed message via wait_delay + send ───────
+      // Convenience wrapper: "send X after Y minutes". Equivalent to a
+      // wait_delay node followed by send_text, but cheaper to author from
+      // the AI / FE blueprint.
+      //
+      // Required cfg:
+      //   delay_minutes  (or delay_seconds)
+      //   text           — message body (interpolated)
+      // Optional cfg:
+      //   media          — same shape as send_media (link/id/type/caption)
+      case 'followup': {
+        const minutes = Number(cfg.delay_minutes ?? 0)
+        const seconds = Number(cfg.delay_seconds ?? 0)
+        const delayMs = (minutes * 60 + seconds) * 1000
+        const text    = cfg.text ? interpolate(cfg.text, vars) : null
+        if (delayMs <= 0 || (!text && !cfg.media)) {
+          return { kind: 'error', error: 'followup: cfg.delay_(minutes|seconds) and cfg.text or cfg.media required' }
+        }
+        // Synthesise an inline node that the wait_delay scheduler picks up
+        // and resumes — but we need a real node id. Simpler: encode the
+        // followup payload into a synthetic next node by abusing connections.
+        // The cleanest path is to use the wait_delay machinery: schedule the
+        // delay, then on resume the executor enqueues the send.
+        // For this iteration we keep it simple: schedule a delayed
+        // enqueueMessageSend by leveraging BullMQ's built-in delay.
+        if (text) {
+          const { messageQueue } = await import('../queue')
+          await messageQueue.add('send', buildSendJob(ctx, { kind: 'text', text }), { delay: delayMs })
+        }
+        if (cfg.media) {
+          const { messageQueue } = await import('../queue')
+          const mediaInterp = interpolateDeep(cfg.media, vars)
+          await messageQueue.add('send', buildSendJob(ctx, {
+            kind: 'media',
+            media: {
+              type:     (mediaInterp.type ?? 'image') as any,
+              link:     mediaInterp.link,
+              id:       mediaInterp.id,
+              caption:  mediaInterp.caption,
+              filename: mediaInterp.filename,
+            },
+          }), { delay: delayMs })
+        }
+        return { kind: 'advance', nextNodeId: pickDefault(node), output: { scheduled_after_ms: delayMs } }
       }
 
       // ── Workflow chaining ───────────────────────────────────────────────────
@@ -342,11 +531,31 @@ function advance(node: any): NodeResult {
   return { kind: 'advance', nextNodeId: pickDefault(node) }
 }
 
+/**
+ * Build a MessageSendJob for the executor's enqueueMessageSend calls.
+ *
+ * Channel routing:
+ *   1. Explicit `partial.channel` wins (caller knows what they want).
+ *   2. Else: use `ctx.session.channel` if set (set when the session was
+ *      created from an inbound webhook — IG / Telegram triggers store the
+ *      origin channel so reply messages land back in the same channel).
+ *   3. Else: fall back to 'whatsapp' for back-compat with older sessions
+ *      that predate the channel column on workflow_sessions.
+ *
+ * `to` for IG/Telegram is the platform-specific id (ig user id /
+ * tg chat id), stored in contact_phone for consistency with the existing
+ * single-column approach. The sender worker treats the field
+ * channel-appropriately.
+ */
 function buildSendJob(ctx: ExecCtx, partial: Partial<MessageSendJob>): MessageSendJob {
+  const channel: MessageSendJob['channel'] =
+    partial.channel
+    ?? (ctx.session as any).channel
+    ?? 'whatsapp'
   return {
     tenantId: ctx.tenant.id,
     to: ctx.session.contact_phone,
-    channel: 'whatsapp',
+    channel,
     sessionId: ctx.session.id,
     ...partial,
   } as MessageSendJob

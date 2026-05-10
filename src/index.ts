@@ -1736,64 +1736,10 @@ async function handleInboundMessage(tenant: any, msg: any, contact: any) {
     name:      contact?.profile?.name ?? `+${phone}`,
   }, { onConflict: 'tenant_id,phone' })
 
-  // Active workflow session?
-  const { data: session } = await supabase.from('workflow_sessions')
-    .select('id, current_node_id, workflow:workflows(id)')
-    .eq('tenant_id', tenant.id)
-    .eq('contact_phone', phone)
-    .eq('status', 'active')
-    .order('started_at', { ascending: false })
-    .limit(1)
-    .maybeSingle()
-
-  if (session) {
-    // Resume: enqueue execution of the current node with the reply payload.
-    // The worker handles condition branching + variable assignment.
-    await enqueueWorkflowExecution({
-      sessionId: session.id,
-      nodeId: session.current_node_id,
-      reply: { text, raw: msg },
-    })
-  } else {
-    await checkKeywordTriggers(tenant, phone, text)
-  }
-}
-
-async function checkKeywordTriggers(tenant: any, phone: string, text: string) {
-  // Tenant-scoped (was user_id-scoped before; broken once a user owned >1 tenant)
-  const { data: workflows } = await supabase.from('workflows')
-    .select('id, nodes')
-    .eq('tenant_id', tenant.id)
-    .eq('status', 'live')
-
-  for (const wf of workflows ?? []) {
-    const trigger = (wf.nodes as any[])?.find((n: any) => n.type === 'trigger_inbound_keyword')
-    if (!trigger) continue
-    const keywords: string[] = trigger.config?.keywords ?? []
-    if (keywords.some((kw: string) => text.toLowerCase().includes(kw.toLowerCase()))) {
-      await startWorkflow(tenant, wf, phone)
-      break
-    }
-  }
-}
-
-async function startWorkflow(tenant: any, workflow: any, phone: string) {
-  const nodes: any[] = workflow.nodes ?? []
-  const firstAction = nodes.find((n: any) => !n.type?.startsWith('trigger_'))
-  if (!firstAction) return
-
-  const { data: session } = await supabase.from('workflow_sessions').insert({
-    tenant_id: tenant.id,
-    workflow_id: workflow.id,
-    contact_phone: phone,
-    current_node_id: firstAction.id,
-    variables: {},
-    status: 'active',
-  }).select('id').single()
-
-  if (session) {
-    await enqueueWorkflowExecution({ sessionId: session.id, nodeId: firstAction.id })
-  }
+  // Channel-aware delegation. Routes session-resume + keyword-trigger via
+  // the shared helper used by Telegram + Instagram webhooks.
+  const { routeInboundToWorkflow } = await import('./engine/inbound-router')
+  await routeInboundToWorkflow(supabase, tenant, 'whatsapp', phone, text, msg)
 }
 
 // NOTE: The inline executor (executeNode/resumeWorkflowSession/interpolate) has

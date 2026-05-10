@@ -64,15 +64,36 @@ export interface WorkflowExecuteJob {
 
 export interface MessageSendJob {
   tenantId: string
-  to: string                          // E.164-ish phone, no leading +
-  channel: 'whatsapp' | 'email'
-  // For whatsapp:
-  kind?: 'text' | 'template' | 'interactive'
+  /** WhatsApp/IG: E.164-ish phone (no +). Telegram: chat_id. Email: ignored
+   *  (email body has its own `to` field). */
+  to: string
+  /** Channel router. 'whatsapp' | 'instagram' | 'telegram' | 'email'.
+   *  Sender-worker dispatches to the right per-channel function. */
+  channel: 'whatsapp' | 'instagram' | 'telegram' | 'email'
+  /** Common message shape across messaging channels. 'media' covers
+   *  image/video/audio/document (kind further qualified by `media.type`). */
+  kind?: 'text' | 'template' | 'interactive' | 'media'
   text?: string
   template?: { name: string; language: string; parameters: string[] }
   interactive?: any
-  // For email:
-  email?: { to: string; subject: string; body: string; provider?: string }
+  /** Media payload — used when kind='media'. type narrows to the actual
+   *  asset; either link OR id (pre-uploaded Meta media id) must be set. */
+  media?: {
+    type:     'image' | 'video' | 'audio' | 'document'
+    link?:    string                  // public https URL
+    id?:      string                  // pre-uploaded Meta media id
+    caption?: string                  // image/video/document only
+    filename?: string                 // document only
+  }
+  // For email (now wired through lib/email.ts → Resend):
+  email?: {
+    to:        string
+    subject:   string
+    body:      string                 // plain text or simple HTML
+    /** Optional provider override; defaults to 'resend' (the only one
+     *  currently implemented). Reserved for future SMTP/SendGrid. */
+    provider?: 'resend' | 'smtp' | 'sendgrid' | 'mailgun'
+  }
   // Bookkeeping
   sessionId?: string | null
   broadcastId?: string | null
