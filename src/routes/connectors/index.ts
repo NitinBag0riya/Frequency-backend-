@@ -24,6 +24,7 @@ import { CONNECTOR_REGISTRY, publicRegistry, getConnector } from '../../connecto
 import { createAirtableConnector } from './airtable'
 import { createRazorpayConnector } from './razorpay'
 import { createShopifyConnector } from './shopify'
+import { createSlackConnector } from './slack'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -264,6 +265,7 @@ export function createConnectorsRouter(deps: Deps): express.Router {
   r.use(createAirtableConnector(deps))
   r.use(createRazorpayConnector(deps))
   r.use(createShopifyConnector(deps))
+  r.use(createSlackConnector(deps))
 
   // ── Google OAuth start routes — mounted inline (sub-router nesting causes
   // path-resolution quirks in Express when using full /api/auth/... paths) ────

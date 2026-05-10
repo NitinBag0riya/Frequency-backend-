@@ -572,10 +572,18 @@ const HUBSPOT: ConnectorDef = {
   capabilities: [],
 }
 const SLACK: ConnectorDef = {
-  key: 'slack', name: 'Slack', category: 'communication', tier: 1, status: 'planned',
-  authMode: 'oauth', brandColor: '#4A154B', iconName: 'Hash',
-  shortDescription: 'Notify channels on events, post messages from workflows.',
-  docsUrl: 'https://api.slack.com/',
+  key: 'slack', name: 'Slack', category: 'communication', tier: 1, status: 'live',
+  // Auth: paste an Incoming Webhook URL (https://hooks.slack.com/services/…).
+  // We avoid the full Slack App OAuth flow because Incoming Webhooks needs no
+  // marketplace registration + scope review; users get the URL from Slack
+  // Settings → Apps → Incoming Webhooks → Add to channel. Webhook URL is
+  // tenant-secret (anyone with it can post), so we encrypt at rest using the
+  // same crypto as Razorpay key_secret.
+  authMode: 'api_key', brandColor: '#4A154B', iconName: 'Hash',
+  shortDescription: 'Notify a Slack channel on events (lead.assigned, broadcast.completed, payment.received…).',
+  docsUrl: 'https://api.slack.com/messaging/webhooks',
+  consoleUrl: 'https://api.slack.com/apps',
+  setupNote: 'Paste your Incoming Webhook URL. We send a test message before saving so you see it land instantly.',
   capabilities: [],
 }
 const NOTION: ConnectorDef = {

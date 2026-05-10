@@ -61,6 +61,15 @@ export interface WaNotificationResult {
 /**
  * Send the WhatsApp notification template to a single recipient. Throws on
  * any failure (caller catches + logs). Returns the wa_message_id for audit.
+ *
+ * Preflight order (each step short-circuits with a clear, actionable error):
+ *   1. Recipient has wa_number on profile
+ *   2. Tenant has WABA linked + status≠'disconnected'
+ *   3. The notification template exists for this tenant AND status='approved'
+ *      (rejecting pending/rejected/paused/draft/in_appeal/deleted prevents
+ *      the noisy "template doesn't exist" 132001 error from Meta and gives
+ *      the user a clear next step: get the template approved first)
+ *   4. Send via Meta Graph API
  */
 export async function sendWaNotification(
   supabase: SupabaseClient,
@@ -90,11 +99,44 @@ export async function sendWaNotification(
     throw new Error('Tenant WhatsApp is disconnected — reconnect from Settings → Channels')
   }
 
-  // 3. Build template payload. Template body is `*{{1}}*\n{{2}}` — 2 params
-  // by default. If extraTemplateParams is set, append more (caller is
-  // responsible for matching template body shape).
   const templateName = process.env.WA_NOTIFICATION_TEMPLATE_NAME || 'frequency_notification'
   const templateLang = process.env.WA_NOTIFICATION_TEMPLATE_LANG || 'en'
+
+  // 3. Template approval preflight. wa_templates.status mirrors Meta's enum:
+  //   'approved' | 'pending' | 'rejected' | 'paused' | 'in_appeal' | 'draft' | 'deleted'
+  // Only 'approved' is sendable. The template-sync worker (every 15min)
+  // keeps this column fresh from Meta's API, so a freshly-approved template
+  // becomes notification-eligible without a server restart.
+  //
+  // We check by (tenant_id, name, language) — the same uniqueness key the
+  // sync worker upserts on. If no row exists, the template was never
+  // submitted on this WABA — point the user to the Templates UI to submit.
+  const { data: tpl } = await supabase.from('wa_templates')
+    .select('status, rejection_reason')
+    .eq('tenant_id', args.tenantId)
+    .eq('name',     templateName)
+    .eq('language', templateLang)
+    .maybeSingle()
+  if (!tpl) {
+    throw new Error(
+      `Notification template '${templateName}' (${templateLang}) is not registered on this WABA. ` +
+      `Submit it in Channels → WhatsApp → Templates with body "*{{1}}*\\n{{2}}" and wait for Meta approval.`
+    )
+  }
+  if (tpl.status !== 'approved') {
+    const detail = tpl.status === 'rejected' && tpl.rejection_reason
+      ? ` Rejection reason: ${tpl.rejection_reason}`
+      : ''
+    throw new Error(
+      `Notification template '${templateName}' (${templateLang}) is '${tpl.status}', not 'approved'. ` +
+      `Meta only delivers approved templates outside the 24h window. ` +
+      `Check Channels → WhatsApp → Templates.${detail}`
+    )
+  }
+
+  // 4. Build template payload. Template body is `*{{1}}*\n{{2}}` — 2 params
+  // by default. If extraTemplateParams is set, append more (caller is
+  // responsible for matching template body shape).
   const params = [args.title, args.body ?? '', ...(args.extraTemplateParams ?? [])]
     .map(text => ({ type: 'text', text: String(text).slice(0, 1024) }))
 

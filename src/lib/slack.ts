@@ -112,21 +112,36 @@ export async function sendSlackNotification(args: SlackNotificationArgs): Promis
  * isn't configured for this tenant — caller should treat as "skip slack
  * delivery for this notification" rather than an error.
  *
- * NOTE on storage: webhook URL lives in `tenant_integrations.config.webhook_url`.
- * If a future migration moves Slack to OAuth (real Slack App), update this
- * single function — every caller goes through here.
+ * Storage shape (set by routes/connectors/slack.ts):
+ *   tenant_integrations.refresh_token  → encrypted webhook URL
+ *   tenant_integrations.metadata       → { auth_mode: 'webhook_paste' }
+ *
+ * Mirrors the Razorpay api_key path so the generic disconnect handler
+ * (POST /api/connectors/:key/disconnect) deletes the row without any
+ * Slack-specific code. If a future migration moves Slack to OAuth,
+ * change this one function — every caller goes through here.
  */
 export async function getTenantSlackWebhook(
   supabase: SupabaseClient,
   tenantId: string,
 ): Promise<string | null> {
   const { data } = await supabase.from('tenant_integrations')
-    .select('config')
+    .select('refresh_token, status')
     .eq('tenant_id', tenantId)
     .eq('key', 'slack')
     .maybeSingle()
-  const url = (data as any)?.config?.webhook_url
-  if (typeof url !== 'string' || !url.startsWith(SLACK_WEBHOOK_PREFIX)) return null
+  if (!data?.refresh_token) return null
+  if (data.status && data.status !== 'active') return null
+  let url: string
+  try {
+    // Lazy-import crypto so this module stays dependency-free for tests.
+    const { decrypt } = await import('../crypto')
+    url = decrypt(data.refresh_token)
+  } catch (e: any) {
+    console.warn(`[slack] failed to decrypt webhook for tenant ${tenantId}: ${e?.message ?? e}`)
+    return null
+  }
+  if (!url.startsWith(SLACK_WEBHOOK_PREFIX)) return null
   return url
 }
 
