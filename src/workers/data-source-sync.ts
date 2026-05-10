@@ -24,6 +24,7 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { sheetsReadRange } from '../google'
+import { listAllRecords } from '../lib/airtable'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -79,19 +80,20 @@ async function runTick() {
   let succeeded = 0, failed = 0, totalImported = 0, totalUpdated = 0
   for (const sub of due) {
     try {
-      let result: { imported: number; updated: number }
-      if (sub.source_type === 'google_sheet') {
-        result = await syncGoogleSheet(sub)
-      } else {
-        // Airtable / csv_url stubs — recorded as errors so the user knows it's unsupported.
-        throw new Error(`source_type=${sub.source_type} not supported yet`)
-      }
+      let result: { imported: number; updated: number; warning?: string }
+      if      (sub.source_type === 'google_sheet') result = await syncGoogleSheet(sub)
+      else if (sub.source_type === 'airtable')     result = await syncAirtable(sub)
+      else throw new Error(`source_type=${sub.source_type} not supported yet`)
       await supabase.from('data_source_subscriptions').update({
         last_synced_at: new Date().toISOString(),
         next_sync_at:   new Date(Date.now() + (sub.sync_interval_minutes * 60_000)).toISOString(),
         rows_imported:  (sub.rows_imported ?? 0) + result.imported,
         rows_updated:   (sub.rows_updated  ?? 0) + result.updated,
-        last_error:     null,
+        // last_error doubles as a "things the user needs to know" channel.
+        // A successful sync clears it unless the source flagged a soft warning
+        // (e.g. record cap hit on Airtable). The Source tab shows last_error
+        // verbatim, so the warning surfaces there without a new column.
+        last_error:     result.warning ?? null,
         updated_at:     new Date().toISOString(),
       }).eq('id', sub.id)
       succeeded++
@@ -175,6 +177,89 @@ async function syncGoogleSheet(sub: any): Promise<{ imported: number; updated: n
     }
   }
   return { imported, updated }
+}
+
+// ── Airtable sync ────────────────────────────────────────────────────────────
+// Same shape as syncGoogleSheet: pull all records (capped to 5000),
+// dedupe against existing rows by Airtable's stable record id (which we
+// stash in lead_rows.data.airtable_record_id), insert new + update changed.
+async function syncAirtable(sub: any): Promise<{ imported: number; updated: number; warning?: string }> {
+  const { base_id, table_id, table_name, view } = (sub.source_config ?? {}) as any
+  if (!base_id) throw new Error('subscription missing base_id')
+  // Either form is accepted by listAllRecords / Airtable's REST API. Mirror
+  // endpoint stashes both `table_id` (Airtable id 'tblXXX') and `table_name`
+  // (human-readable) — prefer the id since it's stable across renames.
+  const tableRef = String(table_id ?? table_name ?? '')
+  if (!tableRef) throw new Error('subscription missing table_id and table_name')
+
+  // Pull tenant for user_id (for lead_rows.user_id which is NOT NULL).
+  const { data: tenant } = await supabase.from('tenants')
+    .select('id, user_id').eq('id', sub.tenant_id).maybeSingle()
+  if (!tenant) throw new Error('tenant not found')
+
+  // Pull all records (worker reuses getValidToken for refresh) — capped at
+  // 5000 records per sync to bound memory + Airtable rate-limit exposure.
+  const records = await listAllRecords(supabase, sub.tenant_id, base_id, tableRef, {
+    view,
+    maxPages: 50,  // 50 × 100 = 5000
+  })
+  // Track whether we hit the cap so we can surface it as last_error rather
+  // than silently dropping records 5001+. Worker tick records 'truncated'
+  // suffix on the subscription so the user sees it on the Source tab.
+  const hitCap = records.length >= 50 * 100
+  if (records.length === 0) return { imported: 0, updated: 0 }
+
+  // The mapping was stashed at mirror time (field name → our column key).
+  const fieldMap = (sub.column_mappings ?? {}) as Record<string, string>
+
+  // Dedupe via Airtable's stable record id, stashed into data.airtable_record_id
+  // on every insert. Far more reliable than a column-value primary key for
+  // Airtable specifically (records can be renamed; ids never change).
+  const { data: existingRows } = await supabase.from('lead_rows')
+    .select('id, data')
+    .eq('table_id', sub.lead_table_id)
+    .limit(10000)
+  const byRecordId = new Map<string, { id: string; data: any }>()
+  for (const r of existingRows ?? []) {
+    const rid = (r.data as any)?.airtable_record_id
+    if (rid) byRecordId.set(String(rid), r)
+  }
+
+  let imported = 0, updated = 0
+  for (const rec of records) {
+    const data: Record<string, string> = { airtable_record_id: rec.id }
+    for (const [fieldName, value] of Object.entries(rec.fields)) {
+      const key = fieldMap[fieldName] ?? keyify(fieldName)
+      data[key] = value == null ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value))
+    }
+
+    const existing = byRecordId.get(rec.id)
+    if (existing) {
+      // Compare full data shape — change-detect to avoid useless writes.
+      const prev = existing.data as Record<string, any>
+      let changed = false
+      for (const k of Object.keys(data)) if (String(prev?.[k] ?? '') !== data[k]) { changed = true; break }
+      if (changed) {
+        await supabase.from('lead_rows')
+          .update({ data, updated_at: new Date().toISOString() })
+          .eq('id', existing.id)
+        updated++
+      }
+    } else {
+      await supabase.from('lead_rows').insert({
+        tenant_id: sub.tenant_id,
+        user_id:   tenant.user_id,
+        table_id:  sub.lead_table_id,
+        data, status: 'new', tags: [],
+        ingest_source: 'sync',
+      })
+      imported++
+    }
+  }
+  return {
+    imported, updated,
+    warning: hitCap ? 'Sync truncated at 5000 records — only the first 5000 are mirrored each tick. Use Airtable views to filter or contact support to raise the cap.' : undefined,
+  }
 }
 
 function keyify(label: string): string {

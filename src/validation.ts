@@ -5,6 +5,27 @@
  *
  * On validation failure: 400 with { error, issues } so the FE can show the
  * exact field that's wrong instead of a generic "Bad Request".
+ *
+ * ─── SECURITY CONTRACT — read before changing this file ──────────────────
+ *
+ * After validateBody runs, `req.body` is REPLACED with the parsed Zod result.
+ * Downstream handlers can safely do `update({ ...req.body, … })` because
+ * the spread will only include fields the schema permitted:
+ *
+ *   - .strict()      → unknown keys threw 400 already, body has only known fields
+ *   - default (strip)→ unknown keys silently dropped, body has only known fields
+ *   - .passthrough() → unknown keys ARE preserved (use only on inner blob fields)
+ *
+ * If you remove or weaken the `req.body = result.data` line below, every
+ * PATCH handler in the codebase that spreads req.body becomes a tenant-write
+ * vulnerability — a client could sneak `tenant_id`/`user_id`/`id` past
+ * validation by sending them alongside legitimate fields. The .eq('tenant_id')
+ * filter on UPDATE only restricts WHICH row is targeted, not what gets
+ * written.
+ *
+ * Don't add a separate `req.parsed` alongside — single source of truth
+ * minimises drift. If you need typed access in a handler, cast at the
+ * use site: `const patch = req.body as z.infer<typeof MySchema>`.
  */
 
 import express from 'express'
@@ -24,7 +45,7 @@ export function validateBody<T extends ZodSchema>(schema: T) {
       return
     }
     // Replace req.body with the parsed (and stripped) value so handlers don't
-    // accidentally trust unknown fields.
+    // accidentally trust unknown fields. See the security contract above.
     req.body = result.data
     next()
   }
@@ -32,17 +53,47 @@ export function validateBody<T extends ZodSchema>(schema: T) {
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
 
+// SECURITY: every Patch/Create schema below uses an explicit allow-list of
+// known fields and DOES NOT use `.passthrough()` on the outer envelope.
+// `.passthrough()` was previously letting clients sneak `tenant_id`,
+// `user_id`, `id`, `created_at` etc. into the spread `update({ ...req.body })`
+// — the .eq('tenant_id', ...) filter on UPDATE only restricts the *target*
+// row, so unknown fields would have re-tenanted the row, leaking it.
+// `.passthrough()` is still allowed on inner JSON-blob fields where forward
+// compat with payloads matters (config / audience / interactive).
+//
+// Note on `__proto__` pollution: Zod's `.strict()` SILENTLY STRIPS the
+// `__proto__` key during parse (it doesn't error like other unknown keys).
+// That's still safe for our use case because (a) we spread the parsed
+// output, not req.body, and (b) Object.prototype is frozen at boot in
+// src/index.ts. Don't rely on `.strict()` alone to defeat pollution.
+//
+// Add new fields here when the FE needs them — fail closed by design.
+
 export const WorkflowCreateSchema = z.object({
   name: z.string().min(1).max(200),
   description: z.string().max(2000).optional().nullable(),
   status: z.enum(['draft', 'live', 'paused', 'archived']).optional(),
-  // Nodes JSON shape comes from Claude — accept any object for now (parser
-  // already shapes it). Just guard the outer envelope.
+  // Nodes JSON shape comes from the parser — accept any object for the
+  // inner array. Still strict on the outer envelope.
   nodes: z.array(z.any()).optional(),
+  blueprint: z.any().optional(),
+  intent_text: z.string().optional().nullable(),
+  integrations: z.array(z.string()).optional(),
   trigger_type: z.string().optional().nullable(),
-}).passthrough()  // keep forward-compat fields like config_completion_percent
+  // Workflow chaining — when set, this workflow auto-runs every time the
+  // referenced upstream workflow completes a session. Cycle prevention
+  // happens server-side in the create/patch handlers.
+  triggered_by_workflow_id: z.string().uuid().optional().nullable(),
+}).strict()
 
-export const WorkflowPatchSchema = WorkflowCreateSchema.partial()
+// IMPORTANT: `.partial()` returns a NEW ZodObject whose unknownKeys policy
+// resets to default (`strip`). It does NOT inherit `.strict()` from the
+// base — caller must re-apply, otherwise unknown keys silently strip but
+// the *route handler* still spreads `req.body` (not the parsed result),
+// so unknown keys land in the UPDATE anyway. Re-strict() makes Zod
+// reject them at validation, before the handler runs.
+export const WorkflowPatchSchema = WorkflowCreateSchema.partial().strict()
 
 export const BroadcastCreateSchema = z.object({
   name: z.string().min(1).max(200),
@@ -56,7 +107,11 @@ export const BroadcastCreateSchema = z.object({
   variable_map: z.record(z.string(), z.string()).optional(),
   scheduled_at: z.string().datetime().optional().nullable(),
   status: z.enum(['draft', 'scheduled', 'sending', 'sent', 'failed']).optional(),
-}).passthrough()
+  // FE seeds zero-valued stats on create — accepted but server overrides
+  // anyway since stats track real delivery state. The DB also defaults to
+  // zero, so a client sending these is harmless.
+  stats: z.record(z.string(), z.number()).optional(),
+}).strict()
 
 export const ContactCreateSchema = z.object({
   name: z.string().min(1).max(200),
@@ -65,9 +120,13 @@ export const ContactCreateSchema = z.object({
   tags: z.array(z.string()).optional(),
   attributes: z.record(z.string(), z.any()).optional(),
   status: z.enum(['active', 'opted_out', 'blocked']).optional(),
-}).passthrough()
+  // bot_paused is editable from ContactModal (the inline checkbox) AND from
+  // the dedicated /api/contacts/:id/bot-pause PATCH. Both paths must accept it.
+  bot_paused: z.boolean().optional(),
+}).strict()
 
-export const ContactPatchSchema = ContactCreateSchema.partial()
+// See WorkflowPatchSchema note re: .partial().strict() pattern.
+export const ContactPatchSchema = ContactCreateSchema.partial().strict()
 
 export const RazorpayConnectSchema = z.object({
   key_id: z.string().regex(/^rzp_(live|test)_/, 'Must start with rzp_live_ or rzp_test_'),
@@ -119,4 +178,12 @@ export const CampaignCreateSchema = z.object({
   status: z.enum(['draft', 'active', 'paused', 'completed']).optional(),
   audience: z.object({}).passthrough().optional(),
   message_count: z.number().int().nonnegative().optional(),
-}).passthrough()
+  // FE seeds zero-valued stats. Server-side, real values come from the
+  // workers as enrolment + delivery proceed. Accepted but harmless either way.
+  stats: z.record(z.string(), z.number()).optional(),
+}).strict()
+
+// Campaigns PATCH was not previously schema-validated at all (the route just
+// spread req.body into update). Mirror the create shape, optional-ised.
+// See WorkflowPatchSchema note re: .partial().strict() — must re-strict.
+export const CampaignPatchSchema = CampaignCreateSchema.partial().strict()

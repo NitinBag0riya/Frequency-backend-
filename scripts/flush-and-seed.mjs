@@ -399,6 +399,63 @@ async function seedTenant(superAdminId) {
     body: JSON.stringify(notifs.map(n => ({ ...n, tenant_id: tenant.id, recipient_user_id: ownerId, data: {} }))),
   })
 
+  // 3.17b Workflows — sample drafts + active automations
+  await rest('/workflows', {
+    method: 'POST',
+    body: JSON.stringify([
+      {
+        user_id: ownerId, tenant_id: tenant.id, name: 'Welcome new lead',
+        description: 'Send welcome WhatsApp + add to Sales Manager queue',
+        status: 'live', intent_text: 'When a new lead comes in, send welcome and notify sales manager',
+        nodes: [
+          { id: 'trigger',  type: 'lead_added',     label: 'New lead added',                 config: {} },
+          { id: 'wa_send',  type: 'send_template',  label: 'Send welcome template',         config: { template_name: 'welcome', template_params: ['{{trigger.contact.name}}'] } },
+          { id: 'notify',   type: 'assign_agent',   label: 'Assign to Sales Manager',       config: { role: 'sales_manager' } },
+        ],
+        integrations: ['whatsapp'],
+        stats: { sent: 248, replied: 92, converted: 31, revenue: 124000, conversionRate: 12.5 },
+      },
+      {
+        user_id: ownerId, tenant_id: tenant.id, name: 'Site visit reminder',
+        description: '24h before booked site visit, send WA reminder + add to Google Calendar',
+        status: 'live', intent_text: 'Day before site visit reminder via WhatsApp + sync to calendar',
+        nodes: [
+          { id: 'trigger',  type: 'scheduled',         label: '24h before site_visit_at',  config: { offset_hours: -24 } },
+          { id: 'wa_send',  type: 'send_template',     label: 'Send reminder template',     config: { template_name: 'site_visit_confirm' } },
+          { id: 'cal',      type: 'create_calendar_event', label: 'Add to Google Calendar', config: {} },
+        ],
+        integrations: ['whatsapp', 'google_calendar'],
+        stats: { sent: 156, replied: 134, converted: 89, revenue: 0, conversionRate: 57.0 },
+      },
+      {
+        user_id: ownerId, tenant_id: tenant.id, name: 'Payment follow-up sequence',
+        description: 'Razorpay payment-link → 3 follow-ups if unpaid in 24/48/72h',
+        status: 'live', intent_text: 'Send Razorpay link, follow up 3 times if not paid',
+        nodes: [
+          { id: 'trigger',  type: 'tag_added',                  label: 'Tag "booked"',                config: { tag: 'booked' } },
+          { id: 'rzp',      type: 'razorpay_create_payment_link', label: 'Create payment link',     config: { amount: 25000 } },
+          { id: 'send1',    type: 'send_template',              label: 'Send link (immediate)',     config: { template_name: 'payment_link' } },
+          { id: 'wait1',    type: 'wait_delay',                 label: 'Wait 24h',                   config: { delay_minutes: 1440 } },
+          { id: 'send2',    type: 'send_template',              label: 'Reminder #1 (if unpaid)',   config: { template_name: 'payment_reminder' } },
+        ],
+        integrations: ['whatsapp', 'razorpay'],
+        stats: { sent: 78, replied: 42, converted: 38, revenue: 950000, conversionRate: 48.7 },
+      },
+      {
+        user_id: ownerId, tenant_id: tenant.id, name: 'AI auto-reply (off-hours)',
+        description: 'Outside business hours, Claude AI replies with pricing + brochure link',
+        status: 'draft', intent_text: 'AI reply outside 9am-6pm with pricing info',
+        nodes: [
+          { id: 'trigger', type: 'inbox_message',     label: 'Inbound WhatsApp message',  config: {} },
+          { id: 'cond',    type: 'condition_variable', label: 'Outside 9-6?',              config: { variable: 'now.hour', operator: 'not_between', values: [9, 18] } },
+          { id: 'ai',      type: 'run_ai_responder',  label: 'Claude reply',              config: { system_prompt: 'You are Acme Realty assistant. Reply with pricing + brochure URL.' } },
+        ],
+        integrations: ['whatsapp'],
+        stats: { sent: 0, replied: 0, converted: 0, revenue: 0, conversionRate: 0 },
+      },
+    ]),
+  })
+
   // 3.18 Platform announcement
   await rest('/platform_announcements', {
     method: 'POST',

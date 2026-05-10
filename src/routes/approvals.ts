@@ -30,6 +30,8 @@ interface Deps {
   supabase: SupabaseClient
   requireAuth: Middleware
   identifyTenant: Middleware
+  /** Permission gate factory — same one mounted in index.ts. */
+  checkPermission: (feature: string, action: 'view' | 'edit' | 'delete') => Middleware
 }
 
 /**
@@ -111,7 +113,7 @@ export async function requireApproval(
 
 export function createApprovalsRouter(deps: Deps): express.Router {
   const r = express.Router()
-  const { supabase, requireAuth, identifyTenant } = deps
+  const { supabase, requireAuth, identifyTenant, checkPermission } = deps
 
   r.get('/api/approvals', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId
@@ -130,7 +132,10 @@ export function createApprovalsRouter(deps: Deps): express.Router {
     res.json({ count: count ?? 0 })
   })
 
-  r.post('/api/approvals/:id/approve', requireAuth, identifyTenant, async (req, res) => {
+  // Approve / reject are gated to settings.edit — same bar as changing
+  // workspace settings, which in practice means owner / workspace_admin.
+  // Sales reps, support agents, analysts etc. cannot bypass approvals.
+  r.post('/api/approvals/:id/approve', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId
     const userId = (req as any).user.id
     const { data: row } = await supabase.from('approval_requests')
@@ -151,7 +156,7 @@ export function createApprovalsRouter(deps: Deps): express.Router {
     res.json({ success: true })
   })
 
-  r.post('/api/approvals/:id/reject', requireAuth, identifyTenant, async (req, res) => {
+  r.post('/api/approvals/:id/reject', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId
     const reason = String(req.body?.reason ?? '').trim() || 'No reason provided'
     const { data: row } = await supabase.from('approval_requests')

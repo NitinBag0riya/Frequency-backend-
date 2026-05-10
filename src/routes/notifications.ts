@@ -191,15 +191,17 @@ export async function emitNotification(
     .in('user_id', args.recipient_user_ids)
     .eq('event_key', args.event_key)
 
+  // Build inserts + parallel array tracking which channels each user opted
+  // into. We dispatch in_app via the row insert (FE picks it up via Realtime
+  // subscription) and email out-of-band via Resend after the insert lands.
   const inserts: any[] = []
-  const skipped: { user_id: string; reason: string }[] = []
+  const channelsByUser: string[][] = []
   for (const userId of args.recipient_user_ids) {
     const pref = (prefs ?? []).find((p: any) => p.user_id === userId && p.tenant_id === args.tenant_id) ??
                  (prefs ?? []).find((p: any) => p.user_id === userId && !p.tenant_id)
-    const channels = pref?.channels ?? type.default_channels
-    if (pref?.is_muted) { skipped.push({ user_id: userId, reason: 'muted' }); continue }
-    if (!channels.includes('in_app')) { skipped.push({ user_id: userId, reason: 'in_app off' }); continue }
-
+    const channels = (pref?.channels ?? type.default_channels) as string[]
+    if (pref?.is_muted) continue
+    if (!channels.includes('in_app')) continue
     inserts.push({
       tenant_id: args.tenant_id ?? null,
       recipient_user_id: userId,
@@ -209,6 +211,7 @@ export async function emitNotification(
       data: ctx,
       severity: type.severity,
     })
+    channelsByUser.push(channels)
   }
 
   if (inserts.length === 0) return []
@@ -218,13 +221,153 @@ export async function emitNotification(
     return []
   }
 
-  // Log the in_app delivery; email/whatsapp/slack would be queued separately
-  const log = (created ?? []).map(n => ({
-    notification_id: n.id, channel: 'in_app', status: 'delivered' as const, delivered_at: new Date().toISOString(),
+  // ── Channel dispatch ──────────────────────────────────────────────────
+  // Log in_app deliveries inline (these "delivered" the moment the row
+  // landed — FE Realtime will push them next render). Email goes async
+  // via Resend; failures get a 'failed' delivery log row but don't block.
+  const inAppLog = (created ?? []).map(n => ({
+    notification_id: n.id, channel: 'in_app' as const, status: 'delivered' as const, delivered_at: new Date().toISOString(),
   }))
-  if (log.length) await supabase.from('notification_delivery_log').insert(log)
+  if (inAppLog.length) await supabase.from('notification_delivery_log').insert(inAppLog)
+
+  // Email — only for users whose channels include 'email'. Dispatched in
+  // parallel; per-recipient errors are logged independently.
+  const wantsEmail = (created ?? []).map((_n, i) => channelsByUser[i]?.includes('email') ?? false)
+  if (wantsEmail.some(Boolean)) {
+    void dispatchEmails(supabase, created ?? [], wantsEmail, args.tenant_id ?? null).catch(e =>
+      console.warn('[notifications] email dispatch crashed:', e?.message ?? e))
+  }
 
   return created ?? []
+}
+
+/**
+ * Send emails for the just-inserted notification rows. Resolves user emails
+ * via per-id Auth admin lookups (only for users we've validated belong to
+ * this tenant), renders the email body, sends via Resend, logs success/
+ * failure to notification_delivery_log keyed by notification_id.
+ *
+ * Fire-and-forget from emitNotification — never blocks the in-app delivery
+ * which is the real-time path users see.
+ *
+ * SECURITY: caller-supplied `recipient_user_ids` is FILTERED against tenant
+ * membership before email lookup. Without this, a caller that mis-scoped
+ * a query (e.g., forgot `.eq('tenant_id')` when fetching assignees) could
+ * silently email arbitrary users from the global auth pool.
+ *
+ * SCALE: previously used bulk listUsers({perPage: 1000}) which silently
+ * dropped recipients beyond page 1 once the global auth pool exceeded 1000
+ * users. Now: per-id getUserById, bounded by the validated-recipient count
+ * (typically ≤team size, ≤50 in practice).
+ */
+async function dispatchEmails(
+  supabase: SupabaseClient,
+  notifications: any[],
+  wantsEmail: boolean[],
+  tenantId: string | null,
+): Promise<void> {
+  // Lazy-import so the email module's env-var check doesn't fire at boot
+  // (we want a graceful degradation: in-app keeps working even if Resend
+  // isn't configured).
+  let sendEmail: typeof import('../lib/email').sendEmail
+  let renderNotificationEmail: typeof import('../lib/email').renderNotificationEmail
+  try {
+    const mod = await import('../lib/email')
+    sendEmail = mod.sendEmail
+    renderNotificationEmail = mod.renderNotificationEmail
+  } catch (e: any) {
+    console.warn('[notifications] email module load failed:', e?.message ?? e)
+    return
+  }
+
+  const userIds = Array.from(new Set(
+    notifications.filter((_, i) => wantsEmail[i]).map(n => n.recipient_user_id as string),
+  ))
+  if (userIds.length === 0) return
+
+  // ── Validate recipients belong to this tenant ────────────────────────
+  // Caller passed recipient_user_ids. They might have mis-scoped a query.
+  // Build allowed set = {tenant owner} ∪ {user_role_assignments rows where
+  // tenant_id matches}. Anything outside is dropped + logged.
+  // Platform-scoped notifications (tenant_id == null, e.g. announcements
+  // to platform admins) skip this check — the caller for those is super-
+  // admin code which has already authorised the recipient list.
+  const allowedUsers = new Set<string>()
+  if (tenantId) {
+    const [{ data: tenant }, { data: roleRows }] = await Promise.all([
+      supabase.from('tenants').select('user_id').eq('id', tenantId).maybeSingle(),
+      supabase.from('user_role_assignments')
+        .select('user_id').eq('tenant_id', tenantId).is('disabled_at', null),
+    ])
+    if (tenant?.user_id) allowedUsers.add(tenant.user_id)
+    for (const r of (roleRows ?? []) as any[]) if (r.user_id) allowedUsers.add(r.user_id)
+  }
+  const validatedIds = tenantId
+    ? userIds.filter(id => allowedUsers.has(id))
+    : userIds  // platform-scoped: trust caller
+  if (validatedIds.length < userIds.length) {
+    const dropped = userIds.filter(id => !validatedIds.includes(id))
+    console.warn(`[notifications] dropped ${dropped.length} non-tenant recipients before email send`,
+      { tenant_id: tenantId, dropped_user_ids: dropped })
+  }
+  if (validatedIds.length === 0) return
+
+  // ── Resolve emails (per-id, bounded by validated recipient count) ────
+  const userEmails = new Map<string, string>()
+  await Promise.all(validatedIds.map(async (id) => {
+    try {
+      const { data: { user } = {} as any } = await (supabase as any).auth.admin.getUserById(id)
+      if (user?.email) userEmails.set(id, user.email)
+    } catch (e: any) {
+      console.warn(`[notifications] getUserById ${id} failed:`, e?.message ?? e)
+    }
+  }))
+
+  const logs: any[] = []
+  await Promise.all(notifications.map(async (n, i) => {
+    if (!wantsEmail[i]) return
+    if (!validatedIds.includes(n.recipient_user_id)) {
+      logs.push({ notification_id: n.id, channel: 'email', status: 'skipped', error_message: 'recipient not in tenant' })
+      return
+    }
+    const to = userEmails.get(n.recipient_user_id)
+    if (!to) {
+      logs.push({ notification_id: n.id, channel: 'email', status: 'skipped', error_message: 'no email on record' })
+      return
+    }
+    // Skip if we already sent for this notification id — covers the rare
+    // case where Resend's 24h idempotency window has expired but we
+    // somehow re-call dispatchEmails for the same notification (e.g. a
+    // worker restart that re-enqueues an already-handled job).
+    const { data: prior } = await supabase.from('notification_delivery_log')
+      .select('id').eq('notification_id', n.id).eq('channel', 'email').eq('status', 'sent').limit(1).maybeSingle()
+    if (prior) {
+      logs.push({ notification_id: n.id, channel: 'email', status: 'skipped', error_message: 'already sent' })
+      return
+    }
+
+    const { html, text } = renderNotificationEmail({ title: n.title, body: n.body, link: n.link })
+    try {
+      const result = await sendEmail({
+        to,
+        subject: n.title,
+        html, text,
+        // Idempotency key includes notification id so retries dedup at Resend.
+        idempotency_key: `notif-${n.id}`,
+      })
+      logs.push({
+        notification_id: n.id, channel: 'email', status: 'sent',
+        delivered_at:    new Date().toISOString(),
+        metadata:        { resend_id: result.id },
+      })
+    } catch (e: any) {
+      logs.push({
+        notification_id: n.id, channel: 'email', status: 'failed',
+        error_message: (e?.message ?? String(e)).slice(0, 500),
+      })
+    }
+  }))
+  if (logs.length) await supabase.from('notification_delivery_log').insert(logs)
 }
 
 function interpolate(template: string, vars: Record<string, any>): string {

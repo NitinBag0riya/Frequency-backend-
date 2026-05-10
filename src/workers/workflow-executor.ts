@@ -19,6 +19,7 @@ import {
   Q, WorkflowExecuteJob, connection, enqueueWorkflowExecution,
 } from '../queue'
 import { executeNode, findNode } from '../engine/executor'
+import { dispatchDownstreamForCompletedSession } from '../engine/chaining'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -85,10 +86,18 @@ export function startWorkflowExecutorWorker() {
             }).eq('id', session.id)
             await enqueueWorkflowExecution({ sessionId: session.id, nodeId: next })
           } else {
-            // No next node = implicit end
+            // No next node = implicit end. Mark complete + fire any
+            // downstream workflows chained to this one (best-effort).
             await supabase.from('workflow_sessions').update({
               status: 'completed', updated_at: new Date().toISOString(),
             }).eq('id', session.id)
+            await dispatchDownstreamForCompletedSession(supabase, {
+              id:            session.id,
+              workflow_id:   workflow.id,
+              tenant_id:     tenant.id,
+              contact_phone: session.contact_phone,
+              variables:     session.variables ?? {},
+            })
           }
           break
         }
@@ -122,6 +131,13 @@ export function startWorkflowExecutorWorker() {
           await supabase.from('workflow_sessions').update({
             status: 'completed', updated_at: new Date().toISOString(),
           }).eq('id', session.id)
+          await dispatchDownstreamForCompletedSession(supabase, {
+            id:            session.id,
+            workflow_id:   workflow.id,
+            tenant_id:     tenant.id,
+            contact_phone: session.contact_phone,
+            variables:     session.variables ?? {},
+          })
           break
 
         case 'error':

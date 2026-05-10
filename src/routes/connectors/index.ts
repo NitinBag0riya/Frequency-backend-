@@ -36,7 +36,7 @@ interface Deps {
 
 export function createConnectorsRouter(deps: Deps): express.Router {
   const r = express.Router()
-  const { supabase, requireAuth, identifyTenant } = deps
+  const { supabase, requireAuth, identifyTenant, checkPermission } = deps
 
   // ── Public registry — used by FE AppsModal + Sidebar ──────────────────────
   r.get('/api/connectors/registry', (_req, res) => {
@@ -112,11 +112,14 @@ export function createConnectorsRouter(deps: Deps): express.Router {
       }
 
       // 2. tenants — WhatsApp + Google live here for legacy reasons. Skip any
-      // key that's already been added from tenant_integrations.
+      // key that's already been added from tenant_integrations. Critically:
+      // gate WhatsApp on tenants.status === 'active' so a disconnected tenant
+      // (waba_id is still present because it's NOT NULL) doesn't show up as
+      // connected.
       const { data: tenant } = await supabase.from('tenants')
-        .select('waba_id, display_phone, google_email, google_access_token')
+        .select('waba_id, display_phone, status, google_email, google_access_token')
         .eq('id', tenantId).maybeSingle()
-      if (tenant?.waba_id && !seen.has('whatsapp')) {
+      if (tenant?.waba_id && tenant.status === 'active' && !seen.has('whatsapp')) {
         rows.push(buildConnRow({ key: 'whatsapp', brand_label: tenant.display_phone ?? tenant.waba_id }))
         seen.add('whatsapp')
       }
@@ -146,30 +149,36 @@ export function createConnectorsRouter(deps: Deps): express.Router {
   // ── Channel filter tabs (Inbox / Contacts / Campaigns) ───────────────────
   // Returns ONLY the connectors marked as `isChannel`. FE renders these as
   // [All] [WhatsApp ●] [Instagram ●] [Telegram ●] tabs above each unified view.
+  // Previously this did N+1 DB roundtrips (one per channel-connector). Now
+  // batched into 3 parallel queries (tenants / tg_bots / tenant_integrations)
+  // and resolved in memory — fires on every sidebar mount + tenant switch
+  // so the savings add up.
   r.get('/api/channels/connected',
     requireAuth, identifyTenant,
     async (req, res) => {
       const tenantId = (req as any).tenantId
-      const channels: { key: string; name: string; brandColor: string; iconName: string; connected: boolean }[] = []
 
-      // For each channel-marked connector, decide if this tenant has it
+      const [tenantRes, tgRes, integrationsRes] = await Promise.all([
+        supabase.from('tenants').select('waba_id, status').eq('id', tenantId).maybeSingle(),
+        supabase.from('tg_bots').select('tenant_id').eq('tenant_id', tenantId).maybeSingle(),
+        supabase.from('tenant_integrations').select('key, status').eq('tenant_id', tenantId),
+      ])
+
+      const tenant = tenantRes.data
+      const tgConnected = !!tgRes.data
+      const intActiveByKey = new Map<string, boolean>()
+      for (const r of (integrationsRes.data ?? []) as any[]) {
+        intActiveByKey.set(r.key, r.status === 'active' || r.status == null)
+      }
+
+      const channels: { key: string; name: string; brandColor: string; iconName: string; connected: boolean }[] = []
       for (const def of CONNECTOR_REGISTRY) {
         if (!def.isChannel) continue
 
         let connected = false
-        if (def.key === 'whatsapp') {
-          const { data } = await supabase.from('tenants')
-            .select('waba_id').eq('id', tenantId).maybeSingle()
-          connected = !!data?.waba_id
-        } else if (def.key === 'telegram') {
-          const { data } = await supabase.from('tg_bots')
-            .select('tenant_id').eq('tenant_id', tenantId).maybeSingle()
-          connected = !!data
-        } else {
-          const { data } = await supabase.from('tenant_integrations')
-            .select('status').eq('tenant_id', tenantId).eq('key', def.key).maybeSingle()
-          connected = !!data && (data.status === 'active' || data.status == null)
-        }
+        if      (def.key === 'whatsapp') connected = !!tenant?.waba_id && tenant.status === 'active'
+        else if (def.key === 'telegram') connected = tgConnected
+        else                             connected = intActiveByKey.get(def.key) === true
 
         if (connected) {
           channels.push({
@@ -186,17 +195,62 @@ export function createConnectorsRouter(deps: Deps): express.Router {
     })
 
   // ── Disconnect (revokes local; user revokes upstream from provider dashboard) ──
+  // Three storage shapes have to be handled:
+  //   1. tenant_integrations rows  → delete the row (Airtable, Razorpay, …)
+  //   2. tg_bots                   → delete the bot row (Telegram)
+  //   3. tenants.* legacy columns  → flip tenants.status to 'disconnected'
+  //                                  (WhatsApp) or NULL google_* fields (Google).
+  // The previous version only did (1), so clicking "Disconnect" on WhatsApp
+  // returned 200 OK while leaving tenants.waba_id intact — the next read of
+  // /api/connectors/connections still saw it as connected.
+  // Disconnect is a destructive operation — gated by integrations:delete so
+  // read-only roles (viewer / analyst / support_agent) can't yank a tenant's
+  // WhatsApp / Google / Telegram out from under the team.
   r.post('/api/connectors/:key/disconnect',
-    requireAuth, identifyTenant,
+    requireAuth, identifyTenant, checkPermission('integrations', 'delete'),
     async (req, res) => {
       const tenantId = (req as any).tenantId
-      const key = req.params.key
+      const key = String(req.params.key ?? '')
 
-      // Channel-specific disconnect side effects
+      // ── Channel-specific disconnect side effects ──
       if (key === 'telegram') {
-        await supabase.from('tg_bots').delete().eq('tenant_id', tenantId)
+        const { error } = await supabase.from('tg_bots').delete().eq('tenant_id', tenantId)
+        if (error) { res.status(500).json({ error: error.message }); return }
       }
 
+      if (key === 'whatsapp') {
+        // tenants.waba_id is NOT NULL + UNIQUE — we can't null it out without a
+        // schema change. Flipping status to 'disconnected' and clearing the
+        // access_token is the supported route. The read endpoints below now
+        // filter by status, so the channel disappears from the UI.
+        const { error } = await supabase.from('tenants').update({
+          status: 'disconnected',
+          access_token: '',  // belt-and-braces: revoke local copy of the Meta token
+          updated_at: new Date().toISOString(),
+        }).eq('id', tenantId)
+        if (error) { res.status(500).json({ error: error.message }); return }
+        res.json({ success: true })
+        return
+      }
+
+      if (key.startsWith('google_')) {
+        // The four google_* keys all share one OAuth token on the tenants row.
+        // Disconnecting any one of them revokes the shared credential, so all
+        // four go away in /api/connectors/connections together — that's the
+        // honest behaviour given how the token is stored.
+        const { error } = await supabase.from('tenants').update({
+          google_email:         null,
+          google_access_token:  null,
+          google_refresh_token: null,
+          google_token_expiry:  null,
+          updated_at: new Date().toISOString(),
+        }).eq('id', tenantId)
+        if (error) { res.status(500).json({ error: error.message }); return }
+        res.json({ success: true })
+        return
+      }
+
+      // ── Generic path: row in tenant_integrations ──
       const { error } = await supabase.from('tenant_integrations').delete()
         .eq('tenant_id', tenantId).eq('key', key)
       if (error) { res.status(500).json({ error: error.message }); return }
@@ -220,11 +274,17 @@ export function createConnectorsRouter(deps: Deps): express.Router {
       (req, res) => {
         const clientId = process.env.GOOGLE_CLIENT_ID
         if (!clientId || !process.env.GOOGLE_CLIENT_SECRET) {
-          res.status(503).type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>Google not configured</title></head><body>
-            <h2>⚙️ Google OAuth not configured</h2>
-            <p>Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET env vars.</p>
-            <script>setTimeout(() => { try { window.close(); } catch(e){} }, 6000);</script>
-            </body></html>`)
+          // Post back ok:false so the FE shows the actual error instead of
+          // either a misleading "connected" toast or a "Window closed before
+          // connection completed" timeout when the popup just closes silently.
+          const message = 'Google OAuth not configured (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars missing on the server)'
+          res.status(503).type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>Google not configured</title></head><body style="font-family:DM Sans,system-ui;background:#0d1117;color:#fff;padding:24px;text-align:center;">
+            <h2>⚠ Google OAuth not configured</h2>
+            <p style="opacity:.6">This window will close…</p>
+            <script>
+              try { window.opener?.postMessage({ ok: false, message: ${JSON.stringify(message)} }, '*') } catch(e){}
+              setTimeout(() => { try { window.close(); } catch(e){} }, 1500);
+            </script></body></html>`)
           return
         }
         const userId   = (req as any).user?.id   as string

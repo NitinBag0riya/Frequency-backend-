@@ -20,6 +20,7 @@ import express from 'express'
 import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sheetsGetMetadata, sheetsReadRange } from '../google'
+import { getTableSchema, listRecords, airtableFieldToLeadType } from '../lib/airtable'
 import { validateBody } from '../validation'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -42,12 +43,26 @@ const MirrorGoogleSheetSchema = z.object({
   lead_table_id: z.string().uuid().optional(),
   suggested_name: z.string().max(200).optional(),
   sync_interval_minutes: z.number().int().min(1).max(1440).optional(),
-})
+}).strict()
 
+const MirrorAirtableSchema = z.object({
+  base_id:  z.string().min(10),       // 'appXXXXXXXXXXXXXX'
+  table_id: z.string().min(1),        // either 'tblXXX' or human name
+  view:     z.string().optional(),    // optional Airtable view to filter by
+  /** If set, attach to existing lead_table; else create fresh from schema. */
+  lead_table_id: z.string().uuid().optional(),
+  suggested_name: z.string().max(200).optional(),
+  sync_interval_minutes: z.number().int().min(1).max(1440).optional(),
+}).strict()
+
+// `.strict()` rejects unknown keys → callers can't sneak `tenant_id`,
+// `user_id`, `id`, `lead_table_id`, `created_at` etc. into the UPDATE via
+// the spread below. The .eq('tenant_id', ...) only filters the target row,
+// so without strict() a PATCH could re-tenant the subscription.
 const PatchSubSchema = z.object({
   status: z.enum(['active', 'paused']).optional(),
   sync_interval_minutes: z.number().int().min(1).max(1440).optional(),
-})
+}).strict()
 
 export function createDataSourcesRouter(deps: Deps): express.Router {
   const r = express.Router()
@@ -80,8 +95,14 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
     validateBody(PatchSubSchema),
     async (req, res) => {
       const tenantId = (req as any).tenantId
+      // `validateBody` replaced req.body with the parsed (strict-stripped)
+      // result. Bind to a typed local so the spread visibly says "spread
+      // the validated patch" — `tenant_id`, `id`, `lead_table_id`,
+      // `created_at` etc. were already 400'd by PatchSubSchema's .strict()
+      // and can't land in the UPDATE. See SECURITY CONTRACT in src/validation.ts.
+      const patch = req.body as z.infer<typeof PatchSubSchema>
       const { data, error } = await supabase.from('data_source_subscriptions')
-        .update({ ...req.body, updated_at: new Date().toISOString() })
+        .update({ ...patch, updated_at: new Date().toISOString() })
         .eq('id', req.params.id).eq('tenant_id', tenantId)
         .select().maybeSingle()
       if (error) { res.status(500).json({ error: error.message }); return }
@@ -228,6 +249,152 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
           rows_updated:   result.updated,
         }).eq('id', sub.id)
       } catch (err: any) {
+        await supabase.from('data_source_subscriptions').update({
+          status: 'error', last_error: err?.message ?? String(err),
+        }).eq('id', sub.id)
+      }
+
+      res.json({ subscription: sub, lead_table: table })
+    })
+
+  // ── Mirror an Airtable table ──────────────────────────────────────────────
+  // Same shape as the Google Sheets mirror: read schema → infer columns →
+  // create lead_table (or attach to existing) → register subscription →
+  // run first import inline → return both. Sync worker handles ongoing pulls.
+  r.post('/api/data-sources/airtable/mirror',
+    requireAuth, identifyTenant, checkPermission('integrations', 'edit'),
+    validateBody(MirrorAirtableSchema),
+    async (req, res) => {
+      const tenantId = (req as any).tenantId
+      const userId   = (req as any).user.id
+      const { base_id, table_id, view, suggested_name, sync_interval_minutes, lead_table_id } =
+        req.body as z.infer<typeof MirrorAirtableSchema>
+
+      // 1. Fetch table schema (validates Airtable connected + table exists).
+      let schema
+      try { schema = await getTableSchema(supabase, tenantId, base_id, table_id) }
+      catch (err: any) { res.status(400).json({ error: `Couldn't read Airtable table: ${err.message}` }); return }
+      if (!schema.fields || schema.fields.length === 0) {
+        res.status(400).json({ error: `Table "${schema.name}" has no fields.` }); return
+      }
+
+      // 2. Resolve target lead_table — reuse or create.
+      let table: { id: string; name: string }
+      if (lead_table_id) {
+        const { data: existing } = await supabase.from('lead_tables').select('id, name')
+          .eq('id', lead_table_id).eq('tenant_id', tenantId).maybeSingle()
+        if (!existing) { res.status(404).json({ error: 'lead_table not found' }); return }
+        table = existing
+      } else {
+        const tableName = (suggested_name?.trim() || schema.name).slice(0, 200)
+        const { data: created, error: createErr } = await supabase.from('lead_tables').insert({
+          tenant_id: tenantId,
+          user_id:   userId,
+          name:      tableName,
+          description: `Mirrored from Airtable base ${base_id} · table "${schema.name}"`,
+          source:    'airtable',
+          source_config: { base_id, table_id: schema.id, table_name: schema.name, view },
+        }).select('id, name').single()
+        if (createErr || !created) {
+          res.status(500).json({ error: createErr?.message ?? 'Failed to create lead_table' }); return
+        }
+        table = created
+
+        // Build columns from Airtable schema. Type-coerce best-effort via
+        // airtableFieldToLeadType — user can change later from Columns tab.
+        const cols = schema.fields.map((f, i) => ({
+          tenant_id:   tenantId,
+          user_id:     userId,
+          table_id:    table.id,
+          name:        f.name.slice(0, 100),
+          key:         keyify(f.name),
+          type:        airtableFieldToLeadType(f.type),
+          is_primary:  i === 0,
+          is_required: false,
+          position:    i,
+        }))
+        if (cols.length > 0) await supabase.from('lead_columns').insert(cols)
+      }
+
+      // 3. Subscription row. column_mappings = airtable field name → our key
+      // so the sync worker doesn't have to reconcile per call.
+      const fieldNameToKey = Object.fromEntries(schema.fields.map(f => [f.name, keyify(f.name)]))
+      const { data: sub, error: subErr } = await supabase.from('data_source_subscriptions').insert({
+        tenant_id:     tenantId,
+        lead_table_id: table.id,
+        source_type:   'airtable',
+        source_config: { base_id, table_id: schema.id, table_name: schema.name, view },
+        column_mappings: fieldNameToKey,
+        sync_interval_minutes: sync_interval_minutes ?? 5,
+        next_sync_at: new Date().toISOString(),
+        status: 'active',
+        created_by: userId,
+      }).select().single()
+      if (subErr || !sub) {
+        res.status(500).json({ error: subErr?.message ?? 'Failed to create subscription' })
+        return
+      }
+
+      // Backlink so the FE Source tab shows "live mirror" pill on the table
+      await supabase.from('lead_tables')
+        .update({ synced_from_subscription_id: sub.id, updated_at: new Date().toISOString() })
+        .eq('id', table.id)
+
+      // 4. Inline first import — pull one page (100 records) so the user
+      // sees data immediately. Worker pages through more on its tick.
+      //
+      // Idempotency: stash Airtable's stable record.id into data.airtable_record_id
+      // and pre-check existing rows before inserting. Without this, a user
+      // double-clicking "Mirror" (or a network blip causing the FE to retry)
+      // would create 200 duplicate rows in the new lead_table. Same dedup
+      // strategy the sync worker uses for ongoing pulls.
+      try {
+        const { records } = await listRecords(supabase, tenantId, base_id, schema.id, { view, pageSize: 100 })
+        if (records.length === 0) {
+          await supabase.from('data_source_subscriptions').update({
+            last_synced_at: new Date().toISOString(),
+            next_sync_at:   new Date(Date.now() + (sub.sync_interval_minutes * 60_000)).toISOString(),
+            rows_imported:  0,
+          }).eq('id', sub.id)
+        } else {
+          // Find any rows already imported for this table (handles the
+          // double-click + reuse-existing-table cases together).
+          const { data: existingRows } = await supabase.from('lead_rows')
+            .select('data->>airtable_record_id')
+            .eq('table_id', table.id)
+            .eq('tenant_id', tenantId)
+            .limit(10000)
+          const existingIds = new Set((existingRows ?? []).map((r: any) => r.airtable_record_id).filter(Boolean))
+
+          const inserts = records
+            .filter(rec => !existingIds.has(rec.id))
+            .map(rec => ({
+              tenant_id: tenantId,
+              user_id:   userId,
+              table_id:  table.id,
+              data:      {
+                airtable_record_id: rec.id,
+                ...Object.fromEntries(Object.entries(rec.fields).map(([k, v]) => [
+                  fieldNameToKey[k] ?? keyify(k),
+                  v == null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v)),
+                ])),
+              },
+              status:    'new',
+              tags:      [],
+              ingest_source: 'sync',
+            }))
+
+          if (inserts.length > 0) {
+            await supabase.from('lead_rows').insert(inserts)
+          }
+          await supabase.from('data_source_subscriptions').update({
+            last_synced_at: new Date().toISOString(),
+            next_sync_at:   new Date(Date.now() + (sub.sync_interval_minutes * 60_000)).toISOString(),
+            rows_imported:  inserts.length,
+          }).eq('id', sub.id)
+        }
+      } catch (err: any) {
+        // First import failed — keep the subscription so the worker retries.
         await supabase.from('data_source_subscriptions').update({
           status: 'error', last_error: err?.message ?? String(err),
         }).eq('id', sub.id)

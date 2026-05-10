@@ -14,6 +14,7 @@ import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
 import { createConnectorsRouter }  from './routes/connectors'
+import { createBillingRouter }     from './routes/billing'
 import { createWaFeaturesRouter }  from './routes/wa-features'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
@@ -27,18 +28,134 @@ import { enqueueWorkflowExecution, workflowQueue, messageQueue, broadcastQueue, 
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
 import { ExpressAdapter } from '@bull-board/express'
+import { z } from 'zod'
 import {
   validateBody,
   WorkflowCreateSchema, WorkflowPatchSchema,
   BroadcastCreateSchema,
   ContactCreateSchema, ContactPatchSchema,
-  RazorpayConnectSchema, InboxSendSchema, CampaignCreateSchema,
+  RazorpayConnectSchema, InboxSendSchema,
+  CampaignCreateSchema, CampaignPatchSchema,
 } from './validation'
+
+// ── Boot-time security checks ────────────────────────────────────────────
+// Refuse to start in production without the impersonation HMAC secret.
+// Without it, super-admin.ts:408 would mint per-request throwaway secrets,
+// turning impersonation into silent permadeny — annoying to debug, and a
+// trap if NODE_ENV is set incorrectly in staging.
+if (process.env.NODE_ENV === 'production') {
+  const impSecret = process.env.IMPERSONATION_HMAC_SECRET ?? process.env.GOOGLE_TOKEN_SECRET
+  if (!impSecret || impSecret.length < 32) {
+    console.error('[boot] FATAL: IMPERSONATION_HMAC_SECRET missing or <32 chars in production. Refusing to start.')
+    process.exit(1)
+  }
+}
+
+// Warn (not fatal) about missing Razorpay env vars. Without them, the
+// billing routes would error opaquely on first use; loud boot warning makes
+// the misconfiguration obvious before a customer discovers it.
+{
+  const missing: string[] = []
+  if (!process.env.RAZORPAY_KEY_ID)         missing.push('RAZORPAY_KEY_ID')
+  if (!process.env.RAZORPAY_KEY_SECRET)     missing.push('RAZORPAY_KEY_SECRET')
+  if (!process.env.RAZORPAY_WEBHOOK_SECRET) missing.push('RAZORPAY_WEBHOOK_SECRET')
+  if (missing.length > 0) {
+    console.warn(`[boot] Razorpay billing partially configured — missing: ${missing.join(', ')}. /api/billing/* endpoints will error until set.`)
+  }
+}
+
+// Same for email — notifications still deliver in-app without these, but
+// any default_channels = ['in_app','email'] event will silently skip its
+// email leg. Loud boot warning so the misconfiguration shows up in logs.
+{
+  const missing: string[] = []
+  if (!process.env.RESEND_API_KEY)    missing.push('RESEND_API_KEY')
+  if (!process.env.RESEND_FROM_EMAIL) missing.push('RESEND_FROM_EMAIL')
+  if (missing.length > 0) {
+    console.warn(`[boot] Email delivery not configured — missing: ${missing.join(', ')}. In-app notifications still work; email leg will be skipped + logged.`)
+  }
+}
+
+// Defence-in-depth against runtime prototype pollution.
+//
+// What this blocks: AFTER the freeze runs, any code path that does
+//   const x = req.body
+//   target[x.something] = x.somethingElse
+// where x came from `JSON.parse(...)` containing `{"__proto__": {...}}` —
+// the `__proto__` is an own property post-parse (not a setter), so it
+// doesn't pollute by itself; but any subsequent code that does
+// `Object.assign({}, x)` or `{ ...x }` and then iterates with a `for…in`
+// would inherit the polluted props. With the prototype frozen, those
+// writes throw in strict mode / silently no-op in sloppy mode.
+//
+// What this does NOT block: any module-level pollution that ran BEFORE
+// these two `Object.freeze` calls. ES module `import` statements at the
+// top of this file all execute their top-level code first — so express,
+// supabase-js, BullMQ, validation schemas, etc. all initialised against
+// MUTABLE prototypes. That's still safe for production traffic because
+// those libs reference their own captured methods internally; pollution
+// arriving at runtime can't change the libs' captured references.
+//
+// In short: this blocks runtime DoS via attacker-supplied JSON, not boot-
+// time manipulation by malicious dependencies. The combination with
+// `pickAllowed`'s `hasOwnProperty.call` (src/security.ts) covers the
+// main known vectors. For boot-time safety, run the freeze before any
+// import — but Node's ESM/CJS hoisting makes that awkward without a
+// dedicated bootstrap module.
+Object.freeze(Object.prototype)
+Object.freeze(Array.prototype)
 
 const app = express()
 const PORT = process.env.PORT || 3001
 
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' }))
+// Trust the X-Forwarded-For header from a known proxy so `req.ip` reflects
+// the actual client IP — critical for the per-IP rate limiter on
+// /api/ingest/:token (src/leads.ts) and any future per-IP throttling.
+//
+// The number is the count of trusted proxy hops in front of us. In typical
+// deployments:
+//   - 1 = single reverse proxy (Render, Fly, single nginx, Vercel functions)
+//   - 2 = CDN → load-balancer (Cloudflare → nginx → app)
+// Override via TRUST_PROXY_HOPS env var if you have a deeper chain.
+//
+// CRITICAL: do NOT set this to `true` in prod — that trusts ANY upstream's
+// XFF header, allowing spoofing from anywhere. The numeric "hop count" form
+// only trusts the last N entries of the XFF chain, which the directly-attached
+// proxy controls.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1))
+
+// CORS: TWO different policies depending on the path.
+//   /api/ingest/* → permissive (origin: '*'). Webhook ingest is intentionally
+//                   cross-origin (Zapier / n8n / arbitrary HTML forms POSTing
+//                   rows). Token is the only credential, no cookies.
+//   everything else → restrictive (origin: FRONTEND_URL). Defence-in-depth
+//                     for cookie-borne CSRF (we use Authorization headers
+//                     today but cookies could land tomorrow).
+//
+// Both `cors()` middlewares unconditionally write the
+// `Access-Control-Allow-Origin` header on every matching request. So if BOTH
+// fire on the same request, the SECOND one wins — overwriting the permissive
+// `*` with the restrictive FRONTEND_URL on /api/ingest. We branch in a single
+// router-level middleware so only ONE cors handler sees each request.
+const ingestCors = cors({ origin: '*', methods: ['POST', 'OPTIONS'], maxAge: 86400 })
+const restrictiveCors = cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' })
+app.use((req, res, next) => {
+  // Match `/api/ingest` (exact) AND `/api/ingest/<token>`. The trailing-slash
+  // form alone would miss preflights / probe requests sent without a token,
+  // which would silently fall through to the restrictive CORS — confusing
+  // for a third-party integrator hitting the URL by hand.
+  if (req.path === '/api/ingest' || req.path.startsWith('/api/ingest/')) {
+    return ingestCors(req, res, next)
+  }
+  return restrictiveCors(req, res, next)
+})
+// CRITICAL: the Razorpay webhook handler verifies an HMAC signature over
+// the raw request bytes. If express.json() parses the body first, the
+// stream is consumed and req.body becomes a parsed object — HMAC over
+// `[object Object]` will never match. Mount express.raw() on the exact
+// webhook path BEFORE the global JSON parser so the route gets a Buffer.
+app.use('/api/billing/razorpay/webhook', express.raw({ type: 'application/json', limit: '1mb' }))
+
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
@@ -62,6 +179,24 @@ app.use((req, res, next) => {
 })
 
 app.get('/api/ping', (req, res) => res.json({ pong: true }))
+
+// Public catalogue of available plans — used by the UpgradeBanner so the
+// modal can render the actual monthly price (₹) when surfacing a 402.
+// No auth required: this is marketing-grade information, same as a public
+// pricing page would expose.
+app.get('/api/plans', async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('plans')
+      .select('id, name, monthly_price_inr, features, limits, sort_order, trial_days, is_active')
+      .eq('is_active', true)
+      .order('sort_order', { ascending: true })
+    if (error) throw error
+    res.json(data || [])
+  } catch (err: any) {
+    res.status(500).json({ error: err.message })
+  }
+})
 
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error('[startup] ANTHROPIC_API_KEY is not set — workflow parsing will fail')
@@ -100,12 +235,65 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
   const user = (req as any).user
   if (!user) { res.status(401).json({ error: 'Auth required' }); return }
 
-  const headerTenantId = (req.headers['x-tenant-id'] as string) || (req.query.tenant_id as string)
+  // Tenant ID comes from the X-Tenant-ID header ONLY. We deliberately
+  // dropped the `?tenant_id=` query-param fallback: query params end up
+  // in server access logs, browser history and HTTP referer headers,
+  // making them a leaky channel for what is effectively an authorisation
+  // dimension. The FE always sets the header (see lib/apiCall.ts).
+  const headerTenantId = req.headers['x-tenant-id'] as string | undefined
+  if (req.query.tenant_id && !headerTenantId) {
+    console.warn(`[identifyTenant] DEPRECATED: caller sent ?tenant_id= query param without X-Tenant-ID header — ignoring. path=${req.path}`)
+  }
   console.log(`[identifyTenant] user=${user.id}, header_tenant=${headerTenantId || '(none)'}`)
+
+  // 0. Platform-scoped role check — runs first so Platform Console actions
+  //    bypass per-tenant permission checks entirely. Two paths:
+  //    (a) new RBAC: a row in user_role_assignments with tenant_id IS NULL
+  //    (b) legacy:   user_roles row with role='super_admin' and tenant_id IS NULL
+  const { data: platformAssignment } = await supabase
+    .from('user_role_assignments')
+    .select('role_definitions ( key, scope )')
+    .eq('user_id', user.id).is('tenant_id', null).maybeSingle()
+  const platformRoleKey = (platformAssignment as any)?.role_definitions?.key as string | undefined
+  let isPlatform = !!platformRoleKey
+
+  if (!isPlatform) {
+    const { data: legacySuper } = await supabase
+      .from('user_roles')
+      .select('role')
+      .eq('user_id', user.id).is('tenant_id', null).maybeSingle()
+    if (legacySuper?.role === 'super_admin') isPlatform = true
+  }
+
+  if (isPlatform) {
+    ;(req as any).isSuperAdmin = true
+    ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
+    // Platform users may still target a specific tenant via header (e.g. when
+    // viewing tenant-scoped data from the admin console). If a header is
+    // present, accept it as-is — they're trusted at the platform layer.
+    if (headerTenantId) (req as any).tenantId = headerTenantId
+    next()
+    return
+  }
 
   // 1. If header provides a tenant ID, verify the user has access to it
   if (headerTenantId) {
-    // Check via user_roles first
+    // Check new RBAC table first (where invited team members live)
+    const { data: assignmentForHeader } = await supabase
+      .from('user_role_assignments')
+      .select('role_definitions ( key )')
+      .eq('user_id', user.id)
+      .eq('tenant_id', headerTenantId)
+      .maybeSingle()
+    const assignmentRole = (assignmentForHeader as any)?.role_definitions?.key
+    if (assignmentRole) {
+      console.log(`[identifyTenant] resolved via user_role_assignments: tenant=${headerTenantId}, role=${assignmentRole}`)
+      ;(req as any).tenantId = headerTenantId
+      ;(req as any).userRole = assignmentRole
+      next()
+      return
+    }
+    // Legacy user_roles fallback
     const { data: roleForHeader } = await supabase
       .from('user_roles')
       .select('role')
@@ -128,16 +316,34 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
       .eq('status', 'active')
       .maybeSingle()
     if (ownedCheck) {
-      console.log(`[identifyTenant] resolved via tenant ownership: tenant=${headerTenantId}, role=admin`)
+      console.log(`[identifyTenant] resolved via tenant ownership: tenant=${headerTenantId}, role=owner`)
       ;(req as any).tenantId = headerTenantId
-      ;(req as any).userRole = 'admin'
+      ;(req as any).userRole = 'owner'
       next()
       return
     }
     console.log(`[identifyTenant] header tenant ${headerTenantId} not accessible by user, falling through`)
   }
 
-  // 2. Auto-detect: Check user_roles table for an explicit tenant assignment
+  // 2. Auto-detect: Check new RBAC user_role_assignments first
+  const { data: assignmentAuto } = await supabase
+    .from('user_role_assignments')
+    .select('tenant_id, role_definitions ( key )')
+    .eq('user_id', user.id)
+    .not('tenant_id', 'is', null)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle()
+  if (assignmentAuto?.tenant_id) {
+    const role = (assignmentAuto as any).role_definitions?.key || 'member'
+    console.log(`[identifyTenant] resolved via user_role_assignments auto: tenant=${assignmentAuto.tenant_id}, role=${role}`)
+    ;(req as any).tenantId = assignmentAuto.tenant_id
+    ;(req as any).userRole = role
+    next()
+    return
+  }
+
+  // 2b. Legacy fallback: Check user_roles table
   const { data: userRole } = await supabase
     .from('user_roles')
     .select('tenant_id, role')
@@ -193,6 +399,40 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
  *
  * Sets `req.userRoleKey` and `req.userPlan` for downstream handlers.
  */
+// Human-readable labels for feature keys — used in 403 messages so users
+// see "Workflows" instead of "whatsapp_automation". Keep in sync with the
+// keys passed to checkPermission().
+const FEATURE_LABELS: Record<string, string> = {
+  whatsapp_automation: 'Workflows & Broadcasts',
+  inbox: 'Inbox',
+  leads: 'Contacts & Leads',
+  integrations: 'Integrations',
+  settings: 'Workspace Settings',
+  google_sheets: 'Google Sheets',
+}
+const ACTION_VERBS: Record<string, string> = { view: 'view', edit: 'edit', delete: 'delete' }
+function featureLabel(key: string) { return FEATURE_LABELS[key] || key.replace(/_/g, ' ') }
+
+// Permission-key aliases. The legacy umbrella feature 'whatsapp_automation'
+// was split in the new RBAC into the granular 'workflows' + 'broadcasts'
+// permissions. 'leads' became 'contacts'. When the middleware checks
+// permissions in role_definitions.permissions[feature] it tries the
+// original key first, then any of these aliases. If ANY of them grants
+// the action, access is granted. (Plan-whitelist checks still use the
+// original feature key — that's a billing concept, not RBAC.)
+const PERMISSION_KEY_ALIASES: Record<string, string[]> = {
+  whatsapp_automation: ['workflows', 'broadcasts'],
+  leads: ['contacts'],
+}
+
+function hasRolePermission(perms: any, feature: string, action: string): boolean {
+  if (!perms) return false
+  const tryKey = (k: string) => !!perms[k]?.[action]
+  if (tryKey(feature)) return true
+  for (const alias of PERMISSION_KEY_ALIASES[feature] || []) if (tryKey(alias)) return true
+  return false
+}
+
 function checkPermission(feature: string, action: 'view' | 'edit' | 'delete') {
   return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if ((req as any).isSuperAdmin) { next(); return }
@@ -213,14 +453,20 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete') {
       .eq('user_id', userId).eq('tenant_id', tenantId)
       .maybeSingle()
     if (assignment?.disabled_at) {
-      res.status(403).json({ error: 'Your account has been disabled by an administrator.' }); return
+      res.status(403).json({
+        error: 'Your account has been disabled by a workspace administrator. Contact them to restore access.',
+        code: 'user_disabled',
+      }); return
     }
 
     // 3. Per-tenant entitlement override
     const { data: ent } = await supabase.from('tenant_entitlements')
       .select('is_enabled').eq('tenant_id', tenantId).eq('feature', feature).maybeSingle()
     if (ent && ent.is_enabled === false) {
-      res.status(403).json({ error: `Feature '${feature}' is disabled for this account.` }); return
+      res.status(403).json({
+        error: `${featureLabel(feature)} has been turned off for your workspace by an administrator.`,
+        code: 'feature_disabled', feature,
+      }); return
     }
 
     // 4. Plan whitelist + 5. Plan quota
@@ -232,7 +478,10 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete') {
       const features: string[] = plan?.features ?? []
       if (!features.includes('*') && !features.includes(feature)) {
         // Feature not in plan — suggest upgrade.
-        res.status(402).json({ error: `Feature '${feature}' is not in your ${sub.plan_id} plan. Upgrade to use.` }); return
+        res.status(402).json({
+          error: `${featureLabel(feature)} isn't included in your ${sub.plan_id} plan. Upgrade to unlock it.`,
+          code: 'plan_upgrade_required', feature, plan: sub.plan_id,
+        }); return
       }
       // (Quota check for metered features happens at write-points where the
       // metric is known — handled by the workers, not this generic middleware.)
@@ -242,19 +491,40 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete') {
     // 6. Role permission matrix — new RBAC path
     if (assignment?.role_definitions) {
       const rd: any = assignment.role_definitions
-      const fp = rd.permissions?.[feature]
       ;(req as any).userRoleKey = rd.key
       ;(req as any).userDataScope = rd.data_scope
       ;(req as any).userAllowedApps = rd.allowed_apps
-      if (fp && fp[action]) { next(); return }
+      // Workspace owner short-circuit — the literal account holder always has
+      // full access within their own workspace (no SaaS treats the owner
+      // role as anything but root). Skips per-feature permission lookups.
+      if (rd.key === 'owner') { next(); return }
+      // Otherwise, look up the permission with alias support so legacy
+      // umbrella keys like 'whatsapp_automation' resolve via 'workflows' /
+      // 'broadcasts' in role_definitions.
+      if (hasRolePermission(rd.permissions, feature, action)) { next(); return }
       // Fall through to legacy check below — user might still be allowed via
       // legacy role_permissions during migration period.
+    }
+
+    // 6b. Workspace-owner safety net — even without a row in
+    //     user_role_assignments, the user listed as tenants.user_id is the
+    //     account holder and must always have full access.
+    {
+      const { data: ownership } = await supabase.from('tenants')
+        .select('user_id').eq('id', tenantId).maybeSingle()
+      if (ownership?.user_id === userId) {
+        ;(req as any).userRoleKey = 'owner'
+        next(); return
+      }
     }
 
     // 7. Legacy fallback — read role_permissions (pre-017)
     const role = (req as any).userRole
     if (!role) {
-      res.status(403).json({ error: `No role assignment found for this user/tenant.` }); return
+      res.status(403).json({
+        error: "You haven't been added to this workspace yet. Ask the workspace owner to invite you.",
+        code: 'no_role_assignment',
+      }); return
     }
     const { data: perm } = await supabase
       .from('role_permissions').select(`can_${action}`)
@@ -267,7 +537,15 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete') {
       .maybeSingle()
     if (sysPerm && (sysPerm as any)[`can_${action}`]) { next(); return }
 
-    res.status(403).json({ error: `Your role (${role}) does not have ${action} access to ${feature}` })
+    // Look up the human label for the role too — fall back to the key.
+    const { data: roleDef } = await supabase
+      .from('role_definitions').select('label').eq('key', role).maybeSingle()
+    const roleLabel = (roleDef as any)?.label || role.replace(/_/g, ' ')
+    res.status(403).json({
+      error: `Your role (${roleLabel}) can't ${ACTION_VERBS[action] || action} ${featureLabel(feature)}. Ask a workspace admin to update your permissions.`,
+      code: 'permission_denied',
+      feature, action, role,
+    })
   }
 }
 
@@ -536,6 +814,29 @@ app.get('/api/workflows/:id', requireAuth, identifyTenant, checkPermission('what
 app.post('/api/workflows', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), validateBody(WorkflowCreateSchema), async (req, res) => {
   const tenantId = (req as any).tenantId
   const userId   = (req as any).user.id
+
+  // Workflow chaining: validate the upstream workflow lives in the SAME
+  // tenant. Without this, a user could trigger off another tenant's
+  // workflow completion (cross-tenant data leak via session.variables).
+  // The CHECK constraint at DB level only blocks self-trigger; tenant
+  // scoping has to happen here.
+  if (req.body.triggered_by_workflow_id) {
+    const { data: upstream } = await supabase.from('workflows')
+      .select('id').eq('id', req.body.triggered_by_workflow_id).eq('tenant_id', tenantId).maybeSingle()
+    if (!upstream) {
+      res.status(400).json({ error: 'triggered_by_workflow_id must reference a workflow in this tenant' })
+      return
+    }
+  }
+
+  // Plan-limit check: only block if the new workflow is being created LIVE.
+  // Drafts are free (users iterate before going live). The PATCH path that
+  // flips draft→live also enforces below.
+  if (req.body.status === 'live') {
+    const { blockIfOverLimit } = await import('./lib/limits')
+    if (await blockIfOverLimit(res, supabase, tenantId, 'workflows_max')) return
+  }
+
   // workflows.user_id is NOT NULL (migration 001) — always set it from the
   // authenticated session so the FE never has to know about the DB shape.
   const { data, error } = await supabase.from('workflows')
@@ -546,8 +847,44 @@ app.post('/api/workflows', requireAuth, identifyTenant, checkPermission('whatsap
 
 app.patch('/api/workflows/:id', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), validateBody(WorkflowPatchSchema), async (req, res) => {
   const tenantId = (req as any).tenantId
+  // `validateBody` already replaced req.body with the parsed (strict-stripped)
+  // result. Bind it to a typed local so the spread below visibly says "spread
+  // the validated patch", not "spread arbitrary client input". See the
+  // SECURITY CONTRACT in src/validation.ts before changing this pattern.
+  const patch = req.body as z.infer<typeof WorkflowPatchSchema>
+
+  // Same chaining checks as create, plus a cycle-detection walk: refuse if
+  // setting this trigger would create A→B→…→A. The DB CHECK constraint
+  // only blocks the trivial 1-hop self-trigger; multi-hop cycles need the
+  // application-level walk in engine/chaining.ts.
+  if (patch.triggered_by_workflow_id) {
+    const { data: upstream } = await supabase.from('workflows')
+      .select('id').eq('id', patch.triggered_by_workflow_id).eq('tenant_id', tenantId).maybeSingle()
+    if (!upstream) {
+      res.status(400).json({ error: 'triggered_by_workflow_id must reference a workflow in this tenant' })
+      return
+    }
+    const { chainWouldCycle } = await import('./engine/chaining')
+    if (await chainWouldCycle(supabase, String(req.params.id), patch.triggered_by_workflow_id)) {
+      res.status(400).json({ error: 'This trigger would form a cycle in the workflow chain' })
+      return
+    }
+  }
+
+  // Plan-limit check: only enforce when transitioning TO 'live'. Reading
+  // current status first so we don't double-count (already-live workflow
+  // staying live, or going from live→paused). Cap is on live count.
+  if (patch.status === 'live') {
+    const { data: existing } = await supabase.from('workflows')
+      .select('status').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (existing && existing.status !== 'live') {
+      const { blockIfOverLimit } = await import('./lib/limits')
+      if (await blockIfOverLimit(res, supabase, tenantId, 'workflows_max')) return
+    }
+  }
+
   const { data, error } = await supabase.from('workflows')
-    .update({ ...req.body, updated_at: new Date().toISOString() })
+    .update({ ...patch, updated_at: new Date().toISOString() })
     .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
   if (error) { res.status(500).json({ error: error.message }); return }
   res.json(data)
@@ -862,10 +1199,13 @@ async function getTenant(userId: string, tenantId?: string) {
   return data as any
 }
 
-app.get('/api/wa-templates', requireAuth, async (req, res) => {
-  const user = (req as any).user
+app.get('/api/wa-templates', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'view'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  // Scope by tenant_id (the workspace) — NOT by user_id, so team members see
+  // their workspace's templates and a user who owns multiple tenants doesn't
+  // see the other tenant's templates here.
   const { data, error } = await supabase.from('wa_templates')
-    .select('*').eq('user_id', user.id).order('created_at', { ascending: false })
+    .select('*').eq('tenant_id', tenantId).order('created_at', { ascending: false })
   if (error) { res.status(500).json({ error: error.message }); return }
 
   // Transform DB format → Meta components format so frontend stays consistent
@@ -887,10 +1227,10 @@ app.get('/api/wa-templates', requireAuth, async (req, res) => {
   res.json(formatted)
 })
 
-app.post('/api/wa-templates', requireAuth, async (req, res) => {
-  const user = (req as any).user
-  const tenant = await getTenant(user.id, req.query.tenant_id as string)
-  if (!tenant) { res.status(404).json({ error: 'No connected WhatsApp account' }); return }
+app.post('/api/wa-templates', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+  if (!tenant?.waba_id) { res.status(404).json({ error: 'No connected WhatsApp account' }); return }
 
   const { name, category = 'MARKETING', language = 'en_US', body, buttons = [] } = req.body
   const components: any[] = [{ type: 'BODY', text: body }]
@@ -909,10 +1249,10 @@ app.post('/api/wa-templates', requireAuth, async (req, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }) }
 })
 
-app.delete('/api/wa-templates/:name', requireAuth, async (req, res) => {
-  const user = (req as any).user
-  const tenant = await getTenant(user.id, req.query.tenant_id as string)
-  if (!tenant) { res.status(404).json({ error: 'No connected WhatsApp account' }); return }
+app.delete('/api/wa-templates/:name', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'delete'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+  if (!tenant?.waba_id) { res.status(404).json({ error: 'No connected WhatsApp account' }); return }
 
   try {
     const r = await fetch(
@@ -1042,6 +1382,12 @@ app.post('/api/contacts', requireAuth, identifyTenant, checkPermission('leads', 
   const tenantId = (req as any).tenantId
   const { name, phone, email, tags } = req.body
 
+  // Plan-limit check: refuse with 402 if the tenant is at their contacts cap.
+  // Standardised response shape so the FE can show the same upgrade modal
+  // regardless of which limit was hit.
+  const { blockIfOverLimit } = await import('./lib/limits')
+  if (await blockIfOverLimit(res, supabase, tenantId, 'contacts_max')) return
+
   const cleanPhone = String(phone).replace(/^\+/, '')
   const { data, error } = await supabase.from('contacts')
     .insert({
@@ -1059,8 +1405,12 @@ app.post('/api/contacts', requireAuth, identifyTenant, checkPermission('leads', 
 
 app.patch('/api/contacts/:id', requireAuth, identifyTenant, checkPermission('leads', 'edit'), validateBody(ContactPatchSchema), async (req, res) => {
   const tenantId = (req as any).tenantId
+  // `validateBody` replaced req.body with the parsed (strict-stripped) result.
+  // Bind it to a typed local so the spread reads as "the validated patch",
+  // not "the raw request body". See SECURITY CONTRACT in src/validation.ts.
+  const patch = req.body as z.infer<typeof ContactPatchSchema>
   const { data, error } = await supabase.from('contacts')
-    .update(req.body).eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
+    .update(patch).eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
   if (error) { res.status(500).json({ error: error.message }); return }
   res.json(data)
 })
@@ -1091,6 +1441,13 @@ app.get('/api/contacts/:phone/messages', requireAuth, identifyTenant, checkPermi
 // view filters correctly.
 app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox', 'edit'), validateBody(InboxSendSchema), async (req, res) => {
   const tenantId = (req as any).tenantId
+
+  // Plan-limit check: refuse with 402 if the tenant is at their monthly
+  // message cap. Critical revenue protection — without this, a Free-tier
+  // tenant can blast unlimited messages.
+  const { blockIfOverLimit } = await import('./lib/limits')
+  if (await blockIfOverLimit(res, supabase, tenantId, 'messages_per_month')) return
+
   const {
     channel, phone, type,
     text, template_name, template_language, template_params,
@@ -1206,35 +1563,51 @@ app.patch('/api/contacts/:id/bot-pause', requireAuth, identifyTenant, checkPermi
 })
 
 // ── Skills API ────────────────────────────────────────────────────────────────
-app.get('/api/skills', requireAuth, async (req, res) => {
-  const user = (req as any).user
+//
+// Skills are workflow blueprints — a curated library of "starter
+// workflows" that the AI parser matches user intent against. Two scopes:
+//   * Global   (tenant_id NULL, is_global TRUE)  — platform-curated
+//   * Tenant   (tenant_id NOT NULL)              — workspace-private
+//
+// All endpoints scope by tenant_id, NEVER by user_id, so a user who
+// belongs to multiple workspaces doesn't leak custom skills across them.
+app.get('/api/skills', requireAuth, identifyTenant, async (req, res) => {
+  const tenantId = (req as any).tenantId
+  // Global + this tenant's skills, sorted by usage.
   const { data, error } = await supabase.from('workflow_skills')
     .select('*')
-    .or(`user_id.eq.${user.id},is_global.eq.true`)
+    .or(`tenant_id.eq.${tenantId},is_global.eq.true`)
     .order('usage_count', { ascending: false })
   if (error) { res.status(500).json({ error: error.message }); return }
   res.json(data)
 })
 
-app.post('/api/skills', requireAuth, async (req, res) => {
+app.post('/api/skills', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), async (req, res) => {
   const user = (req as any).user
+  const tenantId = (req as any).tenantId
   const { name, description, tags, workflow_json } = req.body
   const { data, error } = await supabase.from('workflow_skills')
-    .insert({ user_id: user.id, name, description, tags: tags ?? [], workflow_json })
+    .insert({
+      tenant_id: tenantId,
+      user_id: user.id,           // attribution only — scope is tenant_id
+      name, description, tags: tags ?? [], workflow_json,
+      is_global: false,
+    })
     .select().single()
   if (error) { res.status(500).json({ error: error.message }); return }
   res.json(data)
 })
 
-// Match user description to existing skills (keyword scoring)
-app.post('/api/skills/match', requireAuth, async (req, res) => {
-  const user = (req as any).user
+// Match user description to existing skills (keyword scoring). Considers
+// global + this tenant's skills only.
+app.post('/api/skills/match', requireAuth, identifyTenant, async (req, res) => {
+  const tenantId = (req as any).tenantId
   const { description } = req.body as { description: string }
   if (!description) { res.status(400).json({ error: 'description required' }); return }
 
   const { data: skills } = await supabase.from('workflow_skills')
     .select('*')
-    .or(`user_id.eq.${user.id},is_global.eq.true`)
+    .or(`tenant_id.eq.${tenantId},is_global.eq.true`)
     .order('usage_count', { ascending: false })
     .limit(50)
 
@@ -1249,7 +1622,6 @@ app.post('/api/skills/match', requireAuth, async (req, res) => {
   }).filter((s: any) => s.score > 0).sort((a: any, b: any) => b.score - a.score)
 
   if (scored.length > 0 && scored[0].score >= 2) {
-    // Increment usage_count on the matched skill
     await supabase.from('workflow_skills').update({ usage_count: scored[0].usage_count + 1 }).eq('id', scored[0].id)
     res.json({ matched: true, skill: scored[0], score: scored[0].score })
   } else {
@@ -1310,11 +1682,19 @@ app.post('/webhook/whatsapp', async (req, res) => {
           await handleInboundMessage(tenant, msg, value.contacts?.[0])
         }
 
-        // Handle status updates (delivered, read, etc.)
+        // Handle status updates (delivered, read, etc.).
+        // Scope by tenant_id too — even though Meta only delivers webhooks
+        // for our own WABAs, defense-in-depth: a malicious or replayed
+        // payload mentioning a foreign platform_message_id could otherwise
+        // mutate another tenant's message status.
         for (const status of value.statuses ?? []) {
-          await supabase.from('messages')
+          const { error: statusErr } = await supabase.from('messages')
             .update({ status: status.status })
             .eq('platform_message_id', status.id)
+            .eq('tenant_id', tenant.id)
+          if (statusErr) {
+            console.error(`[webhook] status update failed tenant=${tenant.id} msg=${status.id}:`, statusErr.message)
+          }
         }
       }
     }
@@ -1486,18 +1866,52 @@ async function sendInteractiveMessage(tenant: any, to: string, config: any) {
 
 // Helper: resolve current user's role for their tenant
 async function getUserRole(userId: string): Promise<{ role: string | null; tenantId: string | null }> {
+  // 1. Platform-scoped check, NEW RBAC first — anyone with a row in
+  //    user_role_assignments where tenant_id IS NULL is a platform user
+  //    (super_admin, customer_success, billing_ops, etc.).
+  const { data: platformAssignment } = await supabase.from('user_role_assignments')
+    .select('role_definitions ( key )').eq('user_id', userId).is('tenant_id', null).maybeSingle()
+  const platformKey = (platformAssignment as any)?.role_definitions?.key
+  if (platformKey) return { role: platformKey, tenantId: null }
+
+  // 1b. Legacy super_admin via old user_roles table.
   const { data: superRole } = await supabase.from('user_roles')
     .select('role').eq('user_id', userId).is('tenant_id', null).limit(1)
   if (superRole?.[0]?.role === 'super_admin') return { role: 'super_admin', tenantId: null }
 
+  // 2. New RBAC tenant assignment (this is where invited team members live).
+  const { data: tenantAssignment } = await supabase.from('user_role_assignments')
+    .select('tenant_id, role_definitions ( key )').eq('user_id', userId)
+    .not('tenant_id', 'is', null).limit(1).maybeSingle()
+  if (tenantAssignment?.tenant_id) {
+    const key = (tenantAssignment as any).role_definitions?.key || 'member'
+    return { role: key, tenantId: tenantAssignment.tenant_id }
+  }
+
+  // 3. Tenant ownership fallback — the user owns a tenant directly.
   const { data: tenants } = await supabase.from('tenants')
     .select('id').eq('user_id', userId).eq('status', 'active').limit(1)
   const tenantId = tenants?.[0]?.id ?? null
-  if (!tenantId) return { role: 'admin', tenantId: null }  // owner defaults to admin
+  if (!tenantId) return { role: null, tenantId: null }
 
+  // 4. Legacy user_roles tenant assignment as last resort.
   const { data: roleRow } = await supabase.from('user_roles')
     .select('role').eq('user_id', userId).eq('tenant_id', tenantId).limit(1)
-  return { role: roleRow?.[0]?.role ?? 'admin', tenantId }
+  return { role: roleRow?.[0]?.role ?? 'owner', tenantId }
+}
+
+// Platform-scope check used by legacy /api/admin/* endpoints. Returns true
+// when the user has any platform-scoped role assignment OR the legacy
+// super_admin row. Includes the ten + admins/owners platform roles
+// (customer_success, billing_ops, etc.).
+async function isPlatformUser(userId: string): Promise<boolean> {
+  const { role } = await getUserRole(userId)
+  if (!role) return false
+  const PLATFORM_ROLES = new Set([
+    'super_admin', 'platform_owner', 'customer_success', 'billing_ops',
+    'engineering', 'trust_safety', 'sales_ae', 'support_lead',
+  ])
+  return PLATFORM_ROLES.has(role)
 }
 
 // Get current user's role info
@@ -1507,69 +1921,16 @@ app.get('/api/me/role', requireAuth, async (req, res) => {
   res.json(info)
 })
 
-// List team members for the current user's tenant
-app.get('/api/team', requireAuth, async (req, res) => {
-  const user = (req as any).user
-  const { tenantId } = await getUserRole(user.id)
-  if (!tenantId) {
-    res.status(400).json({ error: 'No active tenant' }); return
-  }
-  const { data, error } = await supabase.from('user_roles')
-    .select('id,user_id,role,invited_by,created_at')
-    .eq('tenant_id', tenantId)
-  if (error) { res.status(500).json({ error: error.message }); return }
-  res.json(data ?? [])
-})
-
-// ── Team API (Live RBAC routes are defined below) ───────────────────────────
-// End of old Team API section
-
-// Update a team member's role
-app.patch('/api/team/:roleId', requireAuth, async (req, res) => {
-  const user = (req as any).user
-  const { role: myRole, tenantId } = await getUserRole(user.id)
-  if (!['super_admin', 'admin'].includes(myRole ?? '')) {
-    res.status(403).json({ error: 'Forbidden' }); return
-  }
-  if (!tenantId) { res.status(403).json({ error: 'No active tenant' }); return }
-  const { role } = req.body
-  const { error } = await supabase.from('user_roles').update({ role })
-    .eq('id', req.params.roleId).eq('tenant_id', tenantId)
-  if (error) { res.status(500).json({ error: error.message }); return }
-  res.json({ success: true })
-})
-
-// Remove a team member
-app.delete('/api/team/:roleId', requireAuth, async (req, res) => {
-  const user = (req as any).user
-  const { role: myRole, tenantId } = await getUserRole(user.id)
-  if (!['super_admin', 'admin'].includes(myRole ?? '')) {
-    res.status(403).json({ error: 'Forbidden' }); return
-  }
-  if (!tenantId) { res.status(403).json({ error: 'No active tenant' }); return }
-  const { error } = await supabase.from('user_roles').delete()
-    .eq('id', req.params.roleId).eq('tenant_id', tenantId)
-  if (error) { res.status(500).json({ error: error.message }); return }
-  res.json({ success: true })
-})
-
-// Get role permissions for this tenant (or defaults)
-app.get('/api/team/permissions', requireAuth, async (req, res) => {
-  const user = (req as any).user
-  const { tenantId } = await getUserRole(user.id)
-  const { data, error } = await supabase.from('role_permissions')
-    .select('role,feature,can_view,can_edit,can_delete')
-    .or(`tenant_id.eq.${tenantId ?? 'null'},tenant_id.is.null`)
-    .order('role').order('feature')
-  if (error) { res.status(500).json({ error: error.message }); return }
-  res.json(data ?? [])
-})
+// NOTE: legacy /api/team CRUD endpoints used to live here. They've been
+// removed in favour of the RBAC team router (see ./routes/teams.ts), which
+// uses user_role_assignments + role_definitions and gates every route with
+// requireTenantPerm. The legacy endpoints leaked role data without a
+// permission check and used the deprecated user_roles table.
 
 // Super admin: list all tenants with stats
 app.get('/api/admin/tenants', requireAuth, async (req, res) => {
   const user = (req as any).user
-  const { role } = await getUserRole(user.id)
-  if (role !== 'super_admin') { res.status(403).json({ error: 'Super admin access required' }); return }
+  if (!(await isPlatformUser(user.id))) { res.status(403).json({ error: 'Platform Console access required.' }); return }
 
   const { data, error } = await supabase.from('tenants')
     .select('id,user_id,business_name,display_phone,waba_id,status,created_at')
@@ -1581,8 +1942,7 @@ app.get('/api/admin/tenants', requireAuth, async (req, res) => {
 // Super admin: platform stats
 app.get('/api/admin/stats', requireAuth, async (req, res) => {
   const user = (req as any).user
-  const { role } = await getUserRole(user.id)
-  if (role !== 'super_admin') { res.status(403).json({ error: 'Super admin access required' }); return }
+  if (!(await isPlatformUser(user.id))) { res.status(403).json({ error: 'Platform Console access required.' }); return }
 
   const [tenantsRes, contactsRes, msgsRes] = await Promise.all([
     supabase.from('tenants').select('*', { count: 'exact', head: true }),
@@ -1636,10 +1996,16 @@ app.post('/api/campaigns', requireAuth, identifyTenant, checkPermission('whatsap
   res.json(data)
 })
 
-app.patch('/api/campaigns/:id', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), async (req, res) => {
+app.patch('/api/campaigns/:id', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), validateBody(CampaignPatchSchema), async (req, res) => {
   const tenantId = (req as any).tenantId
+  // `validateBody` replaced req.body with the parsed (.partial().strict()
+  // -stripped) result. Binding to a typed local makes the spread read as
+  // "spread the validated patch" — tenant_id / user_id / id / created_at
+  // can't land here because Zod 400'd them at validation. See SECURITY
+  // CONTRACT in src/validation.ts before changing this pattern.
+  const patch = req.body as z.infer<typeof CampaignPatchSchema>
   const { data, error } = await supabase.from('campaigns')
-    .update({ ...req.body, updated_at: new Date().toISOString() })
+    .update({ ...patch, updated_at: new Date().toISOString() })
     .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
   if (error) { res.status(500).json({ error: error.message }); return }
   res.json(data)
@@ -1763,7 +2129,7 @@ app.post('/api/integrations/razorpay', requireAuth, identifyTenant, checkPermiss
   res.json({ success: true })
 })
 
-app.delete('/api/integrations/:key', requireAuth, identifyTenant, async (req, res) => {
+app.delete('/api/integrations/:key', requireAuth, identifyTenant, checkPermission('integrations', 'delete'), async (req, res) => {
   const tenantId = (req as any).tenantId
   const key = String(req.params.key)
 
@@ -1798,7 +2164,7 @@ app.get('/api/features', async (req, res) => {
 
 // ── Role Management API ───────────────────────────────────────────────────────
 
-app.get('/api/roles', requireAuth, identifyTenant, async (req, res) => {
+app.get('/api/roles', requireAuth, identifyTenant, checkPermission('settings', 'view'), async (req, res) => {
   const tenantId = (req as any).tenantId
   const { data } = await supabase.from('role_permissions').select('*').eq('tenant_id', tenantId)
   res.json(data || [])
@@ -1983,7 +2349,7 @@ if (process.env.NODE_ENV !== 'production') {
 
 // ── Lead Intake module ────────────────────────────────────────────────────────
 app.use('/api', createLeadsRouter(supabase, requireAuth, identifyTenant, checkPermission))
-app.use('/api/admin', createAdminRouter(supabase, requireAuth))
+app.use('/api/admin', createAdminRouter(supabase, requireAuth, isPlatformUser))
 
 // ── Phase 3: campaigns, analytics, execution logs, activity ──────────────────
 app.use(createPhase3Router({ supabase, requireAuth, identifyTenant, checkPermission }))
@@ -1993,6 +2359,11 @@ app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPe
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
 app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Billing (Razorpay subscriptions + webhook) ───────────────────────────────
+// NOTE: the webhook route inside this router uses express.raw() to bypass the
+// global JSON parser — needed for HMAC signature verification on raw bytes.
+app.use(createBillingRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Channel-specific feature endpoints (omnichannel) ─────────────────────────
 app.use(createWaFeaturesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
@@ -2010,7 +2381,7 @@ app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createNotificationsRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Approval requests (broadcast >threshold, bulk delete, etc.) ──────────────
-app.use(createApprovalsRouter({ supabase, requireAuth, identifyTenant }))
+app.use(createApprovalsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Workflow recommendations (AI-generated once, cached forever) ─────────────
 app.use(createWorkflowRecosRouter({ supabase, requireAuth, identifyTenant }))
@@ -2035,9 +2406,10 @@ async function requireSuperAdminOrLocal(req: express.Request, res: express.Respo
   if (!token) { res.status(401).send('auth required'); return }
   const { data: { user } } = await supabase.auth.getUser(token)
   if (!user) { res.status(401).send('invalid token'); return }
-  const { data: superRole } = await supabase.from('user_roles')
-    .select('role').eq('user_id', user.id).is('tenant_id', null).limit(1)
-  if (superRole?.[0]?.role !== 'super_admin') { res.status(403).send('super admin only'); return }
+  // Use the same platform-user helper as the rest of the admin surface,
+  // so any role with platform scope (Engineering, Trust & Safety, etc.)
+  // can reach Bull Board — not just super_admin.
+  if (!(await isPlatformUser(user.id))) { res.status(403).send('Platform Console access required'); return }
   next()
 }
 app.use('/admin/queues', requireSuperAdminOrLocal, bullBoardAdapter.getRouter())

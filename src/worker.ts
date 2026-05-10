@@ -20,6 +20,7 @@ import { startSchedulePollerWorker }   from './workers/schedule-poller'
 import { startBroadcastWorker }        from './workers/broadcast-worker'
 import { startTemplateSyncWorker }     from './workers/template-sync'
 import { startDataSourceSyncWorker }   from './workers/data-source-sync'
+import { startTrialEndingWorker }      from './workers/trial-ending'
 import { closeQueues } from './queue'
 
 if (process.env.DISABLE_WORKERS === '1') {
@@ -34,10 +35,11 @@ async function main() {
   const sp  = await startSchedulePollerWorker()
   const ts  = await startTemplateSyncWorker()
   const ds  = await startDataSourceSyncWorker()
+  const te  = await startTrialEndingWorker()
 
   const shutdown = async (signal: string) => {
     console.log(`[worker] received ${signal} — draining…`)
-    await Promise.allSettled([wf.close(), ms.close(), bw.close(), sp.close(), ts.close(), ds.close()])
+    await Promise.allSettled([wf.close(), ms.close(), bw.close(), sp.close(), ts.close(), ds.close(), te.close()])
     await closeQueues()
     process.exit(0)
   }

@@ -48,7 +48,7 @@
  */
 
 import express from 'express'
-import jwt from 'crypto'   // Node built-in crypto for JWT signing without dep
+import jwt, { randomUUID } from 'crypto'   // Node built-in crypto for JWT signing + handoff IDs
 import { SupabaseClient } from '@supabase/supabase-js'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -355,6 +355,43 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
   // Issues a short-lived JWT-like token (HMAC-signed). The FE stores it under
   // a separate key (so the user's own session stays intact in another tab) and
   // sends it via the `X-Impersonate-Token` header on subsequent requests.
+  // ─── Impersonation (handoff-token flow) ───────────────────────────────────
+  //
+  // SECURITY: the actual impersonation JWT must NEVER appear in any URL,
+  // browser history, dev-tools network log preview, or paste buffer. To
+  // open the impersonation in a new tab safely we use a two-step handoff:
+  //
+  //   1. POST /tenants/:id/impersonate — mints the JWT, stores it in a
+  //      short-lived in-memory map keyed by a random one-time `handoff_id`,
+  //      and returns ONLY the handoff_id to the FE.
+  //   2. New tab opens with `?imp_handoff=<id>`, on first load it calls
+  //      POST /impersonate/claim with that id (authenticated). Server
+  //      verifies the requesting user matches the actor that started the
+  //      handoff, returns the JWT, then deletes the handoff entry.
+  //
+  // Even if the handoff_id leaks (it's just a UUID in a URL), it's already
+  // consumed; replays return 404. JWT lives only in sessionStorage of the
+  // tab that successfully claimed it.
+  const HANDOFF_TTL_MS = 30_000  // very short — only needs to survive the new tab opening
+
+  interface HandoffEntry {
+    actor_user_id: string
+    token: string
+    expires_at: string
+    tenant_id: string
+    read_only: boolean
+    created_at: number
+  }
+  const pendingHandoffs = new Map<string, HandoffEntry>()
+
+  // Periodic sweep so a never-claimed handoff doesn't leak memory.
+  setInterval(() => {
+    const cutoff = Date.now() - HANDOFF_TTL_MS
+    for (const [id, entry] of pendingHandoffs) {
+      if (entry.created_at < cutoff) pendingHandoffs.delete(id)
+    }
+  }, 60_000).unref?.()
+
   r.post('/api/super-admin/tenants/:id/impersonate',
     requireAuth, requirePlatformPerm(supabase, 'impersonate', 'edit'),
     async (req, res) => {
@@ -368,13 +405,78 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
 
       const expiresAt = Date.now() + ttlMinutes * 60 * 1000
       const payload = { typ: 'imp', actor: userId, tenant_id: tenantId, exp: expiresAt, read_only: true }
-      const secret = process.env.GOOGLE_TOKEN_SECRET ?? 'dev-secret'
+      // Dedicated impersonation secret. Must be a long random string. Refuses
+      // to mint if missing in production — a hardcoded fallback like
+      // 'dev-secret' would let any code-leak forge tenant-impersonation
+      // tokens. Falls back to GOOGLE_TOKEN_SECRET (the legacy var) for backward
+      // compat during deploys, but prefer the dedicated one going forward.
+      const secret = process.env.IMPERSONATION_HMAC_SECRET ?? process.env.GOOGLE_TOKEN_SECRET
+      if (!secret || secret.length < 32) {
+        if (process.env.NODE_ENV === 'production') {
+          res.status(503).json({ error: 'Impersonation not configured. Set IMPERSONATION_HMAC_SECRET (≥32 chars) on the server.' })
+          return
+        }
+        // Dev: warn loudly but still mint so local dev isn't blocked.
+        console.warn('[super-admin] WARNING: minting impersonation token with weak/missing secret. Set IMPERSONATION_HMAC_SECRET.')
+      }
+      const effectiveSecret = secret && secret.length >= 32 ? secret : `dev-only-${process.pid}-${Date.now()}`
       const data = Buffer.from(JSON.stringify(payload)).toString('base64url')
-      const sig = jwt.createHmac('sha256', secret).update(data).digest('base64url')
+      const sig = jwt.createHmac('sha256', effectiveSecret).update(data).digest('base64url')
       const token = `${data}.${sig}`
 
+      // Stash the JWT under a random one-time handoff id.
+      const handoffId = randomUUID()
+      pendingHandoffs.set(handoffId, {
+        actor_user_id: userId,
+        token,
+        expires_at: new Date(expiresAt).toISOString(),
+        tenant_id: tenantId,
+        read_only: true,
+        created_at: Date.now(),
+      })
+
       await audit(supabase, req, { action: 'impersonate.start', target_tenant_id: tenantId, reason, payload: { ttl_minutes: ttlMinutes } })
-      res.json({ token, expires_at: new Date(expiresAt).toISOString(), tenant_id: tenantId, read_only: true })
+      // Return only the handoff id — caller opens a new tab with it, the new
+      // tab claims it, JWT never appears in any URL.
+      res.json({ handoff_id: handoffId, handoff_expires_in_ms: HANDOFF_TTL_MS })
+    })
+
+  r.post('/api/super-admin/impersonate/claim', requireAuth,
+    async (req, res) => {
+      const userId = (req as any).user.id
+      const handoffId = String(req.body?.handoff_id ?? '').trim()
+      if (!handoffId) { res.status(400).json({ error: 'Missing handoff_id' }); return }
+
+      const entry = pendingHandoffs.get(handoffId)
+      if (!entry) { res.status(404).json({ error: 'Handoff expired or already claimed.' }); return }
+      // Single-use: delete immediately so concurrent claims fail.
+      pendingHandoffs.delete(handoffId)
+
+      // The user claiming MUST be the same user who initiated the handoff.
+      // This stops a stolen handoff_id from being replayed by anyone else
+      // who is signed in.
+      if (entry.actor_user_id !== userId) {
+        await audit(supabase, req, {
+          action: 'impersonate.claim_rejected',
+          target_tenant_id: entry.tenant_id,
+          payload: { reason: 'actor_mismatch' },
+        })
+        res.status(403).json({ error: 'This impersonation handoff was issued to a different user.' })
+        return
+      }
+      // TTL check — pendingHandoffs is also swept periodically, but verify here too.
+      if (Date.now() - entry.created_at > HANDOFF_TTL_MS) {
+        res.status(410).json({ error: 'Handoff expired.' })
+        return
+      }
+
+      await audit(supabase, req, { action: 'impersonate.claim', target_tenant_id: entry.tenant_id })
+      res.json({
+        token: entry.token,
+        expires_at: entry.expires_at,
+        tenant_id: entry.tenant_id,
+        read_only: entry.read_only,
+      })
     })
 
   r.post('/api/super-admin/impersonate/stop', requireAuth,

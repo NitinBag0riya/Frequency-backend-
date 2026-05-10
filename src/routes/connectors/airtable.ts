@@ -227,13 +227,31 @@ export function createAirtableConnector(deps: Deps): express.Router {
 // Token refresh — refresh_token rotates on every refresh per spec, so we
 // upsert the new pair atomically.
 // ─────────────────────────────────────────────────────────────────────────────
-async function getValidToken(supabase: SupabaseClient, tenantId: string): Promise<string> {
+/**
+ * Returns a valid Airtable access token for the tenant, refreshing if the
+ * stored one is within 60s of expiring. Exported so the data-sources router
+ * (mirror endpoint) and the data-source-sync worker can reuse the refresh
+ * logic without re-implementing it.
+ *
+ * RACE PROTECTION: Airtable rotates `refresh_token` on every refresh. If two
+ * callers simultaneously hit this with an expiring token, they'll both POST
+ * with the same refresh_token; the first wins, the second gets `invalid_grant`
+ * and (with the previous implementation) overwrote the just-stored fresh
+ * tokens with garbage — bricking the connection until manual reconnect.
+ *
+ * The fix is a compare-and-swap: include `eq('token_expires_at', oldExpiry)`
+ * in the UPDATE. Only the racer that read first lands its write; the second
+ * racer's UPDATE matches zero rows. We then re-read and use whatever the
+ * winner stored. No advisory lock needed.
+ */
+export async function getValidToken(supabase: SupabaseClient, tenantId: string): Promise<string> {
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, refresh_token, token_expires_at')
     .eq('tenant_id', tenantId).eq('key', 'airtable').maybeSingle()
   if (!row?.access_token) throw new Error('Airtable not connected for this tenant')
 
-  const expiresAt = row.token_expires_at ? new Date(row.token_expires_at).getTime() : 0
+  const oldExpiresAtIso = row.token_expires_at as string | null
+  const expiresAt = oldExpiresAtIso ? new Date(oldExpiresAtIso).getTime() : 0
   if (expiresAt > Date.now() + 60_000) {
     return decrypt(row.access_token)
   }
@@ -254,17 +272,44 @@ async function getValidToken(supabase: SupabaseClient, tenantId: string): Promis
     }),
   })
   const body = await r2.json() as any
-  if (!r2.ok) throw new Error(`Airtable refresh failed: ${body.error_description ?? body.error ?? r2.status}`)
+  if (!r2.ok) {
+    // Could be that ANOTHER caller raced ahead, refreshed, and our refresh_token
+    // is now stale (Airtable returns 'invalid_grant'). Re-read the row; if a
+    // newer expiry is now stored, the winner left a fresh access_token we can use.
+    const { data: refreshed } = await supabase.from('tenant_integrations')
+      .select('access_token, token_expires_at')
+      .eq('tenant_id', tenantId).eq('key', 'airtable').maybeSingle()
+    const refreshedExpiry = refreshed?.token_expires_at ? new Date(refreshed.token_expires_at).getTime() : 0
+    if (refreshed?.access_token && refreshedExpiry > Date.now() + 60_000) {
+      return decrypt(refreshed.access_token)
+    }
+    throw new Error(`Airtable refresh failed: ${body.error_description ?? body.error ?? r2.status}`)
+  }
 
   const newExpiresAt = new Date(Date.now() + (body.expires_in ?? 3600) * 1000).toISOString()
-  await supabase.from('tenant_integrations').update({
+  // Compare-and-swap: only land the write if the row's expiry hasn't changed
+  // since we read it. If a parallel call already refreshed, our update affects
+  // 0 rows and we re-read to use the winner's token instead of clobbering it
+  // with our (also-valid-but-different) tokens — which would lose 50% of the
+  // refresh window and kill the OTHER caller's pending requests.
+  const { data: updated } = await supabase.from('tenant_integrations').update({
     access_token:     encrypt(body.access_token),
     refresh_token:    encrypt(body.refresh_token),
     token_expires_at: newExpiresAt,
     last_used_at:     new Date().toISOString(),
-  }).eq('tenant_id', tenantId).eq('key', 'airtable')
+  })
+    .eq('tenant_id', tenantId)
+    .eq('key', 'airtable')
+    .eq('token_expires_at', oldExpiresAtIso ?? '')   // CAS predicate
+    .select('access_token').maybeSingle()
 
-  return body.access_token
+  if (updated) return body.access_token
+
+  // Lost the race — re-read and use the winner's token.
+  const { data: winner } = await supabase.from('tenant_integrations')
+    .select('access_token').eq('tenant_id', tenantId).eq('key', 'airtable').maybeSingle()
+  if (!winner?.access_token) throw new Error('Airtable token lost in concurrent refresh — please retry')
+  return decrypt(winner.access_token)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
