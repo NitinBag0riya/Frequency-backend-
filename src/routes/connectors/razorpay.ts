@@ -288,9 +288,10 @@ export function createRazorpayConnector(deps: Deps): express.Router {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Auth header builder — handles both API-key and OAuth modes
+// Auth header builder — handles both API-key and OAuth modes.
+// Exported so engine/connector-ops.ts can use Razorpay from workflow nodes.
 // ─────────────────────────────────────────────────────────────────────────────
-async function getRazorpayAuthHeader(supabase: SupabaseClient, tenantId: string): Promise<string> {
+export async function getRazorpayAuthHeader(supabase: SupabaseClient, tenantId: string): Promise<string> {
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, refresh_token, metadata, token_expires_at')
     .eq('tenant_id', tenantId).eq('key', 'razorpay').maybeSingle()

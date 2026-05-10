@@ -245,7 +245,9 @@ export function createShopifyConnector(deps: Deps): express.Router {
   return r
 }
 
-async function loadCreds(supabase: SupabaseClient, tenantId: string) {
+// Exported so engine/connector-ops.ts can call Shopify from workflow nodes
+// without duplicating the auth lookup.
+export async function loadCreds(supabase: SupabaseClient, tenantId: string) {
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, metadata')
     .eq('tenant_id', tenantId).eq('key', 'shopify').maybeSingle()

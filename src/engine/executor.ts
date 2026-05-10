@@ -272,9 +272,18 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         return { kind: 'advance', nextNodeId: pickDefault(node), variableUpdates: updates, output: { length: text.length } }
       }
 
-      // ── Email — real Resend send via lib/email.ts ──────────────────────────
+      // ── Email — Gmail-first when tenant has Google connected, Resend fallback ──
       case 'send_email':
       case 'forward_email': {
+        // Provider override:
+        //   cfg.provider = 'gmail'  → force Gmail (errors if Google not connected)
+        //   cfg.provider = 'resend' → force Resend (system / branded mail)
+        //   anything else / unset   → 'auto' = Gmail if connected, else Resend
+        // We default to 'auto' so a tenant who connected Google sends FROM
+        // their own gmail address, not from our Resend domain. The legacy
+        // cfg.smtp_provider field is honoured for back-compat.
+        const provider = (cfg.provider ?? cfg.smtp_provider ?? 'auto') as
+          'auto' | 'gmail' | 'resend' | 'smtp'
         await enqueueMessageSend({
           tenantId: ctx.tenant.id,
           to: interpolate(cfg.to_email, vars),
@@ -283,10 +292,7 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
             to:       interpolate(cfg.to_email, vars),
             subject:  interpolate(cfg.subject ?? '(no subject)', vars),
             body:     interpolate(cfg.body_template ?? cfg.body ?? '', vars),
-            // 'resend' is the only currently-implemented provider; smtp/sendgrid
-            // are reserved keys for future providers. Default to resend so
-            // legacy workflows that wrote `smtp_provider: 'smtp'` still send.
-            provider: 'resend',
+            provider,
           },
           sessionId: ctx.session.id,
         })
@@ -504,6 +510,52 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
           await enqueueWorkflowExecution({ sessionId: newSession.id, nodeId: firstAction.id })
         }
         return advance(node)
+      }
+
+      // ── Connector calls — generic + semantic shortcuts ─────────────────────
+      // Generic: cfg = { op: 'airtable.create_record', args: {...}, response_variable?: 'foo' }
+      // Semantic: case 'airtable_create_record' is sugar for op='airtable.create_record'.
+      // Both routes go through engine/connector-ops.ts so adding new ops doesn't
+      // require new executor cases — one handler in the registry covers both
+      // node-type entry points.
+      case 'connector_call':
+      case 'airtable_list_records':   case 'airtable_create_record':   case 'airtable_update_record':
+      case 'shopify_list_orders':     case 'shopify_get_order':         case 'shopify_list_products':   case 'shopify_create_draft_order':
+      case 'razorpay_list_payments':  case 'razorpay_get_payment':      case 'razorpay_refund_payment': case 'razorpay_list_subscriptions':
+      case 'slack_send_message':
+      case 'gmail_send_email': {
+        // Resolve op: explicit cfg.op for generic 'connector_call', else
+        // derive from the node type by replacing the FIRST underscore with
+        // a dot (airtable_create_record → airtable.create_record).
+        const op: string = node.type === 'connector_call'
+          ? String(cfg.op ?? '')
+          : (() => {
+              const i = node.type.indexOf('_')
+              return i > 0 ? `${node.type.slice(0, i)}.${node.type.slice(i + 1)}` : node.type
+            })()
+        if (!op || !op.includes('.')) {
+          return { kind: 'error', error: `connector_call: invalid op '${op}' (expected 'connector.operation')` }
+        }
+        const args = interpolateDeep(cfg.args ?? cfg, vars)
+        // Strip control fields out of args when the node uses cfg directly
+        // (semantic shortcuts pass the whole cfg as args). The dispatcher
+        // doesn't care about extras but it's cleaner.
+        delete (args as any).op
+        delete (args as any).response_variable
+        try {
+          const { dispatchConnectorOp } = await import('./connector-ops')
+          const result = await dispatchConnectorOp(supabase, ctx.tenant.id, op, args)
+          const updates = cfg.response_variable
+            ? { [cfg.response_variable]: result.primary ?? result.output }
+            : undefined
+          return {
+            kind: 'advance', nextNodeId: pickDefault(node),
+            variableUpdates: updates,
+            output: { op, ok: true },
+          }
+        } catch (err: any) {
+          return { kind: 'error', error: `${op}: ${err?.message ?? err}` }
+        }
       }
 
       // ── Terminal ────────────────────────────────────────────────────────────

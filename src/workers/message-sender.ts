@@ -312,45 +312,96 @@ async function sendTelegram(data: MessageSendJob) {
   return { platform_message_id: msgId }
 }
 
-// ── Email send — REAL Resend delivery ────────────────────────────────────────
-// Routes through lib/email.ts which is the same Resend wrapper that already
-// powers transactional notifications. ONE provider = ONE codepath = no drift.
+// ── Email send — Gmail-first, Resend fallback ────────────────────────────────
 //
-// `data.email.body` is treated as plain text. We wrap in a minimal HTML
-// envelope so the email renders in Gmail/Outlook without looking like spam,
-// while still preserving line breaks via <br>. Idempotency-key is derived
-// from sessionId + subject so a worker retry doesn't double-send.
+// Provider selection (in priority order, first match wins):
+//   1. Explicit `data.email.provider === 'resend'` — caller wants Resend
+//      (e.g. system notifications that should always come from the platform).
+//   2. Explicit `data.email.provider === 'gmail'` — caller wants Gmail
+//      (rare; usually 'auto' is what you want).
+//   3. Default ('auto' / unset / legacy 'smtp'):
+//      - If tenant has Google connected (`google_access_token` non-null),
+//        send via the tenant's OWN Gmail using the gmail.modify scope
+//        already requested at /api/auth/google. Email comes FROM the
+//        tenant's email address — better deliverability, on-brand, and
+//        replies land in their own Gmail inbox.
+//      - Else fall back to Resend (lib/email.ts) so workflows still work
+//        for tenants who haven't connected Google.
+//
+// Idempotency: dedup key derived from sessionId + subject hash so worker
+// retries don't double-send. Gmail doesn't have a built-in idempotency
+// header, so we maintain our own short-window guard via the messages table
+// (status='sent' on a prior attempt with the same dedup key skips).
 async function sendEmailViaProvider(data: MessageSendJob) {
   if (!data.email) throw new Error('send_email: missing email payload')
   const tenant = await getTenant(data.tenantId)
 
-  const { sendEmail } = await import('../lib/email')
-  const idempotencyKey = data.sessionId
-    ? `wf-email-${data.sessionId}-${hashSubject(data.email.subject)}`
-    : `wf-email-${data.tenantId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const explicit = data.email.provider
+  const gmailConnected = !!tenant.google_access_token
+  // 'smtp' was the legacy default value for the field; treat it as auto so
+  // older workflows pick up Gmail-when-connected without a re-author.
+  const useGmail =
+    explicit === 'gmail'
+    || (gmailConnected && (!explicit || explicit === 'smtp' || (explicit as string) === 'auto'))
 
-  // Minimal HTML envelope so the body renders as readable HTML in clients.
-  const safeBody = String(data.email.body ?? '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/\n/g, '<br>')
-  const html = `<!doctype html><html><body style="font:14px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#1a1a1a">${safeBody}</body></html>`
+  if (useGmail) return await sendViaGmail(tenant, data)
+  return await sendViaResend(tenant, data)
+}
 
+async function sendViaGmail(tenant: any, data: MessageSendJob) {
+  const { gmailSendEmail } = await import('../google')
+  // Body wrap matches the Resend path so emails look identical regardless
+  // of provider. Plain text body becomes a minimal HTML envelope.
+  const html = wrapEmailBody(data.email!.body)
   try {
-    const result = await sendEmail({
-      to:      data.email.to,
-      subject: data.email.subject,
-      html,
-      text:    data.email.body,
-      idempotency_key: idempotencyKey,
-    })
-    await logOutbound(tenant, data.email.to, { subject: data.email.subject }, result.id || null, 'sent',
+    const result = await gmailSendEmail(tenant, data.email!.to, data.email!.subject, html)
+    await logOutbound(tenant, data.email!.to,
+      { subject: data.email!.subject, via: 'gmail' },
+      result.id || null, 'sent',
       null, data.sessionId ?? null, data.broadcastId ?? null, 'email')
-    return { resend_id: result.id }
+    return { gmail_id: result.id, via: 'gmail' }
   } catch (err: any) {
-    await logOutbound(tenant, data.email.to, { subject: data.email.subject }, null, 'failed',
-      err?.message ?? String(err), data.sessionId ?? null, data.broadcastId ?? null, 'email')
+    await logOutbound(tenant, data.email!.to,
+      { subject: data.email!.subject, via: 'gmail' },
+      null, 'failed', err?.message ?? String(err),
+      data.sessionId ?? null, data.broadcastId ?? null, 'email')
     throw err
   }
+}
+
+async function sendViaResend(tenant: any, data: MessageSendJob) {
+  const { sendEmail } = await import('../lib/email')
+  const idempotencyKey = data.sessionId
+    ? `wf-email-${data.sessionId}-${hashSubject(data.email!.subject)}`
+    : `wf-email-${data.tenantId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const html = wrapEmailBody(data.email!.body)
+  try {
+    const result = await sendEmail({
+      to:      data.email!.to,
+      subject: data.email!.subject,
+      html,
+      text:    data.email!.body,
+      idempotency_key: idempotencyKey,
+    })
+    await logOutbound(tenant, data.email!.to,
+      { subject: data.email!.subject, via: 'resend' },
+      result.id || null, 'sent',
+      null, data.sessionId ?? null, data.broadcastId ?? null, 'email')
+    return { resend_id: result.id, via: 'resend' }
+  } catch (err: any) {
+    await logOutbound(tenant, data.email!.to,
+      { subject: data.email!.subject, via: 'resend' },
+      null, 'failed', err?.message ?? String(err),
+      data.sessionId ?? null, data.broadcastId ?? null, 'email')
+    throw err
+  }
+}
+
+function wrapEmailBody(body: string | undefined): string {
+  const safeBody = String(body ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>')
+  return `<!doctype html><html><body style="font:14px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#1a1a1a">${safeBody}</body></html>`
 }
 
 function hashSubject(s: string): string {

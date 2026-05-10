@@ -242,3 +242,105 @@ export async function gmailSendEmail(tenant: any, to: string, subject: string, b
   if (data.error) throw new Error(`Gmail send failed: ${data.error.message}`)
   return data
 }
+
+/**
+ * List new INBOX messages since the tenant's last poll.
+ *
+ * Two paths:
+ *   - Have a prior `gmail_history_id`: use users.history.list to get only
+ *     the deltas since that point (cheap, accurate).
+ *   - First-ever poll (no history_id stored): fall back to users.messages.list
+ *     with `q=newer_than:5m -from:me category:primary` so we don't replay
+ *     hours of inbox on first connect. Seeds history_id from the newest
+ *     message in the result so the next tick uses the cheap delta path.
+ *
+ * Returns parsed envelope info (id, from, fromName, subject, snippet,
+ * historyId) for each new message — enough for keyword matching and for
+ * logging to the messages table. Body parts beyond snippet are not
+ * fetched (keeps the polling cycle fast); workflows that need full body
+ * can call gmail.messages.get via http_request.
+ */
+export interface GmailNewThread {
+  id:         string
+  historyId?: string
+  from:       string                // email address only (parsed from header)
+  fromName?:  string                // display name if present
+  subject?:   string
+  snippet?:   string                // Gmail's pre-extracted preview text
+}
+
+export async function gmailListNewThreads(tenant: any): Promise<GmailNewThread[]> {
+  const token = await getValidToken(tenant)
+
+  let messageIds: string[] = []
+  let nextHistoryId: string | undefined
+
+  if (tenant.gmail_history_id) {
+    // Delta path — much cheaper. Returns only changes since startHistoryId.
+    const url = `https://gmail.googleapis.com/gmail/v1/users/me/history?startHistoryId=${tenant.gmail_history_id}&historyTypes=messageAdded&labelId=INBOX`
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+    const body = await r.json() as any
+    if (body.error) {
+      // 404 = history_id too old (Gmail purges after ~7 days). Reset to
+      // bootstrap path on the next tick by clearing the column.
+      if (body.error.code === 404) return []
+      throw new Error(`Gmail history.list failed: ${body.error.message}`)
+    }
+    nextHistoryId = body.historyId
+    for (const h of (body.history ?? [])) {
+      for (const ma of (h.messagesAdded ?? [])) {
+        if (ma.message?.id) messageIds.push(ma.message.id)
+      }
+    }
+  } else {
+    // Bootstrap path — last 5 minutes only, primary category, exclude self.
+    // Caps overall first-tick volume at ~50 messages so a chatty tenant
+    // doesn't fire a workflow blast on Frequency adoption day.
+    const r = await fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent('newer_than:5m -from:me category:primary')}&maxResults=50`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    )
+    const body = await r.json() as any
+    if (body.error) throw new Error(`Gmail messages.list failed: ${body.error.message}`)
+    messageIds = (body.messages ?? []).map((m: any) => m.id).filter(Boolean)
+  }
+
+  if (messageIds.length === 0) {
+    return nextHistoryId ? [{ id: '', historyId: nextHistoryId } as any].slice(0, 0) : []
+  }
+
+  // Hydrate each message with envelope info (From, Subject, snippet).
+  // metadataHeaders limits the payload — much faster than full format.
+  const out: GmailNewThread[] = []
+  for (const id of messageIds.slice(0, 50)) {  // safety cap per tick
+    const r = await fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    )
+    const m = await r.json() as any
+    if (m.error) {
+      console.warn(`[gmail] hydrate ${id} failed: ${m.error.message}`)
+      continue
+    }
+    const headers: Array<{ name: string; value: string }> = m.payload?.headers ?? []
+    const fromHeader = headers.find(h => h.name?.toLowerCase() === 'from')?.value ?? ''
+    const subjectHeader = headers.find(h => h.name?.toLowerCase() === 'subject')?.value ?? ''
+    // Parse "Name <addr>" or just "addr"
+    const fromMatch = /<([^>]+)>/.exec(fromHeader)
+    const from = (fromMatch ? fromMatch[1] : fromHeader).trim()
+    const fromName = fromMatch ? fromHeader.slice(0, fromMatch.index).trim().replace(/^"|"$/g, '') : undefined
+    out.push({
+      id:        m.id,
+      historyId: m.historyId ?? nextHistoryId,
+      from,
+      fromName,
+      subject:   subjectHeader,
+      snippet:   m.snippet,
+    })
+  }
+  // Set historyId on the LAST message so the worker can persist it.
+  if (out.length > 0 && nextHistoryId) {
+    out[out.length - 1].historyId = nextHistoryId
+  }
+  return out
+}

@@ -85,14 +85,19 @@ export interface MessageSendJob {
     caption?: string                  // image/video/document only
     filename?: string                 // document only
   }
-  // For email (now wired through lib/email.ts → Resend):
+  // For email — Gmail-first when tenant has Google connected, Resend fallback.
+  // See workers/message-sender.ts:sendEmailViaProvider for routing rules.
   email?: {
     to:        string
     subject:   string
     body:      string                 // plain text or simple HTML
-    /** Optional provider override; defaults to 'resend' (the only one
-     *  currently implemented). Reserved for future SMTP/SendGrid. */
-    provider?: 'resend' | 'smtp' | 'sendgrid' | 'mailgun'
+    /** Provider override:
+     *   'auto' / unset / 'smtp' (legacy) → Gmail if connected, else Resend
+     *   'gmail'                          → Force Gmail (errors if not connected)
+     *   'resend'                         → Force Resend (system / branded mail)
+     *   'sendgrid' / 'mailgun'           → reserved keys; not yet wired
+     */
+    provider?: 'auto' | 'gmail' | 'resend' | 'smtp' | 'sendgrid' | 'mailgun'
   }
   // Bookkeeping
   sessionId?: string | null
