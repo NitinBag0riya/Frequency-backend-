@@ -30,6 +30,16 @@ export type LimitMetric =
   | 'broadcasts_per_day'
   | 'team_size_max'
   | 'ai_tokens_per_month'
+  /**
+   * Per-tenant AI cost cap in WHOLE DOLLARS per IST month. The hard
+   * margin firewall — protects Frequency from a workflow looping AI
+   * calls that would otherwise blow past the token cap's dollar cost
+   * (Sonnet output is 15× pricier than Haiku input, so the same token
+   * count means anywhere from $1 to $75 in real Anthropic spend).
+   * lib/ai-usage.ts:recordAiUsage writes the cents counter at every
+   * call; this cap reads it via getAiDollarsThisMonth.
+   */
+  | 'ai_dollars_per_month'
 
 export interface LimitCheck {
   allowed: boolean
@@ -134,12 +144,18 @@ export async function blockIfOverLimit(
  * Numbers mirror PRICING_SPEC §2.2 free tier (intentionally tight).
  */
 const FAIL_CLOSED_FREE_DEFAULTS: Record<string, number> = {
-  contacts_max:        100,
-  messages_per_month:  100,
-  workflows_max:       1,
-  broadcasts_per_day:  1,
-  team_size_max:       1,
-  ai_tokens_per_month: 0,
+  contacts_max:         100,
+  messages_per_month:   100,
+  workflows_max:        1,
+  broadcasts_per_day:   1,
+  team_size_max:        1,
+  ai_tokens_per_month:  0,
+  // Hardcoded $1/mo ceiling for the fail-closed Free tier — covers
+  // typical experimental usage (a handful of parse-workflow calls)
+  // without ever exposing Frequency to runaway AI cost on a misconfigured
+  // plans table. Real Free tier in DB is $0.50; this is the SAFETY NET
+  // when the DB read fails entirely.
+  ai_dollars_per_month: 1,
 }
 
 /**
@@ -227,17 +243,26 @@ async function countUsage(
       const { getAiTokensThisMonth } = await import('./ai-usage')
       return await getAiTokensThisMonth(supabase, tenantId)
     }
+    case 'ai_dollars_per_month': {
+      // Dollar-cost cap — same period boundary, reads the
+      // `ai_cost_cents` counter that recordAiUsage writes alongside
+      // ai_tokens. Returns whole dollars (cents/100, ceil) so a $4.50
+      // spend hits a $5 cap. Margin floor enforcement.
+      const { getAiDollarsThisMonth } = await import('./ai-usage')
+      return await getAiDollarsThisMonth(supabase, tenantId)
+    }
   }
 }
 
 function prettyMetric(metric: LimitMetric): string {
   return ({
-    contacts_max:        'Contact',
-    messages_per_month:  'Monthly message',
-    workflows_max:       'Active workflow',
-    broadcasts_per_day:  'Daily broadcast',
-    team_size_max:       'Team seat',
-    ai_tokens_per_month: 'Monthly AI token',
+    contacts_max:         'Contact',
+    messages_per_month:   'Monthly message',
+    workflows_max:        'Active workflow',
+    broadcasts_per_day:   'Daily broadcast',
+    team_size_max:        'Team seat',
+    ai_tokens_per_month:  'Monthly AI token',
+    ai_dollars_per_month: 'Monthly AI spend ($)',
   })[metric]
 }
 
@@ -246,8 +271,10 @@ function prettyMetric(metric: LimitMetric): string {
  * FE can always link to /settings/billing for the canonical comparison.
  */
 function nextTierForMetric(metric: LimitMetric): string {
-  // ai_tokens + workflows tend to bite first on Starter → Growth.
+  // ai_tokens + ai_dollars + workflows tend to bite first on Starter → Growth.
   // contacts + messages bite first on Free → Starter.
-  if (metric === 'ai_tokens_per_month' || metric === 'workflows_max') return 'growth'
+  if (metric === 'ai_tokens_per_month'
+   || metric === 'ai_dollars_per_month'
+   || metric === 'workflows_max') return 'growth'
   return 'starter'
 }

@@ -64,10 +64,24 @@ export function createWorkflowRecosRouter(deps: Deps): express.Router {
       return
     }
 
-    try {
-      const prompt = `You are recommending automation workflow templates for a SaaS that uses these connected apps: ${apps.join(', ')}.
+    // Per-tenant plan-limit gates BEFORE the AI call (see /api/parse-workflow
+    // for rationale on dual gating).
+    {
+      const { blockIfOverLimit } = await import('../lib/limits')
+      if (await blockIfOverLimit(res, supabase, tenantId, 'ai_tokens_per_month'))   return
+      if (await blockIfOverLimit(res, supabase, tenantId, 'ai_dollars_per_month'))  return
+    }
 
-Return up to 4 high-leverage workflow templates that combine these apps. For each, output JSON with:
+    try {
+      // Split prompt into stable system + dynamic user. The system part is
+      // identical across all recommendation calls — wrapping it in a
+      // cache_control block lets Anthropic reuse the prefix at ~90% off
+      // input cost on subsequent calls within the 5-minute cache TTL.
+      // First call seeds (25% premium); next 5min of calls hit the cache.
+      // Net effect on a steady stream: 50-70% cheaper input tokens.
+      const SYSTEM_PROMPT = `You recommend automation workflow templates for an Indian SMB SaaS (Frequency).
+
+For the user's connected apps, return up to 4 high-leverage workflow templates that combine them. For each, output JSON with:
   - name (short, action-oriented)
   - description (1 sentence, what it does)
   - category (one of: lead_capture, payment, reminder, onboarding, support, marketing)
@@ -78,15 +92,20 @@ Return up to 4 high-leverage workflow templates that combine these apps. For eac
 
 Output STRICT JSON: { "recommendations": [...] }. No markdown, no commentary.`
 
+      const userPrompt = `Connected apps: ${apps.join(', ')}`
+
       const completion = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
         max_tokens: 2000,
-        messages: [{ role: 'user', content: prompt }],
+        system: [
+          { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
+        ] as any,
+        messages: [{ role: 'user', content: userPrompt }],
       })
-      // Per-tenant token accounting (lib/ai-usage.ts). Fire-and-forget so a
-      // counter-table hiccup never blocks recommendations.
+      // Per-tenant token + cost accounting (lib/ai-usage.ts). Fire-and-forget
+      // so a counter-table hiccup never blocks recommendations.
       void import('../lib/ai-usage').then(({ recordAiUsage }) =>
-        recordAiUsage(supabase, tenantId, completion.usage as any, 'workflow_recos'))
+        recordAiUsage(supabase, tenantId, completion.usage as any, 'workflow_recos', 'claude-sonnet-4-6'))
       const text = completion.content.find(c => c.type === 'text')?.text ?? '{}'
       const cleaned = text.replace(/^```json\s*|\s*```$/g, '')
       const parsed = JSON.parse(cleaned)

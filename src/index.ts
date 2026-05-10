@@ -664,6 +664,18 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
     res.status(503).json({ error: 'Frequency AI is unavailable right now. Please try again in a moment, or contact support if it persists.' })
     return
   }
+  // Plan-limit checks BEFORE opening the SSE stream — once we send headers
+  // we can't return a clean 402. Both gates must pass:
+  //   1. ai_tokens_per_month — count cap (intuitive for users)
+  //   2. ai_dollars_per_month — dollar-cost cap (margin firewall;
+  //      a workflow looping AI calls past the dollar budget gets blocked
+  //      even if it hasn't hit the token cap, because Sonnet output is
+  //      15× the cost of Haiku input)
+  {
+    const { blockIfOverLimit } = await import('./lib/limits')
+    if (await blockIfOverLimit(res, supabase, tenantId, 'ai_tokens_per_month'))   return
+    if (await blockIfOverLimit(res, supabase, tenantId, 'ai_dollars_per_month'))  return
+  }
 
   // ── SSE setup ───────────────────────────────────────────────────────────────
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
@@ -751,7 +763,7 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
     if (usage) {
       console.log(`[parse-workflow] done chars=${charCount} input=${usage.input_tokens} output=${usage.output_tokens} cache_read=${(usage as any).cache_read_input_tokens ?? 0} cache_create=${(usage as any).cache_creation_input_tokens ?? 0}`)
       void import('./lib/ai-usage').then(({ recordAiUsage }) =>
-        recordAiUsage(supabase, tenantId, usage as any, 'parse_workflow'))
+        recordAiUsage(supabase, tenantId, usage as any, 'parse_workflow', 'claude-sonnet-4-6'))
     }
 
     if (!clientGone) {

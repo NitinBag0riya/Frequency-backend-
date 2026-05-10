@@ -248,18 +248,48 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         // `output.skipped` lands in the workflow session inspection UI — keep
         // it brand-neutral. The engineer-facing detail is in the boot log.
         if (!anthropic) return { kind: 'advance', nextNodeId: pickDefault(node), output: { skipped: 'Frequency AI not available' } }
+
+        // Plan-limit gate — ai_tokens_per_month + ai_dollars_per_month.
+        // Workflow execution MUST NOT crash on a budget exhaustion (the
+        // workflow's other steps should still run); skip with a clear
+        // `output.skipped` instead, so the FE inspector + the user can see
+        // exactly why this node didn't fire and which cap to upgrade.
+        {
+          const { checkLimit } = await import('../lib/limits')
+          const tokenCheck   = await checkLimit(supabase, ctx.tenant.id, 'ai_tokens_per_month')
+          if (!tokenCheck.allowed) {
+            return { kind: 'advance', nextNodeId: pickDefault(node),
+              output: { skipped: `AI token cap reached (${tokenCheck.current}/${tokenCheck.max}). ${tokenCheck.upgrade_to ? `Upgrade to ${tokenCheck.upgrade_to}.` : ''}` } }
+          }
+          const dollarCheck = await checkLimit(supabase, ctx.tenant.id, 'ai_dollars_per_month')
+          if (!dollarCheck.allowed) {
+            return { kind: 'advance', nextNodeId: pickDefault(node),
+              output: { skipped: `AI spend cap reached ($${dollarCheck.current}/$${dollarCheck.max} this month). ${dollarCheck.upgrade_to ? `Upgrade to ${dollarCheck.upgrade_to}.` : ''}` } }
+          }
+        }
+
         const systemPrompt = interpolate(cfg.system_prompt ?? 'You are a helpful WhatsApp assistant. Reply concisely.', vars)
         const userMsg = interpolate(cfg.user_message ?? ctx.reply?.text ?? '', vars)
+        const model = cfg.model ?? 'claude-haiku-4-5'
         const resp = await anthropic.messages.create({
-          model: cfg.model ?? 'claude-haiku-4-5',
+          model,
           max_tokens: cfg.max_tokens ?? 400,
-          system: systemPrompt,
+          // System prompt wrapped in cache_control so the same workflow
+          // firing repeatedly (typical: a "support bot" workflow gets
+          // 100s of incoming messages an hour) reuses the cached prefix
+          // at ~90% off input rate. First call seeds; next 5 min of
+          // identical-prompt calls hit the cache. Per-workflow caching
+          // is the right granularity since each workflow's system_prompt
+          // is its identity.
+          system: [
+            { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
+          ] as any,
           messages: [{ role: 'user', content: userMsg }],
         })
-        // Per-tenant token accounting (lib/ai-usage.ts). Fire-and-forget;
+        // Per-tenant token + cost accounting (lib/ai-usage.ts). Fire-and-forget;
         // workflow execution must not stall on a counter-table write.
         void import('../lib/ai-usage').then(({ recordAiUsage }) =>
-          recordAiUsage(supabase, ctx.tenant.id, resp.usage as any, 'ai_responder'))
+          recordAiUsage(supabase, ctx.tenant.id, resp.usage as any, 'ai_responder', model))
         const text = resp.content
           .filter((b: any) => b.type === 'text')
           .map((b: any) => b.text)
