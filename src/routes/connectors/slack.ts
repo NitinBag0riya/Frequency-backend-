@@ -1,16 +1,22 @@
 /**
  * Slack connector — Incoming Webhook URL paste flow.
  *
- * Two endpoints:
+ * Single endpoint:
  *   POST /api/connectors/slack/connect-webhook   { webhook_url }
- *     Validates URL shape, sends a test "Frequency: Slack connected ✓"
- *     message to verify the URL works, then stores it ENCRYPTED in
- *     tenant_integrations.refresh_token. Same shape as Razorpay's key_secret
- *     so the disconnect handler + capability code stay uniform.
+ *     Validates URL shape, sends ONE verification message to prove the URL
+ *     works, then stores it ENCRYPTED in tenant_integrations.refresh_token.
+ *     Same shape as Razorpay's key_secret so the disconnect handler at
+ *     POST /api/connectors/:key/disconnect works without channel-specific code.
  *
- *   POST /api/connectors/slack/test
- *     Re-sends a test message to the saved webhook. Used by the FE
- *     Settings page "Test Slack" button after the user changes a setting.
+ * No runtime "test" endpoint by design. The verify-on-connect call IS the
+ * test — a separate button:
+ *   1. trains users to expect dev-mode controls in production,
+ *   2. invites accidental spam of their own Slack channel,
+ *   3. duplicates information that's already in notification_delivery_log
+ *      (every real notification dispatch logs success/failure per channel,
+ *      so a broken Slack integration surfaces on the next real event).
+ * If a user wants to re-verify, disconnect + reconnect re-fires the
+ * verification call — one click each, no extra surface area.
  *
  * Why webhook (not OAuth):
  *   Slack's Incoming Webhooks are designed for exactly this case — a
@@ -20,9 +26,8 @@
  *
  * Storage shape (mirrors Razorpay api_key path):
  *   tenant_integrations.refresh_token  → encrypt(webhook_url)
- *   tenant_integrations.brand_label    → channel name parsed from the URL
- *                                         response (Slack returns the channel
- *                                         in test responses) or 'Webhook'
+ *   tenant_integrations.brand_label    → workspace hint (T-prefixed segment
+ *                                         from the URL path)
  *   tenant_integrations.metadata       → { auth_mode: 'webhook_paste' }
  *
  * Notification dispatch reads via `lib/slack.ts:getTenantSlackWebhook` which
@@ -32,7 +37,7 @@
 import express from 'express'
 import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
-import { encrypt, decrypt } from '../../crypto'
+import { encrypt } from '../../crypto'
 import { validateBody } from '../../validation'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -115,37 +120,6 @@ export function createSlackConnector(deps: Deps): express.Router {
       }, { onConflict: 'tenant_id,key' })
 
       res.json({ success: true, workspace_hint: workspaceHint })
-    })
-
-  // ── Test (re-send to the saved webhook) ─────────────────────────────────
-  r.post('/api/connectors/slack/test',
-    requireAuth, identifyTenant, checkPermission('integrations', 'view'),
-    async (req, res) => {
-      const tenantId = (req as any).tenantId
-      const { data } = await supabase.from('tenant_integrations')
-        .select('refresh_token').eq('tenant_id', tenantId).eq('key', 'slack').maybeSingle()
-      if (!data?.refresh_token) {
-        res.status(404).json({ error: 'Slack not connected' })
-        return
-      }
-      const url = decrypt(data.refresh_token)
-      try {
-        const r2 = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: '🔔 Frequency test message — your Slack channel is wired correctly.',
-          }),
-        })
-        if (!r2.ok) {
-          const detail = await r2.text().catch(() => '')
-          res.status(400).json({ error: `Slack returned ${r2.status}: ${detail.slice(0, 200)}` })
-          return
-        }
-        res.json({ success: true })
-      } catch (err: any) {
-        res.status(502).json({ error: `Couldn't reach Slack: ${err?.message ?? err}` })
-      }
     })
 
   return r
