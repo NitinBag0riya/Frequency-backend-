@@ -1034,25 +1034,35 @@ app.get('/api/tenants/:id/members', requireAuth, identifyTenant, async (req, res
 app.post('/api/onboarding', requireAuth, async (req, res) => {
   const user = (req as any).user
   const { business_name, full_name, phone } = req.body
-  
+
   // Update Profile
-  await supabase.from('profiles').update({ 
-    full_name, 
-    wa_number: phone 
+  await supabase.from('profiles').update({
+    full_name,
+    wa_number: phone
   }).eq('id', user.id)
-  
+
+  // Generate the workspace slug from business_name BEFORE the tenant insert.
+  // The DB has a UNIQUE constraint + reserved-word CHECK on slug; this util
+  // (lib/slug.ts) handles slugify + collision suffix + reserved-word fallback
+  // so the insert always succeeds with a clean slug. The user_id is used as
+  // the fallback seed for the unlikely case where business_name slugifies to
+  // empty (all non-Latin characters).
+  const { ensureUniqueSlug } = await import('./lib/slug')
+  const slug = await ensureUniqueSlug(supabase, business_name ?? '', user.id)
+
   // Create/Update Tenant
   const { data: tenant, error } = await supabase.from('tenants').upsert({
     user_id: user.id,
     business_name,
+    slug,
     status: 'active'
   }).select().single()
-  
+
   if (error) { res.status(500).json({ error: error.message }); return }
-  
+
   // Mock sending email
   console.log(`[onboarding:email] Sending welcome email to ${user.email}`)
-  
+
   res.json({ success: true, tenant })
 })
 
@@ -1061,7 +1071,7 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
 
   // 1. Tenants the user owns
   const { data: ownedTenants, error: e1 } = await supabase.from('tenants')
-    .select('id,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
+    .select('id,slug,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
     .eq('user_id', user.id)
   if (e1) { res.status(500).json({ error: e1.message }); return }
 
@@ -1075,7 +1085,7 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
   let teamTenants: any[] = []
   if (roleTenantIds.length > 0) {
     const { data: extra } = await supabase.from('tenants')
-      .select('id,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
+      .select('id,slug,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
       .in('id', roleTenantIds)
     teamTenants = extra ?? []
   }
@@ -1146,13 +1156,29 @@ app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
       console.error(`[connect-waba] ⚠️ Webhook subscription FAILED for WABA ${waba_id}:`, subData)
     }
 
+    // Resolve slug. On a WABA reconnect (existing tenant by waba_id) we keep
+    // the existing slug — renaming a workspace's URL via reconnect would
+    // break every team-member's bookmark. Only generate a fresh slug for
+    // truly new tenants. The `select('slug').eq('waba_id', waba_id)` look-
+    // ahead is the cheapest way to detect new-vs-existing without first
+    // doing a SELECT+INSERT round trip.
+    const { data: existingForWaba } = await supabase.from('tenants')
+      .select('slug').eq('waba_id', waba_id).maybeSingle()
+    const businessName = wabaData.name ?? phoneData.verified_name ?? 'My Business'
+    let slugToWrite: string | undefined = existingForWaba?.slug ?? undefined
+    if (!slugToWrite) {
+      const { ensureUniqueSlug } = await import('./lib/slug')
+      slugToWrite = await ensureUniqueSlug(supabase, businessName, user.id)
+    }
+
     // Upsert tenant row
     const { data, error } = await supabase.from('tenants').upsert({
       user_id: user.id,
       waba_id,
       phone_number_id,
       access_token: longToken,
-      business_name: wabaData.name ?? phoneData.verified_name ?? 'My Business',
+      business_name: businessName,
+      slug: slugToWrite,
       display_phone: phoneData.display_phone_number,
       status: 'active',
       updated_at: new Date().toISOString(),
