@@ -846,6 +846,20 @@ app.post('/api/workflows', requireAuth, identifyTenant, checkPermission('whatsap
   if (req.body.status === 'live') {
     const { blockIfOverLimit } = await import('./lib/limits')
     if (await blockIfOverLimit(res, supabase, tenantId, 'workflows_max')) return
+
+    // Pre-flight validation gate (mirror PATCH /api/workflows/:id). A
+    // workflow created directly as 'live' must already have all its
+    // required connectors connected and no blocking config errors.
+    const { validateWorkflow } = await import('./engine/workflow-validator')
+    const report = await validateWorkflow(supabase, tenantId, (req.body.nodes ?? []) as any[])
+    if (!report.ok) {
+      res.status(422).json({
+        error:  'Workflow cannot be created live yet — fix the issues below or save as draft first',
+        code:   'workflow_validation_failed',
+        report,
+      })
+      return
+    }
   }
 
   // workflows.user_id is NOT NULL (migration 001) — always set it from the
@@ -887,10 +901,33 @@ app.patch('/api/workflows/:id', requireAuth, identifyTenant, checkPermission('wh
   // staying live, or going from live→paused). Cap is on live count.
   if (patch.status === 'live') {
     const { data: existing } = await supabase.from('workflows')
-      .select('status').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+      .select('status, nodes').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
     if (existing && existing.status !== 'live') {
       const { blockIfOverLimit } = await import('./lib/limits')
       if (await blockIfOverLimit(res, supabase, tenantId, 'workflows_max')) return
+    }
+
+    // Pre-flight validation gate. Refuse to set a workflow live if it has
+    // missing connectors OR blocking config errors. Returns the full
+    // ValidationReport in the 422 body so the FE can render the same UI
+    // it shows on /preview without a second round-trip. Without this, a
+    // user clicking "Set live" on a workflow that needs Razorpay would
+    // only find out when an inbound message tried to fire it — by then
+    // the customer was mid-conversation and saw a broken bot.
+    //
+    // Use the post-patch nodes if cfg.nodes is in the patch (they're
+    // updating logic + flipping live in one PATCH), else the existing
+    // nodes from the DB row.
+    const nodesToValidate = (patch as any).nodes ?? existing?.nodes ?? []
+    const { validateWorkflow } = await import('./engine/workflow-validator')
+    const report = await validateWorkflow(supabase, tenantId, nodesToValidate as any[])
+    if (!report.ok) {
+      res.status(422).json({
+        error:  'Workflow cannot be set live yet — fix the issues below',
+        code:   'workflow_validation_failed',
+        report,
+      })
+      return
     }
   }
 
@@ -907,6 +944,59 @@ app.delete('/api/workflows/:id', requireAuth, identifyTenant, checkPermission('w
     .delete().eq('id', req.params.id).eq('tenant_id', tenantId)
   if (error) { res.status(500).json({ error: error.message }); return }
   res.json({ success: true })
+})
+
+// ── Pre-flight workflow validation ───────────────────────────────────────────
+//
+// Two endpoints, same engine (engine/workflow-validator.ts):
+//
+//   POST /api/workflows/:id/dry-run   — validates a SAVED workflow.
+//                                        Used by the FE before "Set live"
+//                                        and by the worker before first run.
+//   POST /api/workflows/preview        — validates an UNSAVED nodes[] array
+//                                        (request body: { nodes: [...] }).
+//                                        Used by the FE while the user is
+//                                        still authoring — calls on each
+//                                        change to update the "needs Razorpay
+//                                        connected" sidebar live.
+//
+// Both return ValidationReport:
+//   { ok, triggers, required_connectors, missing_connectors,
+//     node_issues: [{node_id, severity, message}], summary }
+//
+// `ok=true` means "this workflow will execute end-to-end without surprises".
+// `ok=false` AND missing_connectors.length > 0 → show "connect X" CTAs.
+// `ok=false` AND node_issues with severity=error → show in node inspector.
+//
+// `view` permission is enough — validation is read-only.
+app.post('/api/workflows/:id/dry-run', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'view'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  const { data: wf, error } = await supabase.from('workflows')
+    .select('id, nodes').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+  if (error)  { res.status(500).json({ error: error.message }); return }
+  if (!wf)    { res.status(404).json({ error: 'Workflow not found' }); return }
+  const { validateWorkflow } = await import('./engine/workflow-validator')
+  const report = await validateWorkflow(supabase, tenantId, (wf.nodes as any[]) ?? [])
+  res.json(report)
+})
+
+app.post('/api/workflows/preview', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'view'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  const nodes = (req.body as any)?.nodes
+  if (!Array.isArray(nodes)) {
+    res.status(400).json({ error: 'request body must include { nodes: [...] }' })
+    return
+  }
+  // Cap node count so a maliciously-large blueprint can't DoS the validator
+  // (each node = O(1) work, but per-node DB queries in connection probe are
+  // already amortized — this is paranoia for very large generated workflows).
+  if (nodes.length > 200) {
+    res.status(400).json({ error: 'Workflow too large: max 200 nodes per preview call' })
+    return
+  }
+  const { validateWorkflow } = await import('./engine/workflow-validator')
+  const report = await validateWorkflow(supabase, tenantId, nodes)
+  res.json(report)
 })
 
 // ── Tenants CRUD ──────────────────────────────────────────────────────────────
