@@ -1,8 +1,9 @@
 /**
- * AI token usage accounting.
+ * Frequency AI token usage accounting.
  *
- * Anthropic returns input/output (and cache) token counts on every response.
- * We record them per-tenant in `usage_counters` so:
+ * The underlying provider (Anthropic) returns input/output (and cache)
+ * token counts on every response. We record them per-tenant in
+ * `usage_counters` so:
  *   1. `lib/limits.ts` can enforce the `ai_tokens_per_month` plan cap
  *   2. `/api/billing/usage` can show the user how much they've spent
  *
@@ -36,9 +37,10 @@ export type AiUsageSource =
   | 'skill_match'         // POST /api/skills/match (intent classifier)
 
 /**
- * Shape we accept from Anthropic responses. Both `messages.create()` (sync) and
- * `stream.finalMessage().usage` (streaming) return this shape; cache fields
- * are optional and only present when prompt-caching is in use.
+ * Shape we accept from the AI provider's responses (Anthropic SDK). Both
+ * `messages.create()` (sync) and `stream.finalMessage().usage` (streaming)
+ * return this shape; cache fields are optional and only present when
+ * prompt-caching is in use.
  */
 export interface AiUsage {
   input_tokens?:                number

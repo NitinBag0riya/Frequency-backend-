@@ -220,10 +220,10 @@ async function countUsage(
     }
     case 'ai_tokens_per_month': {
       // Live count — `lib/ai-usage.ts:recordAiUsage()` writes to the
-      // `usage_counters` table from every Claude call site (parse-workflow,
-      // workflow-recos, run_ai_responder node, skill match). Period
-      // boundary is the IST calendar month, same convention as
-      // messages_per_month so the bars + the limit-block agree.
+      // `usage_counters` table from every Frequency AI call site
+      // (parse-workflow, workflow-recos, run_ai_responder node, skill
+      // match). Period boundary is the IST calendar month, same convention
+      // as messages_per_month so the bars + the limit-block agree.
       const { getAiTokensThisMonth } = await import('./ai-usage')
       return await getAiTokensThisMonth(supabase, tenantId)
     }

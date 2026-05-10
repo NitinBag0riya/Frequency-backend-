@@ -658,7 +658,10 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
     res.status(400).json({ error: 'message (string) required' }); return
   }
   if (!process.env.ANTHROPIC_API_KEY) {
-    res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured on this server' })
+    // User-facing — never leak the underlying provider name. The error
+    // message lands in the FE toast for whoever hit /create. Server-side
+    // log (above on boot) has the real ANTHROPIC_API_KEY hint for ops.
+    res.status(503).json({ error: 'Frequency AI is unavailable right now. Please try again in a moment, or contact support if it persists.' })
     return
   }
 
@@ -670,14 +673,15 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
   res.flushHeaders()
 
   // Heartbeat — comment line every 15s. Comments are ignored by EventSource
-  // parsers but keep proxy connections alive during long Claude generations.
+  // parsers but keep proxy connections alive during long Frequency AI
+  // generations (provider: Anthropic).
   const heartbeat = setInterval(() => {
     if (!res.writableEnded) {
       try { res.write(': keepalive\n\n') } catch { /* socket gone */ }
     }
   }, 15_000)
 
-  // Hard timeout — protect against Anthropic API hangs.
+  // Hard timeout — protect against Frequency AI provider (Anthropic) hangs.
   const TIMEOUT_MS = 90_000
   const abortCtl = new AbortController()
   const timeoutId = setTimeout(() => {

@@ -243,9 +243,11 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         }
       }
 
-      // ── AI Responder (Claude) ───────────────────────────────────────────────
+      // ── AI Responder (Frequency AI, powered by Anthropic) ───────────────────
       case 'run_ai_responder': {
-        if (!anthropic) return { kind: 'advance', nextNodeId: pickDefault(node), output: { skipped: 'no ANTHROPIC_API_KEY' } }
+        // `output.skipped` lands in the workflow session inspection UI — keep
+        // it brand-neutral. The engineer-facing detail is in the boot log.
+        if (!anthropic) return { kind: 'advance', nextNodeId: pickDefault(node), output: { skipped: 'Frequency AI not available' } }
         const systemPrompt = interpolate(cfg.system_prompt ?? 'You are a helpful WhatsApp assistant. Reply concisely.', vars)
         const userMsg = interpolate(cfg.user_message ?? ctx.reply?.text ?? '', vars)
         const resp = await anthropic.messages.create({
