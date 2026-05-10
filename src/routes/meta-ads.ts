@@ -251,7 +251,10 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
         body: JSON.stringify({
           name, subtype: 'CUSTOM',
           customer_file_source: 'USER_PROVIDED_ONLY',
-          description: `Created by FlowGPT (source: ${source ?? 'crm'})`,
+          // Saved on Meta's side as the audience description. Visible in
+          // Ads Manager → Audiences. MUST stay product-branded ("Frequency"),
+          // not the legacy internal codename.
+          description: `Created by Frequency (source: ${source ?? 'crm'})`,
         }),
       }).then(r => r.json()) as any
       if (!a.id) throw new Error(a.error?.message ?? 'audience create failed')

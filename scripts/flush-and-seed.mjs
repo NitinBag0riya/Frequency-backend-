@@ -61,7 +61,7 @@ async function execSql(sql) {
     headers: {
       Authorization: `Bearer ${PAT}`,
       'Content-Type': 'application/json',
-      'User-Agent': 'flowgpt-seed/1.0',
+      'User-Agent': 'frequency-seed/1.0',
     },
     body: JSON.stringify({ query: sql }),
   })
