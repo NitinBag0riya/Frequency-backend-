@@ -292,24 +292,33 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
   })
 
   // ── Conversions API ──────────────────────────────────────────────────────
+  // POST a server-side conversion event to Meta. Supports `test_event_code`
+  // (query param OR body) so devs can validate the wiring in Events Manager
+  // → Test Events without polluting production reporting.
   r.post('/api/meta-ads/capi/events', ...guard, async (req, res) => {
     const tenantId = (req as any).tenantId
     const { pixel_id, event_name, event_time, user_data, custom_data, action_source = 'website' } = req.body
     if (!pixel_id || !event_name) { res.status(400).json({ error: 'pixel_id + event_name required' }); return }
     const conn = await getMetaAdsConnection(supabase, tenantId)
     if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    // test_event_code: short string from Events Manager → Test Events tab.
+    // When present, Meta routes the event to the test stream instead of
+    // production reporting (won't show in conversion attribution).
+    const testEventCode = (req.query.test_event_code as string | undefined) ?? req.body.test_event_code
     try {
+      const body: any = {
+        data: [{
+          event_name,
+          event_time: event_time ?? Math.floor(Date.now() / 1000),
+          action_source,
+          user_data: user_data ?? {},
+          custom_data: custom_data ?? {},
+        }],
+      }
+      if (testEventCode) body.test_event_code = String(testEventCode)
       const r1 = await fetch(`${GRAPH}/${pixel_id}/events?access_token=${conn.token}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          data: [{
-            event_name,
-            event_time: event_time ?? Math.floor(Date.now() / 1000),
-            action_source,
-            user_data: user_data ?? {},
-            custom_data: custom_data ?? {},
-          }],
-        }),
+        body: JSON.stringify(body),
       })
       const j = await r1.json() as any
       if (j.error) throw new Error(j.error.message)
@@ -319,8 +328,105 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
     }
   })
 
-  r.get('/api/meta-ads/capi/diagnostics', ...guardView, async (_req, res) => {
-    res.json({ note: 'Diagnostics surface in Events Manager → Conversions API → Diagnostics' })
+  // Real diagnostics — calls Meta's Graph API to surface pixel health + event
+  // volume rather than the previous hardcoded "go look in Events Manager"
+  // breadcrumb. Useful for CAPI integrations where the user can't tell from
+  // the UI whether their POSTs are actually arriving at Meta.
+  //
+  //   GET /api/meta-ads/capi/diagnostics?pixel_id=123&hours=24
+  //
+  // Returns:
+  //   {
+  //     pixel: { id, name, last_fired_time, is_unavailable, creation_time, owner_business },
+  //     ownership_verified: true | false,    // does pixel belong to one of tenant's ad accounts?
+  //     stats: { window_start, window_end, total_events, by_event: { PageView: 123, ... } },
+  //     errors: string[]                     // non-fatal warnings (stats unavailable, etc.)
+  //   }
+  r.get('/api/meta-ads/capi/diagnostics', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const pixel_id = String(req.query.pixel_id ?? '').trim()
+    if (!pixel_id) { res.status(400).json({ error: 'pixel_id query param required' }); return }
+    const hours = Math.min(168, Math.max(1, Number(req.query.hours ?? 24)))   // clamp 1h..7d
+
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+
+    const errors: string[] = []
+    const out: any = { pixel: null, ownership_verified: false, stats: null, errors }
+
+    // 1. Fetch pixel metadata. If the access token can't read the pixel
+    // (wrong tenant, revoked grant), Meta returns an error and we surface it.
+    try {
+      const fields = 'id,name,last_fired_time,is_unavailable,creation_time,owner_business{id,name}'
+      const pj = await fetch(`${GRAPH}/${pixel_id}?fields=${fields}&access_token=${conn.token}`).then(r => r.json()) as any
+      if (pj.error) {
+        res.status(403).json({
+          error: `Cannot read pixel ${pixel_id}: ${pj.error.message}`,
+          code:  'pixel_unauthorized',
+          hint:  'Verify the pixel id and that the connected Meta user has access to it.',
+        })
+        return
+      }
+      out.pixel = pj
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph API unreachable: ${err?.message ?? err}` })
+      return
+    }
+
+    // 2. Validate ownership: the pixel's owner_business should match one of
+    // this tenant's ad accounts' business_id. Defence-in-depth — without it,
+    // a tenant who guessed a pixel id from a competitor could send fake
+    // CAPI events in their name. Soft-warning if we can't confirm rather
+    // than blocking — meta_ad_accounts may not have business_id populated
+    // for older connections (pre-016 migration).
+    const ownerBusinessId = out.pixel?.owner_business?.id
+    if (ownerBusinessId) {
+      const { data: accounts } = await supabase.from('meta_ad_accounts')
+        .select('business_id').eq('tenant_id', tenantId)
+      const tenantBusinessIds = (accounts ?? []).map((a: any) => a.business_id).filter(Boolean)
+      if (tenantBusinessIds.length > 0 && tenantBusinessIds.includes(ownerBusinessId)) {
+        out.ownership_verified = true
+      } else if (tenantBusinessIds.length > 0) {
+        errors.push(`Pixel owner_business ${ownerBusinessId} doesn't match any ad account on this tenant. The pixel may belong to a different account.`)
+      } else {
+        errors.push('Cannot verify pixel ownership — no business_id stored on this tenant\'s ad accounts. Reconnect Meta Ads to refresh metadata.')
+      }
+    }
+
+    // 3. Fetch event volume stats. Meta's `/stats` endpoint requires the
+    // ads_management permission and may not be available on every pixel —
+    // soft-fail if it 4xxs.
+    try {
+      const endTs   = Math.floor(Date.now() / 1000)
+      const startTs = endTs - hours * 3600
+      const sj = await fetch(
+        `${GRAPH}/${pixel_id}/stats?aggregation=event_total_count&start_time=${startTs}&end_time=${endTs}&access_token=${conn.token}`
+      ).then(r => r.json()) as any
+      if (sj.error) {
+        errors.push(`Stats unavailable: ${sj.error.message}`)
+      } else {
+        const buckets = Array.isArray(sj.data) ? sj.data : []
+        const byEvent: Record<string, number> = {}
+        let total = 0
+        for (const b of buckets) {
+          const eventName = b?.value?.event ?? b?.event ?? 'unknown'
+          const count = Number(b?.value?.count ?? b?.count ?? 0)
+          byEvent[eventName] = (byEvent[eventName] ?? 0) + count
+          total += count
+        }
+        out.stats = {
+          window_start: new Date(startTs * 1000).toISOString(),
+          window_end:   new Date(endTs * 1000).toISOString(),
+          window_hours: hours,
+          total_events: total,
+          by_event:     byEvent,
+        }
+      }
+    } catch (err: any) {
+      errors.push(`Stats fetch failed: ${err?.message ?? err}`)
+    }
+
+    res.json(out)
   })
 
   r.get('/api/meta-ads/insights', ...guardView, async (req, res) => {

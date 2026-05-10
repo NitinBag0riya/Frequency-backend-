@@ -230,12 +230,32 @@ export async function emitNotification(
   }))
   if (inAppLog.length) await supabase.from('notification_delivery_log').insert(inAppLog)
 
-  // Email — only for users whose channels include 'email'. Dispatched in
-  // parallel; per-recipient errors are logged independently.
+  // Out-of-band channel dispatch — fire-and-forget, parallelised, isolated
+  // failures (one channel down ≠ all channels down).
+  //
+  // Each dispatcher is responsible for:
+  //   1. Filtering to the recipients who opted into its channel
+  //   2. Resolving per-recipient delivery target (email / wa_number / N/A)
+  //   3. Sending via its provider (Resend / Meta Graph / Slack webhook)
+  //   4. Writing per-attempt result to notification_delivery_log
+  //
+  // Order doesn't matter — they all dispatch in parallel via `void`.
   const wantsEmail = (created ?? []).map((_n, i) => channelsByUser[i]?.includes('email') ?? false)
   if (wantsEmail.some(Boolean)) {
     void dispatchEmails(supabase, created ?? [], wantsEmail, args.tenant_id ?? null).catch(e =>
       console.warn('[notifications] email dispatch crashed:', e?.message ?? e))
+  }
+
+  const wantsSlack = (created ?? []).map((_n, i) => channelsByUser[i]?.includes('slack') ?? false)
+  if (wantsSlack.some(Boolean) && args.tenant_id) {
+    void dispatchSlack(supabase, created ?? [], wantsSlack, args.tenant_id).catch(e =>
+      console.warn('[notifications] slack dispatch crashed:', e?.message ?? e))
+  }
+
+  const wantsWhatsApp = (created ?? []).map((_n, i) => channelsByUser[i]?.includes('whatsapp') ?? false)
+  if (wantsWhatsApp.some(Boolean) && args.tenant_id) {
+    void dispatchWhatsApp(supabase, created ?? [], wantsWhatsApp, args.tenant_id).catch(e =>
+      console.warn('[notifications] whatsapp dispatch crashed:', e?.message ?? e))
   }
 
   return created ?? []
@@ -375,4 +395,163 @@ function interpolate(template: string, vars: Record<string, any>): string {
     const v = path.split('.').reduce((acc: any, k: string) => acc?.[k], vars)
     return v == null ? '' : String(v)
   })
+}
+
+/**
+ * Slack delivery — one webhook URL per tenant in `tenant_integrations`,
+ * one POST per notification. Slack itself does no per-recipient routing —
+ * the webhook URL targets a specific channel — so multiple recipients in
+ * the same tenant collapse into one Slack message (which is what users
+ * expect: "the team channel got pinged").
+ *
+ * Dedup: per-notification check against notification_delivery_log so a
+ * worker restart that re-emits an already-handled event doesn't
+ * double-post. Same pattern as dispatchEmails.
+ */
+async function dispatchSlack(
+  supabase: SupabaseClient,
+  notifications: any[],
+  wantsSlack: boolean[],
+  tenantId: string,
+): Promise<void> {
+  let sendSlackNotification: typeof import('../lib/slack').sendSlackNotification
+  let getTenantSlackWebhook:  typeof import('../lib/slack').getTenantSlackWebhook
+  try {
+    const mod = await import('../lib/slack')
+    sendSlackNotification = mod.sendSlackNotification
+    getTenantSlackWebhook  = mod.getTenantSlackWebhook
+  } catch (e: any) {
+    console.warn('[notifications] slack module load failed:', e?.message ?? e)
+    return
+  }
+
+  const webhookUrl = await getTenantSlackWebhook(supabase, tenantId)
+  if (!webhookUrl) {
+    // Slack opted-in but no webhook configured. Log skipped per notification
+    // so the user can see in Settings → Notifications why nothing is landing.
+    const skipLogs = notifications.filter((_, i) => wantsSlack[i]).map(n => ({
+      notification_id: n.id, channel: 'slack' as const, status: 'skipped' as const,
+      error_message: 'No Slack webhook configured for this tenant (Settings → Integrations → Slack)',
+    }))
+    if (skipLogs.length) await supabase.from('notification_delivery_log').insert(skipLogs)
+    return
+  }
+
+  const logs: any[] = []
+  // Group notifications by content (title+body+link) — the Slack channel
+  // is shared, so emitting 5 identical "lead.assigned" pings to the same
+  // channel because 5 team members opted in is just spam. Dedup by content.
+  const seen = new Set<string>()
+  for (let i = 0; i < notifications.length; i++) {
+    if (!wantsSlack[i]) continue
+    const n = notifications[i]
+    const key = `${n.title}|${n.body ?? ''}|${n.link ?? ''}`
+    if (seen.has(key)) {
+      logs.push({ notification_id: n.id, channel: 'slack', status: 'skipped', error_message: 'duplicate of earlier slack post in this batch' })
+      continue
+    }
+    seen.add(key)
+
+    // Per-notification dedup against delivery log (worker restart safety).
+    const { data: prior } = await supabase.from('notification_delivery_log')
+      .select('id').eq('notification_id', n.id).eq('channel', 'slack').eq('status', 'sent').limit(1).maybeSingle()
+    if (prior) {
+      logs.push({ notification_id: n.id, channel: 'slack', status: 'skipped', error_message: 'already sent' })
+      continue
+    }
+
+    try {
+      await sendSlackNotification({
+        webhookUrl,
+        title:    n.title,
+        body:     n.body,
+        link:     n.link,
+        severity: n.severity,
+      })
+      logs.push({
+        notification_id: n.id, channel: 'slack', status: 'sent',
+        delivered_at:    new Date().toISOString(),
+      })
+    } catch (e: any) {
+      logs.push({
+        notification_id: n.id, channel: 'slack', status: 'failed',
+        error_message:   (e?.message ?? String(e)).slice(0, 500),
+      })
+    }
+  }
+  if (logs.length) await supabase.from('notification_delivery_log').insert(logs)
+}
+
+/**
+ * WhatsApp delivery — sends a notification template message FROM the
+ * tenant's WABA TO the recipient's personal `profiles.wa_number`.
+ *
+ * Per-recipient (not per-channel like Slack) because each recipient has a
+ * different phone number. Skips users with no `wa_number` on profile (and
+ * logs a 'skipped' row so the user can see the gap in Settings).
+ */
+async function dispatchWhatsApp(
+  supabase: SupabaseClient,
+  notifications: any[],
+  wantsWhatsApp: boolean[],
+  tenantId: string,
+): Promise<void> {
+  let sendWaNotification: typeof import('../lib/whatsapp-notifications').sendWaNotification
+  try {
+    const mod = await import('../lib/whatsapp-notifications')
+    sendWaNotification = mod.sendWaNotification
+  } catch (e: any) {
+    console.warn('[notifications] whatsapp module load failed:', e?.message ?? e)
+    return
+  }
+
+  // Same tenant-membership validation as dispatchEmails — caller might have
+  // mis-scoped the recipient list, so we filter against {tenant owner} ∪
+  // {user_role_assignments rows} before any send.
+  const allowedUsers = new Set<string>()
+  const [{ data: tenant }, { data: roleRows }] = await Promise.all([
+    supabase.from('tenants').select('user_id').eq('id', tenantId).maybeSingle(),
+    supabase.from('user_role_assignments')
+      .select('user_id').eq('tenant_id', tenantId).is('disabled_at', null),
+  ])
+  if (tenant?.user_id) allowedUsers.add(tenant.user_id)
+  for (const r of (roleRows ?? []) as any[]) if (r.user_id) allowedUsers.add(r.user_id)
+
+  const logs: any[] = []
+  for (let i = 0; i < notifications.length; i++) {
+    if (!wantsWhatsApp[i]) continue
+    const n = notifications[i]
+    if (!allowedUsers.has(n.recipient_user_id)) {
+      logs.push({ notification_id: n.id, channel: 'whatsapp', status: 'skipped', error_message: 'recipient not in tenant' })
+      continue
+    }
+
+    // Worker-restart dedup.
+    const { data: prior } = await supabase.from('notification_delivery_log')
+      .select('id').eq('notification_id', n.id).eq('channel', 'whatsapp').eq('status', 'sent').limit(1).maybeSingle()
+    if (prior) {
+      logs.push({ notification_id: n.id, channel: 'whatsapp', status: 'skipped', error_message: 'already sent' })
+      continue
+    }
+
+    try {
+      const result = await sendWaNotification(supabase, {
+        tenantId,
+        userId: n.recipient_user_id,
+        title:  n.title,
+        body:   n.body,
+      })
+      logs.push({
+        notification_id: n.id, channel: 'whatsapp', status: 'sent',
+        delivered_at:    new Date().toISOString(),
+        metadata:        { wa_message_id: result.waMessageId },
+      })
+    } catch (e: any) {
+      logs.push({
+        notification_id: n.id, channel: 'whatsapp', status: 'failed',
+        error_message:   (e?.message ?? String(e)).slice(0, 500),
+      })
+    }
+  }
+  if (logs.length) await supabase.from('notification_delivery_log').insert(logs)
 }

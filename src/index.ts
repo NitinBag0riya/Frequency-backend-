@@ -648,7 +648,11 @@ COMMON INTENT PATTERNS:
 
 Be concise. Descriptions ≤15 words, compliance_note ≤20 words. Only include keys with actual values.`
 
-app.post('/api/parse-workflow', requireAuth, async (req, res) => {
+// `identifyTenant` is required so we can attribute AI tokens to the right
+// tenant for plan-limit enforcement (see lib/ai-usage.ts). Without it, a
+// runaway prompt loop would burn unlimited tokens with no per-tenant accounting.
+app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) => {
+  const tenantId = (req as any).tenantId as string
   const { message, history = [] } = req.body
   if (!message || typeof message !== 'string') {
     res.status(400).json({ error: 'message (string) required' }); return
@@ -736,11 +740,14 @@ app.post('/api/parse-workflow', requireAuth, async (req, res) => {
       }
     }
 
-    // Capture final usage for telemetry
+    // Capture final usage for telemetry + per-tenant token accounting.
+    // recordAiUsage is fire-and-forget — never blocks the SSE response close.
     const final = await stream.finalMessage().catch(() => null)
     const usage = final?.usage
     if (usage) {
       console.log(`[parse-workflow] done chars=${charCount} input=${usage.input_tokens} output=${usage.output_tokens} cache_read=${(usage as any).cache_read_input_tokens ?? 0} cache_create=${(usage as any).cache_creation_input_tokens ?? 0}`)
+      void import('./lib/ai-usage').then(({ recordAiUsage }) =>
+        recordAiUsage(supabase, tenantId, usage as any, 'parse_workflow'))
     }
 
     if (!clientGone) {

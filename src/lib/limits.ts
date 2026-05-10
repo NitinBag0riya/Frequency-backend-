@@ -219,9 +219,13 @@ async function countUsage(
       return count ?? 0
     }
     case 'ai_tokens_per_month': {
-      // No canonical table for AI tokens yet — return 0 so the limit is
-      // never enforced. When usage_counters has a writer we'll switch.
-      return 0
+      // Live count — `lib/ai-usage.ts:recordAiUsage()` writes to the
+      // `usage_counters` table from every Claude call site (parse-workflow,
+      // workflow-recos, run_ai_responder node, skill match). Period
+      // boundary is the IST calendar month, same convention as
+      // messages_per_month so the bars + the limit-block agree.
+      const { getAiTokensThisMonth } = await import('./ai-usage')
+      return await getAiTokensThisMonth(supabase, tenantId)
     }
   }
 }

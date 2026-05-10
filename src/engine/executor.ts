@@ -254,6 +254,10 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
           system: systemPrompt,
           messages: [{ role: 'user', content: userMsg }],
         })
+        // Per-tenant token accounting (lib/ai-usage.ts). Fire-and-forget;
+        // workflow execution must not stall on a counter-table write.
+        void import('../lib/ai-usage').then(({ recordAiUsage }) =>
+          recordAiUsage(supabase, ctx.tenant.id, resp.usage as any, 'ai_responder'))
         const text = resp.content
           .filter((b: any) => b.type === 'text')
           .map((b: any) => b.text)

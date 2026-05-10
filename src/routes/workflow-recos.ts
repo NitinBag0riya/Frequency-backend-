@@ -83,6 +83,10 @@ Output STRICT JSON: { "recommendations": [...] }. No markdown, no commentary.`
         max_tokens: 2000,
         messages: [{ role: 'user', content: prompt }],
       })
+      // Per-tenant token accounting (lib/ai-usage.ts). Fire-and-forget so a
+      // counter-table hiccup never blocks recommendations.
+      void import('../lib/ai-usage').then(({ recordAiUsage }) =>
+        recordAiUsage(supabase, tenantId, completion.usage as any, 'workflow_recos'))
       const text = completion.content.find(c => c.type === 'text')?.text ?? '{}'
       const cleaned = text.replace(/^```json\s*|\s*```$/g, '')
       const parsed = JSON.parse(cleaned)

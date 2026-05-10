@@ -219,6 +219,21 @@ export function createTelegramRouter(deps: Deps): express.Router {
     const tenantId = (req as any).tenantId
     const { title, description, amount, payload, currency } = req.body
     if (!title || !amount || !payload) { res.status(400).json({ error: 'title + amount + payload required' }); return }
+    // The (tenant_id, payload) unique index added in migration 030 ensures
+    // the webhook's `update WHERE tenant_id=X AND payload=Y` only ever marks
+    // ONE row paid (rather than every pending invoice that happened to share
+    // a payload). Reject collisions early with a clean 409 instead of letting
+    // the UNIQUE violation surface as a generic 500.
+    const { data: existingPayload } = await supabase.from('tg_invoices')
+      .select('id, status').eq('tenant_id', tenantId).eq('payload', payload).maybeSingle()
+    if (existingPayload) {
+      res.status(409).json({
+        error:    `Invoice payload '${payload}' already exists for this tenant (status: ${existingPayload.status})`,
+        code:     'duplicate_payload',
+        existing_invoice_id: existingPayload.id,
+      })
+      return
+    }
     const bot = await getBot(supabase, tenantId)
     if (!bot) { res.status(404).json({ error: 'Telegram bot not connected' }); return }
     try {
@@ -238,6 +253,22 @@ export function createTelegramRouter(deps: Deps): express.Router {
     } catch (err: any) {
       res.status(500).json({ error: err.message })
     }
+  })
+
+  // ── Status polling ───────────────────────────────────────────────────────
+  // Used by FE to check if a Stars invoice has been paid without waiting for
+  // the user to come back to the page. Telegram only delivers payment
+  // confirmation via webhook (no GET-status endpoint on the Bot API for
+  // invoice links), so we serve this from our own tg_invoices state which
+  // the webhook updates inline.
+  r.get('/api/telegram/payments/:id', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data, error } = await supabase.from('tg_invoices')
+      .select('id, status, amount, currency, paid_at, invoice_link, title, description, payload, created_at')
+      .eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (error) { res.status(500).json({ error: error.message }); return }
+    if (!data)  { res.status(404).json({ error: 'invoice not found' }); return }
+    res.json(data)
   })
 
   // ── Channels (bot is admin of) ────────────────────────────────────────────
@@ -303,12 +334,21 @@ export function createTelegramRouter(deps: Deps): express.Router {
           })
         }
       }
-      // Successful payment confirmation
+      // Successful payment confirmation. Idempotent — we only flip to 'paid'
+      // if status is still 'pending', so a TG webhook retry doesn't bump
+      // paid_at on an already-confirmed invoice. Also records the
+      // telegram_payment_charge_id + provider_payment_charge_id which are
+      // required for any future refund call (refundStarPayment).
       if (msg?.successful_payment) {
-        const payload = msg.successful_payment.invoice_payload
+        const sp = msg.successful_payment
         await supabase.from('tg_invoices').update({
-          status: 'paid', paid_at: new Date().toISOString(),
-        }).eq('tenant_id', tenantId).eq('payload', payload)
+          status:                       'paid',
+          paid_at:                      new Date().toISOString(),
+          telegram_payment_charge_id:   sp.telegram_payment_charge_id ?? null,
+          provider_payment_charge_id:   sp.provider_payment_charge_id ?? null,
+          paid_amount:                  sp.total_amount ?? null,
+        })
+        .eq('tenant_id', tenantId).eq('payload', sp.invoice_payload).eq('status', 'pending')
       }
       res.sendStatus(200)
     } catch (err) {
