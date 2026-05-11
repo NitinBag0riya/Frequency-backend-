@@ -51,6 +51,15 @@ export const Q = {
   message:  'message.send',
   broadcast:'broadcast.batch',
   cron:     'system.cron',
+  // ── WA Business Calling (migration 035) ───────────────────────────────────
+  // dispatch:      agent click → Meta POST /<phone_number_id>/calls
+  // event_ingest:  Meta webhook fan-in → state-machine transitions
+  // recording_archive: pull recording from Meta CDN → Supabase Storage
+  // transcribe:    Anthropic call against archived audio → call_transcripts
+  callDispatch:         'call.dispatch',
+  callEventIngest:      'call.event.ingest',
+  callRecordingArchive: 'call.recording.archive',
+  callTranscribe:       'call.transcribe',
 } as const
 
 // ── Job payload types ─────────────────────────────────────────────────────────
@@ -108,6 +117,37 @@ export interface BroadcastBatchJob {
   broadcastId: string
 }
 
+// ── WA Calling job payload types (migration 035) ─────────────────────────────
+// Keep payloads small — workers re-read state from DB to avoid stale-job
+// drift. Job IDs are stable per logical event so BullMQ dedupes retries.
+
+export interface CallDispatchJob {
+  tenantId:        string
+  callSessionId:   string
+  // Optional: the intent_id row that materialised this call. Worker checks
+  // and stamps `used_at` defensively.
+  consentLogId?:   string
+}
+
+export interface CallEventIngestJob {
+  tenantId:    string
+  callEventId: string
+}
+
+export interface CallRecordingArchiveJob {
+  tenantId:         string
+  callSessionId:    string
+  metaRecordingUrl: string
+  metaRecordingId?: string
+}
+
+export interface CallTranscribeJob {
+  tenantId:       string
+  callSessionId:  string
+  recordingId:    string
+  storagePath:    string
+}
+
 // ── Queue instances ───────────────────────────────────────────────────────────
 const defaultJobOpts = {
   removeOnComplete: { count: 1000, age: 24 * 60 * 60 },  // keep last 1000 / 24h
@@ -134,6 +174,34 @@ export const cronQueue = new Queue(Q.cron, {
   defaultJobOptions: { ...defaultJobOpts, attempts: 1 },
 })
 
+// ── WA Calling queues (migration 035) ──────────────────────────────────────
+// Retries / backoff match `01-backend-design.md` §6:
+//   dispatch:          3 attempts, 2s/8s/30s
+//   event.ingest:      5 attempts, 1s → 60s
+//   recording.archive: 5 attempts, 5s → 5m
+//   transcribe:        3 attempts, 10s/60s/5m; AI-cap-exceeded is terminal
+//                      (the worker throws non-retryable on that branch)
+
+export const callDispatchQueue = new Queue<CallDispatchJob>(Q.callDispatch, {
+  connection,
+  defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 2000 } },
+})
+
+export const callEventIngestQueue = new Queue<CallEventIngestJob>(Q.callEventIngest, {
+  connection,
+  defaultJobOptions: { ...defaultJobOpts, attempts: 5, backoff: { type: 'exponential', delay: 1000 } },
+})
+
+export const callRecordingArchiveQueue = new Queue<CallRecordingArchiveJob>(Q.callRecordingArchive, {
+  connection,
+  defaultJobOptions: { ...defaultJobOpts, attempts: 5, backoff: { type: 'exponential', delay: 5000 } },
+})
+
+export const callTranscribeQueue = new Queue<CallTranscribeJob>(Q.callTranscribe, {
+  connection,
+  defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 10000 } },
+})
+
 // ── Convenience helpers used by routes / engine ───────────────────────────────
 export async function enqueueWorkflowExecution(payload: WorkflowExecuteJob, delayMs = 0) {
   return workflowQueue.add('execute', payload, {
@@ -150,6 +218,36 @@ export async function enqueueMessageSend(payload: MessageSendJob) {
 
 export async function enqueueBroadcast(broadcastId: string) {
   return broadcastQueue.add('batch', { broadcastId })
+}
+
+// ── WA Calling enqueue helpers ─────────────────────────────────────────────
+// jobId uses the call_session_id / call_event_id so retries of the same
+// logical event collapse instead of producing duplicates. BullMQ rejects
+// adds for an existing jobId — the route/worker callers swallow that and
+// treat as already-enqueued.
+
+export async function enqueueCallDispatch(payload: CallDispatchJob) {
+  return callDispatchQueue.add('dispatch', payload, {
+    jobId: `call.dispatch:${payload.callSessionId}`,
+  })
+}
+
+export async function enqueueCallEventIngest(payload: CallEventIngestJob) {
+  return callEventIngestQueue.add('ingest', payload, {
+    jobId: `call.event.ingest:${payload.callEventId}`,
+  })
+}
+
+export async function enqueueCallRecordingArchive(payload: CallRecordingArchiveJob) {
+  return callRecordingArchiveQueue.add('archive', payload, {
+    jobId: `call.recording.archive:${payload.callSessionId}`,
+  })
+}
+
+export async function enqueueCallTranscribe(payload: CallTranscribeJob) {
+  return callTranscribeQueue.add('transcribe', payload, {
+    jobId: `call.transcribe:${payload.callSessionId}`,
+  })
 }
 
 // Optional: queue events listener for diagnostics in dev. Disabled in prod.
@@ -169,6 +267,46 @@ export async function closeQueues() {
     messageQueue.close(),
     broadcastQueue.close(),
     cronQueue.close(),
+    // WA Calling queues
+    callDispatchQueue.close(),
+    callEventIngestQueue.close(),
+    callRecordingArchiveQueue.close(),
+    callTranscribeQueue.close(),
   ])
   await connection.quit().catch(() => {})
+}
+
+/**
+ * Attach a QueueEvents listener on call.dispatch — when a dispatch job
+ * permanently exhausts its retries (attemptsMade >= attempts), flip
+ * call_sessions.status='failed' so the agent's UI doesn't sit on
+ * "Connecting…" forever. The listener is mounted from src/worker.ts on
+ * boot; we keep the wiring here so the queue topology stays in one file.
+ *
+ * Returns the QueueEvents instance so the caller can close() it on
+ * graceful shutdown.
+ */
+export function attachCallDispatchFailureListener(
+  onPermanentFail: (jobId: string, callSessionId: string | undefined, reason: string) => Promise<void>
+) {
+  const qe = new QueueEvents(Q.callDispatch, { connection: buildConnection() })
+  qe.on('failed', async ({ jobId, failedReason, prev }) => {
+    // BullMQ emits one `failed` event per attempt. We only act on the LAST
+    // attempt — by then BullMQ has moved the job to `failed` state, which is
+    // what `prev === 'active'` indicates on a terminal failure.
+    if (prev !== 'active') return
+    try {
+      const job = await callDispatchQueue.getJob(jobId)
+      if (!job) return
+      // attemptsMade is incremented before this event; once it equals the
+      // configured attempts, this was the final retry.
+      const attempts = job.opts.attempts ?? 1
+      if ((job.attemptsMade ?? 0) < attempts) return
+      const callSessionId = (job.data as CallDispatchJob | undefined)?.callSessionId
+      await onPermanentFail(jobId, callSessionId, failedReason ?? 'dispatch_exhausted')
+    } catch (e: any) {
+      console.warn(`[queue:call.dispatch] failure listener errored: ${e?.message ?? e}`)
+    }
+  })
+  return qe
 }

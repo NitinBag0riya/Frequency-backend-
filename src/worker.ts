@@ -22,7 +22,13 @@ import { startTemplateSyncWorker }     from './workers/template-sync'
 import { startDataSourceSyncWorker }   from './workers/data-source-sync'
 import { startTrialEndingWorker }      from './workers/trial-ending'
 import { startGmailPollerWorker }      from './workers/gmail-poller'
-import { closeQueues } from './queue'
+// WA Business Calling — migration 035
+import { startCallDispatchWorker }         from './workers/call-dispatch'
+import { startCallEventIngestWorker }      from './workers/call-event-ingest'
+import { startCallRecordingArchiveWorker } from './workers/call-recording-archive'
+import { startCallTranscribeWorker }       from './workers/call-transcribe'
+import { createClient } from '@supabase/supabase-js'
+import { closeQueues, attachCallDispatchFailureListener } from './queue'
 
 if (process.env.DISABLE_WORKERS === '1') {
   console.log('[worker] DISABLE_WORKERS=1 — exiting without starting any workers')
@@ -39,9 +45,40 @@ async function main() {
   const te  = await startTrialEndingWorker()
   const gp  = await startGmailPollerWorker()
 
+  // WA Calling workers — concurrency per env (defaults in `01-backend-design.md` §11).
+  const cd = startCallDispatchWorker()
+  const ce = startCallEventIngestWorker()
+  const ca = startCallRecordingArchiveWorker()
+  const ct = startCallTranscribeWorker()
+
+  // Failure listener for call.dispatch — when BullMQ permanently fails a
+  // dispatch job, flip call_sessions.status='failed' so the agent's UI
+  // doesn't sit on "Connecting…" forever.
+  const dispatchFailureSb = createClient(
+    process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co',
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  )
+  const dispatchFailureListener = attachCallDispatchFailureListener(async (_jobId, callSessionId, reason) => {
+    if (!callSessionId) return
+    const nowIso = new Date().toISOString()
+    await dispatchFailureSb.from('call_sessions').update({
+      status:         'failed',
+      failure_reason: reason || 'dispatch_exhausted',
+      ended_at:       nowIso,
+      ended_by:       'system',
+      updated_at:     nowIso,
+    }).eq('id', callSessionId)
+  })
+
   const shutdown = async (signal: string) => {
     console.log(`[worker] received ${signal} — draining…`)
-    await Promise.allSettled([wf.close(), ms.close(), bw.close(), sp.close(), ts.close(), ds.close(), te.close(), gp.close()])
+    await Promise.allSettled([
+      wf.close(), ms.close(), bw.close(),
+      sp.close(), ts.close(), ds.close(), te.close(), gp.close(),
+      // WA Calling
+      cd.close(), ce.close(), ca.close(), ct.close(),
+      dispatchFailureListener.close(),
+    ])
     await closeQueues()
     process.exit(0)
   }

@@ -187,3 +187,64 @@ export const CampaignCreateSchema = z.object({
 // spread req.body into update). Mirror the create shape, optional-ised.
 // See WorkflowPatchSchema note re: .partial().strict() — must re-strict.
 export const CampaignPatchSchema = CampaignCreateSchema.partial().strict()
+
+// ── WhatsApp Business Calling schemas ───────────────────────────────────────
+//
+// All envelopes .strict() — unknown keys throw 400 so a client can't sneak
+// `tenant_id`, `agent_id` (when the route resolves it itself), `id`, etc.
+// past validation into a downstream spread. See the SECURITY CONTRACT at
+// the top of this file.
+//
+// Shape matches 01-backend-design.md §3 verbatim.
+
+export const CallIntentSchema = z.object({
+  contact_id:           z.string().uuid(),
+  consent_choice:       z.enum(['record_transcribe', 'record_only', 'none']),
+  source:               z.enum(['inbox', 'contacts', 'leads']),
+  remember_for_session: z.boolean().optional().default(false),
+  // Only meaningful when source='leads' — server promotes the lead → contact
+  // before opening the call, defense-in-depth even if FE forgot.
+  lead_id:              z.string().uuid().optional().nullable(),
+}).strict()
+
+export const CallInitiateSchema = z.object({
+  intent_id: z.string().uuid(),
+  // Server defaults to req.user.id; only platform_owner / workspace_admin
+  // can hand a call to a different agent_id at initiate time.
+  agent_id:  z.string().uuid().optional(),
+  // sales_manager+ override of contacts.do_not_call. Server enforces the
+  // role gate; this is just the FE telling us the agent confirmed.
+  override_dnc: z.boolean().optional(),
+}).strict()
+
+export const CallRoutingRulesSchema = z.object({
+  business_hours_json: z.record(
+    z.enum(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']),
+    z.object({
+      open:    z.string().regex(/^\d{2}:\d{2}$/),
+      close:   z.string().regex(/^\d{2}:\d{2}$/),
+      enabled: z.boolean(),
+    })
+  ),
+  agent_pool:           z.array(z.string().uuid()).min(0).max(200),
+  ring_strategy:        z.enum(['parallel', 'round_robin']).default('parallel'),
+  ring_timeout_seconds: z.number().int().min(10).max(60).default(30),
+  fallback:             z.enum(['voicemail', 'missed_template', 'none']).default('missed_template'),
+  fallback_template_name: z.string().optional().nullable(),
+}).strict()
+
+export const ConsentDefaultSchema = z.object({
+  value: z.enum(['always_ask', 'always_on', 'always_off']),
+}).strict()
+
+// Agent-initiated hangup. Reason free-form, capped so a runaway client can't
+// stuff multi-MB strings into the audit row.
+export const CallEndSchema = z.object({
+  reason: z.string().max(500).optional(),
+}).strict()
+
+// Explicit lead → contact promotion endpoint. The body is empty in practice;
+// we accept and ignore an optional preserve_tags flag for future-compat.
+export const PromoteToContactSchema = z.object({
+  preserve_tags: z.boolean().optional(),
+}).strict()

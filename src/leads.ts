@@ -508,6 +508,17 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       }]).catch(e => console.warn('[create-row] notify failed (non-fatal):', e?.message))
     }
 
+    // Calling feature (migration 035): if the lead carries a phone, mirror
+    // into contacts so the universal Call action can fire. Fire-and-forget —
+    // non-fatal, never blocks the response. Bail silently when phone is
+    // absent or the tenant doesn't have calling enabled (the resolver itself
+    // is cheap and idempotent).
+    void import('./services/contact-resolver').then(({ upsertContactFromLead }) =>
+      upsertContactFromLead(supabase, tenantId, {
+        id: data.id, data: data.data, tags: data.tags ?? [],
+      })
+    ).catch(e => console.warn('[create-row] contact resolve (non-fatal):', e?.message))
+
     res.json({ ...data, _rule_applied: !!ruleResult })
   })
 
@@ -748,10 +759,13 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
 
     let inserted = 0
     const BATCH = 500
+    const insertedIds: Array<{ id: string; data: any; tags?: string[] }> = []
     for (let i = 0; i < transformed.length; i += BATCH) {
-      const { error } = await supabase.from('lead_rows').insert(transformed.slice(i, i + BATCH))
+      const slice = transformed.slice(i, i + BATCH)
+      const { data: insRows, error } = await supabase.from('lead_rows').insert(slice).select('id, data, tags')
       if (error) { res.status(500).json({ error: error.message, inserted }); return }
       inserted += Math.min(BATCH, transformed.length - i)
+      if (Array.isArray(insRows)) for (const r of insRows) insertedIds.push(r as any)
     }
 
     // Fire `lead.assigned` notifications for any rule-routed assignments —
@@ -760,6 +774,17 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       void notifyOnAssignment(supabase, tenantId, String(req.params.id), transformed).catch(e =>
         console.warn('[csv-import] notify failed (non-fatal):', e?.message))
     }
+
+    // Calling feature (migration 035): mirror each newly-imported lead row
+    // with a phone into the contacts table. Fire-and-forget; failures don't
+    // affect the response. Capped at 200 to avoid hammering the contacts
+    // table on bulk uploads — production should move this to a worker.
+    void import('./services/contact-resolver').then(({ upsertContactFromLead }) => {
+      const subset = insertedIds.slice(0, 200)
+      return Promise.allSettled(subset.map(r =>
+        upsertContactFromLead(supabase, tenantId, { id: r.id, data: r.data, tags: r.tags ?? [] })
+      ))
+    }).catch(e => console.warn('[csv-import] contact resolve (non-fatal):', e?.message))
 
     res.json({ inserted, auto_assigned: assigned })
   })
@@ -878,7 +903,8 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       }
     })
 
-    const { error: insErr } = await supabase.from('lead_rows').insert(inserts)
+    const { data: insertedRows, error: insErr } = await supabase
+      .from('lead_rows').insert(inserts).select('id, data, tags')
     if (insErr) { res.status(500).json({ error: insErr.message }); return }
 
     // Fire `lead.assigned` notifications to anyone the rules just routed rows
@@ -889,6 +915,19 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
     if (assigned > 0) {
       void notifyOnAssignment(supabase, table.tenant_id, table.id, inserts).catch(e =>
         console.warn('[ingest] notify failed (non-fatal):', e?.message))
+    }
+
+    // Calling feature (migration 035): mirror lead → contact for phone-bearing
+    // rows. Fire-and-forget; cap at 100 to keep the response fast on bulk
+    // ingest. Tenants without calling enabled pay essentially nothing because
+    // the resolver short-circuits on missing phone.
+    if (Array.isArray(insertedRows) && insertedRows.length > 0) {
+      void import('./services/contact-resolver').then(({ upsertContactFromLead }) => {
+        const subset = (insertedRows as Array<{ id: string; data: any; tags?: string[] }>).slice(0, 100)
+        return Promise.allSettled(subset.map(r =>
+          upsertContactFromLead(supabase, table.tenant_id, { id: r.id, data: r.data, tags: r.tags ?? [] })
+        ))
+      }).catch(e => console.warn('[ingest] contact resolve (non-fatal):', e?.message))
     }
 
     res.json({ inserted: inserts.length, auto_assigned: assigned })

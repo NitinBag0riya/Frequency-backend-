@@ -24,7 +24,13 @@ import { createTeamsRouter }       from './routes/teams'
 import { createNotificationsRouter } from './routes/notifications'
 import { createApprovalsRouter, requireApproval } from './routes/approvals'
 import { createWorkflowRecosRouter } from './routes/workflow-recos'
-import { enqueueWorkflowExecution, workflowQueue, messageQueue, broadcastQueue, cronQueue, attachDebugListeners } from './queue'
+import { createWaCallingRouter }     from './routes/wa-calling'
+import {
+  enqueueWorkflowExecution,
+  workflowQueue, messageQueue, broadcastQueue, cronQueue,
+  callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue,
+  attachDebugListeners,
+} from './queue'
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
 import { ExpressAdapter } from '@bull-board/express'
@@ -155,6 +161,12 @@ app.use((req, res, next) => {
 // `[object Object]` will never match. Mount express.raw() on the exact
 // webhook path BEFORE the global JSON parser so the route gets a Buffer.
 app.use('/api/billing/razorpay/webhook', express.raw({ type: 'application/json', limit: '1mb' }))
+
+// WhatsApp Business Calling webhook — same raw-body pattern as Razorpay so
+// HMAC verification gets the exact bytes Meta signed. Mount BEFORE the
+// global express.json() so the parser only fires for this path.
+const WA_CALLS_WEBHOOK_PATH = process.env.WA_CALLING_WEBHOOK_PATH || '/webhook/wa-calls'
+app.use(WA_CALLS_WEBHOOK_PATH, express.raw({ type: 'application/json', limit: '1mb' }))
 
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
@@ -2471,6 +2483,12 @@ app.use(createApprovalsRouter({ supabase, requireAuth, identifyTenant, checkPerm
 // ── Workflow recommendations (AI-generated once, cached forever) ─────────────
 app.use(createWorkflowRecosRouter({ supabase, requireAuth, identifyTenant }))
 
+// ── WhatsApp Business Calling (intent → initiate → dispatch → events) ───────
+// The router owns the public /webhook/wa-calls endpoint AND all /api/calls/*
+// routes. The raw-body parser for the webhook is mounted at the app level
+// above (before express.json) so HMAC verification sees the exact bytes.
+app.use(createWaCallingRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
 // ── Bull Board (queue dashboard) ──────────────────────────────────────────────
 // Mounted at /admin/queues. Guarded — only super_admin (or local dev) can view.
 const bullBoardAdapter = new ExpressAdapter()
@@ -2481,6 +2499,12 @@ createBullBoard({
     new BullMQAdapter(messageQueue),
     new BullMQAdapter(broadcastQueue),
     new BullMQAdapter(cronQueue),
+    // WA Business Calling queues — visible in Bull Board so ops can spot
+    // stuck dispatches / archive backlogs / transcribe retries.
+    new BullMQAdapter(callDispatchQueue),
+    new BullMQAdapter(callEventIngestQueue),
+    new BullMQAdapter(callRecordingArchiveQueue),
+    new BullMQAdapter(callTranscribeQueue),
   ],
   serverAdapter: bullBoardAdapter,
 })
