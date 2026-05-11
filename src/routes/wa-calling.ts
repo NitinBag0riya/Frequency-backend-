@@ -102,6 +102,30 @@ function impersonationGuard(req: express.Request, res: express.Response, next: e
 }
 
 /**
+ * In-memory per-user hour-bucket rate limiter for transcript-export.
+ * Compliance §8.5 caps transcript export at 5/h/user. Process-local — fine
+ * for the v1 single-instance deploy; revisit when we scale horizontally.
+ * Keyed on `${userId|ip}:${hourBucket}`; map self-prunes the previous bucket
+ * on each call so unbounded growth is avoided.
+ */
+const transcriptExportHits = new Map<string, number>()
+function transcriptExportRateLimit(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const userKey = (req as any).user?.id as string | undefined ?? req.ip ?? 'anon'
+  const hourBucket = Math.floor(Date.now() / 3_600_000)
+  const key = `${userKey}:${hourBucket}`
+  const prevKey = `${userKey}:${hourBucket - 1}`
+  transcriptExportHits.delete(prevKey)
+  const count = (transcriptExportHits.get(key) ?? 0) + 1
+  transcriptExportHits.set(key, count)
+  if (count > 5) {
+    res.setHeader('Retry-After', String(3600 - Math.floor((Date.now() % 3_600_000) / 1000)))
+    res.status(429).json({ error: 'transcript export rate limit exceeded (5/hour)', code: 'rate_limited' })
+    return
+  }
+  next()
+}
+
+/**
  * Entitlement gate. Two checks:
  *   1) `feature_flags.wa_calling_enabled.enabled_for_tenants[]` includes this tenant.
  *   2) Tenant's plan is in the calling whitelist (growth, scale).
@@ -172,12 +196,17 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   const { supabase, requireAuth, identifyTenant, checkPermission } = deps
   const entitlement = createEntitlementGate(supabase)
 
-  const guardView   = [requireAuth, identifyTenant, entitlement, checkPermission('inbox', 'view')]
-  const guardEdit   = [requireAuth, identifyTenant, impersonationGuard, entitlement, checkPermission('inbox', 'edit')]
-  // Settings-scoped routes (routing rules, consent default) use the
-  // settings permission key.
-  const guardSettingsEdit = [requireAuth, identifyTenant, entitlement, checkPermission('settings', 'edit')]
-  const guardSettingsView = [requireAuth, identifyTenant, entitlement, checkPermission('settings', 'view')]
+  // Per-route capability chains. Map to the calls.* permission tree added by
+  // migration 035 §13 (workspace_admin/sales_manager/sales_rep/support_agent
+  // have these; marketing_manager / analyst do not). impersonationGuard is on
+  // every write path AND on playback/export (compliance §8.4: super-admin
+  // playback under impersonation is a Red Line). QA audit defects #7 and #8.
+  const guardInitiate    = [requireAuth, identifyTenant, impersonationGuard, entitlement, checkPermission('calls', 'initiate')]
+  const guardListen      = [requireAuth, identifyTenant, impersonationGuard, entitlement, checkPermission('calls', 'listen')]
+  const guardReadXcript  = [requireAuth, identifyTenant, impersonationGuard, entitlement, checkPermission('calls', 'read_transcript')]
+  const guardMetadata    = [requireAuth, identifyTenant, entitlement, checkPermission('calls', 'read_metadata')]
+  const guardConfigure   = [requireAuth, identifyTenant, entitlement, checkPermission('calls', 'configure_default')]
+  const guardBilling     = [requireAuth, identifyTenant, entitlement, checkPermission('calls', 'view_billing')]
 
   // Webhook needs to run BEFORE auth and BEFORE the global JSON parser.
   // The caller mounts the raw-body parser at this path in src/index.ts so
@@ -341,7 +370,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   // Capture per-call consent BEFORE we know the call_session_id. The
   // SECURITY DEFINER function `insert_call_consent_log` defends against
   // cross-tenant writes. The row is later linked when /initiate is called.
-  r.post('/api/calls/intent', ...guardEdit, validateBody(CallIntentSchema), async (req, res) => {
+  r.post('/api/calls/intent', ...guardInitiate, validateBody(CallIntentSchema), async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const user     = (req as any).user
     const agentId  = user?.id as string | undefined
@@ -419,7 +448,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
 
   // ── POST /api/calls/initiate ───────────────────────────────────────────
   // Atomic: lock the consent row, mark it used, enqueue dispatch.
-  r.post('/api/calls/initiate', ...guardEdit, validateBody(CallInitiateSchema), async (req, res) => {
+  r.post('/api/calls/initiate', ...guardInitiate, validateBody(CallInitiateSchema), async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const user     = (req as any).user
     const userRole = ((req as any).userRole ?? '') as string
@@ -519,7 +548,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   })
 
   // ── GET /api/calls — paginated list with filters ───────────────────────
-  r.get('/api/calls', ...guardView, async (req, res) => {
+  r.get('/api/calls', ...guardMetadata, async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const q = req.query as Record<string, string>
     const page     = Math.max(1, parseInt(q.page ?? '1', 10) || 1)
@@ -545,7 +574,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   })
 
   // ── GET /api/calls/:id — full detail ──────────────────────────────────
-  r.get('/api/calls/:id', ...guardView, async (req, res) => {
+  r.get('/api/calls/:id', ...guardMetadata, async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const callId = String(req.params.id)
     const [sessionRes, eventsRes, recordingRes, transcriptRes] = await Promise.all([
@@ -568,7 +597,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   })
 
   // ── POST /api/calls/:id/recording-access — signed URL ─────────────────
-  r.post('/api/calls/:id/recording-access', ...guardView, async (req, res) => {
+  r.post('/api/calls/:id/recording-access', ...guardListen, async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const userId   = (req as any).user?.id as string | undefined
     const callId   = String(req.params.id)
@@ -584,8 +613,10 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       .storage.from('inbox-media').createSignedUrl(rec.storage_path, ttl)
     if (error || !signed?.signedUrl) { res.status(500).json({ error: error?.message ?? 'sign_failed' }); return }
 
-    // Audit row — compliance §8.4 requires every playback to be logged.
-    await supabase.rpc('append_tenant_audit', {
+    // Audit row — compliance §8.4 Red Line #4: no playback without an
+    // immutable audit row. We await + check error; on failure we do NOT
+    // return the signed URL.
+    const { error: auditErr } = await supabase.rpc('append_tenant_audit', {
       p_tenant_id:     tenantId,
       p_actor_id:      userId ?? null,
       p_actor_role:    (req as any).userRole ?? null,
@@ -598,13 +629,17 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       p_after_value:   { call_session_id: callId },
       p_ip_address:    req.ip ?? null,
       p_user_agent:    (req.headers['user-agent'] as string | undefined) ?? null,
-    }).then(() => undefined, (e: any) => console.warn(`[wa-calling] audit insert failed: ${e?.message ?? e}`))
+    })
+    if (auditErr) {
+      console.warn(`[wa-calling] audit insert failed: ${auditErr.message}`)
+      res.status(500).json({ error: 'audit_failed' }); return
+    }
 
     res.json({ url: signed.signedUrl, expires_in: ttl })
   })
 
   // ── POST /api/calls/:id/transcript-export — rate-limited bulk pull ────
-  r.post('/api/calls/:id/transcript-export', ...guardEdit, async (req, res) => {
+  r.post('/api/calls/:id/transcript-export', ...guardReadXcript, transcriptExportRateLimit, async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const userId   = (req as any).user?.id as string | undefined
     const callId   = String(req.params.id)
@@ -616,7 +651,9 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       res.status(404).json({ error: 'transcript_not_ready', status: t?.status ?? 'missing' }); return
     }
 
-    await supabase.rpc('append_tenant_audit', {
+    // Audit row — compliance §8.5 requires the audit row to land BEFORE the
+    // payload is returned. On failure we 500 instead of leaking the transcript.
+    const { error: auditErr } = await supabase.rpc('append_tenant_audit', {
       p_tenant_id:     tenantId,
       p_actor_id:      userId ?? null,
       p_actor_role:    (req as any).userRole ?? null,
@@ -629,7 +666,11 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       p_after_value:   { call_session_id: callId },
       p_ip_address:    req.ip ?? null,
       p_user_agent:    (req.headers['user-agent'] as string | undefined) ?? null,
-    }).then(() => undefined, (e: any) => console.warn(`[wa-calling] audit insert failed: ${e?.message ?? e}`))
+    })
+    if (auditErr) {
+      console.warn(`[wa-calling] audit insert failed: ${auditErr.message}`)
+      res.status(500).json({ error: 'audit_failed' }); return
+    }
 
     res.json({
       transcript: t.transcript_redacted,
@@ -639,7 +680,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   })
 
   // ── POST /api/calls/:id/end — agent-initiated hangup ──────────────────
-  r.post('/api/calls/:id/end', ...guardEdit, validateBody(CallEndSchema), async (req, res) => {
+  r.post('/api/calls/:id/end', ...guardInitiate, validateBody(CallEndSchema), async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const callId = String(req.params.id)
     const body = req.body as { reason?: string }
@@ -664,7 +705,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   })
 
   // ── Routing rules CRUD ────────────────────────────────────────────────
-  r.get('/api/calls/routing-rules', ...guardSettingsView, async (req, res) => {
+  r.get('/api/calls/routing-rules', ...guardConfigure, async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const { data, error } = await supabase.from('call_routing_rules')
       .select('*').eq('tenant_id', tenantId).maybeSingle()
@@ -672,7 +713,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     res.json(data ?? null)
   })
 
-  r.post('/api/calls/routing-rules', ...guardSettingsEdit, validateBody(CallRoutingRulesSchema), async (req, res) => {
+  r.post('/api/calls/routing-rules', ...guardConfigure, validateBody(CallRoutingRulesSchema), async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const body = req.body as any
     const row: Record<string, any> = {
@@ -691,7 +732,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     res.json(data)
   })
 
-  r.patch('/api/calls/routing-rules', ...guardSettingsEdit, async (req, res) => {
+  r.patch('/api/calls/routing-rules', ...guardConfigure, async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const allowed = ['business_hours_json', 'agent_pool', 'ring_strategy', 'ring_timeout_seconds', 'fallback']
     const patch: Record<string, any> = {}
@@ -707,7 +748,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   })
 
   // ── POST /api/calls/consent-default ───────────────────────────────────
-  r.post('/api/calls/consent-default', ...guardSettingsEdit, validateBody(ConsentDefaultSchema), async (req, res) => {
+  r.post('/api/calls/consent-default', ...guardConfigure, validateBody(ConsentDefaultSchema), async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const userId   = (req as any).user?.id as string | undefined
     const body = req.body as { value: 'always_ask' | 'always_on' | 'always_off' }
@@ -737,7 +778,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   })
 
   // ── GET /api/calls/usage — current period meters ──────────────────────
-  r.get('/api/calls/usage', ...guardView, async (req, res) => {
+  r.get('/api/calls/usage', ...guardBilling, async (req, res) => {
     const tenantId = (req as any).tenantId as string
     // plan_id lives in tenant_subscriptions, not tenants.
     const [{ data: t }, plan] = await Promise.all([

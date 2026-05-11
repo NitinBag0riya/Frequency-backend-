@@ -445,7 +445,7 @@ function hasRolePermission(perms: any, feature: string, action: string): boolean
   return false
 }
 
-function checkPermission(feature: string, action: 'view' | 'edit' | 'delete') {
+function checkPermission(feature: string, action: 'view' | 'edit' | 'delete' | string) {
   return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if ((req as any).isSuperAdmin) { next(); return }
 
