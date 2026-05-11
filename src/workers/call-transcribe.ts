@@ -22,6 +22,7 @@ import { createClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 import { Q, CallTranscribeJob, connection } from '../queue'
 import { recordAiUsage, getAiDollarsThisMonth } from '../lib/ai-usage'
+import { getActivePlanForTenant } from '../lib/plans'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -173,11 +174,13 @@ export function startCallTranscribeWorker() {
 }
 
 async function loadPlanLimits(tenantId: string): Promise<{ ai_dollars_per_month: number } | null> {
-  const { data: t } = await supabase.from('tenants').select('plan_id').eq('id', tenantId).maybeSingle()
-  if (!t?.plan_id) return null
-  const { data: p } = await supabase.from('plans').select('limits').eq('id', t.plan_id).maybeSingle()
-  const lim = (p?.limits ?? {}) as Record<string, any>
-  const dollars = Number(lim.ai_dollars_per_month ?? -1)
+  // Plan lookup goes through tenant_subscriptions (not tenants.plan_id —
+  // that column doesn't exist). getActivePlanForTenant returns null for
+  // tenants without an active sub, in which case we let the worker proceed
+  // without a cap pre-check (same legacy behaviour as before this fix).
+  const plan = await getActivePlanForTenant(supabase, tenantId)
+  if (!plan) return null
+  const dollars = Number(plan.limits.ai_dollars_per_month ?? -1)
   return { ai_dollars_per_month: Number.isFinite(dollars) ? dollars : -1 }
 }
 

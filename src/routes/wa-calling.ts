@@ -38,6 +38,7 @@ import {
   enqueueCallDispatch, enqueueCallEventIngest,
 } from '../queue'
 import { upsertContactFromLead } from '../services/contact-resolver'
+import { getActivePlanForTenant } from '../lib/plans'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -45,7 +46,11 @@ interface Deps {
   supabase:        SupabaseClient
   requireAuth:     Middleware
   identifyTenant:  Middleware
-  checkPermission: (feature: string, action: 'view' | 'edit' | 'delete') => Middleware
+  // Action widened to `string` so we can use the granular `calls.*` sub-keys
+  // (initiate / answer / listen / read_transcript / …) from migration 035
+  // §13. `hasRolePermission()` already does `perms[feature]?.[action]` with
+  // an arbitrary string. See QA audit defect #8.
+  checkPermission: (feature: string, action: string) => Middleware
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -114,17 +119,14 @@ function createEntitlementGate(supabase: SupabaseClient) {
     // verbs (intent/initiate/end), so allowing read paths is safe.
     if ((req as any).isSuperAdmin) { next(); return }
 
-    const [flagRes, tenantRes] = await Promise.all([
+    const [flagRes, plan] = await Promise.all([
       supabase.from('feature_flags')
         .select('is_enabled, rollout_percent, enabled_for_tenants')
         .eq('key', 'wa_calling_enabled').maybeSingle(),
-      supabase.from('tenants')
-        .select('id, plan_id')
-        .eq('id', tenantId).maybeSingle(),
+      getActivePlanForTenant(supabase, tenantId),
     ])
 
     const flag    = flagRes.data as any
-    const tenant  = tenantRes.data as any
 
     // Flag must exist and either be globally on OR include this tenant.
     const flagOk =
@@ -140,23 +142,20 @@ function createEntitlementGate(supabase: SupabaseClient) {
       return
     }
 
-    // Plan whitelist. Lookup plan name from plans table — `plan_id` is the
-    // FK, plan key/name is the human-facing identifier.
-    if (tenant?.plan_id) {
-      const { data: plan } = await supabase.from('plans')
-        .select('id, name, features').eq('id', tenant.plan_id).maybeSingle()
-      const planName = String(plan?.name ?? '').toLowerCase()
-      const features = (plan?.features ?? []) as string[]
-      const allowed = planName === 'growth' || planName === 'scale' ||
-                      (Array.isArray(features) && (features.includes('wa_calling') || features.includes('*')))
-      if (!allowed) {
-        res.status(402).json({
-          error: 'WhatsApp Calling requires Growth or Scale plan.',
-          code:  'calling_plan_required',
-          upgrade_to: 'growth',
-        })
-        return
-      }
+    // Plan whitelist. Plan lives in tenant_subscriptions (not tenants.plan_id
+    // — that column doesn't exist). Without a sub row the tenant is Free and
+    // calling is blocked.
+    const planId   = String(plan?.plan_id ?? '').toLowerCase()
+    const features = plan?.features ?? []
+    const allowed = planId === 'growth' || planId === 'scale' ||
+                    (Array.isArray(features) && (features.includes('wa_calling') || features.includes('*')))
+    if (!allowed) {
+      res.status(402).json({
+        error: 'WhatsApp Calling requires Growth or Scale plan.',
+        code:  'calling_plan_required',
+        upgrade_to: 'growth',
+      })
+      return
     }
     next()
   }
@@ -265,9 +264,12 @@ export function createWaCallingRouter(deps: Deps): express.Router {
               .maybeSingle()
 
             if (!session) {
+              // Outbound sessions are pre-created at /initiate; if we land
+              // here without a row, the event is inbound (ringing/incoming)
+              // unless explicitly named otherwise.
               const directionGuess: 'inbound' | 'outbound' =
-                /ringing|incoming/i.test(eventType) ? 'inbound' : 'inbound'
-              const { data: newSess } = await supabase
+                /ringing|incoming|inbound/i.test(eventType) ? 'inbound' : 'outbound'
+              const { data: newSess, error: sessInsErr } = await supabase
                 .from('call_sessions')
                 .insert({
                   tenant_id:        tenant.id,
@@ -280,7 +282,19 @@ export function createWaCallingRouter(deps: Deps): express.Router {
                 })
                 .select('id')
                 .maybeSingle()
-              session = newSess ?? null
+              if (sessInsErr && (sessInsErr as any).code === '23505') {
+                // Parallel webhook delivery won the INSERT race. Re-SELECT
+                // the winning row so we still enqueue this event.
+                const { data: existing } = await supabase
+                  .from('call_sessions')
+                  .select('id')
+                  .eq('tenant_id', tenant.id)
+                  .eq('meta_call_id', metaCallId)
+                  .maybeSingle()
+                session = existing ?? null
+              } else {
+                session = newSess ?? null
+              }
               if (!session?.id) continue
             }
 
@@ -725,13 +739,17 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   // ── GET /api/calls/usage — current period meters ──────────────────────
   r.get('/api/calls/usage', ...guardView, async (req, res) => {
     const tenantId = (req as any).tenantId as string
-    const { data: t } = await supabase.from('tenants')
-      .select('call_minutes_allotment, call_minutes_used_current_period, plan_id')
-      .eq('id', tenantId).maybeSingle()
+    // plan_id lives in tenant_subscriptions, not tenants.
+    const [{ data: t }, plan] = await Promise.all([
+      supabase.from('tenants')
+        .select('call_minutes_allotment, call_minutes_used_current_period')
+        .eq('id', tenantId).maybeSingle(),
+      getActivePlanForTenant(supabase, tenantId),
+    ])
     res.json({
       minutes_allotment: t?.call_minutes_allotment ?? 0,
       minutes_used:      t?.call_minutes_used_current_period ?? 0,
-      plan_id:           t?.plan_id ?? null,
+      plan_id:           plan?.plan_id ?? null,
     })
   })
 
