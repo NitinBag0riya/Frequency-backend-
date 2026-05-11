@@ -76,15 +76,79 @@ function verifyMetaSignature(rawBody: Buffer, header: string | undefined, appSec
 }
 
 /**
+ * Verifies an X-Impersonate-Token if present. The token is the HMAC-signed
+ * payload minted at routes/super-admin.ts (typ:'imp', actor, tenant_id, exp).
+ * On success populates `req.impersonatorId` so `impersonationGuard` below can
+ * see a real value (Security audit F-01: the original guard relied on
+ * client-controlled headers / metadata fields that Supabase never populates,
+ * so every check was bypassable).
+ *
+ * Absent header → no-op (regular non-impersonated flow). Malformed / expired
+ * token → 401 (refuse to fall through to the unimpersonated path; otherwise
+ * a stale token would silently downgrade to the super-admin's own scope).
+ */
+function verifyImpersonationToken(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const raw = req.headers['x-impersonate-token'] as string | undefined
+  if (!raw) { next(); return }
+
+  const [data, sig] = raw.split('.')
+  if (!data || !sig) { res.status(401).json({ error: 'invalid_impersonation_token', code: 'invalid_impersonation_token' }); return }
+
+  const secret = process.env.IMPERSONATION_HMAC_SECRET ?? process.env.GOOGLE_TOKEN_SECRET
+  if (!secret || secret.length < 32) {
+    if (process.env.NODE_ENV === 'production') {
+      res.status(503).json({ error: 'Impersonation not configured', code: 'impersonation_misconfigured' })
+      return
+    }
+    // Dev: refuse anyway so we don't silently bypass in dev either.
+    res.status(401).json({ error: 'IMPERSONATION_HMAC_SECRET not set', code: 'impersonation_misconfigured' })
+    return
+  }
+
+  const expected = createHmac('sha256', secret).update(data).digest('base64url')
+  // Use timingSafeEqual via the existing helper pattern from verifyMetaSignature.
+  let sigOk = false
+  if (sig.length === expected.length) {
+    try { sigOk = timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expected, 'utf8')) } catch { sigOk = false }
+  }
+  if (!sigOk) {
+    res.status(401).json({ error: 'invalid_impersonation_token', code: 'invalid_impersonation_token' })
+    return
+  }
+
+  let payload: any
+  try {
+    payload = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'))
+  } catch {
+    res.status(401).json({ error: 'invalid_impersonation_token', code: 'invalid_impersonation_token' })
+    return
+  }
+
+  if (payload?.typ !== 'imp' || !payload?.actor || !payload?.tenant_id) {
+    res.status(401).json({ error: 'invalid_impersonation_token', code: 'invalid_impersonation_token' })
+    return
+  }
+  if (typeof payload.exp === 'number' && payload.exp < Date.now()) {
+    res.status(401).json({ error: 'impersonation_token_expired', code: 'impersonation_token_expired' })
+    return
+  }
+
+  ;(req as any).impersonatorId         = String(payload.actor)
+  ;(req as any).impersonatedTenantId   = String(payload.tenant_id)
+  ;(req as any).impersonationReadOnly  = payload.read_only !== false
+  next()
+}
+
+/**
  * Impersonation guard. Compliance §6.7: super-admins acting as a tenant
  * user MUST NOT initiate/accept calls under that user's identity (the
  * customer would otherwise see an agent calling on a recorded line with no
  * audit trail).
  *
- * Detection paths (defense-in-depth — block if ANY is set):
- *   - `(req as any).impersonatorId`    set by future impersonation middleware
- *   - `X-Impersonator-Id` header       FE forwards when in impersonation mode
- *   - `(req as any).user?.app_metadata?.impersonator_id`  reserved
+ * After F-01 fix: `req.impersonatorId` is populated by `verifyImpersonationToken`
+ * earlier in the chain, so this guard is now load-bearing rather than
+ * decorative. We still keep the header / metadata fallbacks for defense in
+ * depth — if a future middleware also sets impersonator state, we block.
  */
 function impersonationGuard(req: express.Request, res: express.Response, next: express.NextFunction) {
   const imp =
@@ -201,12 +265,22 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   // have these; marketing_manager / analyst do not). impersonationGuard is on
   // every write path AND on playback/export (compliance §8.4: super-admin
   // playback under impersonation is a Red Line). QA audit defects #7 and #8.
-  const guardInitiate    = [requireAuth, identifyTenant, impersonationGuard, entitlement, checkPermission('calls', 'initiate')]
-  const guardListen      = [requireAuth, identifyTenant, impersonationGuard, entitlement, checkPermission('calls', 'listen')]
-  const guardReadXcript  = [requireAuth, identifyTenant, impersonationGuard, entitlement, checkPermission('calls', 'read_transcript')]
-  const guardMetadata    = [requireAuth, identifyTenant, entitlement, checkPermission('calls', 'read_metadata')]
-  const guardConfigure   = [requireAuth, identifyTenant, entitlement, checkPermission('calls', 'configure_default')]
-  const guardBilling     = [requireAuth, identifyTenant, entitlement, checkPermission('calls', 'view_billing')]
+  // F-01 (security audit Wave 3): verifyImpersonationToken runs right after
+  // requireAuth. It decodes the HMAC X-Impersonate-Token header (if present)
+  // and populates req.impersonatorId, which impersonationGuard then sees.
+  // Before this, the guard was decorative — every "impersonator_cannot_call"
+  // 403 was bypassable because no middleware was actually setting the field.
+  const guardInitiate    = [requireAuth, verifyImpersonationToken, identifyTenant, impersonationGuard, entitlement, checkPermission('calls', 'initiate')]
+  // F-26 (security audit Wave 3): playback by impersonators is allowed but
+  // gated on justification + ticket_ref (compliance §9). The inline check in
+  // each playback route enforces this and writes the values to tenant_audit.
+  // impersonationGuard is NOT in these two chains — Wave 2 BE-3's outright
+  // block was over-strict for support/audit playback scenarios.
+  const guardListen      = [requireAuth, verifyImpersonationToken, identifyTenant, entitlement, checkPermission('calls', 'listen')]
+  const guardReadXcript  = [requireAuth, verifyImpersonationToken, identifyTenant, entitlement, checkPermission('calls', 'read_transcript')]
+  const guardMetadata    = [requireAuth, verifyImpersonationToken, identifyTenant, entitlement, checkPermission('calls', 'read_metadata')]
+  const guardConfigure   = [requireAuth, verifyImpersonationToken, identifyTenant, entitlement, checkPermission('calls', 'configure_default')]
+  const guardBilling     = [requireAuth, verifyImpersonationToken, identifyTenant, entitlement, checkPermission('calls', 'view_billing')]
 
   // Webhook needs to run BEFORE auth and BEFORE the global JSON parser.
   // The caller mounts the raw-body parser at this path in src/index.ts so
@@ -514,19 +588,31 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       }
     }
 
-    // Move session into the dispatch lane. We do this BEFORE enqueueing so
-    // the FE poll/realtime path sees the state advance even if the queue
-    // hiccups; the dispatch worker is idempotent on (call_session_id).
+    // Move session into the dispatch lane. Reality Checker #13 (Wave 3): the
+    // previous form's race protection was an in-memory status check followed
+    // by an UPDATE — two parallel /initiate calls could both pass the check
+    // before either UPDATE landed. The atomic pattern below relies on PG's
+    // row-level lock during UPDATE: we restrict the WHERE clause to rows
+    // that still have NULL agent_id, and ask Postgres to RETURN the row.
+    // If zero rows returned, another /initiate already claimed this session.
     const agentId = body.agent_id ?? user?.id ?? null
-    const { error: updErr } = await supabase
+    const { data: locked, error: updErr } = await supabase
       .from('call_sessions')
       .update({
-        status:    'queued',  // explicit no-op transition — we keep 'queued' until worker accepts
-        agent_id:  agentId,
+        agent_id:   agentId,
         updated_at: new Date().toISOString(),
       })
       .eq('id', session.id).eq('tenant_id', tenantId)
+      .eq('status', 'queued')
+      .is('agent_id', null)
+      .select('id')
+      .maybeSingle()
     if (updErr) { res.status(500).json({ error: updErr.message }); return }
+    if (!locked) {
+      // Another parallel initiate won the race.
+      res.status(409).json({ error: 'intent_already_used', code: 'intent_already_used' })
+      return
+    }
 
     try {
       await enqueueCallDispatch({
@@ -598,9 +684,22 @@ export function createWaCallingRouter(deps: Deps): express.Router {
 
   // ── POST /api/calls/:id/recording-access — signed URL ─────────────────
   r.post('/api/calls/:id/recording-access', ...guardListen, async (req, res) => {
-    const tenantId = (req as any).tenantId as string
-    const userId   = (req as any).user?.id as string | undefined
-    const callId   = String(req.params.id)
+    const tenantId       = (req as any).tenantId as string
+    const userId         = (req as any).user?.id as string | undefined
+    const impersonatorId = (req as any).impersonatorId as string | undefined
+    const callId         = String(req.params.id)
+
+    // F-26: impersonated playback requires justification + ticket_ref so the
+    // audit row carries a real reason and is matchable against a support ticket.
+    const justification = String(req.body?.justification ?? '').trim()
+    const ticketRef     = String(req.body?.ticket_ref ?? '').trim()
+    if (impersonatorId && (!justification || !ticketRef)) {
+      res.status(400).json({
+        error: 'Impersonated recording playback requires `justification` and `ticket_ref`.',
+        code:  'impersonation_justification_required',
+      })
+      return
+    }
 
     const { data: rec } = await supabase.from('call_recordings')
       .select('id, status, storage_path')
@@ -620,13 +719,13 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       p_tenant_id:     tenantId,
       p_actor_id:      userId ?? null,
       p_actor_role:    (req as any).userRole ?? null,
-      p_action:        'recording.playback',
+      p_action:        impersonatorId ? 'recording.playback.impersonated' : 'recording.playback',
       p_entity_type:   'call_recording',
       p_entity_id:     rec.id,
-      p_justification: null,
-      p_ticket_ref:    null,
+      p_justification: justification || null,
+      p_ticket_ref:    ticketRef || null,
       p_before_value:  null,
-      p_after_value:   { call_session_id: callId },
+      p_after_value:   { call_session_id: callId, impersonator_id: impersonatorId ?? null },
       p_ip_address:    req.ip ?? null,
       p_user_agent:    (req.headers['user-agent'] as string | undefined) ?? null,
     })
@@ -640,9 +739,21 @@ export function createWaCallingRouter(deps: Deps): express.Router {
 
   // ── POST /api/calls/:id/transcript-export — rate-limited bulk pull ────
   r.post('/api/calls/:id/transcript-export', ...guardReadXcript, transcriptExportRateLimit, async (req, res) => {
-    const tenantId = (req as any).tenantId as string
-    const userId   = (req as any).user?.id as string | undefined
-    const callId   = String(req.params.id)
+    const tenantId       = (req as any).tenantId as string
+    const userId         = (req as any).user?.id as string | undefined
+    const impersonatorId = (req as any).impersonatorId as string | undefined
+    const callId         = String(req.params.id)
+
+    // F-26: impersonated export requires justification + ticket_ref (compliance §9).
+    const justification = String(req.body?.justification ?? '').trim()
+    const ticketRef     = String(req.body?.ticket_ref ?? '').trim()
+    if (impersonatorId && (!justification || !ticketRef)) {
+      res.status(400).json({
+        error: 'Impersonated transcript export requires `justification` and `ticket_ref`.',
+        code:  'impersonation_justification_required',
+      })
+      return
+    }
 
     const { data: t } = await supabase.from('call_transcripts')
       .select('id, status, transcript_redacted, segments, completed_at')
@@ -657,13 +768,13 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       p_tenant_id:     tenantId,
       p_actor_id:      userId ?? null,
       p_actor_role:    (req as any).userRole ?? null,
-      p_action:        'transcript.export',
+      p_action:        impersonatorId ? 'transcript.export.impersonated' : 'transcript.export',
       p_entity_type:   'call_transcript',
       p_entity_id:     t.id,
-      p_justification: null,
-      p_ticket_ref:    null,
+      p_justification: justification || null,
+      p_ticket_ref:    ticketRef || null,
       p_before_value:  null,
-      p_after_value:   { call_session_id: callId },
+      p_after_value:   { call_session_id: callId, impersonator_id: impersonatorId ?? null },
       p_ip_address:    req.ip ?? null,
       p_user_agent:    (req.headers['user-agent'] as string | undefined) ?? null,
     })

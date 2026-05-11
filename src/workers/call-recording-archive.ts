@@ -88,7 +88,16 @@ export function startCallRecordingArchiveWorker() {
       const { data: session } = await supabase.from('call_sessions')
         .select('recording_consent').eq('id', callSessionId).eq('tenant_id', tenantId).maybeSingle()
       if (session?.recording_consent === 'record_transcribe') {
-        const allowCrossBorder = tenant?.allow_cross_border_transcription !== false
+        // F-02 (security audit): regulated verticals (BFSI / healthcare /
+        // government) default to cross-border DISABLED even if the column
+        // wasn't explicitly flipped. Treat regulated_vertical IS NOT NULL as
+        // the override anchor — defense in depth against any tenant whose
+        // backfill missed the migration 040 sweep.
+        const isRegulated     = !!(tenant as any)?.regulated_vertical
+        const explicitOptIn   = (tenant as any)?.allow_cross_border_transcription === true
+        const allowCrossBorder = isRegulated
+          ? explicitOptIn  // regulated tenants need a true opt-in, not just the default
+          : ((tenant as any)?.allow_cross_border_transcription !== false)
         if (allowCrossBorder) {
           // AI-cap pre-check is the worker's responsibility (terminal if exhausted)
           try {
