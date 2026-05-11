@@ -25,6 +25,7 @@ import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { sheetsReadRange } from '../google'
 import { listAllRecords } from '../lib/airtable'
+import { loadMapping, applyMappingToPayload, type DecodedField } from '../lib/apply-mapping'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -127,6 +128,12 @@ async function syncGoogleSheet(sub: any): Promise<{ imported: number; updated: n
     .eq('id', sub.tenant_id).maybeSingle()
   if (!tenant?.google_access_token) throw new Error('Google not connected for this tenant')
 
+  // Optional pinned mapping from the global library — applied to every row
+  // after the raw header→key step. When absent, falls back to the legacy
+  // keyify-only path (back-compat). Identifier-level access control happens
+  // inside loadMapping (tenant-scoped query).
+  const pinnedMapping = await loadMapping(supabase, sub.tenant_id, sub.default_mapping_id)
+
   // Read the entire tab in one go (capped to 5000 rows for safety).
   const range = `${tab_name ?? 'Sheet1'}!1:5000`
   const values = await sheetsReadRange(tenant, spreadsheet_id, range)
@@ -137,22 +144,44 @@ async function syncGoogleSheet(sub: any): Promise<{ imported: number; updated: n
   const primaryKey = keys[0]
 
   // Pull existing rows once to dedupe by primary value (cheaper than per-row queries).
+  // When a mapping is pinned, the visible `data` no longer carries the raw
+  // header keys — so we also stash the raw primary-key value under
+  // `_source_pk` on every write. Lookup tries both: `_source_pk` first
+  // (mapping-aware, stable across renames), `primaryKey` second (legacy
+  // rows written before mappings were pinned). New code keeps writing both.
   const { data: existingRows } = await supabase.from('lead_rows')
     .select('id, data')
     .eq('table_id', sub.lead_table_id)
     .limit(10000)
   const byPrimary = new Map<string, { id: string; data: any }>()
   for (const r of existingRows ?? []) {
-    const v = String((r.data as any)?.[primaryKey] ?? '').trim()
+    const v = String(
+      (r.data as any)?._source_pk
+      ?? (r.data as any)?.[primaryKey]
+      ?? '',
+    ).trim()
     if (v) byPrimary.set(v, r)
   }
 
   let imported = 0, updated = 0
   for (const row of dataRows) {
-    const data: Record<string, string> = {}
-    for (let i = 0; i < keys.length; i++) data[keys[i]] = String(row[i] ?? '')
-    const pk = data[primaryKey]?.trim()
+    // Build the raw header-keyed object first. This is the shape the pinned
+    // mapping operates on — same shape the user sees in the FE preview when
+    // they pasted a sample, so transforms behave identically.
+    const rawByHeader: Record<string, string> = {}
+    for (let i = 0; i < keys.length; i++) rawByHeader[keys[i]] = String(row[i] ?? '')
+
+    // When a mapping is pinned, apply it. Otherwise: pass-through (legacy
+    // behaviour — every header → column key, raw value). We always stash
+    // the raw primary-key under `_source_pk` so dedup stays stable across
+    // mapping changes (see the byPrimary build above).
+    const data: Record<string, string> = pinnedMapping
+      ? applyMappingToPayload(pinnedMapping, rawByHeader)
+      : { ...rawByHeader }
+
+    const pk = String(rawByHeader[primaryKey] ?? '').trim()
     if (!pk) continue
+    data._source_pk = pk
 
     const existing = byPrimary.get(pk)
     if (existing) {
@@ -210,7 +239,17 @@ async function syncAirtable(sub: any): Promise<{ imported: number; updated: numb
   if (records.length === 0) return { imported: 0, updated: 0 }
 
   // The mapping was stashed at mirror time (field name → our column key).
+  // This is the static rename-only map. The richer `default_mapping_id`
+  // below (if pinned) layers transforms on top of this rename — the user
+  // can lowercase emails, coerce budgets to numbers, regex-extract IDs etc.
   const fieldMap = (sub.column_mappings ?? {}) as Record<string, string>
+
+  // Optional pinned mapping with transforms (separate from the static
+  // rename map above). When set, it runs AFTER the rename map normalizes
+  // Airtable's field names to our column keys — so users can pin a single
+  // mapping in the library and reuse it across the webhook + the sheets +
+  // the airtable source for the same target table.
+  const pinnedMapping = await loadMapping(supabase, sub.tenant_id, sub.default_mapping_id)
 
   // Dedupe via Airtable's stable record id, stashed into data.airtable_record_id
   // on every insert. Far more reliable than a column-value primary key for
@@ -227,11 +266,19 @@ async function syncAirtable(sub: any): Promise<{ imported: number; updated: numb
 
   let imported = 0, updated = 0
   for (const rec of records) {
-    const data: Record<string, string> = { airtable_record_id: rec.id }
+    // Step 1: apply the static rename map (Airtable field name → our key).
+    const renamed: Record<string, string> = {}
     for (const [fieldName, value] of Object.entries(rec.fields)) {
       const key = fieldMap[fieldName] ?? keyify(fieldName)
-      data[key] = value == null ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value))
+      renamed[key] = value == null ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value))
     }
+
+    // Step 2: if a pinned mapping exists, run the renamed object through
+    // the transform pipeline. Otherwise pass-through. Always keep the
+    // Airtable record id so the dedupe map above keeps working.
+    const data: Record<string, string> = pinnedMapping
+      ? { ...applyMappingToPayload(pinnedMapping, renamed), airtable_record_id: rec.id }
+      : { airtable_record_id: rec.id, ...renamed }
 
     const existing = byRecordId.get(rec.id)
     if (existing) {

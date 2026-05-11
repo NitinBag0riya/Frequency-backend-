@@ -62,6 +62,10 @@ const MirrorAirtableSchema = z.object({
 const PatchSubSchema = z.object({
   status: z.enum(['active', 'paused']).optional(),
   sync_interval_minutes: z.number().int().min(1).max(1440).optional(),
+  // Pin a saved field mapping to be auto-applied on every sync tick. NULL
+  // clears the pin (worker falls back to legacy keyify/column_mappings).
+  // Tenant ownership is enforced below before the UPDATE lands.
+  default_mapping_id: z.string().uuid().nullable().optional(),
 }).strict()
 
 export function createDataSourcesRouter(deps: Deps): express.Router {
@@ -101,6 +105,16 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
       // `created_at` etc. were already 400'd by PatchSubSchema's .strict()
       // and can't land in the UPDATE. See SECURITY CONTRACT in src/validation.ts.
       const patch = req.body as z.infer<typeof PatchSubSchema>
+      // Tenant-scope the pinned mapping. A caller from tenant A must not be
+      // able to pin tenant B's mapping; .strict() prevented spoofing
+      // tenant_id, but the FK target value itself still needs validation.
+      if (patch.default_mapping_id) {
+        const { data: mp, error: mpErr } = await supabase
+          .from('lead_field_mappings')
+          .select('id').eq('id', patch.default_mapping_id).eq('tenant_id', tenantId).maybeSingle()
+        if (mpErr) { res.status(500).json({ error: mpErr.message }); return }
+        if (!mp)   { res.status(400).json({ error: 'default_mapping_id does not belong to this tenant' }); return }
+      }
       const { data, error } = await supabase.from('data_source_subscriptions')
         .update({ ...patch, updated_at: new Date().toISOString() })
         .eq('id', req.params.id).eq('tenant_id', tenantId)

@@ -4,6 +4,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import type { Request, Response, NextFunction } from 'express'
 import { pickAllowed } from './security'
 import { emitNotification } from './routes/notifications'
+import { loadMapping, applyMappingToPayload } from './lib/apply-mapping'
 
 type AuthMiddleware = (req: Request, res: Response, next: NextFunction) => void
 
@@ -308,7 +309,27 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
 
   router.patch('/lead-tables/:id', requireAuth, identifyTenant, checkPermission('leads', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId
-    const patch = pickAllowed(req.body, ['name', 'description', 'source'] as const)
+    // `default_mapping_id` is the table-level pin used by POST /api/ingest/:token
+    // to auto-apply a saved mapping to every inbound webhook payload. NULL
+    // means store payloads verbatim (the legacy behaviour). UUID values are
+    // additionally validated below — we don't trust the client to send a
+    // mapping id from a different tenant.
+    const patch = pickAllowed(req.body, ['name', 'description', 'source', 'default_mapping_id'] as const) as Record<string, unknown>
+    if (patch.default_mapping_id != null) {
+      const mid = String(patch.default_mapping_id)
+      // Empty string from a "clear" interaction → store as NULL.
+      if (mid === '') { patch.default_mapping_id = null }
+      else {
+        const { data: mp, error: mpErr } = await supabase
+          .from('lead_field_mappings')
+          .select('id')
+          .eq('id', mid)
+          .eq('tenant_id', (req as any).tenantId)
+          .maybeSingle()
+        if (mpErr) { res.status(500).json({ error: mpErr.message }); return }
+        if (!mp)   { res.status(400).json({ error: 'default_mapping_id does not belong to this tenant' }); return }
+      }
+    }
     const { data, error } = await supabase
       .from('lead_tables')
       .update({ ...patch, updated_at: new Date().toISOString() })
@@ -827,10 +848,17 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
 
     const { data: table, error: tableErr } = await supabase
       .from('lead_tables')
-      .select('id, tenant_id, user_id')
+      .select('id, tenant_id, user_id, default_mapping_id')
       .eq('ingest_token', token)
       .maybeSingle()
     if (tableErr || !table) { fail(); return }
+
+    // Pinned mapping (if any) — loaded ONCE before processing the batch.
+    // Failure to load (e.g. mapping deleted concurrently) falls back to
+    // verbatim mode rather than rejecting the request; that matches the
+    // ON DELETE SET NULL semantics on the column. See lib/apply-mapping.ts
+    // for the shared transform pipeline (same one the FE preview uses).
+    const pinnedMapping = await loadMapping(supabase, table.tenant_id, (table as any).default_mapping_id)
 
     // Coerce to an array of plain row objects.
     let rowList: Array<Record<string, unknown>>
@@ -880,11 +908,24 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
 
     let assigned = 0
     const inserts = rowList.map(raw => {
-      // Coerce primitive values to strings so the JSONB column has predictable shape.
-      const data: Record<string, unknown> = {}
-      for (const [k, v] of Object.entries(raw)) {
-        if (v === null || v === undefined) continue
-        data[toKey(k)] = typeof v === 'object' ? JSON.stringify(v) : String(v)
+      // Two shapes:
+      //   (a) Pinned mapping present → run the row through the shared
+      //       transform pipeline, producing only the target columns the
+      //       mapping defines. Anything the mapping doesn't reference is
+      //       intentionally dropped (the pin is a contract — payload may
+      //       contain noise the table doesn't want).
+      //   (b) No pin → legacy verbatim shape: every payload key becomes a
+      //       column (with `toKey` slugification), JSON-stringify nested
+      //       objects so the JSONB has predictable shape.
+      let data: Record<string, unknown>
+      if (pinnedMapping) {
+        data = applyMappingToPayload(pinnedMapping, raw)
+      } else {
+        data = {}
+        for (const [k, v] of Object.entries(raw)) {
+          if (v === null || v === undefined) continue
+          data[toKey(k)] = typeof v === 'object' ? JSON.stringify(v) : String(v)
+        }
       }
       const hit = ruleFor(data)
       if (hit) assigned++
