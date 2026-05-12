@@ -666,8 +666,18 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     const pageSize = Math.min(100, Math.max(1, parseInt(q.pageSize ?? '25', 10) || 25))
     const offset = (page - 1) * pageSize
 
+    // TASK-4b v1.1 voicemails MVP — `has_recording=true` joins
+    // call_recordings via the existing FK so the listing only includes
+    // sessions whose recording landed (status='archived'). Keeps the
+    // voicemails tab cheap (no N+1 from the FE).
+    const wantsRecording = q.has_recording === 'true' || q.has_recording === '1'
+    const baseSelect = 'id, tenant_id, contact_id, agent_id, direction, status, source, meta_call_id, recording_consent, duration_seconds, queued_at, dialing_at, ringing_at, connected_at, ended_at, failure_reason, outcome, created_at, updated_at'
+    const selectStr = wantsRecording
+      ? `${baseSelect}, call_recordings!inner(id,storage_path,duration_seconds,archived_at,status)`
+      : baseSelect
+
     let query = supabase.from('call_sessions')
-      .select('id, tenant_id, contact_id, agent_id, direction, status, source, meta_call_id, recording_consent, duration_seconds, queued_at, dialing_at, ringing_at, connected_at, ended_at, failure_reason, outcome, created_at, updated_at', { count: 'exact' })
+      .select(selectStr, { count: 'exact' })
       .eq('tenant_id', tenantId)
       .order('created_at', { ascending: false })
       .range(offset, offset + pageSize - 1)
@@ -683,6 +693,11 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     // to a specific call_sessions.outcome value.
     if (q.outcome === 'pending') query = query.is('outcome', null)
     else if (q.outcome)          query = query.eq('outcome', q.outcome)
+    // Voicemails — only return sessions whose embedded recording has
+    // actually been archived (skip pending/failed/expired/deleted).
+    if (wantsRecording) {
+      query = query.eq('call_recordings.status', 'archived')
+    }
 
     const { data, error, count } = await query
     if (error) { res.status(500).json({ error: error.message }); return }
