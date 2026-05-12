@@ -324,11 +324,18 @@ export function createWaCallingRouter(deps: Deps): express.Router {
   r.post(webhookPath, async (req, res) => {
     const appSecret = process.env.META_APP_SECRET
     if (!appSecret) {
-      // Loud, but ack 200 so Meta doesn't retry-storm us when we know we
-      // can't process anyway. The boot warning in env.ts is the operator-
-      // facing signal.
-      console.warn('[wa-calls.webhook] META_APP_SECRET missing — dropping payload')
-      res.sendStatus(200); return
+      // Item #6 fix: previously silently 200-ACK'd here, which hid the
+      // misconfig from operators (Meta thinks delivery succeeded so no
+      // backpressure / retry / dashboard signal). Now we 503 + Retry-After
+      // so Meta backs off cleanly AND ops gets a visible failure spike in
+      // the WhatsApp Business dashboard. Boot-side warning still fires too.
+      console.warn('[wa-calls.webhook] META_APP_SECRET missing — returning 503 so Meta backs off')
+      res.setHeader('Retry-After', '60')
+      res.status(503).json({
+        error: 'webhook_secret_not_configured',
+        code:  'webhook_secret_not_configured',
+      })
+      return
     }
     const sigHeader = req.headers['x-hub-signature-256'] as string | undefined
     const raw = req.body as Buffer
