@@ -660,7 +660,7 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     const offset = (page - 1) * pageSize
 
     let query = supabase.from('call_sessions')
-      .select('id, tenant_id, contact_id, agent_id, direction, status, source, meta_call_id, recording_consent, duration_seconds, queued_at, dialing_at, ringing_at, connected_at, ended_at, failure_reason, created_at, updated_at', { count: 'exact' })
+      .select('id, tenant_id, contact_id, agent_id, direction, status, source, meta_call_id, recording_consent, duration_seconds, queued_at, dialing_at, ringing_at, connected_at, ended_at, failure_reason, outcome, created_at, updated_at', { count: 'exact' })
       .eq('tenant_id', tenantId)
       .order('created_at', { ascending: false })
       .range(offset, offset + pageSize - 1)
@@ -671,6 +671,11 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     if (q.contact_id) query = query.eq('contact_id', q.contact_id)
     if (q.from)      query = query.gte('created_at', q.from)
     if (q.to)        query = query.lte('created_at', q.to)
+    // TASK-4a v1.1 — outcome filter for the Callbacks tab. 'pending' is
+    // a synthetic value meaning "outcome IS NULL"; everything else maps
+    // to a specific call_sessions.outcome value.
+    if (q.outcome === 'pending') query = query.is('outcome', null)
+    else if (q.outcome)          query = query.eq('outcome', q.outcome)
 
     const { data, error, count } = await query
     if (error) { res.status(500).json({ error: error.message }); return }
@@ -907,6 +912,35 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     }).then(() => undefined, (e: any) => console.warn(`[wa-calling] audit insert failed: ${e?.message ?? e}`))
 
     res.json({ consent_default: body.value })
+  })
+
+  // ── PATCH /api/calls/:id/outcome — callback queue triage (TASK-4a) ────
+  // Sets the outcome on a missed-call row so it falls out of the Callbacks
+  // tab listing. Allowed values are enforced server-side AND by the
+  // call_sessions_outcome_check CHECK constraint in migration 043.
+  r.patch('/api/calls/:id/outcome', ...guardInitiate, async (req, res) => {
+    const tenantId = (req as any).tenantId as string
+    const userId   = (req as any).user?.id as string | undefined
+    const callId   = String(req.params.id)
+    const outcome  = String((req.body ?? {}).outcome ?? '').trim()
+
+    const allowed = ['callback_attempted', 'callback_done', 'no_action', 'voicemail_left']
+    if (!allowed.includes(outcome)) {
+      res.status(400).json({ error: 'invalid_outcome', allowed, code: 'invalid_outcome' }); return
+    }
+
+    const { error, data } = await supabase.from('call_sessions')
+      .update({
+        outcome,
+        outcome_at: new Date().toISOString(),
+        outcome_by: userId ?? null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', callId).eq('tenant_id', tenantId)
+      .select('id, status, outcome').maybeSingle()
+    if (error) { res.status(500).json({ error: error.message }); return }
+    if (!data) { res.status(404).json({ error: 'call_not_found' }); return }
+    res.json({ ok: true, outcome: data.outcome })
   })
 
   // ── POST /api/calls/csat-defaults — set TASK-6 v1.1 CSAT knobs ────────
