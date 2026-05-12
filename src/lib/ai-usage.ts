@@ -38,6 +38,8 @@ export type AiUsageSource =
   | 'workflow_recos'
   | 'ai_responder'
   | 'skill_match'
+  | 'call_transcript'
+  | 'call_sentiment'
 
 /**
  * Anthropic SDK's usage shape. Cache fields are optional and only present

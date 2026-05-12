@@ -39,6 +39,7 @@ import {
 } from '../queue'
 import { upsertContactFromLead } from '../services/contact-resolver'
 import { getActivePlanForTenant } from '../lib/plans'
+import { connection as redis } from '../queue'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -166,25 +167,42 @@ function impersonationGuard(req: express.Request, res: express.Response, next: e
 }
 
 /**
- * In-memory per-user hour-bucket rate limiter for transcript-export.
- * Compliance §8.5 caps transcript export at 5/h/user. Process-local — fine
- * for the v1 single-instance deploy; revisit when we scale horizontally.
- * Keyed on `${userId|ip}:${hourBucket}`; map self-prunes the previous bucket
- * on each call so unbounded growth is avoided.
+ * Redis-backed per-user hour-bucket rate limiter for transcript-export.
+ * Compliance §8.5 caps export at 5/h/user. Backed by ioredis (`connection`
+ * exported from queue.ts) so the counter is shared across replicas — fixes
+ * the multi-instance footgun where each replica granted its own 5/h budget.
+ *
+ * Atomic flow:
+ *   1. INCR rl:transcript-export:<user>:<hourBucket>   (atomic counter bump)
+ *   2. EXPIRE same-key 3600s on first increment        (auto-cleanup)
+ *   3. Compare against the cap; 429 if exceeded.
+ *
+ * If Redis is unreachable, we fail OPEN (let the request through) and log
+ * — the alternative (fail-closed) would 500 every export when Redis hiccups,
+ * which is a worse user experience than rare over-limit slips.
  */
-const transcriptExportHits = new Map<string, number>()
-function transcriptExportRateLimit(req: express.Request, res: express.Response, next: express.NextFunction) {
+const TRANSCRIPT_EXPORT_CAP_PER_HOUR = 5
+async function transcriptExportRateLimit(req: express.Request, res: express.Response, next: express.NextFunction) {
   const userKey = (req as any).user?.id as string | undefined ?? req.ip ?? 'anon'
   const hourBucket = Math.floor(Date.now() / 3_600_000)
-  const key = `${userKey}:${hourBucket}`
-  const prevKey = `${userKey}:${hourBucket - 1}`
-  transcriptExportHits.delete(prevKey)
-  const count = (transcriptExportHits.get(key) ?? 0) + 1
-  transcriptExportHits.set(key, count)
-  if (count > 5) {
-    res.setHeader('Retry-After', String(3600 - Math.floor((Date.now() % 3_600_000) / 1000)))
-    res.status(429).json({ error: 'transcript export rate limit exceeded (5/hour)', code: 'rate_limited' })
-    return
+  const key = `rl:transcript-export:${userKey}:${hourBucket}`
+  try {
+    const count = await redis.incr(key)
+    if (count === 1) {
+      // First hit in this bucket — set the TTL so the key auto-prunes.
+      // Slight over-allocation (3700s) so the previous-hour key always
+      // expires before its successor starts incrementing.
+      await redis.expire(key, 3700)
+    }
+    if (count > TRANSCRIPT_EXPORT_CAP_PER_HOUR) {
+      res.setHeader('Retry-After', String(3600 - Math.floor((Date.now() % 3_600_000) / 1000)))
+      res.status(429).json({ error: `transcript export rate limit exceeded (${TRANSCRIPT_EXPORT_CAP_PER_HOUR}/hour)`, code: 'rate_limited' })
+      return
+    }
+  } catch (e: any) {
+    // Fail open with a warn — better than blocking exports during a Redis
+    // outage. Audit log still records every export anyway.
+    console.warn(`[wa-calling.rl] Redis unreachable, allowing through: ${e?.message ?? e}`)
   }
   next()
 }
@@ -707,14 +725,11 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     if (!rec || !rec.storage_path) { res.status(404).json({ error: 'recording_not_available' }); return }
     if (rec.status !== 'archived') { res.status(409).json({ error: 'recording_not_ready', status: rec.status }); return }
 
-    const ttl = Number(process.env.RECORDING_TTL_SECONDS ?? 3600)
-    const { data: signed, error } = await supabase
-      .storage.from('inbox-media').createSignedUrl(rec.storage_path, ttl)
-    if (error || !signed?.signedUrl) { res.status(500).json({ error: error?.message ?? 'sign_failed' }); return }
-
-    // Audit row — compliance §8.4 Red Line #4: no playback without an
-    // immutable audit row. We await + check error; on failure we do NOT
-    // return the signed URL.
+    // Security audit follow-up: audit row writes FIRST, sign URL only after
+    // audit succeeds. Previously the URL was minted before the audit
+    // (createSignedUrl is stateless, so the URL only existed in the
+    // server's process memory if audit failed — but doing audit-first
+    // closes even that narrow window and makes the order intent-clear).
     const { error: auditErr } = await supabase.rpc('append_tenant_audit', {
       p_tenant_id:     tenantId,
       p_actor_id:      userId ?? null,
@@ -733,6 +748,12 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       console.warn(`[wa-calling] audit insert failed: ${auditErr.message}`)
       res.status(500).json({ error: 'audit_failed' }); return
     }
+
+    // Audit landed — now sign the URL and return.
+    const ttl = Number(process.env.RECORDING_TTL_SECONDS ?? 3600)
+    const { data: signed, error } = await supabase
+      .storage.from('inbox-media').createSignedUrl(rec.storage_path, ttl)
+    if (error || !signed?.signedUrl) { res.status(500).json({ error: error?.message ?? 'sign_failed' }); return }
 
     res.json({ url: signed.signedUrl, expires_in: ttl })
   })

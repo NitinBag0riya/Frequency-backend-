@@ -151,9 +151,10 @@ export function startCallTranscribeWorker() {
         output_tokens:               resp?.usage?.output_tokens,
         cache_read_input_tokens:     resp?.usage?.cache_read_input_tokens,
         cache_creation_input_tokens: resp?.usage?.cache_creation_input_tokens,
-      }, 'ai_responder', MODEL)
-      // (We reuse 'ai_responder' as the source enum; purpose='call_transcript'
-      // is captured implicitly by the call_transcripts row.)
+      }, 'call_transcript', MODEL)
+      // QA #8 fix: AiUsageSource union now includes 'call_transcript' so we
+      // can attribute Anthropic spend correctly in observability + audits
+      // instead of masquerading as 'ai_responder'.
 
       await publishTranscriptStatus(tenantId, callSessionId, 'completed').catch(() => {})
       console.log(`[worker:call.transcribe] done call=${callSessionId} recording=${recordingId} ms=${Date.now() - start}`)
@@ -224,8 +225,15 @@ async function publishTranscriptStatus(tenantId: string, callSessionId: string, 
 export function redactPII(input: string): string {
   if (!input) return input
   let out = input
-  // Aadhaar
-  out = out.replace(/\b\d{4}\s?\d{4}\s?\d{4}\b/g, '[REDACTED:aadhaar]')
+  // Aadhaar — official format XXXX XXXX XXXX (12 digits, optionally
+  // space-separated). The original `\b\d{4}\s?\d{4}\s?\d{4}\b` pattern
+  // false-positives on Indian phones in international format
+  // (`+919876543210` has 12 trailing digits that match the pattern at
+  // the `\b` between `+` and `9`). Negative lookbehind for `+` or any
+  // digit ensures we don't match inside a longer number; negative
+  // lookahead for `\d` ensures we don't match the first 12 of a longer
+  // numeric run.
+  out = out.replace(/(?<![+\d])\b\d{4}\s?\d{4}\s?\d{4}\b(?!\d)/g, '[REDACTED:aadhaar]')
   // PAN
   out = out.replace(/\b[A-Z]{5}\d{4}[A-Z]\b/g, '[REDACTED:pan]')
   // Card numbers (Luhn-validated to avoid false positives on phone-like strings).
