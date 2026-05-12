@@ -1026,20 +1026,27 @@ app.post('/api/workflows/preview', requireAuth, identifyTenant, checkPermission(
 // ── Tenants CRUD ──────────────────────────────────────────────────────────────
 app.get('/api/tenants/:id/members', requireAuth, identifyTenant, async (req, res) => {
   const tenantId = req.params.id
+  // Previously did `profiles:user_id(...)` PostgREST embed but the
+  // `profiles` table doesn't exist in this schema — every call returned
+  // 500 with PGRST200 "could not find a relationship". The newer
+  // /api/team/members endpoint (routes/teams.ts) is the canonical reader
+  // for team membership; this older one is kept as a back-compat alias
+  // returning the minimal {id, role} shape that callers actually use
+  // (the InboxPage falls back to seeded display names anyway).
   const { data, error } = await supabase
     .from('user_roles')
-    .select('user_id, role, profiles:user_id(full_name, avatar_url)')
+    .select('user_id, role')
     .eq('tenant_id', tenantId)
 
   if (error) { res.status(500).json({ error: error.message }); return }
-  
+
   const members = (data || []).map((m: any) => ({
-    id: m.user_id,
-    role: m.role,
-    name: m.profiles?.full_name || 'Unknown User',
-    avatar: m.profiles?.avatar_url
+    id:    m.user_id,
+    role:  m.role,
+    name:  null,   // populated by /api/team/members; this endpoint stays lean
+    avatar: null,
   }))
-  
+
   res.json(members)
 })
 
