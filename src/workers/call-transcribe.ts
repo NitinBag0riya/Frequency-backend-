@@ -159,6 +159,13 @@ export function startCallTranscribeWorker() {
       await publishTranscriptStatus(tenantId, callSessionId, 'completed').catch(() => {})
       console.log(`[worker:call.transcribe] done call=${callSessionId} recording=${recordingId} ms=${Date.now() - start}`)
 
+      // 6) Sentiment scoring (TASK-5 v1.1). Best-effort second Claude call;
+      //    a failure here does NOT roll back the transcript. Skipped when
+      //    AI dollar cap is too low to safely run.
+      void scoreSentiment(tenantId, callSessionId, transcriptRedacted).catch(err => {
+        console.warn(`[worker:call.transcribe] sentiment skipped (${callSessionId}): ${err?.message ?? err}`)
+      })
+
       return { ok: true, segments: segments?.length ?? 0 }
     },
     {
@@ -172,6 +179,109 @@ export function startCallTranscribeWorker() {
   })
   console.log('[worker:call.transcribe] started')
   return worker
+}
+
+/**
+ * Sentiment scoring — second Claude call after the transcript lands.
+ * Fire-and-forget from the caller's POV; this function awaits internally
+ * but the caller doesn't await on the promise. Failures are logged + the
+ * transcript stays "completed" without sentiment.
+ *
+ * Cost: ~$0.001 per call (short prompt, short JSON output). Deducted
+ * separately via recordAiUsage source='call_sentiment' so the existing
+ * AI dollar cap pre-check on transcription doesn't have to know about
+ * the follow-up cost.
+ *
+ * Output schema (strict JSON, no markdown):
+ *   { sentiment: 'positive'|'neutral'|'negative'|'mixed', summary: '...', topics: ['...'] }
+ */
+const SENTIMENT_SYSTEM_PROMPT = `You score short customer-service call transcripts.
+
+Output STRICT JSON, no markdown, no surrounding text:
+{
+  "sentiment": "positive" | "neutral" | "negative" | "mixed",
+  "summary":   "<one short sentence, agent-facing>",
+  "topics":    ["<short tag>", "<short tag>"]
+}
+
+Rules:
+- Sentiment is the customer's mood toward the business by end-of-call.
+- Summary <= 140 chars. Plain text. No emoji.
+- 1-4 topics, lowercased, kebab-case, drawn from CSR vocabulary
+  (e.g. "billing", "refund", "outage", "churn-risk", "upsell-opportunity",
+  "tech-support", "compliment", "complaint").`
+
+async function scoreSentiment(tenantId: string, callSessionId: string, transcriptText: string): Promise<void> {
+  // Skip if the transcript is essentially empty.
+  if (!transcriptText || transcriptText.trim().length < 30) return
+
+  // Cheap cap pre-check — skip if we're already within $0.01 of the cap.
+  const plan = await loadPlanLimits(tenantId)
+  if (plan && plan.ai_dollars_per_month !== -1) {
+    const used = await getAiDollarsThisMonth(supabase, tenantId)
+    if ((plan.ai_dollars_per_month - used) < 0.01) return
+  }
+
+  // Truncate transcripts that are unreasonably long for a "short call".
+  // Keep first 12 KB of text — enough for a 5-minute call at ~40 chars/sec.
+  const text = transcriptText.slice(0, 12_000)
+
+  let resp: any
+  try {
+    resp = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 256,
+      system: [
+        { type: 'text' as const, text: SENTIMENT_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } as const },
+      ] as any,
+      messages: [{
+        role: 'user',
+        content: `Score this call transcript:\n\n${text}`,
+      }],
+    } as any)
+  } catch (e: any) {
+    console.warn(`[worker:call.transcribe] sentiment Anthropic err (${callSessionId}): ${e?.message ?? e}`)
+    return
+  }
+
+  const rawText = (resp?.content ?? [])
+    .filter((c: any) => c.type === 'text')
+    .map((c: any) => c.text).join('').trim()
+  let parsed: { sentiment?: string; summary?: string; topics?: string[] } = {}
+  try { parsed = JSON.parse(rawText) } catch {
+    console.warn(`[worker:call.transcribe] sentiment JSON parse fail (${callSessionId}); raw="${rawText.slice(0, 100)}"`)
+    return
+  }
+
+  // Compute the cost separately so we can store it on the row.
+  const inputTokens  = resp?.usage?.input_tokens ?? 0
+  const outputTokens = resp?.usage?.output_tokens ?? 0
+
+  await supabase.from('call_transcripts')
+    .update({
+      sentiment: ['positive', 'neutral', 'negative', 'mixed'].includes(parsed.sentiment ?? '')
+        ? parsed.sentiment : null,
+      summary:   typeof parsed.summary === 'string' ? parsed.summary.slice(0, 280) : null,
+      topics:    Array.isArray(parsed.topics)
+        ? parsed.topics.filter((t: any) => typeof t === 'string').slice(0, 8)
+        : null,
+      // Cost: ~$3/M input + $15/M output for claude-sonnet-4-6 (rough).
+      // Keep precision but don't claim more accuracy than the worker has.
+      sentiment_dollar_cost: Number(((inputTokens * 3 + outputTokens * 15) / 1_000_000).toFixed(4)),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('call_session_id', callSessionId)
+    .eq('tenant_id', tenantId)
+
+  // Record AI usage so the cap meter sees the spend.
+  await recordAiUsage(supabase, tenantId, {
+    input_tokens:                resp?.usage?.input_tokens,
+    output_tokens:               resp?.usage?.output_tokens,
+    cache_read_input_tokens:     resp?.usage?.cache_read_input_tokens,
+    cache_creation_input_tokens: resp?.usage?.cache_creation_input_tokens,
+  }, 'call_sentiment', MODEL)
+
+  await publishTranscriptStatus(tenantId, callSessionId, 'sentiment_ready').catch(() => {})
 }
 
 async function loadPlanLimits(tenantId: string): Promise<{ ai_dollars_per_month: number } | null> {

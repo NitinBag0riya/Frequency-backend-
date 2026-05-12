@@ -909,6 +909,59 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     res.json({ consent_default: body.value })
   })
 
+  // ── POST /api/calls/csat-defaults — set TASK-6 v1.1 CSAT knobs ────────
+  r.post('/api/calls/csat-defaults', ...guardConfigure, async (req, res) => {
+    const tenantId = (req as any).tenantId as string
+    const userId   = (req as any).user?.id as string | undefined
+    const body     = (req.body ?? {}) as Partial<{
+      csat_enabled:           boolean
+      csat_template_name:     string | null
+      csat_delay_minutes:     number
+      csat_min_call_seconds:  number
+    }>
+
+    // Build the patch with only the keys the client sent. Each key
+    // gets a light type-coerce + clamp so malformed input doesn't poison
+    // the row.
+    const patch: Record<string, any> = {}
+    if (typeof body.csat_enabled === 'boolean')
+      patch.csat_enabled = body.csat_enabled
+    if (body.csat_template_name !== undefined)
+      patch.csat_template_name = (body.csat_template_name ?? '').toString().slice(0, 64) || null
+    if (body.csat_delay_minutes !== undefined)
+      patch.csat_delay_minutes = Math.max(1, Math.min(60, Number(body.csat_delay_minutes) || 5))
+    if (body.csat_min_call_seconds !== undefined)
+      patch.csat_min_call_seconds = Math.max(10, Math.min(600, Number(body.csat_min_call_seconds) || 30))
+
+    if (Object.keys(patch).length === 0) {
+      res.status(400).json({ error: 'no_csat_fields', code: 'no_csat_fields' }); return
+    }
+    patch.updated_at = new Date().toISOString()
+
+    const { data: before } = await supabase.from('tenants')
+      .select('csat_enabled, csat_template_name, csat_delay_minutes, csat_min_call_seconds')
+      .eq('id', tenantId).maybeSingle()
+    const { error } = await supabase.from('tenants').update(patch).eq('id', tenantId)
+    if (error) { res.status(500).json({ error: error.message }); return }
+
+    await supabase.rpc('append_tenant_audit', {
+      p_tenant_id:     tenantId,
+      p_actor_id:      userId ?? null,
+      p_actor_role:    (req as any).userRole ?? null,
+      p_action:        'csat_defaults.change',
+      p_entity_type:   'tenant_setting',
+      p_entity_id:     null,
+      p_justification: null,
+      p_ticket_ref:    null,
+      p_before_value:  before ?? null,
+      p_after_value:   patch,
+      p_ip_address:    req.ip ?? null,
+      p_user_agent:    (req.headers['user-agent'] as string | undefined) ?? null,
+    }).then(() => undefined, (e: any) => console.warn(`[wa-calling] audit insert failed: ${e?.message ?? e}`))
+
+    res.json({ ok: true, csat: patch })
+  })
+
   // ── GET /api/calls/usage — current period meters ──────────────────────
   r.get('/api/calls/usage', ...guardBilling, async (req, res) => {
     const tenantId = (req as any).tenantId as string

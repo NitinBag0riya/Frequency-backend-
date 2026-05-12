@@ -24,6 +24,7 @@ import { createClient } from '@supabase/supabase-js'
 import {
   Q, CallEventIngestJob, connection,
   enqueueCallRecordingArchive,
+  enqueueMessageSend,
 } from '../queue'
 import { emitNotification } from '../routes/notifications'
 
@@ -152,6 +153,12 @@ export function startCallEventIngestWorker() {
       // Billing: connected → completed = bill the minutes.
       if (fromStatus === 'connected' && transition.to === 'completed') {
         await incrementCallMinutes(tenantId, session.id as string, session.connected_at, nowIso)
+        // TASK-6 (v1.1): enqueue CSAT template send if tenant has it on
+        // and the call lasted at least csat_min_call_seconds. Best-effort
+        // — failures here don't roll back the call lifecycle.
+        await maybeEnqueueCsat(tenantId, session, nowIso).catch(err => {
+          console.warn(`[worker:call.event.ingest] csat enqueue failed (${session.id}): ${err?.message ?? err}`)
+        })
       }
 
       // Notifications
@@ -186,6 +193,77 @@ export function startCallEventIngestWorker() {
   worker.on('failed', (job, err) => {
     console.warn(`[worker:call.event.ingest] ✗ job=${job?.id} — ${err.message}`)
   })
+
+  /**
+   * CSAT post-call template (TASK-6 v1.1). Conditionally enqueues a
+   * WhatsApp template send to the customer's phone with a configurable
+   * delay. Stores the resulting message_id on call_sessions so the
+   * call-log row can later show the rating once the customer replies.
+   *
+   * Conditions (ALL must be true):
+   *   - tenants.csat_enabled = true
+   *   - tenants.csat_template_name is non-empty
+   *   - call duration >= tenants.csat_min_call_seconds (default 30s)
+   *   - direction = outbound OR inbound (both are valid CSAT triggers)
+   *   - session has a contact with a usable phone
+   *
+   * Compliance note: the disclosure greeting played pre-call should
+   * include "you may receive a follow-up survey" so the message isn't
+   * unsolicited under WhatsApp Business policy.
+   */
+  async function maybeEnqueueCsat(tenantId: string, session: any, completedAtIso: string) {
+    const { data: tenant } = await supabase
+      .from('tenants')
+      .select('csat_enabled, csat_template_name, csat_delay_minutes, csat_min_call_seconds')
+      .eq('id', tenantId).maybeSingle()
+    if (!tenant?.csat_enabled || !tenant.csat_template_name) return
+
+    // Compute duration. If connected_at wasn't recorded (transient ringing
+    // → completed for missed-but-billable cases), fall back to 0.
+    const connectedAt = session.connected_at ? new Date(session.connected_at).getTime() : 0
+    const completedAt = new Date(completedAtIso).getTime()
+    const durationSec = connectedAt ? Math.floor((completedAt - connectedAt) / 1000) : 0
+    if (durationSec < (tenant.csat_min_call_seconds ?? 30)) return
+
+    // Need a phone to send to.
+    const contactId = session.contact_id as string | null
+    if (!contactId) return
+    const { data: contact } = await supabase
+      .from('contacts').select('phone').eq('id', contactId).eq('tenant_id', tenantId).maybeSingle()
+    if (!contact?.phone) return
+
+    // Use bullmq's delay option so the queue itself holds the job. The
+    // message-sender worker will dispatch when the delay expires. No
+    // need for our own scheduler.
+    const delayMs = Math.max(60_000, (tenant.csat_delay_minutes ?? 5) * 60_000)
+    await enqueueMessageSend({
+      tenantId,
+      to:       String(contact.phone).replace(/[^\d]/g, ''),
+      channel:  'whatsapp',
+      kind:     'template',
+      template: {
+        name:       tenant.csat_template_name,
+        language:   'en_US',
+        // The CSAT template typically has 1 variable for agent_name.
+        // Plain string fallback if agent_id isn't resolvable here.
+        parameters: [String(session.agent_id ?? 'your agent').slice(0, 64)],
+      },
+      sessionId: null,
+    } as any).catch(err => {
+      console.warn(`[csat] enqueueMessageSend failed (${session.id}): ${err?.message ?? err}`)
+    })
+
+    // Mark the session so we know a CSAT was sent + can correlate replies.
+    // We don't have the message_id here (the send worker creates it).
+    // Setting NOW as a sentinel — the message-sender worker can update the
+    // real id later if/when we wire that callback. For v1 the boolean
+    // "was a CSAT enqueued?" is enough to drive the call-log pill.
+    await supabase.from('call_sessions')
+      .update({ csat_template_message_id: '00000000-0000-0000-0000-000000000000' /* sentinel: enqueued */ })
+      .eq('id', session.id).eq('tenant_id', tenantId)
+  }
+
+
   console.log('[worker:call.event.ingest] started')
   return worker
 }
