@@ -50,12 +50,16 @@ kill_timeout = "30s"
 [http_service]
   internal_port = 3001
   force_https = true
-  # Web auto-stops when no traffic for ~5 min; first request after a stop
-  # adds ~1s cold-start. Set false if you want always-warm.
+  # Single always-on web machine. Was 1-3 with HA standby; dropped the
+  # standby for cost (root-disk storage on stopped machines is small but
+  # nonzero, and an early-stage workload doesn't need the redundancy).
+  # When traffic justifies it, bump max_machines_running back to 2-3 and
+  # Fly will spin up extras automatically — no fly.toml redeploy needed
+  # if you set those via `fly scale count` instead.
   auto_stop_machines = "stop"
   auto_start_machines = true
   min_machines_running = 1
-  max_machines_running = 3
+  max_machines_running = 1
   processes = ["web"]
 
   [[http_service.checks]]
