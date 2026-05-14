@@ -237,7 +237,38 @@ app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1))
 // `*` with the restrictive FRONTEND_URL on /api/ingest. We branch in a single
 // router-level middleware so only ONE cors handler sees each request.
 const ingestCors = cors({ origin: '*', methods: ['POST', 'OPTIONS'], maxAge: 86400 })
-const restrictiveCors = cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' })
+
+// Multi-origin allowlist for the restrictive CORS:
+//   - FRONTEND_URL (canonical custom-domain origin, e.g. https://getfrequency.app)
+//   - FRONTEND_URL_ALIASES (comma-separated additional origins; useful for the
+//     www.* variant, the canonical Vercel preview URL, and any per-deploy
+//     preview URLs you want to whitelist)
+//   - Vercel preview URLs (regex: any *.vercel.app under our project's slug)
+//   - localhost on common dev ports
+// In development we also allow any localhost origin to keep the DX painless.
+const FRONTEND_PRIMARY = process.env.FRONTEND_URL || 'http://localhost:5173'
+const FRONTEND_ALIASES = (process.env.FRONTEND_URL_ALIASES ?? '')
+  .split(',').map(s => s.trim()).filter(Boolean)
+const STATIC_ALLOWED = new Set([FRONTEND_PRIMARY, ...FRONTEND_ALIASES])
+// Match the canonical Vercel project + any per-deploy preview hostname so
+// the team can curl staging links without re-deploying. Adjust the slug
+// when you rename the Vercel project.
+const VERCEL_PREVIEW_RE = /^https:\/\/[a-z0-9-]+(-[a-z0-9]+)?\.vercel\.app$/
+
+const restrictiveCors = cors({
+  origin: (origin, cb) => {
+    // Same-origin / non-browser tools (curl, server-to-server) send no Origin
+    // — let them through, the route auth still applies.
+    if (!origin) return cb(null, true)
+    if (STATIC_ALLOWED.has(origin)) return cb(null, true)
+    if (VERCEL_PREVIEW_RE.test(origin)) return cb(null, true)
+    if (process.env.NODE_ENV !== 'production' && /^https?:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) {
+      return cb(null, true)
+    }
+    return cb(new Error(`CORS blocked: origin ${origin} not in allowlist`), false)
+  },
+  credentials: false,
+})
 app.use((req, res, next) => {
   // Match `/api/ingest` (exact) AND `/api/ingest/<token>`. The trailing-slash
   // form alone would miss preflights / probe requests sent without a token,
