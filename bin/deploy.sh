@@ -54,39 +54,62 @@ set -o allexport
 source .env.deploy
 set +o allexport
 
-# Verify required values are filled
-REQUIRED=(
+# HARD-required: app refuses to boot without these (boot-checked in src/index.ts).
+HARD_REQUIRED=(
   IMPERSONATION_HMAC_SECRET OAUTH_STATE_SECRET ENCRYPTION_KEY
-  WH_VERIFY_TOKEN META_VERIFY_TOKEN GOOGLE_TOKEN_SECRET
+  WH_VERIFY_TOKEN
   FLY_APP_NAME FLY_REGION VERCEL_PROJECT_NAME
   SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY SUPABASE_ANON_KEY
   ANTHROPIC_API_KEY
-  META_APP_ID META_APP_SECRET
-  GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET
-  RAZORPAY_KEY_ID RAZORPAY_KEY_SECRET RAZORPAY_WEBHOOK_SECRET
-  RESEND_API_KEY RESEND_FROM_EMAIL
   REDIS_URL
 )
-MISSING=()
-for var in "${REQUIRED[@]}"; do
-  if [ -z "${!var:-}" ]; then MISSING+=("$var"); fi
+# SOFT-required: app boots without these but the corresponding feature
+# is non-functional. Deploy proceeds with a warning so partial launches
+# (e.g. WhatsApp-only, no Razorpay yet) work.
+SOFT_REQUIRED=(
+  META_APP_ID META_APP_SECRET META_VERIFY_TOKEN
+  GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GOOGLE_TOKEN_SECRET
+  RAZORPAY_KEY_ID RAZORPAY_KEY_SECRET RAZORPAY_WEBHOOK_SECRET
+  RESEND_API_KEY RESEND_FROM_EMAIL
+)
+HARD_MISSING=()
+for var in "${HARD_REQUIRED[@]}"; do
+  if [ -z "${!var:-}" ]; then HARD_MISSING+=("$var"); fi
 done
-if [ ${#MISSING[@]} -ne 0 ]; then
-  echo "❌ .env.deploy is missing required values:"
-  printf '   - %s\n' "${MISSING[@]}"
+if [ ${#HARD_MISSING[@]} -ne 0 ]; then
+  echo "❌ .env.deploy missing HARD-required values (app won't boot):"
+  printf '   - %s\n' "${HARD_MISSING[@]}"
   exit 1
 fi
-echo "  ✓ .env.deploy populated"
+SOFT_MISSING=()
+for var in "${SOFT_REQUIRED[@]}"; do
+  if [ -z "${!var:-}" ]; then SOFT_MISSING+=("$var"); fi
+done
+if [ ${#SOFT_MISSING[@]} -ne 0 ]; then
+  echo "  ⚠ .env.deploy missing optional values (feature will be degraded):"
+  printf '     - %s\n' "${SOFT_MISSING[@]}"
+fi
+# Reject obviously-local URLs that won't work from Fly's network.
+if [[ "${REDIS_URL:-}" =~ (127\.0\.0\.1|localhost) ]]; then
+  echo
+  echo "❌ REDIS_URL points at localhost/127.0.0.1 — unreachable from Fly."
+  echo "   Provision a Redis instance:"
+  echo "     fly redis create --name ${FLY_APP_NAME}-redis --region ${FLY_REGION} --no-replicas --plan free"
+  echo "   Then copy the rediss:// URL it prints into .env.deploy and re-run."
+  echo "   Alternatively use Upstash directly: https://upstash.com (Mumbai region)"
+  exit 1
+fi
+echo "  ✓ .env.deploy validated"
 
 # ── 1. Fly.io: create app if needed ───────────────────────────────────────
 echo
 echo "▶ Fly.io setup"
 
-if flyctl apps list 2>/dev/null | grep -q "^$FLY_APP_NAME "; then
+if flyctl status --app "$FLY_APP_NAME" &> /dev/null; then
   echo "  ✓ App $FLY_APP_NAME already exists"
 else
   echo "  Creating app $FLY_APP_NAME in $FLY_REGION..."
-  flyctl apps create "$FLY_APP_NAME" --org personal
+  flyctl apps create "$FLY_APP_NAME" --org personal || true
 fi
 
 # Update fly.toml's `app` field to match the env-configured name
@@ -102,44 +125,51 @@ echo "▶ Pushing secrets to Fly..."
 PUBLIC_API_URL="https://${FLY_APP_NAME}.fly.dev"
 FRONTEND_URL="https://${VERCEL_PROJECT_NAME}.vercel.app"
 
-# `flyctl secrets set` accepts KEY=VALUE pairs; we pipe them all in one
-# call so Fly only restarts the app once instead of per-secret.
-flyctl secrets set \
-  --app "$FLY_APP_NAME" \
-  --stage \
-  NODE_ENV=production \
-  PORT=3001 \
-  TRUST_PROXY_HOPS=1 \
-  PUBLIC_API_URL="$PUBLIC_API_URL" \
-  FRONTEND_URL="$FRONTEND_URL" \
-  IMPERSONATION_HMAC_SECRET="$IMPERSONATION_HMAC_SECRET" \
-  OAUTH_STATE_SECRET="$OAUTH_STATE_SECRET" \
-  ENCRYPTION_KEY="$ENCRYPTION_KEY" \
-  ALLOW_SMOKE_TEST=0 \
-  WH_VERIFY_TOKEN="$WH_VERIFY_TOKEN" \
-  META_VERIFY_TOKEN="$META_VERIFY_TOKEN" \
-  META_APP_ID="$META_APP_ID" \
-  META_APP_SECRET="$META_APP_SECRET" \
-  META_REDIRECT_URI="$PUBLIC_API_URL/api/auth/instagram/callback" \
-  GOOGLE_CLIENT_ID="$GOOGLE_CLIENT_ID" \
-  GOOGLE_CLIENT_SECRET="$GOOGLE_CLIENT_SECRET" \
-  GOOGLE_REDIRECT_URI="$PUBLIC_API_URL/api/auth/google/callback" \
-  GOOGLE_TOKEN_SECRET="$GOOGLE_TOKEN_SECRET" \
-  SUPABASE_URL="$SUPABASE_URL" \
-  SUPABASE_SERVICE_ROLE_KEY="$SUPABASE_SERVICE_ROLE_KEY" \
-  ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  LOG_AI_USAGE=0 \
-  RAZORPAY_KEY_ID="$RAZORPAY_KEY_ID" \
-  RAZORPAY_KEY_SECRET="$RAZORPAY_KEY_SECRET" \
-  RAZORPAY_WEBHOOK_SECRET="$RAZORPAY_WEBHOOK_SECRET" \
-  RESEND_API_KEY="$RESEND_API_KEY" \
-  RESEND_FROM_EMAIL="$RESEND_FROM_EMAIL" \
-  REDIS_URL="$REDIS_URL" \
-  WORKFLOW_CONCURRENCY=10 \
-  MESSAGE_CONCURRENCY=5 \
-  BROADCAST_CONCURRENCY=3 \
-  IDEMPOTENCY_RETENTION_HOURS=24 \
+# Build secrets array dynamically — only include non-empty values so Fly
+# doesn't store literal empty strings (some libraries treat "" differently
+# from "unset" and behave unpredictably).
+SECRETS=(
+  NODE_ENV=production
+  PORT=3001
+  TRUST_PROXY_HOPS=1
+  PUBLIC_API_URL="$PUBLIC_API_URL"
+  FRONTEND_URL="$FRONTEND_URL"
+  IMPERSONATION_HMAC_SECRET="$IMPERSONATION_HMAC_SECRET"
+  OAUTH_STATE_SECRET="$OAUTH_STATE_SECRET"
+  ENCRYPTION_KEY="$ENCRYPTION_KEY"
+  ALLOW_SMOKE_TEST=0
+  WH_VERIFY_TOKEN="$WH_VERIFY_TOKEN"
+  SUPABASE_URL="$SUPABASE_URL"
+  SUPABASE_SERVICE_ROLE_KEY="$SUPABASE_SERVICE_ROLE_KEY"
+  ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+  LOG_AI_USAGE=0
+  REDIS_URL="$REDIS_URL"
+  WORKFLOW_CONCURRENCY=10
+  MESSAGE_CONCURRENCY=5
+  BROADCAST_CONCURRENCY=3
+  IDEMPOTENCY_RETENTION_HOURS=24
   DISABLE_WORKERS=1
+)
+# Conditionally include each soft-required secret only if it has a value.
+add_if_set() {
+  local key="$1" val="${!2:-}"
+  if [ -n "$val" ]; then SECRETS+=("$key=$val"); fi
+}
+add_if_set META_VERIFY_TOKEN META_VERIFY_TOKEN
+add_if_set META_APP_ID META_APP_ID
+add_if_set META_APP_SECRET META_APP_SECRET
+[ -n "${META_APP_ID:-}" ] && SECRETS+=("META_REDIRECT_URI=$PUBLIC_API_URL/api/auth/instagram/callback")
+add_if_set GOOGLE_CLIENT_ID GOOGLE_CLIENT_ID
+add_if_set GOOGLE_CLIENT_SECRET GOOGLE_CLIENT_SECRET
+[ -n "${GOOGLE_CLIENT_ID:-}" ] && SECRETS+=("GOOGLE_REDIRECT_URI=$PUBLIC_API_URL/api/auth/google/callback")
+add_if_set GOOGLE_TOKEN_SECRET GOOGLE_TOKEN_SECRET
+add_if_set RAZORPAY_KEY_ID RAZORPAY_KEY_ID
+add_if_set RAZORPAY_KEY_SECRET RAZORPAY_KEY_SECRET
+add_if_set RAZORPAY_WEBHOOK_SECRET RAZORPAY_WEBHOOK_SECRET
+add_if_set RESEND_API_KEY RESEND_API_KEY
+add_if_set RESEND_FROM_EMAIL RESEND_FROM_EMAIL
+
+flyctl secrets set --app "$FLY_APP_NAME" --stage "${SECRETS[@]}"
 
 # Per-process override: worker process should NOT have DISABLE_WORKERS=1
 # (it's the queue consumer). Fly secrets are app-wide so we use a process-

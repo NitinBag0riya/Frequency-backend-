@@ -41,7 +41,10 @@ kill_timeout = "30s"
 # Without this split, both instances would try to consume the same jobs.
 [processes]
   web = "npm start"
-  worker = "npm run start:worker"
+  # Worker uses an inline shell to override DISABLE_WORKERS for this process
+  # only. The app-wide secret sets it to 1 (so the web process doesn't spin up
+  # queue consumers); the worker resets it to 0 so it actually runs jobs.
+  worker = "sh -c 'DISABLE_WORKERS=0 npm run start:worker'"
 
 # ─── HTTP service (web process only) ──────────────────────────────────────
 [http_service]
@@ -91,6 +94,6 @@ kill_timeout = "30s"
   # release_command = "npm run migrate"
 
 # ─── Restart policy ───────────────────────────────────────────────────────
-[restart]
+[[restart]]
   policy = "always"
   retries = 3
