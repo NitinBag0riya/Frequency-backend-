@@ -1,0 +1,66 @@
+name: Deploy to Fly.io
+
+# Triggers:
+#   - push to `stage`  → deploys to frequency-api-prod (until we split a
+#                        dedicated stage app; same Fly app is fine while
+#                        traffic is dev/early-customer only)
+#   - push to `main`   → deploys to frequency-api-prod (production)
+#   - workflow_dispatch → manual run from the GitHub Actions UI
+#
+# Required GitHub repo secret (set once via `gh secret set FLY_API_TOKEN`):
+#   FLY_API_TOKEN — generate with `flyctl auth token`
+#
+# Concurrency: cancels any in-flight deploy of the same branch when a
+# newer commit lands, so rapid pushes only deploy the latest tip.
+
+on:
+  push:
+    branches: [main, stage]
+  workflow_dispatch:
+
+concurrency:
+  group: fly-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP_NAME: frequency-api-prod
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Verify auth
+        run: flyctl auth whoami
+
+      - name: Deploy
+        # --remote-only: build the Docker image on Fly's builder so the
+        # GitHub runner doesn't need Docker. Saves ~2 min per run.
+        # --strategy=rolling: replace machines one at a time so we always
+        # serve traffic from at least one healthy instance.
+        run: flyctl deploy --app "$FLY_APP_NAME" --remote-only --strategy=rolling
+
+      - name: Health check after deploy
+        run: |
+          sleep 5
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://${FLY_APP_NAME}.fly.dev/health || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✓ Health check passed (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS — retrying in 5s"
+            sleep 5
+          done
+          echo "✗ Health check failed after 5 attempts"
+          exit 1

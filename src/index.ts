@@ -18,6 +18,7 @@ import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
 import { createConnectorsRouter }  from './routes/connectors'
 import { createBillingRouter }     from './routes/billing'
+import { createWaitlistRouter }    from './routes/waitlist'
 import { createWaFeaturesRouter }  from './routes/wa-features'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
@@ -2932,6 +2933,10 @@ app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPe
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
 app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Public waitlist (apex landing page signups, no auth) ────────────────────
+// Mounted at /api/waitlist. Per-IP rate limit lives inside the router.
+app.use('/api/waitlist', createWaitlistRouter({ supabase }))
 
 // ── Billing (Razorpay subscriptions + webhook) ───────────────────────────────
 // NOTE: the webhook route inside this router uses express.raw() to bypass the
