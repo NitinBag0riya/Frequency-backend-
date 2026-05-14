@@ -4,5 +4,9 @@ dist/
 *.log
 *.map
 .env*
+# Whitelist example/template files — these are committed and act as the
+# source of truth for environment-variable contracts.
+!.env.example
+!.env.*.example
 scratch/
 scripts/*.xlsx
