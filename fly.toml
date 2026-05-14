@@ -1,0 +1,96 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Frequency API — Fly.io configuration.
+#
+# Deploys the Express API + BullMQ worker as TWO processes inside ONE Fly
+# app. Sharing the same Docker image keeps deploys atomic (web + worker
+# always ship the same code) and the build cache hot.
+#
+# Region: bom (Mumbai) — closest Fly region to Indian SMB users; saves
+# 60-90ms RTT vs Singapore for every WhatsApp / Razorpay / Supabase call.
+#
+# Auto-scaling: web scales 0→3 based on concurrent connections; worker
+# stays at 1 instance (BullMQ queues only need a single consumer per
+# queue type — we run all queues in the one worker process). Bump worker
+# to `count = 2` when broadcast volume sustains > 100/min.
+#
+# Secrets: never commit env values here. Use `fly secrets set KEY=VALUE`
+# (or paste from .env.staging.example into Fly dashboard). Boot-checked
+# secrets enumerated in src/index.ts — see SECRETS.md or the
+# .env.example for the full list.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Replace with your chosen app name (must be globally unique on Fly).
+# Suggested naming: <project>-api-<env>. Pick this once; renaming requires
+# `fly apps move`.
+app = "frequency-api-prod"
+primary_region = "bom"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+# ─── Build ────────────────────────────────────────────────────────────────
+[build]
+  dockerfile = "Dockerfile"
+
+# ─── Process model ────────────────────────────────────────────────────────
+# Two processes from the SAME image:
+#   web    → Express HTTP server (handles /api/*, /webhook/*, /health)
+#   worker → BullMQ job runner (workflow execution, broadcasts, polling)
+#
+# DISABLE_WORKERS=1 on web prevents it from also subscribing to queues;
+# DISABLE_WORKERS=0 on worker (the default) makes it the queue consumer.
+# Without this split, both instances would try to consume the same jobs.
+[processes]
+  web = "npm start"
+  worker = "npm run start:worker"
+
+# ─── HTTP service (web process only) ──────────────────────────────────────
+[http_service]
+  internal_port = 3001
+  force_https = true
+  # Web auto-stops when no traffic for ~5 min; first request after a stop
+  # adds ~1s cold-start. Set false if you want always-warm.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  max_machines_running = 3
+  processes = ["web"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/health"
+    # Check protocol: HTTP inside the VM (Fly terminates HTTPS at the proxy).
+    protocol = "http"
+
+# ─── Worker process (no public port) ──────────────────────────────────────
+# Worker doesn't expose HTTP — it just polls Redis (BullMQ). Keep one
+# instance running 24/7; auto-stop is OFF so queue lag doesn't accumulate.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["web"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["worker"]
+
+# ─── Deployment ───────────────────────────────────────────────────────────
+[deploy]
+  # Rolling strategy: replace one machine at a time so there's always a
+  # warm instance serving traffic. For ≤3 web machines this is safe.
+  strategy = "rolling"
+  # Run DB migrations BEFORE swapping traffic. Override with
+  # `fly deploy --release-command-timeout 300` if migrations are slow.
+  # Note: requires SUPABASE_DB_URL secret set. Keep commented until
+  # migrations are idempotent enough to auto-apply (currently 053 needs
+  # CONCURRENTLY which can't run inside a transaction, so manual apply
+  # is required for THAT migration).
+  # release_command = "npm run migrate"
+
+# ─── Restart policy ───────────────────────────────────────────────────────
+[restart]
+  policy = "always"
+  retries = 3

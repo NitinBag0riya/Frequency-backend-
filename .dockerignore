@@ -1,0 +1,38 @@
+# Match .gitignore semantics — but Docker builds also need to skip the
+# build output (we rebuild inside the image) and any local secrets.
+node_modules
+dist
+.git
+.github
+
+# Local env files — secrets MUST come via `fly secrets set`, not COPY.
+.env
+.env.local
+.env.*.local
+.env.development
+.env.staging
+
+# Local logs
+*.log
+debug.log
+npm-debug.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.vscode
+.idea
+*.swp
+
+# Local scripts that shouldn't run in prod containers
+scripts/flush-and-seed.mjs
+
+# Supabase migrations are applied via Supabase CLI from the laptop, not
+# from inside the container. Excluding shrinks the image by a few KB.
+supabase/migrations
+
+# Docs
+README.md
+docs/
