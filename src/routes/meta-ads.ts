@@ -13,7 +13,8 @@
 
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
-import { encrypt, decrypt, randomToken } from '../crypto'
+import { encrypt, decrypt } from '../crypto'
+import { signOauthState, verifyOauthState } from '../lib/oauth-state'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -43,7 +44,8 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
     const appId    = process.env.META_APP_ID
     if (!appId) { res.status(503).type('html').send(closePopupHtml('Meta App ID not configured')); return }
     const redirectUri = (process.env.META_REDIRECT_URI ?? `${process.env.PUBLIC_API_URL ?? 'http://localhost:3001'}/api/auth/meta_ads/callback`)
-    const state = Buffer.from(JSON.stringify({ userId, tenantId, csrf: randomToken(8) })).toString('base64url')
+    // B4: signed state with 10-min TTL + nonce.
+    const state = signOauthState({ userId, tenantId })
     const params = new URLSearchParams({
       client_id: appId, redirect_uri: redirectUri, response_type: 'code',
       scope: SCOPES, state,
@@ -54,9 +56,10 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
   r.get('/api/auth/meta_ads/callback', async (req, res) => {
     const { code, state, error } = req.query as Record<string, string>
     if (error || !code) { res.type('html').send(closePopupHtml(`Authorization cancelled${error ? `: ${error}` : ''}`)); return }
-    let parsed: { userId: string; tenantId: string }
-    try { parsed = JSON.parse(Buffer.from(state, 'base64url').toString()) }
-    catch { res.status(400).type('html').send(closePopupHtml('Invalid state')); return }
+    // B4: verify HMAC + expiry on state. Single error path on failure.
+    const verified = verifyOauthState(state)
+    if (!verified) { res.status(400).type('html').send(closePopupHtml('Invalid or expired state')); return }
+    const parsed = { userId: verified.u, tenantId: verified.t ?? '' }
 
     const appId = process.env.META_APP_ID!
     const appSecret = process.env.META_APP_SECRET!
@@ -481,11 +484,14 @@ async function getMetaAdsConnection(supabase: SupabaseClient, tenantId: string) 
 }
 
 function closePopupHtml(message: string, ok = false): string {
+  // B10: pin postMessage targetOrigin so cross-origin openers can't sniff
+  // the connect result (which leaks the active ad-account name).
+  const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:5173'
   return `<!doctype html><html><head><meta charset="utf-8"><title>${ok ? 'Connected' : 'Error'}</title></head><body style="font-family:DM Sans,system-ui;background:#0d1117;color:#fff;padding:24px;text-align:center;">
     <h2>${ok ? '✓ Connected' : '⚠ '}${message}</h2>
     <p style="opacity:.6">This window will close…</p>
     <script>
-      try { window.opener?.postMessage({ ok: ${ok}, message: ${JSON.stringify(message)} }, '*') } catch(e){}
+      try { window.opener?.postMessage({ ok: ${ok}, message: ${JSON.stringify(message)} }, ${JSON.stringify(FRONTEND_ORIGIN)}) } catch(e){}
       setTimeout(() => { try { window.close(); } catch(e){} }, 1500);
     </script></body></html>`
 }

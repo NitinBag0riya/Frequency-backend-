@@ -50,6 +50,7 @@
 import express from 'express'
 import jwt, { randomUUID } from 'crypto'   // Node built-in crypto for JWT signing + handoff IDs
 import { SupabaseClient } from '@supabase/supabase-js'
+import { sanitizeSearch } from '../lib/safe-key'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -138,7 +139,11 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
         .range(offset, offset + ps - 1)
 
       if (status && status !== 'all') query = query.eq('status', status)
-      if (search) query = query.or(`business_name.ilike.%${search}%,display_phone.ilike.%${search}%,waba_id.ilike.%${search}%`)
+      // F6: sanitize search before .or() interpolation. See lib/safe-key.ts
+      // for why — without this a hostile platform-user query string could
+      // append PostgREST predicates and skew the tenants list.
+      const safeSearch = sanitizeSearch(search)
+      if (safeSearch) query = query.or(`business_name.ilike.%${safeSearch}%,display_phone.ilike.%${safeSearch}%,waba_id.ilike.%${safeSearch}%`)
 
       const { data, error, count } = await query
       if (error) { res.status(500).json({ error: error.message }); return }

@@ -316,6 +316,8 @@ export async function getValidToken(supabase: SupabaseClient, tenantId: string):
 // HTML helpers — popup close + env-missing screen
 // ─────────────────────────────────────────────────────────────────────────────
 function closePopupHtml(payload: { ok: boolean; connector?: string; label?: string; error?: string }) {
+  // B10: pin postMessage targetOrigin to FRONTEND_URL.
+  const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:5173'
   return `<!doctype html><html><head><meta charset="utf-8"><title>${payload.ok ? 'Connected' : 'Connection failed'}</title>
 <style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:32px;max-width:420px;margin:48px auto;text-align:center;color:#1a1a1a}h2{font-size:18px;margin:8px 0}.icon{font-size:42px;margin-bottom:8px}.muted{color:#6b7280;font-size:13px;margin-top:16px}</style>
 </head><body>
@@ -324,7 +326,7 @@ function closePopupHtml(payload: { ok: boolean; connector?: string; label?: stri
 <p>${payload.ok ? (payload.label ?? '') : escapeHtml(payload.error ?? 'Unknown error')}</p>
 <p class="muted">${payload.ok ? 'You can close this window.' : 'You can close this window and try again.'}</p>
 <script>
-  try { window.opener?.postMessage(${JSON.stringify(payload)}, '*'); } catch(e){}
+  try { window.opener?.postMessage(${JSON.stringify(payload)}, ${JSON.stringify(FRONTEND_ORIGIN)}); } catch(e){}
   setTimeout(() => { try { window.close(); } catch(e){} }, 1200);
 </script>
 </body></html>`

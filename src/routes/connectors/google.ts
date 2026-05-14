@@ -25,6 +25,7 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { encrypt } from '../../crypto'
+import { signOauthState, verifyOauthState } from '../../lib/oauth-state'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -73,8 +74,10 @@ export function createGoogleConnector(deps: Deps): express.Router {
         const tenantId = (req as any).tenantId  as string
         const redirectUri = REDIRECT_URI()
 
-        // Encode userId + tenantId + initiating key into state param
-        const statePayload = Buffer.from(JSON.stringify({ userId, tenantId, connectorKey: key })).toString('base64')
+        // B4: HMAC-signed state with 10-min TTL + nonce. The connectorKey is
+        // bound into the signed payload so an attacker can't downgrade a
+        // 'google_drive' grant into a 'google_gmail' write target.
+        const statePayload = signOauthState({ userId, tenantId, connectorKey: key })
 
         const params = new URLSearchParams({
           client_id:     clientId,
@@ -134,7 +137,17 @@ async function handleGoogleCallback(
   }
 
   try {
-    const { userId, tenantId, connectorKey } = JSON.parse(Buffer.from(state, 'base64').toString())
+    // B4: verify HMAC + expiry on state. Reject unforgeable / expired
+    // payloads with a generic "Invalid or expired state" so attackers can't
+    // distinguish failure modes via timing or response body.
+    const verified = verifyOauthState(state)
+    if (!verified) {
+      res.type('html').send(closePopupHtml({ ok: false, error: 'Invalid or expired state' }))
+      return
+    }
+    const userId = verified.u
+    const tenantId = verified.t ?? null
+    const connectorKey = verified.k
 
     // Exchange code for tokens
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
@@ -202,6 +215,10 @@ async function handleGoogleCallback(
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 function closePopupHtml(payload: { ok: boolean; connector?: string; label?: string; error?: string }) {
+  // B10: pin postMessage targetOrigin (was '*'). The OAuth result carries
+  // the connected Google email — leaking that to a cross-origin opener is
+  // a low-risk but easily preventable disclosure.
+  const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:5173'
   return `<!doctype html><html><head><meta charset="utf-8"><title>${payload.ok ? 'Connected' : 'Connection failed'}</title>
 <style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:32px;max-width:420px;margin:48px auto;text-align:center;color:#1a1a1a}h2{font-size:18px;margin:8px 0}.icon{font-size:42px;margin-bottom:8px}.muted{color:#6b7280;font-size:13px;margin-top:16px}</style>
 </head><body>
@@ -210,7 +227,7 @@ function closePopupHtml(payload: { ok: boolean; connector?: string; label?: stri
 <p>${payload.ok ? escapeHtml(payload.label ?? '') : escapeHtml(payload.error ?? 'Unknown error')}</p>
 <p class="muted">${payload.ok ? 'You can close this window.' : 'You can close this window and try again.'}</p>
 <script>
-  try { window.opener?.postMessage(${JSON.stringify(payload)}, '*'); } catch(e){}
+  try { window.opener?.postMessage(${JSON.stringify(payload)}, ${JSON.stringify(FRONTEND_ORIGIN)}); } catch(e){}
   setTimeout(() => { try { window.close(); } catch(e){} }, 1200);
 </script>
 </body></html>`

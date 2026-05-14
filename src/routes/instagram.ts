@@ -14,8 +14,10 @@
  */
 
 import express from 'express'
+import { createHmac, timingSafeEqual } from 'crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
-import { encrypt, decrypt, randomToken } from '../crypto'
+import { encrypt, decrypt } from '../crypto'
+import { signOauthState, verifyOauthState } from '../lib/oauth-state'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -53,7 +55,11 @@ export function createInstagramRouter(deps: Deps): express.Router {
       return
     }
     const redirectUri = (process.env.META_REDIRECT_URI ?? `${process.env.PUBLIC_API_URL ?? 'http://localhost:3001'}/api/auth/instagram/callback`)
-    const state = Buffer.from(JSON.stringify({ userId, tenantId, csrf: randomToken(8) })).toString('base64url')
+    // B4: HMAC-signed state with 10-min TTL + nonce. The unsigned base64
+    // JSON used previously could be forged by any attacker who guessed the
+    // shape (trivial — { userId, tenantId, csrf }), letting them steal the
+    // resulting Instagram tokens onto another tenant.
+    const state = signOauthState({ userId, tenantId })
     const params = new URLSearchParams({
       client_id: appId,
       redirect_uri: redirectUri,
@@ -70,12 +76,13 @@ export function createInstagramRouter(deps: Deps): express.Router {
       res.type('html').send(closePopupHtml(`Instagram authorization cancelled${error ? `: ${error}` : ''}`))
       return
     }
-    let parsed: { userId: string; tenantId: string }
-    try {
-      parsed = JSON.parse(Buffer.from(state, 'base64url').toString())
-    } catch {
-      res.status(400).type('html').send(closePopupHtml('Invalid state')); return
+    // B4: verify HMAC + expiry on the state blob. Treats forged / expired
+    // states identically (single error path, no oracle).
+    const verified = verifyOauthState(state)
+    if (!verified) {
+      res.status(400).type('html').send(closePopupHtml('Invalid or expired state')); return
     }
+    const parsed = { userId: verified.u, tenantId: verified.t ?? '' }
 
     const appId = process.env.META_APP_ID!
     const appSecret = process.env.META_APP_SECRET!
@@ -314,10 +321,37 @@ export function createInstagramRouter(deps: Deps): express.Router {
   // contain `messaging[]` (DMs) and/or `changes[]` (comments / mentions).
   // Always 200 quickly — never let Meta retry on our processing errors,
   // it just doubles the load.
+  //
+  // B2: HMAC verification. The raw-body parser is mounted in src/index.ts
+  // BEFORE the global express.json(), so req.body is a Buffer here. Reject
+  // unsigned / mis-signed payloads with 401 before doing any DB work.
   r.post('/webhook/instagram', async (req, res) => {
+    const sigHeader = req.header('x-hub-signature-256') || req.header('X-Hub-Signature-256')
+    const rawBody = req.body as Buffer
+    const appSecret = process.env.META_APP_SECRET || ''
+    if (!Buffer.isBuffer(rawBody)) {
+      console.warn('[ig-webhook] body is not a Buffer — raw parser not mounted? Refusing.')
+      res.status(401).json({ error: 'invalid_signature' }); return
+    }
+    const verifyMetaSignature = (body: Buffer, header: string | undefined, secret: string): boolean => {
+      if (!header || !secret) return false
+      const prefix = 'sha256='
+      if (!header.startsWith(prefix)) return false
+      const provided = header.slice(prefix.length)
+      const expected = createHmac('sha256', secret).update(body).digest('hex')
+      if (provided.length !== expected.length) return false
+      try { return timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(expected, 'utf8')) }
+      catch { return false }
+    }
+    if (!verifyMetaSignature(rawBody, sigHeader, appSecret)) {
+      console.warn('[ig-webhook] HMAC verification failed — rejecting')
+      res.status(401).json({ error: 'invalid_signature' }); return
+    }
     res.sendStatus(200)
     try {
-      const body: any = req.body
+      let body: any
+      try { body = JSON.parse(rawBody.toString('utf8')) }
+      catch { console.warn('[ig-webhook] JSON parse failed (body verified but malformed)'); return }
       const entries: any[] = Array.isArray(body?.entry) ? body.entry : []
       for (const entry of entries) {
         // Resolve tenant by page_id stored in tenant_integrations metadata.
@@ -393,11 +427,14 @@ async function getIgConnection(supabase: SupabaseClient, tenantId: string) {
 }
 
 function closePopupHtml(message: string, ok = false): string {
+  // B10: pin targetOrigin to FRONTEND_URL so cross-origin openers can't
+  // intercept the connect-result message (which carries IG account names).
+  const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:5173'
   return `<!doctype html><html><head><meta charset="utf-8"><title>${ok ? 'Connected' : 'Error'}</title></head><body style="font-family:DM Sans,system-ui;background:#0d1117;color:#fff;padding:24px;text-align:center;">
     <h2>${ok ? '✓ Connected' : '⚠ '}${message}</h2>
     <p style="opacity:.6">This window will close…</p>
     <script>
-      try { window.opener?.postMessage({ ok: ${ok}, message: ${JSON.stringify(message)} }, '*') } catch(e){}
+      try { window.opener?.postMessage({ ok: ${ok}, message: ${JSON.stringify(message)} }, ${JSON.stringify(FRONTEND_ORIGIN)}) } catch(e){}
       setTimeout(() => { try { window.close(); } catch(e){} }, 1500);
     </script></body></html>`
 }

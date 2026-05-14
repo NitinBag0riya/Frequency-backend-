@@ -17,6 +17,7 @@
  */
 
 import express from 'express'
+import crypto from 'crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { encrypt, decrypt } from '../crypto'
 
@@ -123,8 +124,32 @@ export function createTelegramRouter(deps: Deps): express.Router {
     if (!baseUrl) { res.status(400).json({ error: 'public_url required (or set PUBLIC_API_URL env)' }); return }
     const webhook = `${baseUrl}/webhook/telegram?tenant_id=${tenantId}`
     try {
-      await tgCall(bot.token, 'setWebhook', { url: webhook, allowed_updates: ['message', 'callback_query', 'pre_checkout_query'] })
-      await supabase.from('tg_bots').update({ webhook_url: webhook }).eq('tenant_id', tenantId)
+      // B3: per-tenant Telegram webhook secret_token. Telegram sends the
+      // configured value back as `x-telegram-bot-api-secret-token` on every
+      // webhook delivery; the inbound handler refuses anything that doesn't
+      // match. Without this, anyone who learns the public webhook URL +
+      // tenant_id can forge inbound updates.
+      const secretToken = crypto.randomBytes(32).toString('hex')
+      await tgCall(bot.token, 'setWebhook', {
+        url: webhook,
+        allowed_updates: ['message', 'callback_query', 'pre_checkout_query'],
+        secret_token: secretToken,
+      })
+      // Persist the secret on the bot row. The column SHOULD be `webhook_secret`
+      // on the tg_bots table; if the migration hasn't landed yet, the update
+      // becomes a no-op and the inbound handler falls through to legacy
+      // (unverified) behaviour. TODO(secret-token-column): once the DB agent
+      // adds the column we can drop the try/catch below.
+      try {
+        await supabase.from('tg_bots').update({
+          webhook_url: webhook,
+          webhook_secret: secretToken,
+        }).eq('tenant_id', tenantId)
+      } catch {
+        // Likely "column does not exist" until the migration lands. Persist
+        // the URL alone so the existing functionality still works.
+        await supabase.from('tg_bots').update({ webhook_url: webhook }).eq('tenant_id', tenantId)
+      }
       res.json({ success: true, webhook })
     } catch (err: any) {
       res.status(500).json({ error: err.message })
@@ -300,6 +325,32 @@ export function createTelegramRouter(deps: Deps): express.Router {
   r.post('/webhook/telegram', async (req, res) => {
     const tenantId = String(req.query.tenant_id ?? '')
     if (!tenantId) { res.sendStatus(400); return }
+    // B3: verify x-telegram-bot-api-secret-token. Look up the per-tenant
+    // secret persisted at setWebhook time; if it's set, require an exact
+    // (timing-safe) match. If it's NOT set (column missing or older bot row
+    // that pre-dates the secret rollout), fall through to the legacy
+    // unverified path so we don't break in-flight tenants — but log loudly.
+    try {
+      const { data: botRow } = await supabase.from('tg_bots')
+        .select('webhook_secret').eq('tenant_id', tenantId).maybeSingle()
+      const expected = (botRow as any)?.webhook_secret as string | undefined
+      if (expected && expected.length > 0) {
+        const provided = req.header('x-telegram-bot-api-secret-token') || ''
+        const a = Buffer.from(provided, 'utf8')
+        const b = Buffer.from(expected, 'utf8')
+        const ok = a.length === b.length && crypto.timingSafeEqual(a, b)
+        if (!ok) {
+          console.warn(`[telegram-webhook] secret token mismatch tenant=${tenantId}`)
+          res.status(401).json({ error: 'invalid_secret' }); return
+        }
+      } else {
+        console.warn(`[telegram-webhook] no webhook_secret stored tenant=${tenantId} — accepting unverified (run /api/telegram/bot/webhook to enable)`)
+      }
+    } catch (e: any) {
+      // Column missing on tg_bots — accept this delivery but warn so the
+      // operator knows to apply the migration.
+      console.warn(`[telegram-webhook] could not read webhook_secret (tenant=${tenantId}): ${e?.message}`)
+    }
     try {
       const update: any = req.body
       const msg = update.message ?? update.edited_message

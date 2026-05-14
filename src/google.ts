@@ -4,7 +4,11 @@
  */
 
 import { createClient } from '@supabase/supabase-js'
-import crypto from 'crypto'
+// B5: encrypt/decrypt now live in src/crypto.ts (AES-256-GCM with v1 prefix
+// + legacy CBC fallback). The wrappers below preserve the old (text:string)
+// signature this module exports — callers just keep importing { encrypt,
+// decrypt } from './google' and get GCM under the hood for free.
+import { encrypt as cryptoEncrypt, decrypt as cryptoDecrypt } from './crypto'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -12,37 +16,21 @@ const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KE
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID!
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!
 
-// In production, refuse to start with the dev fallback — encrypted Google
-// refresh tokens would be readable by anyone who saw the source. Roadmap §2.9.
-const FALLBACK_DEV_KEY = 'fallback-secret-for-dev-only-32chars-long'
-const ENCRYPTION_KEY = process.env.GOOGLE_TOKEN_SECRET || FALLBACK_DEV_KEY
-if (process.env.NODE_ENV === 'production' && (!process.env.GOOGLE_TOKEN_SECRET || ENCRYPTION_KEY === FALLBACK_DEV_KEY)) {
-  // Hard-crash on startup rather than silently encrypt with a known key.
-  throw new Error('GOOGLE_TOKEN_SECRET must be set in production. Generate with: openssl rand -hex 16')
-}
 if (process.env.GOOGLE_TOKEN_SECRET && process.env.GOOGLE_TOKEN_SECRET.length < 16) {
   console.warn('[google] GOOGLE_TOKEN_SECRET is shorter than 16 chars — recommended >= 32 hex')
 }
-const IV_LENGTH = 16
 
-export function encrypt(text: string) {
+export function encrypt(text: string): string {
+  // Preserve legacy "" / undefined-passthrough behaviour at this call surface.
+  // crypto.ts's encrypt returns null for empty input; old callers expect a
+  // string — fall back to the input itself so DB inserts of "" stay "".
   if (!text) return text
-  const iv = crypto.randomBytes(IV_LENGTH)
-  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY.padEnd(32).slice(0, 32)), iv)
-  let encrypted = cipher.update(text)
-  encrypted = Buffer.concat([encrypted, cipher.final()])
-  return iv.toString('hex') + ':' + encrypted.toString('hex')
+  return cryptoEncrypt(text) ?? text
 }
 
-export function decrypt(text: string) {
-  if (!text || !text.includes(':')) return text
-  const textParts = text.split(':')
-  const iv = Buffer.from(textParts.shift()!, 'hex')
-  const encryptedText = Buffer.from(textParts.join(':'), 'hex')
-  const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY.padEnd(32).slice(0, 32)), iv)
-  let decrypted = decipher.update(encryptedText)
-  decrypted = Buffer.concat([decrypted, decipher.final()])
-  return decrypted.toString()
+export function decrypt(text: string): string {
+  if (!text) return text
+  return cryptoDecrypt(text)
 }
 
 // ── Token refresh ─────────────────────────────────────────────────────────────

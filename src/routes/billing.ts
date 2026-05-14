@@ -21,6 +21,7 @@ import { z } from 'zod'
 import { validateBody } from '../validation'
 import { ensureCustomer, createSubscription, cancelSubscription, verifyWebhookSignature } from '../lib/razorpay'
 import { emitNotification } from './notifications'
+import { withIdempotency } from '../lib/idempotency'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -52,80 +53,83 @@ export function createBillingRouter(deps: Deps): express.Router {
     requireAuth, identifyTenant, checkPermission('billing', 'edit'),
     validateBody(CheckoutSchema),
     async (req, res) => {
-      const tenantId = (req as any).tenantId as string
-      const userId   = (req as any).user.id as string
-      const userEmail = (req as any).user.email as string | undefined
-      const { plan_id, billing_cycle } = req.body as z.infer<typeof CheckoutSchema>
+      // F4: idempotency wrap. Without this, a network retry on this endpoint
+      // could create a duplicate Razorpay subscription and double-charge the
+      // tenant. Replay returns the original subscription_id + short_url so
+      // the FE picks up exactly where it left off.
+      return withIdempotency(supabase, req, res, 'POST /api/billing/checkout', async () => {
+        const tenantId = (req as any).tenantId as string
+        const userId   = (req as any).user.id as string
+        const userEmail = (req as any).user.email as string | undefined
+        const { plan_id, billing_cycle } = req.body as z.infer<typeof CheckoutSchema>
 
-      // 1. Look up the Razorpay plan_id for this tier+cycle.
-      const planCol = billing_cycle === 'annual' ? 'razorpay_plan_id_yearly' : 'razorpay_plan_id_monthly'
-      const { data: plan, error: planErr } = await supabase.from('plans')
-        .select(`id, name, ${planCol}, price_inr_mo, price_inr_yr`)
-        .eq('id', plan_id).maybeSingle()
-      if (planErr || !plan) { res.status(404).json({ error: 'plan not found' }); return }
-      const razorpayPlanId = (plan as any)[planCol] as string | null
-      if (!razorpayPlanId) {
-        res.status(503).json({
-          error: `${plan.name} (${billing_cycle}) isn't configured for online checkout yet — contact support to set it up.`,
-        })
-        return
-      }
-
-      try {
-        // 2. Look up or create the Razorpay customer for this tenant.
-        const { data: existingSub } = await supabase.from('tenant_subscriptions')
-          .select('razorpay_customer_id').eq('tenant_id', tenantId).maybeSingle()
-        let customerId = existingSub?.razorpay_customer_id ?? null
-        if (!customerId) {
-          const { data: tenant } = await supabase.from('tenants')
-            .select('business_name, display_phone').eq('id', tenantId).maybeSingle()
-          const cust = await ensureCustomer({
-            email:   userEmail ?? `tenant-${tenantId}@frequency.in`,
-            name:    tenant?.business_name ?? undefined,
-            contact: tenant?.display_phone ?? undefined,
-            notes:   { tenant_id: tenantId, user_id: userId },
-          })
-          customerId = cust.id
+        // 1. Look up the Razorpay plan_id for this tier+cycle.
+        const planCol = billing_cycle === 'annual' ? 'razorpay_plan_id_yearly' : 'razorpay_plan_id_monthly'
+        const { data: plan, error: planErr } = await supabase.from('plans')
+          .select(`id, name, ${planCol}, price_inr_mo, price_inr_yr`)
+          .eq('id', plan_id).maybeSingle()
+        if (planErr || !plan) return { status: 404, body: { error: 'plan not found' } }
+        const razorpayPlanId = (plan as any)[planCol] as string | null
+        if (!razorpayPlanId) {
+          return {
+            status: 503,
+            body: { error: `${plan.name} (${billing_cycle}) isn't configured for online checkout yet — contact support to set it up.` },
+          }
         }
 
-        // 3. Create the Razorpay subscription. The FE will pass subscription_id
-        // to Razorpay Checkout.js to collect card / UPI details.
-        const sub = await createSubscription({
-          plan_id:     razorpayPlanId,
-          customer_id: customerId,
-          notes:       { tenant_id: tenantId, plan_id, billing_cycle },
-          // total_count: 120 default = "until cancelled" for monthly. For annual
-          // we use 10 to cap explicitly (Razorpay prefers a number).
-          total_count: billing_cycle === 'annual' ? 10 : 120,
-        })
+        try {
+          // 2. Look up or create the Razorpay customer for this tenant.
+          const { data: existingSub } = await supabase.from('tenant_subscriptions')
+            .select('razorpay_customer_id').eq('tenant_id', tenantId).maybeSingle()
+          let customerId = existingSub?.razorpay_customer_id ?? null
+          if (!customerId) {
+            const { data: tenant } = await supabase.from('tenants')
+              .select('business_name, display_phone').eq('id', tenantId).maybeSingle()
+            const cust = await ensureCustomer({
+              email:   userEmail ?? `tenant-${tenantId}@frequency.in`,
+              name:    tenant?.business_name ?? undefined,
+              contact: tenant?.display_phone ?? undefined,
+              notes:   { tenant_id: tenantId, user_id: userId },
+            })
+            customerId = cust.id
+          }
 
-        // 4. Persist what we know so the webhook can later flip status to active.
-        // Schema check constraint allows ('trial','active','past_due','cancelled',
-        // 'suspended') — NOT 'pending'. We use 'trial' as the holding state
-        // between checkout and subscription.activated webhook arrival; the
-        // user already had paid-tier access during their trial, so no FE
-        // experience changes. The webhook handler flips to 'active' once
-        // Razorpay confirms the first payment captured.
-        await supabase.from('tenant_subscriptions').upsert({
-          tenant_id:                tenantId,
-          plan_id,                  // our internal plan id, not Razorpay's
-          billing_cycle,
-          razorpay_customer_id:     customerId,
-          razorpay_subscription_id: sub.id,
-          status:                   'trial',
-          updated_at:               new Date().toISOString(),
-        }, { onConflict: 'tenant_id' })
+          // 3. Create the Razorpay subscription. The FE will pass subscription_id
+          // to Razorpay Checkout.js to collect card / UPI details.
+          const sub = await createSubscription({
+            plan_id:     razorpayPlanId,
+            customer_id: customerId,
+            notes:       { tenant_id: tenantId, plan_id, billing_cycle },
+            // total_count: 120 default = "until cancelled" for monthly. For annual
+            // we use 10 to cap explicitly (Razorpay prefers a number).
+            total_count: billing_cycle === 'annual' ? 10 : 120,
+          })
 
-        // 5. Return what the FE needs. key_id is the public key (NOT the secret).
-        res.json({
-          razorpay_key_id:        process.env.RAZORPAY_KEY_ID,
-          razorpay_subscription_id: sub.id,
-          short_url:              sub.short_url,  // fallback if Checkout.js fails to load
-        })
-      } catch (e: any) {
-        console.error('[billing.checkout]', e?.message ?? e)
-        res.status(500).json({ error: e?.message ?? 'Checkout failed' })
-      }
+          // 4. Persist what we know so the webhook can later flip status to active.
+          await supabase.from('tenant_subscriptions').upsert({
+            tenant_id:                tenantId,
+            plan_id,                  // our internal plan id, not Razorpay's
+            billing_cycle,
+            razorpay_customer_id:     customerId,
+            razorpay_subscription_id: sub.id,
+            status:                   'trial',
+            updated_at:               new Date().toISOString(),
+          }, { onConflict: 'tenant_id' })
+
+          // 5. Return what the FE needs. key_id is the public key (NOT the secret).
+          return {
+            status: 200,
+            body: {
+              razorpay_key_id:        process.env.RAZORPAY_KEY_ID,
+              razorpay_subscription_id: sub.id,
+              short_url:              sub.short_url,
+            },
+          }
+        } catch (e: any) {
+          console.error('[billing.checkout]', e?.message ?? e)
+          return { status: 500, body: { error: e?.message ?? 'Checkout failed' } }
+        }
+      })
     })
 
   // ── Cancel (schedules at period end by default) ───────────────────────
@@ -133,30 +137,33 @@ export function createBillingRouter(deps: Deps): express.Router {
     requireAuth, identifyTenant, checkPermission('billing', 'edit'),
     validateBody(CancelSchema),
     async (req, res) => {
-      const tenantId = (req as any).tenantId as string
-      const { at_cycle_end } = req.body as z.infer<typeof CancelSchema>
+      // F4: idempotency wrap. Cancel is naturally near-idempotent at Razorpay
+      // (cancelling an already-cancelled sub is a no-op), but a retry could
+      // race with the cancellation webhook and overwrite cancel_reason in
+      // tenant_subscriptions. Cached replay keeps the original timestamp.
+      return withIdempotency(supabase, req, res, 'POST /api/billing/cancel', async () => {
+        const tenantId = (req as any).tenantId as string
+        const { at_cycle_end } = req.body as z.infer<typeof CancelSchema>
 
-      const { data: sub } = await supabase.from('tenant_subscriptions')
-        .select('razorpay_subscription_id').eq('tenant_id', tenantId).maybeSingle()
-      if (!sub?.razorpay_subscription_id) {
-        res.status(404).json({ error: 'No active subscription to cancel' }); return
-      }
+        const { data: sub } = await supabase.from('tenant_subscriptions')
+          .select('razorpay_subscription_id').eq('tenant_id', tenantId).maybeSingle()
+        if (!sub?.razorpay_subscription_id) {
+          return { status: 404, body: { error: 'No active subscription to cancel' } }
+        }
 
-      try {
-        await cancelSubscription(sub.razorpay_subscription_id, { atCycleEnd: at_cycle_end })
-        // Don't flip status here — wait for the subscription.cancelled webhook
-        // so the source of truth stays Razorpay's lifecycle. We do mark
-        // cancelled_at so the UI can show "scheduled to cancel".
-        await supabase.from('tenant_subscriptions').update({
-          cancelled_at:  new Date().toISOString(),
-          cancel_reason: 'user_initiated',
-          updated_at:    new Date().toISOString(),
-        }).eq('tenant_id', tenantId)
-        res.json({ success: true, scheduled_at_cycle_end: at_cycle_end })
-      } catch (e: any) {
-        console.error('[billing.cancel]', e?.message ?? e)
-        res.status(500).json({ error: e?.message ?? 'Cancel failed' })
-      }
+        try {
+          await cancelSubscription(sub.razorpay_subscription_id, { atCycleEnd: at_cycle_end })
+          await supabase.from('tenant_subscriptions').update({
+            cancelled_at:  new Date().toISOString(),
+            cancel_reason: 'user_initiated',
+            updated_at:    new Date().toISOString(),
+          }).eq('tenant_id', tenantId)
+          return { status: 200, body: { success: true, scheduled_at_cycle_end: at_cycle_end } }
+        } catch (e: any) {
+          console.error('[billing.cancel]', e?.message ?? e)
+          return { status: 500, body: { error: e?.message ?? 'Cancel failed' } }
+        }
+      })
     })
 
   // ── Invoices ──────────────────────────────────────────────────────────

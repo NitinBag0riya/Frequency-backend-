@@ -3,6 +3,9 @@ import express from 'express'
 import fs from 'fs'
 import path from 'path'
 import cors from 'cors'
+import crypto from 'crypto'
+import helmet from 'helmet'
+import rateLimit from 'express-rate-limit'
 import { createClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 import {
@@ -43,6 +46,45 @@ import {
   RazorpayConnectSchema, InboxSendSchema,
   CampaignCreateSchema, CampaignPatchSchema,
 } from './validation'
+// B6: per-route filter+sort column allowlist. Replaces the prior
+// Object.entries(parsed).forEach((k,v) => q.ilike(k, ...)) which let any
+// client-controlled key flow into the PostgREST column expression.
+import { isAllowedColumn, FILTER_ALLOWLISTS, sanitizeSearch, type FilterAllowlistName } from './lib/safe-key'
+// F5: standardized error response shape — every 4xx/5xx JSON body goes
+// through this helper so the FE can branch on `error.code` reliably.
+import { apiError } from './lib/api-error'
+
+/**
+ * Apply ?filters={"<col>":"<val>"} to a PostgREST query, gated by the
+ * per-route column allowlist. Returns either the (possibly mutated) query
+ * or a sentinel `{ error: 'invalid_filter_key', key }` shape that the caller
+ * forwards as a 400 — explicit reject, not silent drop, so a misbehaving
+ * client gets a clear failure mode.
+ */
+function applyAllowedFilters<T>(q: T, parsed: any, route: FilterAllowlistName): T | { __filterError: { key: string } } {
+  if (!parsed || typeof parsed !== 'object') return q
+  for (const [key, val] of Object.entries(parsed)) {
+    if (!val) continue
+    if (!isAllowedColumn(route, key)) {
+      return { __filterError: { key } }
+    }
+    q = (q as any).ilike(key, `%${String(val)}%`)
+  }
+  return q
+}
+
+/**
+ * Validate `?sortBy=<col>` against the per-route column allowlist. Returns
+ * the validated key or `null` if the caller passed a column not in the
+ * allowlist — in which case callers should either ignore it (use default)
+ * or 400. We choose to 400 to surface integration bugs rather than silently
+ * sort by created_at when the FE asked for something else.
+ */
+function validateSortBy(route: FilterAllowlistName, raw: string | undefined, fallback = 'created_at'): { ok: true; sortBy: string } | { ok: false; key: string } {
+  if (!raw) return { ok: true, sortBy: fallback }
+  if (!isAllowedColumn(route, raw)) return { ok: false, key: raw }
+  return { ok: true, sortBy: raw }
+}
 
 // ── Boot-time security checks ────────────────────────────────────────────
 // Refuse to start in production without the impersonation HMAC secret.
@@ -55,6 +97,39 @@ if (process.env.NODE_ENV === 'production') {
     console.error('[boot] FATAL: IMPERSONATION_HMAC_SECRET missing or <32 chars in production. Refusing to start.')
     process.exit(1)
   }
+}
+
+// B4: OAuth state HMAC secret. Required to mint signed `state` blobs on the
+// Google / Instagram / Facebook OAuth handoff. Without this we'd fall back
+// to per-process random secrets that can't survive a process restart, which
+// would silently 401 every callback that landed on a different worker.
+if (process.env.NODE_ENV === 'production') {
+  const oauthSecret = process.env.OAUTH_STATE_SECRET ?? process.env.IMPERSONATION_HMAC_SECRET
+  if (!oauthSecret || oauthSecret.length < 32) {
+    console.error('[boot] FATAL: OAUTH_STATE_SECRET missing or <32 chars in production. Refusing to start.')
+    process.exit(1)
+  }
+}
+
+// B11: Webhook verify token must be set + meaningfully long. The legacy
+// fallback ('Frequency_webhook_secret') was a public string anyone reading
+// this repo could use to spoof webhook subscription handshakes — refuse to
+// boot without an explicit, sufficiently-long value.
+{
+  const t = process.env.WH_VERIFY_TOKEN ?? ''
+  if (!t || t.length < 16) {
+    console.error('[boot] FATAL: WH_VERIFY_TOKEN missing or <16 chars. Generate with: openssl rand -hex 32')
+    process.exit(1)
+  }
+}
+
+// B8: SMOKE_TEST_TOKEN bypass guardrail. The dev bypass below logs a request
+// in as the seeded demo user when the literal string SMOKE_TEST_TOKEN is
+// passed as auth. Production must NEVER allow this; explicitly refuse to
+// boot if someone enables it there by mistake.
+if (process.env.NODE_ENV === 'production' && process.env.ALLOW_SMOKE_TEST === '1') {
+  console.error('[boot] FATAL: ALLOW_SMOKE_TEST=1 is not allowed in production. Refusing to start.')
+  process.exit(1)
 }
 
 // Warn (not fatal) about missing Razorpay env vars. Without them, the
@@ -114,6 +189,24 @@ Object.freeze(Array.prototype)
 const app = express()
 const PORT = process.env.PORT || 3001
 
+// F1: helmet — sets standard hardening response headers BEFORE any route
+// can write to the response. Adds X-Content-Type-Options, X-Frame-Options,
+// Strict-Transport-Security, Referrer-Policy, X-DNS-Prefetch-Control,
+// X-Download-Options, X-Permitted-Cross-Domain-Policies, Origin-Agent-Cluster.
+//
+// Two helmet defaults disabled:
+//   - contentSecurityPolicy: false. The FE app serves CSP via Vercel/Netlify
+//     edge headers; this API never renders HTML so a server-side CSP would
+//     only break the JSON responses (helmet's default CSP blocks inline
+//     scripts which our /api/auth/google/callback uses to bounce the user).
+//   - crossOriginEmbedderPolicy: false. OAuth popups (Facebook, Google,
+//     Instagram) need to be embeddable / interact with opener.postMessage;
+//     COEP would break that on browsers that honour it strictly.
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+}))
+
 // Trust the X-Forwarded-For header from a known proxy so `req.ip` reflects
 // the actual client IP — critical for the per-IP rate limiter on
 // /api/ingest/:token (src/leads.ts) and any future per-IP throttling.
@@ -168,12 +261,114 @@ app.use('/api/billing/razorpay/webhook', express.raw({ type: 'application/json',
 const WA_CALLS_WEBHOOK_PATH = process.env.WA_CALLING_WEBHOOK_PATH || '/webhook/wa-calls'
 app.use(WA_CALLS_WEBHOOK_PATH, express.raw({ type: 'application/json', limit: '1mb' }))
 
-app.use(express.json({ limit: '50mb' }))
-app.use(express.urlencoded({ limit: '50mb', extended: true }))
+// B2: WhatsApp + Instagram inbound webhooks. Same raw-body requirement as
+// the calling + Razorpay webhooks — Meta signs the exact bytes, so any JSON
+// re-serialisation will break HMAC verification. Mount BEFORE the global
+// express.json() parser.
+app.use('/webhook/whatsapp', express.raw({ type: 'application/json', limit: '5mb' }))
+app.use('/webhook/instagram', express.raw({ type: 'application/json', limit: '5mb' }))
 
+// F2: tight global body limit. Default to 1 MB for every JSON endpoint —
+// far more than any normal API call needs, but small enough to stop a
+// malicious client from exhausting memory with a 50 MB payload. The routes
+// that legitimately ship bigger bodies (CSV import, workflow blueprint
+// save, contact bulk-insert) opt in to a higher per-route limit at their
+// `app.post(...)` mount via an additional express.json({ limit: '...' })
+// middleware — that limit overrides this default for the matched path.
+app.use(express.json({ limit: '1mb' }))
+app.use(express.urlencoded({ limit: '1mb', extended: true }))
+
+// F2: per-route body-limit overrides for legitimate large-payload endpoints.
+// Mounted as path-scoped middleware BEFORE the route handler runs — express
+// matches in order, so when the matching express.json() with the larger
+// limit fires first, the global 1 MB parser sees an already-parsed body and
+// is a no-op. Audit performed: file uploads, bulk lead inserts, workflow
+// blueprint saves (which can carry hundreds of node configs).
+app.post('/api/lead-tables/:id/import', express.json({ limit: '20mb' }))
+app.post('/api/workflows',              express.json({ limit: '5mb'  }))
+app.patch('/api/workflows/:id',         express.json({ limit: '5mb'  }))
+app.post('/api/workflows/preview',      express.json({ limit: '5mb'  }))
+app.post('/api/workflows/:id/dry-run',  express.json({ limit: '5mb'  }))
+// Skills + workflow-recos accept similar blueprint shapes.
+app.post('/api/skills/:id/apply',       express.json({ limit: '5mb'  }))
+app.post('/api/workflow-recos/:id/apply', express.json({ limit: '5mb' }))
+
+// B7: Per-request ID. Set as early as possible so every downstream log,
+// error response, and audit entry can reference the same opaque ID. Echoed
+// back in the response header so clients can correlate (curl + grep server
+// logs to find the matching trace).
+app.use((req, res, next) => {
+  const incoming = req.headers['x-request-id']
+  const id = (typeof incoming === 'string' && incoming.length > 0 && incoming.length < 200)
+    ? incoming
+    : crypto.randomUUID()
+  ;(req as any).id = id
+  res.setHeader('x-request-id', id)
+  next()
+})
+
+// F9: log line redaction. Even though logToFile() today only writes
+// `${method} ${path}`, future contributors will inevitably reach for it to
+// log a header / cookie / token value. Centralise the redaction here so
+// any string that lands in the log file gets sensitive-token patterns
+// rewritten BEFORE being persisted. Cheap belt-and-braces; no perf impact
+// on the path-only happy path (no matches → no replacement).
+const HEADER_REDACT_PATTERNS: Array<[RegExp, string]> = [
+  // Bearer / Basic / arbitrary scheme followed by an opaque token.
+  [/Authorization:\s*\S+/gi,                       'Authorization: [REDACTED]'],
+  [/X-Impersonate-Token:\s*\S+/gi,                 'X-Impersonate-Token: [REDACTED]'],
+  [/Cookie:\s*[^\r\n]+/gi,                         'Cookie: [REDACTED]'],
+  [/Set-Cookie:\s*[^\r\n]+/gi,                     'Set-Cookie: [REDACTED]'],
+  [/X-Telegram-Bot-Api-Secret-Token:\s*\S+/gi,     'X-Telegram-Bot-Api-Secret-Token: [REDACTED]'],
+  [/x-hub-signature(?:-256)?:\s*\S+/gi,            'X-Hub-Signature: [REDACTED]'],
+]
+function redactLogLine(s: string): string {
+  let out = s
+  for (const [re, repl] of HEADER_REDACT_PATTERNS) out = out.replace(re, repl)
+  return out
+}
 function logToFile(msg: string) {
-  const line = `[${new Date().toISOString()}] ${msg}\n`
+  const line = `[${new Date().toISOString()}] ${redactLogLine(msg)}\n`
   try { fs.appendFileSync('debug.log', line) } catch(e) {}
+}
+
+// B12 + F9: log redaction. We deliberately log only `req.path` (not `req.url`)
+// so query strings — which often carry tokens / verification codes / OAuth
+// state — never reach the log file. Sensitive paths (webhooks + OAuth
+// callbacks) skip body+query logging entirely; the redactObject helper
+// rewrites well-known secret keys to '[REDACTED]' before any structured
+// logger touches the payload.
+const SENSITIVE_LOG_PATHS = new Set([
+  '/webhook/whatsapp',
+  '/webhook/instagram',
+  '/webhook/telegram',
+  '/api/billing/razorpay/webhook',
+  // F9: OAuth callbacks carry `?code=...&state=...` — short-lived but
+  // sensitive enough that a leaked log line within their TTL is exploitable.
+  '/api/auth/google/callback',
+  '/api/auth/instagram/callback',
+  '/api/auth/facebook/callback',
+  '/api/auth/airtable/callback',
+  '/api/auth/shopify/callback',
+  '/api/auth/razorpay/callback',
+])
+const SECRET_KEY_NAMES = new Set([
+  'token', 'secret', 'password', 'code', 'access_token', 'refresh_token',
+  'client_secret', 'authorization', 'cookie', 'set-cookie', 'api_key', 'apikey',
+  // F9 additions
+  'x-impersonate-token', 'impersonate_token', 'webhook_secret',
+  'x-telegram-bot-api-secret-token', 'x-hub-signature', 'x-hub-signature-256',
+])
+function redactObject(input: unknown, depth = 0): unknown {
+  if (depth > 4 || input == null) return input
+  if (Array.isArray(input)) return input.map((v) => redactObject(v, depth + 1))
+  if (typeof input !== 'object') return input
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    if (SECRET_KEY_NAMES.has(k.toLowerCase())) out[k] = '[REDACTED]'
+    else out[k] = redactObject(v, depth + 1)
+  }
+  return out
 }
 
 /** Parse page / pageSize from query params, return offset + limit for Supabase .range() */
@@ -185,10 +380,102 @@ function parsePagination(query: Record<string, string>) {
 }
 
 app.use((req, res, next) => {
-  logToFile(`${req.method} ${req.url}`)
-  console.log(`[request] ${req.method} ${req.url}`)
+  // B12 + F9: log path only — req.url includes the query string which
+  // routinely carries OAuth `code`, `state`, verify tokens, etc. For
+  // SENSITIVE_LOG_PATHS we don't even log the path's exact form (the
+  // tenant_id sub-path can be telemetry-flavoured PII); collapse to the
+  // base path so request rate is still observable but per-tenant linkability
+  // requires DB joins, not log scraping.
+  const isSensitive = SENSITIVE_LOG_PATHS.has(req.path) ||
+    Array.from(SENSITIVE_LOG_PATHS).some(p => req.path.startsWith(p + '/'))
+  if (isSensitive) {
+    // Find the base path that matched and log only that.
+    const matched = Array.from(SENSITIVE_LOG_PATHS).find(p => req.path === p || req.path.startsWith(p + '/')) ?? req.path
+    logToFile(`${req.method} ${matched} [body+query suppressed]`)
+    console.log(`[request] ${req.method} ${matched} [body+query suppressed]`)
+  } else {
+    logToFile(`${req.method} ${req.path}`)
+    console.log(`[request] ${req.method} ${req.path}`)
+  }
   next()
 })
+
+// ── F3: Rate limiting ─────────────────────────────────────────────────────
+// Layered limits — looser baseline on every `/api/*` request, with tighter
+// limits on the endpoints that burn third-party credit (AI prompts → Anthropic,
+// WhatsApp send → Meta credit) or that are obvious brute-force targets (auth).
+//
+// keyGenerator combines `req.ip` AND `req.user?.id` so a single bad actor
+// can't burn through the quota by rotating tenants or IPs. Auth lands on the
+// route handler — for unauthed paths req.user is undefined and we fall back
+// to IP-only. We deliberately do NOT use `req.tenantId` because identifyTenant
+// hasn't run by the time the rate-limit middleware fires.
+//
+// All limiter responses use the standardized error shape via `handler:`.
+//
+// Platform users (super-admin / impersonation flows) are skipped — internal
+// dashboard browsing can spike well above the baseline and we don't want a
+// support engineer locked out mid-investigation. Detection is best-effort:
+// the X-Impersonate-Token header is the only signal available pre-auth.
+
+function isPlatformRequest(req: express.Request): boolean {
+  // Best-effort detection — the platform header is set by the Platform Console
+  // FE only. Forging it just shifts the user past the limit; they still need
+  // a valid bearer token to hit any authenticated endpoint downstream.
+  return !!req.headers['x-impersonate-token'] || !!req.headers['x-platform-console']
+}
+
+function makeLimiter(opts: { windowMs: number; max: number; perUser?: boolean }) {
+  return rateLimit({
+    windowMs: opts.windowMs,
+    max: opts.max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: isPlatformRequest,
+    keyGenerator: (req) => {
+      const ip = req.ip ?? 'unknown'
+      if (!opts.perUser) return ip
+      const userId = (req as any).user?.id ?? 'anon'
+      return `${ip}:${userId}`
+    },
+    handler: (req, res) => {
+      return apiError(
+        res,
+        429,
+        'rate_limited',
+        'Too many requests — slow down and try again in a moment.',
+        { retry_after_seconds: Math.ceil(opts.windowMs / 1000) },
+      )
+    },
+  })
+}
+
+// Global per-IP+user baseline: 600/min — generous enough for a power user
+// flipping between tabs, low enough to stop a single buggy client from
+// saturating the API.
+const globalLimiter = makeLimiter({ windowMs: 60_000, max: 600, perUser: true })
+app.use('/api/', globalLimiter)
+
+// AI endpoints — Anthropic burn risk. 10/min is plenty for human use of the
+// workflow-from-prompt flow; abusive clients hit the wall fast.
+const aiLimiter = makeLimiter({ windowMs: 60_000, max: 10, perUser: true })
+app.use('/api/parse-workflow', aiLimiter)
+app.use('/api/workflow-recos', aiLimiter)
+app.use('/api/skills/match',   aiLimiter)
+
+// WhatsApp / Telegram / Instagram send — every call costs Meta credit.
+// 30/min covers manual inbox replies + a moderate broadcast trigger rate.
+const sendLimiter = makeLimiter({ windowMs: 60_000, max: 30, perUser: true })
+app.use('/api/inbox/send',           sendLimiter)
+app.use('/api/broadcasts',           sendLimiter)  // covers /:id/send
+app.use('/api/wa-calling/dispatch',  sendLimiter)
+
+// Auth / onboarding — brute-force surface. IP-only keying so a single bad
+// actor cycling user IDs can't bypass it. 10/min is tight but legitimate
+// flows make at most 2–3 calls per minute.
+const authLimiter = makeLimiter({ windowMs: 60_000, max: 10, perUser: false })
+app.use('/api/auth/',     authLimiter)
+app.use('/api/onboarding', authLimiter)
 
 app.get('/api/ping', (req, res) => res.json({ pong: true }))
 
@@ -221,22 +508,32 @@ const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KE
 const META_APP_ID     = process.env.META_APP_ID!
 const META_APP_SECRET = process.env.META_APP_SECRET!
 const GRAPH           = 'https://graph.facebook.com/v18.0'
-const WH_VERIFY_TOKEN = process.env.WH_VERIFY_TOKEN || 'Frequency_webhook_secret'
+// B11: no in-source default. Boot check above (line ~85) refuses to start
+// if WH_VERIFY_TOKEN is unset or <16 chars, so this read is guaranteed to
+// be a real value at this point.
+const WH_VERIFY_TOKEN = process.env.WH_VERIFY_TOKEN!
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
   const token = req.headers.authorization?.replace('Bearer ', '') || (req.query.token as string)
-  if (!token) { res.status(401).json({ error: 'Unauthorized' }); return }
+  if (!token) { apiError(res, 401, 'unauthorized', 'Missing authentication token.'); return }
 
-  // Smoke test bypass for local testing
-  if (token === 'SMOKE_TEST_TOKEN' && process.env.NODE_ENV !== 'production') {
+  // B8: Smoke test bypass — strictly gated. Two conditions BOTH required:
+  //   1. NODE_ENV === 'development' (NOT just !=production — staging/test
+  //      builds shouldn't accept it either)
+  //   2. ALLOW_SMOKE_TEST === '1' (explicit opt-in env var)
+  // The boot guard above ALSO refuses to start if ALLOW_SMOKE_TEST=1 lands
+  // in production by accident (defense in depth).
+  if (token === 'SMOKE_TEST_TOKEN'
+      && process.env.NODE_ENV === 'development'
+      && process.env.ALLOW_SMOKE_TEST === '1') {
     ;(req as any).user = { id: 'bfc37cf8-ad1a-4419-a65b-d5b6548abc41' } // demo user id from seed-demo.mjs
     next()
     return
   }
 
   const { data: { user }, error } = await supabase.auth.getUser(token)
-  if (error || !user) { res.status(401).json({ error: 'Invalid token' }); return }
+  if (error || !user) { apiError(res, 401, 'invalid_token', 'Authentication token is invalid or expired.'); return }
   ;(req as any).user = user
   next()
 }
@@ -245,7 +542,7 @@ async function requireAuth(req: express.Request, res: express.Response, next: ex
 
 async function identifyTenant(req: express.Request, res: express.Response, next: express.NextFunction) {
   const user = (req as any).user
-  if (!user) { res.status(401).json({ error: 'Auth required' }); return }
+  if (!user) { apiError(res, 401, 'unauthorized', 'Authentication required.'); return }
 
   // Tenant ID comes from the X-Tenant-ID header ONLY. We deliberately
   // dropped the `?tenant_id=` query-param fallback: query params end up
@@ -391,7 +688,7 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
   }
 
   console.log(`[identifyTenant] FAILED for user=${user.id} — no tenant found via any path`)
-  res.status(403).json({ error: 'No active tenant found. Please complete onboarding to connect your WhatsApp account.' })
+  apiError(res, 403, 'no_active_tenant', 'No active tenant found. Please complete onboarding to connect your WhatsApp account.')
 }
 
 /**
@@ -451,13 +748,13 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete' | s
 
     const userId = (req as any).user?.id
     const tenantId = (req as any).tenantId
-    if (!userId || !tenantId) { res.status(401).json({ error: 'Auth required' }); return }
+    if (!userId || !tenantId) { apiError(res, 401, 'unauthorized', 'Authentication required.'); return }
 
     // 1. Tenant lifecycle gate
     const { data: tenant } = await supabase.from('tenants')
       .select('status').eq('id', tenantId).maybeSingle()
-    if (tenant?.status === 'suspended') { res.status(403).json({ error: 'This account is suspended. Contact support.' }); return }
-    if (tenant?.status === 'deleted')   { res.status(403).json({ error: 'This account has been deleted.' }); return }
+    if (tenant?.status === 'suspended') { apiError(res, 403, 'tenant_suspended', 'This account is suspended. Contact support.'); return }
+    if (tenant?.status === 'deleted')   { apiError(res, 403, 'tenant_deleted', 'This account has been deleted.'); return }
 
     // 2. User-disabled gate (new RBAC) — falls through to legacy if no row
     const { data: assignment } = await supabase.from('user_role_assignments')
@@ -465,10 +762,10 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete' | s
       .eq('user_id', userId).eq('tenant_id', tenantId)
       .maybeSingle()
     if (assignment?.disabled_at) {
-      res.status(403).json({
-        error: 'Your account has been disabled by a workspace administrator. Contact them to restore access.',
-        code: 'user_disabled',
-      }); return
+      apiError(
+        res, 403, 'user_disabled',
+        'Your account has been disabled by a workspace administrator. Contact them to restore access.',
+      ); return
     }
 
     // 3. Per-tenant entitlement override
@@ -814,21 +1111,34 @@ app.get('/api/workflows', requireAuth, identifyTenant, checkPermission('whatsapp
   let q = supabase.from('workflows').select('*', { count: 'exact' })
     .eq('tenant_id', tenantId)
 
-  if (search) q = q.or(`name.ilike.%${search}%,description.ilike.%${search}%,intent_text.ilike.%${search}%`)
+  // F6: sanitize search before string-interpolating into PostgREST .or().
+  // Strips PostgREST tree-building characters (commas/dots/parens/etc.) so
+  // a malicious value can't append arbitrary predicates.
+  const safeSearch = sanitizeSearch(search)
+  if (safeSearch) q = q.or(`name.ilike.%${safeSearch}%,description.ilike.%${safeSearch}%,intent_text.ilike.%${safeSearch}%`)
   if (status && status !== 'all') q = q.eq('status', status)
 
-  // Dynamic field filters
+  // B6: dynamic field filters with column allowlist (workflows scope).
   const filtersRaw = req.query.filters as string
   if (filtersRaw) {
     try {
       const parsed = JSON.parse(filtersRaw)
-      Object.entries(parsed).forEach(([key, val]) => {
-        if (val) q = q.ilike(key, `%${val}%`)
-      })
+      const result = applyAllowedFilters(q, parsed, 'workflows')
+      if ((result as any).__filterError) {
+        res.status(400).json({ error: `Invalid filter key: ${(result as any).__filterError.key}`, allowed: FILTER_ALLOWLISTS.workflows })
+        return
+      }
+      q = result as typeof q
     } catch (e) {}
   }
 
-  q = q.order(sortBy || 'created_at', { ascending: sortOrder === 'asc' })
+  // B6: gate sortBy too — same allowlist.
+  const sortCheck = validateSortBy('workflows', sortBy)
+  if (!sortCheck.ok) {
+    res.status(400).json({ error: `Invalid sortBy: ${sortCheck.key}`, allowed: FILTER_ALLOWLISTS.workflows })
+    return
+  }
+  q = q.order(sortCheck.sortBy, { ascending: sortOrder === 'asc' })
     .range(offset, offset + pageSize - 1)
 
   const { data, count, error } = await q
@@ -1025,7 +1335,16 @@ app.post('/api/workflows/preview', requireAuth, identifyTenant, checkPermission(
 
 // ── Tenants CRUD ──────────────────────────────────────────────────────────────
 app.get('/api/tenants/:id/members', requireAuth, identifyTenant, async (req, res) => {
-  const tenantId = req.params.id
+  // B1: cross-tenant data leak fix. The path param :id was previously trusted
+  // as the tenant id, even though identifyTenant has already authoritatively
+  // resolved the caller's tenant. A user belonging to tenant A could request
+  // /api/tenants/<tenant-B>/members and get tenant B's roster. Reject
+  // anything that doesn't match the resolved tenant. Super-admins (who can
+  // legitimately target any tenant via X-Tenant-ID) bypass the check.
+  if (!(req as any).isSuperAdmin && req.params.id !== (req as any).tenantId) {
+    res.status(403).json({ error: 'Forbidden' }); return
+  }
+  const tenantId = (req as any).tenantId
   // Previously did `profiles:user_id(...)` PostgREST embed but the
   // `profiles` table doesn't exist in this schema — every call returned
   // 500 with PGRST200 "could not find a relationship". The newer
@@ -1228,7 +1547,7 @@ const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID!
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!
 const GOOGLE_REDIRECT_URI  = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3001/api/auth/google/callback'
 
-app.get('/api/auth/google', requireAuth, (req, res) => {
+app.get('/api/auth/google', requireAuth, async (req, res) => {
   const user = (req as any).user
   const scopes = [
     'https://www.googleapis.com/auth/calendar',
@@ -1238,7 +1557,14 @@ app.get('/api/auth/google', requireAuth, (req, res) => {
     'https://www.googleapis.com/auth/gmail.modify',
     'email', 'profile'
   ].join(' ')
-  const state = Buffer.from(JSON.stringify({ userId: user.id, tenantId: req.query.tenant_id })).toString('base64')
+  // B4: HMAC-signed state with 10-min TTL + nonce. Replaces the prior
+  // unsigned base64 JSON which let any attacker mint a state pinning the
+  // callback to another userId/tenantId.
+  const { signOauthState } = await import('./lib/oauth-state')
+  const state = signOauthState({
+    userId: user.id,
+    tenantId: typeof req.query.tenant_id === 'string' ? req.query.tenant_id : null,
+  })
   const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${GOOGLE_CLIENT_ID}&redirect_uri=${encodeURIComponent(GOOGLE_REDIRECT_URI)}&response_type=code&scope=${encodeURIComponent(scopes)}&access_type=offline&prompt=consent&state=${state}`
   
   logToFile(`Initiating OAuth for user: ${user.id}`)
@@ -1253,7 +1579,14 @@ app.get('/api/auth/google/callback', async (req, res) => {
   if (!code) { res.status(400).send('Missing code'); return }
 
   try {
-    const { userId, tenantId } = JSON.parse(Buffer.from(state, 'base64').toString())
+    // B4: verify HMAC + expiry on state. Refuse on any failure (forged,
+    // expired, malformed) — single error path so a forged state can't be
+    // distinguished from an expired one by timing or response body.
+    const { verifyOauthState } = await import('./lib/oauth-state')
+    const verified = verifyOauthState(state)
+    if (!verified) { res.status(400).send('Invalid or expired state'); return }
+    const userId = verified.u
+    const tenantId = verified.t ?? undefined
 
     // Exchange code for tokens
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
@@ -1328,7 +1661,14 @@ app.get('/api/auth/google/callback', async (req, res) => {
     // Close the popup and notify parent.
     // Shape MUST be { ok: true } for openOAuthPopup() to resolve — it polls
     // for `e.data.ok` (see src/lib/connectors.ts openOAuthPopup).
+    //
+    // B10: lock postMessage targetOrigin to FRONTEND_URL. The previous '*'
+    // would broadcast the OAuth result (including profile.email) to ANY
+    // window that the user happened to have open via window.opener — a
+    // cross-origin opener can sniff e.data and learn which Google account
+    // was just connected. Pin to our own frontend instead.
     const successPayload = { ok: true, connector: 'google', label: profile.email }
+    const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:5173'
     res.send(`
       <!doctype html><html><head><meta charset="utf-8"><title>Connected</title>
       <style>body{font:14px/1.5 system-ui,sans-serif;text-align:center;padding:32px;color:#1a1a1a}</style>
@@ -1338,7 +1678,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
       <p>${profile.email ?? ''}</p>
       <p style="color:#6b7280;font-size:13px;margin-top:16px">You can close this window.</p>
       <script>
-        try { window.opener?.postMessage(${JSON.stringify(successPayload)}, '*'); } catch(e){}
+        try { window.opener?.postMessage(${JSON.stringify(successPayload)}, ${JSON.stringify(FRONTEND_ORIGIN)}); } catch(e){}
         setTimeout(() => { try { window.close(); } catch(e){} }, 1200);
       </script>
       </body></html>
@@ -1435,18 +1775,26 @@ app.get('/api/broadcasts', requireAuth, identifyTenant, checkPermission('whatsap
   if (search) q = q.ilike('name', `%${search}%`)
   if (status && status !== 'all') q = q.eq('status', status)
 
-  // Dynamic field filters
+  // B6: dynamic field filters with column allowlist (broadcasts scope).
   const filtersRaw = req.query.filters as string
   if (filtersRaw) {
     try {
       const parsed = JSON.parse(filtersRaw)
-      Object.entries(parsed).forEach(([key, val]) => {
-        if (val) q = q.ilike(key, `%${val}%`)
-      })
+      const result = applyAllowedFilters(q, parsed, 'broadcasts')
+      if ((result as any).__filterError) {
+        res.status(400).json({ error: `Invalid filter key: ${(result as any).__filterError.key}`, allowed: FILTER_ALLOWLISTS.broadcasts })
+        return
+      }
+      q = result as typeof q
     } catch (e) {}
   }
 
-  q = q.order(sortBy || 'created_at', { ascending: sortOrder === 'asc' })
+  const sortCheck = validateSortBy('broadcasts', sortBy)
+  if (!sortCheck.ok) {
+    res.status(400).json({ error: `Invalid sortBy: ${sortCheck.key}`, allowed: FILTER_ALLOWLISTS.broadcasts })
+    return
+  }
+  q = q.order(sortCheck.sortBy, { ascending: sortOrder === 'asc' })
     .range(offset, offset + pageSize - 1)
 
   const { data, count, error } = await q
@@ -1466,34 +1814,42 @@ app.post('/api/broadcasts', requireAuth, identifyTenant, checkPermission('whatsa
 // Send broadcast — enqueue to broadcast.batch (immediate) or schedule via scheduled_jobs.
 // Replaces the legacy fire-and-forget for-loop. Per-message delivery + retries
 // are handled by message-sender.ts; broadcast-worker.ts fans out per contact.
+//
+// F4: wrapped in `withIdempotency`. A retry on this endpoint without
+// idempotency would silently re-enqueue the batch — broadcast-worker would
+// then send the same template to every contact a second time. Critical
+// guard for any client that retries on 5xx / network failure.
 app.post('/api/broadcasts/:id/send', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), async (req, res) => {
-  const tenantId = (req as any).tenantId
-  const { data: broadcast } = await supabase.from('broadcasts').select('id, scheduled_at, status, template_name')
-    .eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
-  if (!broadcast) { res.status(404).json({ error: 'Broadcast not found' }); return }
-  if (!broadcast.template_name) { res.status(400).json({ error: 'Broadcast has no template_name' }); return }
-  if (broadcast.status === 'sending' || broadcast.status === 'sent') {
-    res.status(409).json({ error: `Broadcast already ${broadcast.status}` }); return
-  }
+  const { withIdempotency } = await import('./lib/idempotency')
+  return withIdempotency(supabase, req, res, 'POST /api/broadcasts/:id/send', async () => {
+    const tenantId = (req as any).tenantId
+    const { data: broadcast } = await supabase.from('broadcasts').select('id, scheduled_at, status, template_name')
+      .eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (!broadcast) return { status: 404, body: { error: 'Broadcast not found' } }
+    if (!broadcast.template_name) return { status: 400, body: { error: 'Broadcast has no template_name' } }
+    if (broadcast.status === 'sending' || broadcast.status === 'sent') {
+      return { status: 409, body: { error: `Broadcast already ${broadcast.status}` } }
+    }
 
-  // Schedule for later if scheduled_at is in the future.
-  const sched = broadcast.scheduled_at ? new Date(broadcast.scheduled_at) : null
-  if (sched && sched.getTime() > Date.now() + 5_000) {
-    await supabase.from('scheduled_jobs').insert({
-      tenant_id: tenantId,
-      kind: 'broadcast_send',
-      payload: { broadcastId: broadcast.id },
-      resume_at: sched.toISOString(),
-    })
-    await supabase.from('broadcasts').update({ status: 'scheduled' }).eq('id', broadcast.id)
-    res.json({ success: true, scheduled_for: sched.toISOString() }); return
-  }
+    // Schedule for later if scheduled_at is in the future.
+    const sched = broadcast.scheduled_at ? new Date(broadcast.scheduled_at) : null
+    if (sched && sched.getTime() > Date.now() + 5_000) {
+      await supabase.from('scheduled_jobs').insert({
+        tenant_id: tenantId,
+        kind: 'broadcast_send',
+        payload: { broadcastId: broadcast.id },
+        resume_at: sched.toISOString(),
+      })
+      await supabase.from('broadcasts').update({ status: 'scheduled' }).eq('id', broadcast.id)
+      return { status: 200, body: { success: true, scheduled_for: sched.toISOString() } }
+    }
 
-  // Send now: enqueue, return immediately.
-  const { broadcastQueue } = await import('./queue')
-  await broadcastQueue.add('batch', { broadcastId: broadcast.id })
-  await supabase.from('broadcasts').update({ status: 'sending' }).eq('id', broadcast.id)
-  res.json({ success: true, queued: true })
+    // Send now: enqueue, return immediately.
+    const { broadcastQueue } = await import('./queue')
+    await broadcastQueue.add('batch', { broadcastId: broadcast.id })
+    await supabase.from('broadcasts').update({ status: 'sending' }).eq('id', broadcast.id)
+    return { status: 200, body: { success: true, queued: true } }
+  })
 })
 
 app.delete('/api/broadcasts/:id', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'delete'), async (req, res) => {
@@ -1512,22 +1868,32 @@ app.get('/api/contacts', requireAuth, identifyTenant, checkPermission('leads', '
   let q = supabase.from('contacts').select('*', { count: 'exact' })
     .eq('tenant_id', tenantId)
 
-  if (search) q = q.or(`name.ilike.%${search}%,phone.ilike.%${search}%,email.ilike.%${search}%`)
+  // F6: sanitize search before .or() interpolation (see lib/safe-key.ts).
+  const safeSearch = sanitizeSearch(search)
+  if (safeSearch) q = q.or(`name.ilike.%${safeSearch}%,phone.ilike.%${safeSearch}%,email.ilike.%${safeSearch}%`)
   if (tag) q = q.contains('tags', [tag])
   if (status && status !== 'all') q = q.eq('status', status)
 
-  // Dynamic field filters
+  // B6: dynamic field filters with column allowlist (contacts scope).
   const filtersRaw = req.query.filters as string
   if (filtersRaw) {
     try {
       const parsed = JSON.parse(filtersRaw)
-      Object.entries(parsed).forEach(([key, val]) => {
-        if (val) q = q.ilike(key, `%${val}%`)
-      })
+      const result = applyAllowedFilters(q, parsed, 'contacts')
+      if ((result as any).__filterError) {
+        res.status(400).json({ error: `Invalid filter key: ${(result as any).__filterError.key}`, allowed: FILTER_ALLOWLISTS.contacts })
+        return
+      }
+      q = result as typeof q
     } catch (e) {}
   }
 
-  q = q.order(sortBy || 'created_at', { ascending: sortOrder === 'asc' })
+  const sortCheck = validateSortBy('contacts', sortBy)
+  if (!sortCheck.ok) {
+    res.status(400).json({ error: `Invalid sortBy: ${sortCheck.key}`, allowed: FILTER_ALLOWLISTS.contacts })
+    return
+  }
+  q = q.order(sortCheck.sortBy, { ascending: sortOrder === 'asc' })
     .range(offset, offset + pageSize - 1)
 
   const { data, count, error } = await q
@@ -1597,82 +1963,105 @@ app.get('/api/contacts/:phone/messages', requireAuth, identifyTenant, checkPermi
 // provider based on `channel` ('whatsapp' | 'instagram' | 'telegram'). Inserts
 // the outbound message with the correct `channel` column so the unified inbox
 // view filters correctly.
+//
+// F4: wrapped in `withIdempotency` — clients can pass an `Idempotency-Key`
+// header to make retries safe. Without it, a client retry on network
+// failure could double-send to WhatsApp (burning Meta credit + spamming
+// the contact).
 app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox', 'edit'), validateBody(InboxSendSchema), async (req, res) => {
-  const tenantId = (req as any).tenantId
+  const { withIdempotency } = await import('./lib/idempotency')
+  return withIdempotency(supabase, req, res, 'POST /api/inbox/send', async () => {
+    const tenantId = (req as any).tenantId
 
-  // Plan-limit check: refuse with 402 if the tenant is at their monthly
-  // message cap. Critical revenue protection — without this, a Free-tier
-  // tenant can blast unlimited messages.
-  const { blockIfOverLimit } = await import('./lib/limits')
-  if (await blockIfOverLimit(res, supabase, tenantId, 'messages_per_month')) return
-
-  const {
-    channel, phone, type,
-    text, template_name, template_language, template_params,
-    media_kind, media_url, caption, filename,
-    interactive,
-  } = req.body
-  const cleanPhone = String(phone).replace(/^\+/, '')
-
-  try {
-    if (channel === 'whatsapp') {
-      const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).single()
-      if (!tenant?.access_token) { res.status(404).json({ error: 'WhatsApp not connected for this tenant' }); return }
-      if (type === 'text')              await sendTextMessage(tenant, cleanPhone, text)
-      else if (type === 'template')     await sendTemplateMessage(tenant, cleanPhone, template_name, template_language ?? 'en_US', template_params ?? [])
-      else if (type === 'media')        await sendWAMedia(tenant, cleanPhone, media_kind, media_url, caption, filename)
-      else if (type === 'interactive')  await sendInteractiveMessage(tenant, cleanPhone, interactive)
-    } else if (channel === 'telegram') {
-      const { data: bot } = await supabase.from('tg_bots').select('*').eq('tenant_id', tenantId).maybeSingle()
-      if (!bot?.bot_token) { res.status(404).json({ error: 'Telegram bot not connected for this tenant' }); return }
-      const { decrypt } = await import('./crypto')
-      const token = decrypt(bot.bot_token)
-      if (type === 'text') {
-        await tgSend(token, 'sendMessage', { chat_id: cleanPhone, text })
-        await supabase.from('messages').insert({ tenant_id: tenantId, channel: 'telegram', direction: 'outbound', contact_phone: cleanPhone, content: { type: 'text', text }, status: 'sent' })
-      } else if (type === 'media') {
-        const method = ({ image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio', document: 'sendDocument' } as any)[media_kind!]
-        const fieldKey = ({ image: 'photo', video: 'video', audio: 'audio', document: 'document' } as any)[media_kind!]
-        await tgSend(token, method, { chat_id: cleanPhone, [fieldKey]: media_url, caption: caption ?? undefined })
-        await supabase.from('messages').insert({ tenant_id: tenantId, channel: 'telegram', direction: 'outbound', contact_phone: cleanPhone, content: { type: media_kind, url: media_url, caption, filename }, status: 'sent' })
-      } else {
-        res.status(400).json({ error: `Telegram does not support type=${type}` }); return
+    // Plan-limit check: refuse with 402 if the tenant is at their monthly
+    // message cap. Critical revenue protection — without this, a Free-tier
+    // tenant can blast unlimited messages. Use checkLimit here (not
+    // blockIfOverLimit) because we need to return a HandlerResult, not write
+    // directly to res — the idempotency wrapper handles serialization.
+    const { checkLimit } = await import('./lib/limits')
+    const limitCheck = await checkLimit(supabase, tenantId, 'messages_per_month')
+    if (!limitCheck.allowed) {
+      return {
+        status: 402,
+        body: {
+          error: limitCheck.reason,
+          code: 'plan_limit_exceeded',
+          metric: 'messages_per_month',
+          current: limitCheck.current,
+          max: limitCheck.max,
+          upgrade_to: (limitCheck as any).upgrade_to,
+        },
       }
-    } else if (channel === 'instagram') {
-      const { data: ig } = await supabase.from('tenant_integrations')
-        .select('access_token, metadata').eq('tenant_id', tenantId).eq('key', 'instagram').maybeSingle()
-      if (!ig?.access_token) { res.status(404).json({ error: 'Instagram not connected for this tenant' }); return }
-      const { decrypt } = await import('./crypto')
-      const igToken = decrypt(ig.access_token)
-      const igUserId = (ig.metadata as any)?.ig_user_id
-      if (!igUserId) { res.status(400).json({ error: 'Instagram metadata missing ig_user_id; reconnect.' }); return }
-      const payload: any = { recipient: { id: cleanPhone } }
-      if (type === 'text') {
-        payload.message = { text }
-      } else if (type === 'media' && media_url && media_kind) {
-        payload.message = { attachment: { type: media_kind, payload: { url: media_url, is_reusable: true } } }
-      } else {
-        res.status(400).json({ error: `Instagram does not support type=${type}` }); return
-      }
-      const r1 = await fetch(`${GRAPH}/${igUserId}/messages?access_token=${igToken}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
-      })
-      const data = await r1.json() as any
-      if (!r1.ok || data.error) throw new Error(data.error?.message ?? `IG send failed (${r1.status})`)
-      await supabase.from('messages').insert({
-        tenant_id: tenantId, channel: 'instagram', direction: 'outbound',
-        contact_phone: cleanPhone,
-        platform_message_id: data.message_id ?? null,
-        content: type === 'text' ? { type: 'text', text } : { type: media_kind, url: media_url, caption, filename },
-        status: 'sent',
-      })
-    } else {
-      res.status(400).json({ error: `Unsupported channel: ${channel}` }); return
     }
-    res.json({ success: true })
-  } catch (err: any) {
-    res.status(500).json({ error: err.message })
-  }
+
+    const {
+      channel, phone, type,
+      text, template_name, template_language, template_params,
+      media_kind, media_url, caption, filename,
+      interactive,
+    } = req.body
+    const cleanPhone = String(phone).replace(/^\+/, '')
+
+    try {
+      if (channel === 'whatsapp') {
+        const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).single()
+        if (!tenant?.access_token) return { status: 404, body: { error: 'WhatsApp not connected for this tenant' } }
+        if (type === 'text')              await sendTextMessage(tenant, cleanPhone, text)
+        else if (type === 'template')     await sendTemplateMessage(tenant, cleanPhone, template_name, template_language ?? 'en_US', template_params ?? [])
+        else if (type === 'media')        await sendWAMedia(tenant, cleanPhone, media_kind, media_url, caption, filename)
+        else if (type === 'interactive')  await sendInteractiveMessage(tenant, cleanPhone, interactive)
+      } else if (channel === 'telegram') {
+        const { data: bot } = await supabase.from('tg_bots').select('*').eq('tenant_id', tenantId).maybeSingle()
+        if (!bot?.bot_token) return { status: 404, body: { error: 'Telegram bot not connected for this tenant' } }
+        const { decrypt } = await import('./crypto')
+        const token = decrypt(bot.bot_token)
+        if (type === 'text') {
+          await tgSend(token, 'sendMessage', { chat_id: cleanPhone, text })
+          await supabase.from('messages').insert({ tenant_id: tenantId, channel: 'telegram', direction: 'outbound', contact_phone: cleanPhone, content: { type: 'text', text }, status: 'sent' })
+        } else if (type === 'media') {
+          const method = ({ image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio', document: 'sendDocument' } as any)[media_kind!]
+          const fieldKey = ({ image: 'photo', video: 'video', audio: 'audio', document: 'document' } as any)[media_kind!]
+          await tgSend(token, method, { chat_id: cleanPhone, [fieldKey]: media_url, caption: caption ?? undefined })
+          await supabase.from('messages').insert({ tenant_id: tenantId, channel: 'telegram', direction: 'outbound', contact_phone: cleanPhone, content: { type: media_kind, url: media_url, caption, filename }, status: 'sent' })
+        } else {
+          return { status: 400, body: { error: `Telegram does not support type=${type}` } }
+        }
+      } else if (channel === 'instagram') {
+        const { data: ig } = await supabase.from('tenant_integrations')
+          .select('access_token, metadata').eq('tenant_id', tenantId).eq('key', 'instagram').maybeSingle()
+        if (!ig?.access_token) return { status: 404, body: { error: 'Instagram not connected for this tenant' } }
+        const { decrypt } = await import('./crypto')
+        const igToken = decrypt(ig.access_token)
+        const igUserId = (ig.metadata as any)?.ig_user_id
+        if (!igUserId) return { status: 400, body: { error: 'Instagram metadata missing ig_user_id; reconnect.' } }
+        const payload: any = { recipient: { id: cleanPhone } }
+        if (type === 'text') {
+          payload.message = { text }
+        } else if (type === 'media' && media_url && media_kind) {
+          payload.message = { attachment: { type: media_kind, payload: { url: media_url, is_reusable: true } } }
+        } else {
+          return { status: 400, body: { error: `Instagram does not support type=${type}` } }
+        }
+        const r1 = await fetch(`${GRAPH}/${igUserId}/messages?access_token=${igToken}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+        })
+        const data = await r1.json() as any
+        if (!r1.ok || data.error) throw new Error(data.error?.message ?? `IG send failed (${r1.status})`)
+        await supabase.from('messages').insert({
+          tenant_id: tenantId, channel: 'instagram', direction: 'outbound',
+          contact_phone: cleanPhone,
+          platform_message_id: data.message_id ?? null,
+          content: type === 'text' ? { type: 'text', text } : { type: media_kind, url: media_url, caption, filename },
+          status: 'sent',
+        })
+      } else {
+        return { status: 400, body: { error: `Unsupported channel: ${channel}` } }
+      }
+      return { status: 200, body: { success: true } }
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message } }
+    }
+  })
 })
 
 // WhatsApp Cloud API media send — image / video / audio / document.
@@ -1802,12 +2191,51 @@ app.get('/webhook/whatsapp', (req, res) => {
 })
 
 // POST: Inbound messages
+//
+// B2: HMAC verification of x-hub-signature-256. Without this, anyone who
+// learns the public webhook URL can craft inbound messages, spoof status
+// updates, and pollute every tenant's inbox / fire workflows under any
+// WABA we host. The raw body parser is mounted above (before express.json)
+// so req.body is a Buffer at this point — exactly the bytes Meta signed.
 app.post('/webhook/whatsapp', async (req, res) => {
-  // Always ack immediately so Meta doesn't retry
+  const sigHeader = req.header('x-hub-signature-256') || req.header('X-Hub-Signature-256')
+  const rawBody = req.body as Buffer
+  const appSecret = process.env.META_APP_SECRET || ''
+  if (!Buffer.isBuffer(rawBody)) {
+    // Should never happen given the express.raw mount, but fail closed.
+    console.warn('[wa-webhook] body is not a Buffer — raw parser not mounted? Refusing.')
+    res.status(401).json({ error: 'invalid_signature' }); return
+  }
+  // Local helper kept inline to avoid an extra import cycle. Same constant-
+  // time compare pattern as routes/wa-calling.ts:verifyMetaSignature.
+  const verifyMetaSignature = (body: Buffer, header: string | undefined, secret: string): boolean => {
+    if (!header || !secret) return false
+    const prefix = 'sha256='
+    if (!header.startsWith(prefix)) return false
+    const provided = header.slice(prefix.length)
+    const expected = crypto.createHmac('sha256', secret).update(body).digest('hex')
+    if (provided.length !== expected.length) return false
+    try {
+      return crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(expected, 'utf8'))
+    } catch { return false }
+  }
+  if (!verifyMetaSignature(rawBody, sigHeader, appSecret)) {
+    console.warn('[wa-webhook] HMAC verification failed — rejecting')
+    res.status(401).json({ error: 'invalid_signature' }); return
+  }
+
+  // ACK only AFTER signature verified so we don't lend our 200 to spoofed
+  // payloads. Meta still gets a fast response — verification is microseconds.
   res.sendStatus(200)
 
   try {
-    const body = req.body
+    // Parse the now-verified raw bytes into JSON. We do this AFTER ack so a
+    // malformed payload from Meta doesn't keep them retrying — the signature
+    // already proved authenticity, and an unparseable body will surface in
+    // logs but not block the webhook channel.
+    let body: any
+    try { body = JSON.parse(rawBody.toString('utf8')) }
+    catch { console.warn('[wa-webhook] JSON parse failed (body verified but malformed)'); return }
 
     // ── Diagnostic logging ──
     const msgCount = body.entry?.reduce((acc: number, e: any) =>
@@ -2069,21 +2497,31 @@ app.get('/api/campaigns', requireAuth, identifyTenant, checkPermission('whatsapp
   let q = supabase.from('campaigns').select('*', { count: 'exact' })
     .eq('tenant_id', tenantId)
 
-  if (search) q = q.or(`name.ilike.%${search}%,description.ilike.%${search}%`)
+  // F6: sanitize search before .or() interpolation (see lib/safe-key.ts).
+  const safeSearch = sanitizeSearch(search)
+  if (safeSearch) q = q.or(`name.ilike.%${safeSearch}%,description.ilike.%${safeSearch}%`)
   if (status && status !== 'all') q = q.eq('status', status)
 
-  // Dynamic field filters
+  // B6: dynamic field filters with column allowlist (campaigns scope).
   const filtersRaw = req.query.filters as string
   if (filtersRaw) {
     try {
       const parsed = JSON.parse(filtersRaw)
-      Object.entries(parsed).forEach(([key, val]) => {
-        if (val) q = q.ilike(key, `%${val}%`)
-      })
+      const result = applyAllowedFilters(q, parsed, 'campaigns')
+      if ((result as any).__filterError) {
+        res.status(400).json({ error: `Invalid filter key: ${(result as any).__filterError.key}`, allowed: FILTER_ALLOWLISTS.campaigns })
+        return
+      }
+      q = result as typeof q
     } catch (e) {}
   }
 
-  q = q.order(sortBy || 'created_at', { ascending: sortOrder === 'asc' })
+  const sortCheck = validateSortBy('campaigns', sortBy)
+  if (!sortCheck.ok) {
+    res.status(400).json({ error: `Invalid sortBy: ${sortCheck.key}`, allowed: FILTER_ALLOWLISTS.campaigns })
+    return
+  }
+  q = q.order(sortCheck.sortBy, { ascending: sortOrder === 'asc' })
     .range(offset, offset + pageSize - 1)
 
   const { data, count, error } = await q
@@ -2516,8 +2954,12 @@ createBullBoard({
   serverAdapter: bullBoardAdapter,
 })
 async function requireSuperAdminOrLocal(req: express.Request, res: express.Response, next: express.NextFunction) {
-  // Allow unauthed access on local dev for convenience
-  if (process.env.NODE_ENV !== 'production' && (req.hostname === 'localhost' || req.hostname === '127.0.0.1')) return next()
+  // F8: removed the `req.hostname === 'localhost'` bypass. Previously, any
+  // request to http://localhost:3001/admin/queues from a dev machine got
+  // unauthenticated access to BullMQ — fine for solo dev, but a footgun on
+  // shared dev VMs / port-forwarded staging where "localhost" can mean an
+  // attacker-controlled origin. Local dev now logs in as a platform user
+  // exactly like prod does (the dev seed creates a super-admin user).
   const token = req.headers.authorization?.replace('Bearer ', '') || (req.query.token as string)
   if (!token) { res.status(401).send('auth required'); return }
   const { data: { user } } = await supabase.auth.getUser(token)
@@ -2529,6 +2971,48 @@ async function requireSuperAdminOrLocal(req: express.Request, res: express.Respo
   next()
 }
 app.use('/admin/queues', requireSuperAdminOrLocal, bullBoardAdapter.getRouter())
+
+// ── F5: Global error handler ─────────────────────────────────────────────
+// Last-resort catch-all for thrown exceptions in route handlers + any
+// failure from express-internal middleware (body-parser size overrun, CORS
+// pre-flight, etc.). Standardises the response shape so clients never see:
+//   - Stack traces
+//   - Internal file paths
+//   - Postgres error messages with column names
+//   - body-parser's default plaintext 413 PayloadTooLargeError
+//
+// Important: this MUST be mounted AFTER every route + router, because
+// express picks error middleware by signature (4-arg) AND insertion order.
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  // Don't double-respond if a handler already sent headers.
+  if (res.headersSent) return _next(err)
+
+  const isBodySizeError = err?.type === 'entity.too.large' || err?.status === 413
+  const isJsonParseError = err?.type === 'entity.parse.failed' || err?.statusCode === 400 && /JSON/.test(String(err?.message))
+
+  if (isBodySizeError) {
+    return apiError(
+      res,
+      413,
+      'payload_too_large',
+      'Request body exceeds the size limit for this endpoint.',
+    )
+  }
+  if (isJsonParseError) {
+    return apiError(res, 400, 'invalid_json', 'Request body is not valid JSON.')
+  }
+
+  // Anything else — log the full thing server-side, return a safe generic
+  // error to the client. Stack traces NEVER leave the server.
+  console.error(`[unhandled-error] req_id=${(req as any).id} path=${req.path} err=${err?.message ?? err}`)
+  if (err?.stack) console.error(err.stack)
+  return apiError(
+    res,
+    err?.status && err.status >= 400 && err.status < 600 ? err.status : 500,
+    'internal_error',
+    'Something went wrong on our end. The request ID is in the response header — share it with support if this persists.',
+  )
+})
 
 if (process.env.NODE_ENV !== 'production') attachDebugListeners()
 

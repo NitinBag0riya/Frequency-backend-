@@ -25,6 +25,7 @@ import { createAirtableConnector } from './airtable'
 import { createRazorpayConnector } from './razorpay'
 import { createShopifyConnector } from './shopify'
 import { createSlackConnector } from './slack'
+import { signOauthState } from '../../lib/oauth-state'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -280,11 +281,13 @@ export function createConnectorsRouter(deps: Deps): express.Router {
           // either a misleading "connected" toast or a "Window closed before
           // connection completed" timeout when the popup just closes silently.
           const message = 'Google OAuth not configured (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars missing on the server)'
+          // B10: pin postMessage targetOrigin to FRONTEND_URL.
+          const FRONTEND_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:5173'
           res.status(503).type('html').send(`<!doctype html><html><head><meta charset="utf-8"><title>Google not configured</title></head><body style="font-family:DM Sans,system-ui;background:#0d1117;color:#fff;padding:24px;text-align:center;">
             <h2>⚠ Google OAuth not configured</h2>
             <p style="opacity:.6">This window will close…</p>
             <script>
-              try { window.opener?.postMessage({ ok: false, message: ${JSON.stringify(message)} }, '*') } catch(e){}
+              try { window.opener?.postMessage({ ok: false, message: ${JSON.stringify(message)} }, ${JSON.stringify(FRONTEND_ORIGIN)}) } catch(e){}
               setTimeout(() => { try { window.close(); } catch(e){} }, 1500);
             </script></body></html>`)
           return
@@ -292,7 +295,8 @@ export function createConnectorsRouter(deps: Deps): express.Router {
         const userId   = (req as any).user?.id   as string
         const tenantId = (req as any).tenantId   as string
         const redirectUri = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3001/api/auth/google/callback'
-        const statePayload = Buffer.from(JSON.stringify({ userId, tenantId, connectorKey: googleKey })).toString('base64')
+        // B4: signed state with 10-min TTL + nonce + bound connectorKey.
+        const statePayload = signOauthState({ userId, tenantId, connectorKey: googleKey })
         const scopes = [
           'https://www.googleapis.com/auth/calendar',
           'https://www.googleapis.com/auth/spreadsheets',
