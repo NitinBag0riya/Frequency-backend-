@@ -17,6 +17,68 @@ function toKey(name: string): string {
 // pickAllowed lives in src/security.ts — imported above so other route
 // modules can share the exact same prototype-safe implementation.
 
+// ── Idempotency key derivation for /api/ingest/:token (migration 058) ────
+// Three layers, priority order:
+//   1. Explicit `_dedup_key` (canonical) — Stripe-style opt-in idempotency
+//      key. Aliases `__dedup_key` and `dedupKey` are also accepted to soften
+//      keyword-case pitfalls in tools like Zapier and Make.
+//   2. Natural-key fallback: email then phone, scanning common spellings
+//      seen in lead-form payloads (`email`/`Email`/`e_mail`, `phone`/
+//      `Phone`/`phone_number`/`mobile`/`contact`).
+//   3. Returns null → caller stores the row with dedup_key = NULL → plain
+//      insert path (legacy behaviour, duplicates allowed).
+//
+// Normalization rules:
+//   • email: trim + lowercase. Common case where Zapier passes
+//     "Alice@Example.com" should collide with a later "alice@example.com".
+//   • phone: digits-only. "(555) 123-4567" and "+1 555 123 4567" collapse
+//     to "15551234567" → "5551234567" respectively; we don't try to
+//     normalize country-code variants beyond stripping non-digits. That
+//     keeps the dedup conservative (same digits = same lead) without
+//     mis-routing two real people who share the last 10 digits across
+//     different country codes.
+//   • Explicit key: trim, take as-is, max 256 chars (the column is `text`
+//     so Postgres won't reject; we cap defensively to keep the partial
+//     unique index small).
+const DEDUP_EMAIL_KEYS = ['email', 'Email', 'EMAIL', 'e_mail', 'eMail', 'mail']
+const DEDUP_PHONE_KEYS = ['phone', 'Phone', 'PHONE', 'phone_number', 'phoneNumber', 'mobile', 'Mobile', 'contact', 'tel', 'telephone']
+const DEDUP_EXPLICIT_KEYS = ['_dedup_key', '__dedup_key', 'dedupKey']
+
+function deriveDedupKey(payload: Record<string, unknown>): string | null {
+  // Layer 1: explicit key wins outright.
+  for (const k of DEDUP_EXPLICIT_KEYS) {
+    const v = payload[k]
+    if (typeof v === 'string') {
+      const t = v.trim()
+      if (t) return t.slice(0, 256)
+    } else if (typeof v === 'number' || typeof v === 'bigint') {
+      const t = String(v)
+      if (t) return t.slice(0, 256)
+    }
+  }
+  // Layer 2a: email aliases.
+  for (const k of DEDUP_EMAIL_KEYS) {
+    const v = payload[k]
+    if (typeof v === 'string') {
+      const t = v.trim().toLowerCase()
+      // Only accept things that look at least vaguely like an email so we
+      // don't dedup on a stray "n/a" or "unknown" placeholder string.
+      if (t && t.includes('@') && t.length <= 256) return `email:${t}`
+    }
+  }
+  // Layer 2b: phone aliases.
+  for (const k of DEDUP_PHONE_KEYS) {
+    const v = payload[k]
+    if (typeof v === 'string' || typeof v === 'number') {
+      const digits = String(v).replace(/\D+/g, '')
+      // Require at least 6 digits to avoid colliding on extension stubs or
+      // garbage values (e.g. a field that says "1" or "ext 4").
+      if (digits.length >= 6) return `phone:${digits.slice(0, 32)}`
+    }
+  }
+  return null
+}
+
 // ── Module-level rate limiter for /api/ingest/:token ──────────────────────
 // Was previously inside createLeadsRouter, which would have leaked timers
 // + duplicated state if the factory was ever called twice (tests, multi-
@@ -929,6 +991,12 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       }
       const hit = ruleFor(data)
       if (hit) assigned++
+      // Derive dedup_key from the RAW payload, not the mapped `data` —
+      // mapping might rename `email` to `contact_email`, and we want to
+      // dedup on the producer's original identity. Falls back to null when
+      // no _dedup_key / email / phone is present → plain insert path,
+      // preserving legacy duplicate-allowed behaviour.
+      const dedup_key = deriveDedupKey(raw)
       return {
         table_id:         table.id,
         tenant_id:        table.tenant_id,
@@ -941,18 +1009,173 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
         // Audit trail — distinguishes webhook-ingested rows from manual
         // creations even though both stamp user_id = table.user_id.
         ingest_source:    'webhook',
+        dedup_key,
       }
     })
 
-    const { data: insertedRows, error: insErr } = await supabase
-      .from('lead_rows').insert(inserts).select('id, data, tags')
-    if (insErr) { res.status(500).json({ error: insErr.message }); return }
+    // Split: rows with a derivable dedup_key go through the SELECT-then-
+    // INSERT-or-UPDATE path; rows without keep the legacy plain INSERT.
+    // Within a single request we also collapse duplicates against the SAME
+    // dedup_key — last row wins for the merged payload — so a Zapier batch
+    // that includes the same lead twice in one POST doesn't try to insert
+    // both copies and trip the partial unique index.
+    const dedupRowsByKey = new Map<string, typeof inserts[number]>()
+    const plainRows: typeof inserts = []
+    for (const row of inserts) {
+      if (row.dedup_key) {
+        const prev = dedupRowsByKey.get(row.dedup_key)
+        if (prev) {
+          // Same-batch dup: merge data (new wins on key conflicts), keep
+          // the latest assignment + tags. Both rows already counted in
+          // `assigned`; we don't try to back that out (assignment is about
+          // rules firing, not about distinct rows landing — a 2x-firing
+          // rule on the same lead is informationally fine).
+          row.data = { ...prev.data, ...row.data }
+        }
+        dedupRowsByKey.set(row.dedup_key, row)
+      } else {
+        plainRows.push(row)
+      }
+    }
+    const dedupRows = Array.from(dedupRowsByKey.values())
+
+    let insertedCount = 0
+    let updatedCount = 0
+    // Aggregate rows we end up persisting (id + data + tags) for the
+    // contact-resolver fire-and-forget below. Both INSERTed and UPDATEd
+    // rows mirror to contacts — the upsert resolver itself is idempotent
+    // by (tenant_id, phone), so re-mirroring a dedup-merged row is safe.
+    const persistedRows: Array<{ id: string; data: any; tags?: string[] }> = []
+
+    // ── Plain insert path (no dedup_key) ──────────────────────────────
+    if (plainRows.length > 0) {
+      const { data: insertedRows, error: insErr } = await supabase
+        .from('lead_rows').insert(plainRows).select('id, data, tags')
+      if (insErr) { res.status(500).json({ error: insErr.message }); return }
+      insertedCount += plainRows.length
+      if (Array.isArray(insertedRows)) {
+        for (const r of insertedRows as Array<{ id: string; data: any; tags?: string[] }>) {
+          persistedRows.push(r)
+        }
+      }
+    }
+
+    // ── Dedup path (SELECT existing, then INSERT new + UPDATE existing) ─
+    // We do the merge client-side because supabase-js / PostgREST has no
+    // JSONB-merge upsert — a vanilla upsert would REPLACE `data` entirely,
+    // which would wipe out the original email/name/etc. if a re-POST
+    // included only an updated `status`. The partial unique index from
+    // migration 058 acts as the storage-layer race-condition backstop:
+    // two near-simultaneous POSTs with the same key will see "no existing
+    // row" in the SELECT, both attempt INSERT, and the second one hits
+    // SQLSTATE 23505. We catch that and fold the loser into an UPDATE.
+    if (dedupRows.length > 0) {
+      const keys = dedupRows.map(r => r.dedup_key as string)
+      const { data: existingRows, error: selErr } = await supabase
+        .from('lead_rows')
+        .select('id, data, dedup_key, tags, assigned_to, assigned_to_name')
+        .eq('table_id', table.id)
+        .in('dedup_key', keys)
+      if (selErr) { res.status(500).json({ error: selErr.message }); return }
+      const existingByKey = new Map<string, { id: string; data: any; tags?: string[] }>()
+      for (const r of (existingRows ?? []) as Array<{ id: string; dedup_key: string; data: any; tags?: string[] }>) {
+        if (r.dedup_key) existingByKey.set(r.dedup_key, r)
+      }
+
+      const toInsert: typeof dedupRows = []
+      const toUpdate: Array<{ id: string; data: any; row: typeof dedupRows[number]; existingTags?: string[] }> = []
+      for (const row of dedupRows) {
+        const ex = existingByKey.get(row.dedup_key as string)
+        if (ex) {
+          // Merge: existing first, new wins on key conflicts. So a re-POST
+          // that includes only `status: 'contacted'` will leave email/name
+          // intact and just bump status.
+          const mergedData = { ...(ex.data ?? {}), ...row.data }
+          toUpdate.push({ id: ex.id, data: mergedData, row, existingTags: ex.tags })
+        } else {
+          toInsert.push(row)
+        }
+      }
+
+      // INSERT pass — bulk insert with .select() so we can return the new ids.
+      if (toInsert.length > 0) {
+        const { data: newRows, error: insErr2 } = await supabase
+          .from('lead_rows').insert(toInsert).select('id, data, tags, dedup_key')
+        if (insErr2) {
+          // Race condition (23505): a concurrent request beat us to the
+          // INSERT. The rows we lost on are exactly the ones whose
+          // dedup_key now has a winner in the DB. Re-SELECT just those
+          // keys, route them to the UPDATE pass, and don't fail the
+          // request.
+          const isUniqueViolation = (insErr2 as any).code === '23505' ||
+            /duplicate key|lead_rows_table_dedup_uq/i.test(insErr2.message ?? '')
+          if (!isUniqueViolation) {
+            res.status(500).json({ error: insErr2.message }); return
+          }
+          const insertKeys = toInsert.map(r => r.dedup_key as string)
+          const { data: refetched, error: reErr } = await supabase
+            .from('lead_rows')
+            .select('id, data, dedup_key, tags')
+            .eq('table_id', table.id)
+            .in('dedup_key', insertKeys)
+          if (reErr) { res.status(500).json({ error: reErr.message }); return }
+          const refetchedByKey = new Map<string, { id: string; data: any; tags?: string[] }>()
+          for (const r of (refetched ?? []) as Array<{ id: string; dedup_key: string; data: any; tags?: string[] }>) {
+            if (r.dedup_key) refetchedByKey.set(r.dedup_key, r)
+          }
+          for (const row of toInsert) {
+            const ex = refetchedByKey.get(row.dedup_key as string)
+            if (!ex) continue // shouldn't happen — defensive
+            const mergedData = { ...(ex.data ?? {}), ...row.data }
+            toUpdate.push({ id: ex.id, data: mergedData, row, existingTags: ex.tags })
+          }
+        } else {
+          insertedCount += toInsert.length
+          for (const r of (newRows ?? []) as Array<{ id: string; data: any; tags?: string[] }>) {
+            persistedRows.push(r)
+          }
+        }
+      }
+
+      // UPDATE pass — one statement per row because the merged `data` is
+      // per-row distinct. Sequential to keep memory bounded; bulk webhook
+      // batches that hit this path are rare (re-POSTed leads, not the
+      // first-time-seen majority). Sub-20ms per UPDATE with the partial
+      // unique index satisfying the (table_id, dedup_key) lookup.
+      for (const u of toUpdate) {
+        const { data: updatedRow, error: updErr } = await supabase
+          .from('lead_rows')
+          .update({
+            data: u.data,
+            // Bump updated_at explicitly so downstream change-feeds notice.
+            // Do NOT touch assigned_to / tags / status on dedup hits —
+            // the operator may have manually re-assigned or progressed
+            // the lead since first contact, and the producer (Zapier) is
+            // not authoritative over those operator decisions.
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', u.id)
+          .select('id, data, tags')
+          .maybeSingle()
+        if (updErr) { res.status(500).json({ error: updErr.message }); return }
+        updatedCount += 1
+        if (updatedRow) persistedRows.push(updatedRow as { id: string; data: any; tags?: string[] })
+      }
+    }
 
     // Fire `lead.assigned` notifications to anyone the rules just routed rows
     // to. Fire-and-forget (await but swallow errors) — notification delivery
     // failure shouldn't block ingestion. We dedupe by recipient + matched-rule
     // so a 100-row webhook that all match the same rule pings the assignee
     // ONCE with a count, not 100 times.
+    //
+    // Note: we notify on ALL rows where a rule fired, including dedup-merged
+    // rows. The rationale is that the assignment-rule INPUT (the new payload)
+    // matched, even if we ended up updating instead of inserting — and the
+    // existing row's `assigned_to` is unchanged so the notification target
+    // is still the correct human. If the existing row was already assigned
+    // to that recipient, the count just reflects "another payload matched
+    // your queue" which is the truth on the wire.
     if (assigned > 0) {
       void notifyOnAssignment(supabase, table.tenant_id, table.id, inserts).catch(e =>
         console.warn('[ingest] notify failed (non-fatal):', e?.message))
@@ -961,17 +1184,18 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
     // Calling feature (migration 035): mirror lead → contact for phone-bearing
     // rows. Fire-and-forget; cap at 100 to keep the response fast on bulk
     // ingest. Tenants without calling enabled pay essentially nothing because
-    // the resolver short-circuits on missing phone.
-    if (Array.isArray(insertedRows) && insertedRows.length > 0) {
+    // the resolver short-circuits on missing phone. Includes dedup-merged
+    // rows — upsertContactFromLead is itself idempotent on (tenant, phone).
+    if (persistedRows.length > 0) {
       void import('./services/contact-resolver').then(({ upsertContactFromLead }) => {
-        const subset = (insertedRows as Array<{ id: string; data: any; tags?: string[] }>).slice(0, 100)
+        const subset = persistedRows.slice(0, 100)
         return Promise.allSettled(subset.map(r =>
           upsertContactFromLead(supabase, table.tenant_id, { id: r.id, data: r.data, tags: r.tags ?? [] })
         ))
       }).catch(e => console.warn('[ingest] contact resolve (non-fatal):', e?.message))
     }
 
-    res.json({ inserted: inserts.length, auto_assigned: assigned })
+    res.json({ inserted: insertedCount, updated: updatedCount, auto_assigned: assigned })
   })
 
   // Rotate the ingest token (do this if it leaks). Owner-only via the
