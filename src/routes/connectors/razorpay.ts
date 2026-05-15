@@ -48,22 +48,46 @@ const KeySchema = z.object({
   key_secret: z.string().min(8, 'Secret looks too short'),
 })
 
+// Flat-shape schema matching `connectors/registry.ts` create_payment_link
+// inputSchema. The registry's `Amount (INR)` field sends rupees; we convert
+// to paise before forwarding to Razorpay. The workflow-builder engine and a
+// future capability form will both POST this exact shape.
+//
+// Example successful payload from the FE / workflow node:
+//   {
+//     "amount": 1499,                       // rupees (INR)
+//     "description": "Plan upgrade",
+//     "customer_phone": "+919876543210",
+//     "customer_name":  "Asha Patel",
+//     "customer_email": "asha@example.com"  // optional
+//   }
+//
+// Sent to Razorpay as:
+//   {
+//     "amount": 149900,                     // paise
+//     "currency": "INR",
+//     "description": "Plan upgrade",
+//     "customer": { name, email, contact }
+//   }
+//
+// Coerce numeric strings to numbers (FE form inputs return strings even on
+// type='number' fields). z.coerce.number lets workflow interpolators that
+// produce "1499" continue to work without per-callsite Number() casts.
 const PaymentLinkSchema = z.object({
-  amount:       z.number().int().positive(),                                  // in paise
-  currency:     z.string().length(3).default('INR'),
-  description:  z.string().max(2048).optional(),
-  customer:     z.object({
-    name:    z.string().min(1).max(100).optional(),
-    email:   z.string().email().optional(),
-    contact: z.string().min(6).max(20).optional(),
-  }).optional(),
-  notify:       z.object({ sms: z.boolean().optional(), email: z.boolean().optional() }).optional(),
+  amount:          z.coerce.number().positive(),                       // rupees (INR), converted to paise in handler
+  currency:        z.string().length(3).default('INR'),
+  description:     z.string().max(2048).optional(),
+  customer_name:   z.string().min(1).max(100).optional(),
+  customer_email:  z.string().email().optional(),
+  customer_phone:  z.string().min(6).max(20).optional(),
+  notify_sms:      z.boolean().optional(),
+  notify_email:    z.boolean().optional(),
   reminder_enable: z.boolean().optional(),
-  notes:        z.record(z.string(), z.string()).optional(),
-  callback_url: z.string().url().optional(),
+  notes:           z.record(z.string(), z.string()).optional(),
+  callback_url:    z.string().url().optional(),
   callback_method: z.enum(['get']).optional(),
-  expire_by:    z.number().int().optional(),                                  // unix ts
-}).passthrough()
+  expire_by:       z.number().int().optional(),                        // unix ts
+}).strict()
 
 const RefundSchema = z.object({
   amount:    z.number().int().positive().optional(),                           // partial refund
@@ -82,6 +106,13 @@ export function createRazorpayConnector(deps: Deps): express.Router {
     validateBody(KeySchema),
     async (req, res) => {
       const tenantId = (req as any).tenantId
+      // user_id is required by tenant_integrations.user_id NOT NULL (migration
+      // 005). requireAuth populates (req as any).user from supabase.auth.getUser,
+      // so .id is always present after the middleware runs — but we guard
+      // explicitly so a misconfigured route ordering surfaces with a clean 401
+      // instead of a silent constraint violation.
+      const userId = (req as any).user?.id as string | undefined
+      if (!userId) { res.status(401).json({ error: 'auth missing user.id' }); return }
       const { key_id, key_secret } = req.body as z.infer<typeof KeySchema>
 
       // Verify with a real Razorpay call before persisting — if the keys are
@@ -96,8 +127,13 @@ export function createRazorpayConnector(deps: Deps): express.Router {
       }
 
       const live = key_id.startsWith('rzp_live_')
-      await supabase.from('tenant_integrations').upsert({
+      // supabase-js does NOT throw on DB errors — it returns { data, error }.
+      // The previous version ignored `error`, so a NOT NULL constraint
+      // violation (missing user_id) silently produced a misleading 200 with
+      // nothing persisted. Always check `error` and surface it.
+      const { error: upsertErr } = await supabase.from('tenant_integrations').upsert({
         tenant_id:   tenantId,
+        user_id:     userId,
         key:         'razorpay',
         status:      'active',
         scope:       live ? 'live_keys' : 'test_keys',
@@ -108,6 +144,10 @@ export function createRazorpayConnector(deps: Deps): express.Router {
         refresh_token: encrypt(key_secret),
         metadata:      { auth_mode: 'api_key', mode: live ? 'live' : 'test' },
       }, { onConflict: 'tenant_id,key' })
+      if (upsertErr) {
+        console.error(`[razorpay connect] DB upsert failed: ${upsertErr.message}`)
+        res.status(500).json({ error: 'Failed to persist connection: ' + upsertErr.message }); return
+      }
       res.json({ success: true, mode: live ? 'live' : 'test' })
     })
 
@@ -171,8 +211,17 @@ export function createRazorpayConnector(deps: Deps): express.Router {
     const expiresAt = tokenBody.expires_in
       ? new Date(Date.now() + tokenBody.expires_in * 1000).toISOString()
       : null
-    await supabase.from('tenant_integrations').upsert({
+    // tenant_integrations.user_id is NOT NULL. The OAuth start endpoint
+    // persisted user_id on the oauth_states row — use it here so the upsert
+    // doesn't fail the constraint and leave the popup showing "connected"
+    // while nothing was written.
+    if (!stateRow.user_id) {
+      res.status(400).type('html').send(closePopupHtml({ ok: false, error: 'oauth_states row missing user_id — please retry the connect flow' }))
+      return
+    }
+    const { error: upsertErr } = await supabase.from('tenant_integrations').upsert({
       tenant_id:        stateRow.tenant_id,
+      user_id:          stateRow.user_id,
       key:              'razorpay',
       status:           'active',
       access_token:     encrypt(tokenBody.access_token),
@@ -182,22 +231,63 @@ export function createRazorpayConnector(deps: Deps): express.Router {
       brand_label:      tokenBody.razorpay_account_id ?? 'OAuth',
       metadata:         { auth_mode: 'oauth' },
     }, { onConflict: 'tenant_id,key' })
+    if (upsertErr) {
+      console.error(`[razorpay oauth callback] DB upsert failed: ${upsertErr.message}`)
+      res.status(500).type('html').send(closePopupHtml({ ok: false, error: 'Failed to persist connection: ' + upsertErr.message }))
+      return
+    }
     await supabase.from('oauth_states').delete().eq('state', state)
     res.type('html').send(closePopupHtml({ ok: true, connector: 'razorpay' }))
   })
 
   // ── 2. Capabilities ───────────────────────────────────────────────────────
   // create_payment_link
+  // Accepts the flat shape declared by the registry inputSchema (amount in INR,
+  // flat customer_* fields) and translates it to Razorpay's wire format
+  // (amount in paise, nested `customer` object). Keeps schema drift across
+  // registry ↔ handler at zero — the registry stays the single source of
+  // truth for what the FE sends.
   r.post('/api/connectors/razorpay/payment-links',
     requireAuth, identifyTenant, checkPermission('integrations', 'edit'),
     validateBody(PaymentLinkSchema),
     async (req, res) => {
       try {
         const auth = await getRazorpayAuthHeader(supabase, (req as any).tenantId)
+        const input = req.body as z.infer<typeof PaymentLinkSchema>
+
+        // INR (rupees) → paise. Razorpay rejects non-integer amounts, so round
+        // defensively for any fractional-rupee input that slipped past Zod.
+        const amountPaise = Math.round(input.amount * 100)
+
+        // Build nested customer only if at least one sub-field is present —
+        // Razorpay 400s on an empty {} customer object.
+        const customer: Record<string, string> = {}
+        if (input.customer_name)  customer.name    = input.customer_name
+        if (input.customer_email) customer.email   = input.customer_email
+        if (input.customer_phone) customer.contact = input.customer_phone
+
+        // Same for notify — only emit if explicitly set.
+        const notify: Record<string, boolean> = {}
+        if (typeof input.notify_sms   === 'boolean') notify.sms   = input.notify_sms
+        if (typeof input.notify_email === 'boolean') notify.email = input.notify_email
+
+        const wirePayload: Record<string, unknown> = {
+          amount:   amountPaise,
+          currency: input.currency,
+        }
+        if (input.description)              wirePayload.description     = input.description
+        if (Object.keys(customer).length)   wirePayload.customer        = customer
+        if (Object.keys(notify).length)     wirePayload.notify          = notify
+        if (input.reminder_enable !== undefined) wirePayload.reminder_enable = input.reminder_enable
+        if (input.notes)                    wirePayload.notes           = input.notes
+        if (input.callback_url)             wirePayload.callback_url    = input.callback_url
+        if (input.callback_method)          wirePayload.callback_method = input.callback_method
+        if (input.expire_by)                wirePayload.expire_by       = input.expire_by
+
         const r2 = await fetch(`${RZP}/payment_links`, {
           method: 'POST',
           headers: { Authorization: auth, 'Content-Type': 'application/json' },
-          body: JSON.stringify(req.body),
+          body: JSON.stringify(wirePayload),
         })
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.description ?? `Razorpay ${r2.status}` }); return }

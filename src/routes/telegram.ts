@@ -52,6 +52,14 @@ export function createTelegramRouter(deps: Deps): express.Router {
   // ── Connect / disconnect ──────────────────────────────────────────────────
   r.post('/api/telegram/connect', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId
+    // tg_bots itself has no user_id column (PK is tenant_id, see migration 016),
+    // but the MIRROR into tenant_integrations DOES require user_id NOT NULL —
+    // the previous version omitted it and ignored the returned `error`, so the
+    // mirror row was never written and /api/connectors/connections never
+    // showed Telegram as connected (the FE still saw "connected" because the
+    // tg_bots row landed — the mirror is the silent failure).
+    const userId = (req as any).user?.id as string | undefined
+    if (!userId) { res.status(401).json({ error: 'auth missing user.id' }); return }
     const { bot_token } = req.body
     if (typeof bot_token !== 'string' || !/^\d+:[A-Za-z0-9_-]{30,}$/.test(bot_token)) {
       res.status(400).json({ error: 'Invalid bot token format. Get one from @BotFather.' }); return
@@ -59,20 +67,28 @@ export function createTelegramRouter(deps: Deps): express.Router {
     try {
       const me = await tgCall<{ id: number; username?: string; first_name?: string }>(bot_token, 'getMe')
       const enc = encrypt(bot_token)
-      await supabase.from('tg_bots').upsert({
+      const { error: tgErr } = await supabase.from('tg_bots').upsert({
         tenant_id: tenantId,
         bot_username: me.username ?? null,
         bot_id: me.id,
         bot_token: enc,
         updated_at: new Date().toISOString(),
       })
+      if (tgErr) {
+        console.error(`[telegram connect] tg_bots upsert failed: ${tgErr.message}`)
+        res.status(500).json({ error: 'Failed to persist bot: ' + tgErr.message }); return
+      }
       // Mirror into tenant_integrations so /api/connectors/connections lists
       // it as a generic connected app for status / disconnect-flow consistency.
-      await supabase.from('tenant_integrations').upsert({
-        tenant_id: tenantId, key: 'telegram', status: 'active',
+      const { error: tiErr } = await supabase.from('tenant_integrations').upsert({
+        tenant_id: tenantId, user_id: userId, key: 'telegram', status: 'active',
         brand_label: me.username ? `@${me.username}` : `bot ${me.id}`,
         connected_at: new Date().toISOString(),
-      })
+      }, { onConflict: 'tenant_id,key' })
+      if (tiErr) {
+        console.error(`[telegram connect] tenant_integrations mirror upsert failed: ${tiErr.message}`)
+        res.status(500).json({ error: 'Failed to persist connection mirror: ' + tiErr.message }); return
+      }
       res.json({ success: true, bot: { id: me.id, username: me.username, name: me.first_name } })
     } catch (err: any) {
       res.status(400).json({ error: err.message || 'Could not validate bot token' })

@@ -64,6 +64,10 @@ export function createShopifyConnector(deps: Deps): express.Router {
     validateBody(TokenSchema),
     async (req, res) => {
       const tenantId = (req as any).tenantId
+      // tenant_integrations.user_id is NOT NULL — omitting it produces a silent
+      // constraint violation that supabase-js returns as { error } (not a throw).
+      const userId = (req as any).user?.id as string | undefined
+      if (!userId) { res.status(401).json({ error: 'auth missing user.id' }); return }
       const { shop_domain, admin_token } = req.body as z.infer<typeof TokenSchema>
 
       // Verify with a real call to GET /shop.json
@@ -79,8 +83,9 @@ export function createShopifyConnector(deps: Deps): express.Router {
       const shopBody = await verify.json() as any
       const label = shopBody?.shop?.name ?? shop_domain
 
-      await supabase.from('tenant_integrations').upsert({
+      const { error: upsertErr } = await supabase.from('tenant_integrations').upsert({
         tenant_id:     tenantId,
+        user_id:       userId,
         key:           'shopify',
         status:        'active',
         access_token:  encrypt(admin_token),
@@ -88,6 +93,10 @@ export function createShopifyConnector(deps: Deps): express.Router {
         brand_label:   label,
         metadata:      { auth_mode: 'custom_app', shop_domain, shop_id: shopBody?.shop?.id },
       }, { onConflict: 'tenant_id,key' })
+      if (upsertErr) {
+        console.error(`[shopify connect] DB upsert failed: ${upsertErr.message}`)
+        res.status(500).json({ error: 'Failed to persist connection: ' + upsertErr.message }); return
+      }
       res.json({ success: true, shop: label })
     })
 
@@ -153,17 +162,54 @@ export function createShopifyConnector(deps: Deps): express.Router {
     const body = await tokenRes.json() as any
     if (!tokenRes.ok) { res.status(400).type('html').send(closePopupHtml({ ok: false, error: body.error_description ?? body.error ?? 'Shopify token exchange failed' })); return }
 
-    await supabase.from('tenant_integrations').upsert({
+    // tenant_integrations.user_id is NOT NULL — the OAuth start endpoint
+    // recorded user_id on the oauth_states row, propagate it here.
+    if (!stateRow.user_id) {
+      res.status(400).type('html').send(closePopupHtml({ ok: false, error: 'oauth_states row missing user_id — please retry the connect flow' }))
+      return
+    }
+
+    // Identity sync: fetch shop.json so brand_label shows the storefront name
+    // (e.g. "Frequency Labs") instead of the bare domain ("frequency.myshopify.com").
+    // Token-paste already does this on /connect-token; we mirror the behaviour
+    // here so OAuth-installed shops aren't second-class.
+    // Wrapped in try/catch — identity fetch must NEVER block the connect: the
+    // token is already verified by Shopify's OAuth handshake and the upsert
+    // below must land regardless.
+    let label = shop
+    let shopId: number | null = null
+    let shopEmail: string | null = null
+    try {
+      const shopRes = await fetch(`https://${shop}/admin/api/${API_VERSION}/shop.json`, {
+        headers: { 'X-Shopify-Access-Token': body.access_token, 'Content-Type': 'application/json' },
+      })
+      if (shopRes.ok) {
+        const shopBody = await shopRes.json() as any
+        if (shopBody?.shop?.name)  label     = shopBody.shop.name
+        if (shopBody?.shop?.id)    shopId    = shopBody.shop.id
+        if (shopBody?.shop?.email) shopEmail = shopBody.shop.email
+      }
+    } catch (e: any) {
+      console.warn(`[shopify oauth callback] identity fetch failed (non-fatal): ${e?.message}`)
+    }
+
+    const { error: upsertErr } = await supabase.from('tenant_integrations').upsert({
       tenant_id:    stateRow.tenant_id,
+      user_id:      stateRow.user_id,
       key:          'shopify',
       status:       'active',
       access_token: encrypt(body.access_token),
       scope:        body.scope,
-      brand_label:  shop,
-      metadata:     { auth_mode: 'oauth', shop_domain: shop },
+      brand_label:  label,
+      metadata:     { auth_mode: 'oauth', shop_domain: shop, shop_id: shopId, shop_email: shopEmail },
     }, { onConflict: 'tenant_id,key' })
+    if (upsertErr) {
+      console.error(`[shopify oauth callback] DB upsert failed: ${upsertErr.message}`)
+      res.status(500).type('html').send(closePopupHtml({ ok: false, error: 'Failed to persist connection: ' + upsertErr.message }))
+      return
+    }
     await supabase.from('oauth_states').delete().eq('state', state)
-    res.type('html').send(closePopupHtml({ ok: true, connector: 'shopify', label: shop }))
+    res.type('html').send(closePopupHtml({ ok: true, connector: 'shopify', label }))
   })
 
   // ── Capabilities ──────────────────────────────────────────────────────────

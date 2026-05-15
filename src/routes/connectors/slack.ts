@@ -67,6 +67,11 @@ export function createSlackConnector(deps: Deps): express.Router {
     validateBody(ConnectSchema),
     async (req, res) => {
       const tenantId = (req as any).tenantId
+      // tenant_integrations.user_id is NOT NULL — without this the upsert
+      // returns { error } (constraint violation) and the previous code path
+      // ignored it, returning 200 with nothing persisted.
+      const userId = (req as any).user?.id as string | undefined
+      if (!userId) { res.status(401).json({ error: 'auth missing user.id' }); return }
       const { webhook_url } = req.body as z.infer<typeof ConnectSchema>
 
       // 1. Verify with a real Slack call BEFORE persisting. Sends a test
@@ -105,8 +110,9 @@ export function createSlackConnector(deps: Deps): express.Router {
       // segment is the workspace id).
       const workspaceHint = webhook_url.split('/').find(s => /^T[A-Z0-9]{6,}$/.test(s)) ?? 'Webhook'
 
-      await supabase.from('tenant_integrations').upsert({
+      const { error: upsertErr } = await supabase.from('tenant_integrations').upsert({
         tenant_id:     tenantId,
+        user_id:       userId,
         key:           'slack',
         status:        'active',
         scope:         'incoming_webhook',
@@ -118,6 +124,10 @@ export function createSlackConnector(deps: Deps): express.Router {
         refresh_token: encrypt(webhook_url),
         metadata:      { auth_mode: 'webhook_paste' },
       }, { onConflict: 'tenant_id,key' })
+      if (upsertErr) {
+        console.error(`[slack connect] DB upsert failed: ${upsertErr.message}`)
+        res.status(500).json({ error: 'Failed to persist connection: ' + upsertErr.message }); return
+      }
 
       res.json({ success: true, workspace_hint: workspaceHint })
     })

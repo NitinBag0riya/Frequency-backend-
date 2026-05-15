@@ -75,14 +75,57 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
       const accounts = await fetch(`${GRAPH}/me/adaccounts?fields=id,name,currency,business&access_token=${userToken}`).then(r => r.json()) as any
       const accs = accounts.data ?? []
 
-      await supabase.from('tenant_integrations').upsert({
-        tenant_id: parsed.tenantId, key: 'meta_ads', status: 'active',
+      // Identity sync: pull the connecting Meta user's display name so
+      // brand_label shows e.g. "Asha Patel — 2 ad accounts" rather than the
+      // bare ad-account name (which can be a generic "Default Ad Account").
+      // Wrapped in try/catch — identity fetch failures MUST NOT block the
+      // connect; the access_token is already verified by the token exchange.
+      let metaUserName: string | null = null
+      try {
+        const me = await fetch(`${GRAPH}/me?fields=name&access_token=${userToken}`).then(r => r.json()) as any
+        if (me?.name) metaUserName = me.name
+      } catch (e: any) {
+        console.warn(`[meta_ads oauth-callback] /me identity fetch failed (non-fatal): ${e?.message}`)
+      }
+
+      // tenant_integrations.user_id is NOT NULL (migration 005). The signed
+      // state blob carries the user id (verified.u → parsed.userId); without
+      // it the upsert silently fails the constraint and the popup
+      // postMessages ok:true while nothing landed.
+      if (!parsed.userId) {
+        res.status(400).type('html').send(closePopupHtml('Signed state missing user_id — please retry')); return
+      }
+      // Friendly label: prefer the single ad-account name (most users have
+      // one), else "<Meta user> — N ad accounts", else fall back to the
+      // generic "<N> ad accounts" if /me failed.
+      const brandLabel =
+        accs.length === 1
+          ? (accs[0].name as string)
+          : metaUserName
+            ? `${metaUserName} — ${accs.length} ad account${accs.length === 1 ? '' : 's'}`
+            : `${accs.length} ad account${accs.length === 1 ? '' : 's'}`
+      // supabase-js returns { data, error } and never throws on DB errors —
+      // the previous version ignored `error`, so any constraint violation
+      // produced a misleading "Connected" toast in the FE.
+      const { error: upsertErr } = await supabase.from('tenant_integrations').upsert({
+        tenant_id: parsed.tenantId, user_id: parsed.userId, key: 'meta_ads', status: 'active',
         access_token: encrypt(userToken),
         scope: SCOPES,
-        brand_label: accs.length === 1 ? accs[0].name : `${accs.length} ad accounts`,
+        brand_label: brandLabel,
         connected_at: new Date().toISOString(),
-        metadata: { ad_accounts: accs.map((a: any) => ({ id: a.id, name: a.name, currency: a.currency })) },
-      })
+        metadata: {
+          meta_user_name: metaUserName,
+          ad_accounts: accs.map((a: any) => ({ id: a.id, name: a.name, currency: a.currency })),
+        },
+      }, { onConflict: 'tenant_id,key' })
+      if (upsertErr) {
+        console.error(`[meta_ads oauth-callback] DB upsert failed: ${upsertErr.message}`)
+        // closePopupHtml(msg, ok=false) → popup postMessages { ok:false, message }
+        // so the FE OAuth popup helper surfaces the failure as an error toast
+        // instead of silently believing the connection succeeded.
+        res.status(500).type('html').send(closePopupHtml('Failed to save Meta Ads connection: ' + upsertErr.message))
+        return
+      }
       // Mirror into our own meta_ad_accounts table for FK referencing
       for (const a of accs) {
         await supabase.from('meta_ad_accounts').upsert({

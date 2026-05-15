@@ -126,8 +126,21 @@ export function createAirtableConnector(deps: Deps): express.Router {
     } catch { /* swallow — label is cosmetic */ }
 
     const expiresAt = new Date(Date.now() + (tokenBody.expires_in ?? 3600) * 1000).toISOString()
-    await supabase.from('tenant_integrations').upsert({
+    // tenant_integrations.user_id is NOT NULL (migration 005). The OAuth start
+    // endpoint persisted user_id on the oauth_states row — reuse it here so
+    // the upsert doesn't fail the constraint and leave the popup showing
+    // "connected" while nothing was written.
+    if (!stateRow.user_id) {
+      res.status(400).type('html').send(closePopupHtml({ ok: false, error: 'oauth_states row missing user_id — please retry the connect flow' }))
+      return
+    }
+    // supabase-js does NOT throw on DB errors — it returns { data, error }.
+    // The previous version ignored `error`, so a NOT NULL constraint
+    // violation silently produced a 200 with nothing persisted while the
+    // popup still postMessaged ok:true.
+    const { error: upsertErr } = await supabase.from('tenant_integrations').upsert({
       tenant_id:        stateRow.tenant_id,
+      user_id:          stateRow.user_id,
       key:              'airtable',
       status:           'active',
       access_token:     encrypt(tokenBody.access_token),
@@ -137,6 +150,11 @@ export function createAirtableConnector(deps: Deps): express.Router {
       brand_label:      label,
       metadata:         { token_type: tokenBody.token_type ?? 'Bearer' },
     }, { onConflict: 'tenant_id,key' })
+    if (upsertErr) {
+      console.error(`[airtable oauth-callback] DB upsert failed: ${upsertErr.message}`)
+      res.status(500).type('html').send(closePopupHtml({ ok: false, error: 'Failed to persist connection: ' + upsertErr.message }))
+      return
+    }
 
     // Clean up state row
     await supabase.from('oauth_states').delete().eq('state', state)
@@ -292,7 +310,15 @@ export async function getValidToken(supabase: SupabaseClient, tenantId: string):
   // 0 rows and we re-read to use the winner's token instead of clobbering it
   // with our (also-valid-but-different) tokens — which would lose 50% of the
   // refresh window and kill the OTHER caller's pending requests.
-  const { data: updated } = await supabase.from('tenant_integrations').update({
+  // supabase-js returns { data, error } and never throws on DB failures. The
+  // previous version dropped `error` on the floor, so a transient DB issue
+  // here would look like "lost the race" (data=null), send us into the
+  // re-read branch, and ultimately throw a misleading
+  // "lost in concurrent refresh — please retry". Capture + log the error so
+  // we can diagnose later; don't 500 because this path runs async during
+  // token use (not on a route handler), and the CAS fallback is correct
+  // behaviour either way.
+  const { data: updated, error: updErr } = await supabase.from('tenant_integrations').update({
     access_token:     encrypt(body.access_token),
     refresh_token:    encrypt(body.refresh_token),
     token_expires_at: newExpiresAt,
@@ -302,6 +328,11 @@ export async function getValidToken(supabase: SupabaseClient, tenantId: string):
     .eq('key', 'airtable')
     .eq('token_expires_at', oldExpiresAtIso ?? '')   // CAS predicate
     .select('access_token').maybeSingle()
+  if (updErr) {
+    console.error(`[airtable token-refresh] CAS update failed for tenant ${tenantId}: ${updErr.message}`)
+    // Fall through to the re-read branch below — if the row is still readable
+    // we'll just return the stored (possibly stale) token rather than crash.
+  }
 
   if (updated) return body.access_token
 

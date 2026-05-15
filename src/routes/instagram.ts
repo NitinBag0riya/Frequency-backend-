@@ -105,16 +105,57 @@ export function createInstagramRouter(deps: Deps): express.Router {
       const pageId   = linked.id
       const pageToken = linked.access_token
 
-      await supabase.from('tenant_integrations').upsert({
-        tenant_id: parsed.tenantId, key: 'instagram', status: 'active',
+      // Identity sync: pull the IG business account's @username + display
+      // name so brand_label is the @handle ("@frequency_labs") rather than
+      // the linked Facebook Page name. Users recognize the IG handle far
+      // more than the Page name they may have set years ago.
+      // Wrapped in try/catch — identity fetch failures MUST NOT block the
+      // connect; the page_access_token is already valid.
+      let igUsername: string | null = null
+      let igDisplayName: string | null = null
+      try {
+        const igMe = await fetch(`${GRAPH}/${igUserId}?fields=username,name&access_token=${pageToken}`).then(r => r.json()) as any
+        if (igMe?.username) igUsername    = igMe.username
+        if (igMe?.name)     igDisplayName = igMe.name
+      } catch (e: any) {
+        console.warn(`[instagram oauth-callback] IG /me identity fetch failed (non-fatal): ${e?.message}`)
+      }
+      const brandLabel = igUsername ? `@${igUsername}` : (linked.name ?? `IG ${igUserId}`)
+
+      // tenant_integrations.user_id is NOT NULL (migration 005). The signed
+      // state blob carries the user id (verified.u → parsed.userId); without
+      // it the upsert silently fails the constraint and the popup
+      // postMessages ok:true while nothing landed.
+      if (!parsed.userId) {
+        res.status(400).type('html').send(closePopupHtml('Signed state missing user_id — please retry')); return
+      }
+      // supabase-js returns { data, error } and never throws on DB errors —
+      // the previous version ignored `error`, so any constraint violation
+      // produced a misleading "Connected" toast in the FE.
+      const { error: upsertErr } = await supabase.from('tenant_integrations').upsert({
+        tenant_id: parsed.tenantId, user_id: parsed.userId, key: 'instagram', status: 'active',
         access_token: encrypt(pageToken),
         scope: SCOPES,
-        brand_label: linked.name ?? `IG ${igUserId}`,
+        brand_label: brandLabel,
         connected_at: new Date().toISOString(),
-        metadata: { ig_user_id: igUserId, page_id: pageId },
-      })
+        metadata: {
+          ig_user_id:      igUserId,
+          ig_username:     igUsername,
+          ig_display_name: igDisplayName,
+          page_id:         pageId,
+          page_name:       linked.name ?? null,
+        },
+      }, { onConflict: 'tenant_id,key' })
+      if (upsertErr) {
+        console.error(`[instagram oauth-callback] DB upsert failed: ${upsertErr.message}`)
+        // closePopupHtml(msg, ok=false) → popup postMessages { ok:false, message }
+        // so the FE OAuth popup helper surfaces the failure as an error toast
+        // instead of silently believing the connection succeeded.
+        res.status(500).type('html').send(closePopupHtml('Failed to save Instagram connection: ' + upsertErr.message))
+        return
+      }
 
-      res.type('html').send(closePopupHtml(`Connected ${linked.name}`, true))
+      res.type('html').send(closePopupHtml(`Connected ${brandLabel}`, true))
     } catch (err: any) {
       res.type('html').send(closePopupHtml(err.message ?? 'Instagram connect failed'))
     }
