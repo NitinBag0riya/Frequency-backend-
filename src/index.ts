@@ -10,7 +10,8 @@ import { createClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 import {
   sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets,
-  calendarCreateEvent, calendarCheckAvailability
+  calendarCreateEvent, calendarCheckAvailability,
+  getValidGoogleToken,
 } from './google'
 import { createLeadsRouter } from './leads'
 import { createAdminRouter } from './admin'
@@ -2690,6 +2691,241 @@ app.get('/api/google/spreadsheets/:id', requireAuth, identifyTenant, checkPermis
     res.status(500).json({ error: err.message }) 
   }
 })
+
+// ── Google Sheets + Calendar capability handlers ─────────────────────────────
+// REST surface for the connector registry capabilities. The workflow engine
+// has its own internal `update_sheet` / `create_calendar_event` paths; these
+// endpoints expose the same Google operations as one-shot REST calls so the
+// AppsModal capability page (and any user-facing "test run" surface) can drive
+// them directly with the same OAuth token + auto-refresh helper.
+//
+// All five handlers reuse `getValidToken`-backed helpers from ../google.ts —
+// they read tokens off the tenants row, refresh via oauth2.googleapis.com/token
+// if expired, and persist the new access_token back to the row.
+
+// Body shape mirrors registry.GOOGLE_SHEETS.capabilities[].inputSchema.fields.
+// `values` accepts either a JSON-encoded string (FE textarea, same pattern as
+// WhatsApp template_params) or an already-parsed array — both forms are
+// normalised before hitting Google.
+const GoogleSheetsAppendSchema = z.object({
+  spreadsheet_id: z.string().min(1, 'spreadsheet_id is required'),
+  sheet_name:     z.string().min(1, 'sheet_name is required'),
+  values:         z.union([z.string(), z.array(z.any())]),
+}).strict()
+
+const GoogleSheetsUpdateSchema = z.object({
+  spreadsheet_id: z.string().min(1, 'spreadsheet_id is required'),
+  range:          z.string().min(1, 'range is required'),  // e.g. 'Sheet1!B5:D5'
+  values:         z.union([z.string(), z.array(z.any())]),
+}).strict()
+
+const GoogleCalendarEventSchema = z.object({
+  calendar_id: z.string().min(1).default('primary'),
+  summary:     z.string().min(1, 'summary is required'),
+  description: z.string().optional(),
+  location:    z.string().optional(),
+  start:       z.string().min(1, 'start is required'),  // ISO 8601 dateTime
+  end:         z.string().min(1, 'end is required'),    // ISO 8601 dateTime
+  time_zone:   z.string().optional(),
+  attendees:   z.union([z.string(), z.array(z.string())]).optional(),
+}).strict()
+
+// Coerce FE-friendly inputs (JSON string / CSV / nested array) into the
+// shape the Google helper expects. Throws a typed Error on malformed input
+// so the route can return a clean 400.
+function coerceSheetValuesFlat(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    // Single-row array OR a [[…]] 2D — flatten if FE handed in [["a","b"]]
+    if (raw.length === 1 && Array.isArray(raw[0])) return (raw[0] as any[]).map(String)
+    return (raw as any[]).map(String)
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed) throw new Error('values is required')
+    if (trimmed.startsWith('[')) {
+      let parsed: any
+      try { parsed = JSON.parse(trimmed) } catch { throw new Error('values: invalid JSON') }
+      return coerceSheetValuesFlat(parsed)
+    }
+    // Fallback: comma-separated. Quoted tokens are unquoted so '"A","B"' → ['A','B'].
+    return trimmed.split(',').map(s => s.trim().replace(/^["']|["']$/g, ''))
+  }
+  throw new Error('values must be an array or string')
+}
+
+function coerceSheetValues2D(raw: unknown): string[][] {
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return []
+    // Already 2D
+    if (Array.isArray(raw[0])) return (raw as any[][]).map(row => row.map(String))
+    // 1D → wrap as single row
+    return [(raw as any[]).map(String)]
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed) throw new Error('values is required')
+    if (trimmed.startsWith('[')) {
+      let parsed: any
+      try { parsed = JSON.parse(trimmed) } catch { throw new Error('values: invalid JSON') }
+      return coerceSheetValues2D(parsed)
+    }
+    return [trimmed.split(',').map(s => s.trim().replace(/^["']|["']$/g, ''))]
+  }
+  throw new Error('values must be an array or string')
+}
+
+// 1) Append row → POST /api/google/sheets/append
+app.post('/api/google/sheets/append',
+  requireAuth, identifyTenant, checkPermission('google_sheets', 'edit'),
+  validateBody(GoogleSheetsAppendSchema),
+  async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    let row: string[]
+    try { row = coerceSheetValuesFlat((req.body as any).values) }
+    catch (err: any) { res.status(400).json({ error: err.message }); return }
+
+    // Range form for append: 'SheetName!A:Z' — the helper URL-encodes for us.
+    const range = `${(req.body as any).sheet_name}!A:Z`
+    try {
+      const data = await sheetsAppendRow(tenant, String((req.body as any).spreadsheet_id), range, row)
+      res.json(data)  // { spreadsheetId, tableRange, updates: { updatedRange, updatedRows, … } }
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
+
+// 2) Update range → POST /api/google/sheets/update
+app.post('/api/google/sheets/update',
+  requireAuth, identifyTenant, checkPermission('google_sheets', 'edit'),
+  validateBody(GoogleSheetsUpdateSchema),
+  async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    let rows: string[][]
+    try { rows = coerceSheetValues2D((req.body as any).values) }
+    catch (err: any) { res.status(400).json({ error: err.message }); return }
+
+    try {
+      const data = await sheetsUpdateRange(
+        tenant,
+        String((req.body as any).spreadsheet_id),
+        String((req.body as any).range),
+        rows,
+      )
+      res.json(data)  // { spreadsheetId, updatedRange, updatedRows, updatedColumns, updatedCells }
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
+
+// 3) Read range → GET /api/google/sheets/read?spreadsheet_id=…&range=Sheet1!A1:D10
+app.get('/api/google/sheets/read',
+  requireAuth, identifyTenant, checkPermission('google_sheets', 'view'),
+  async (req, res) => {
+    const spreadsheetId = String(req.query.spreadsheet_id ?? '').trim()
+    const range = String(req.query.range ?? '').trim()
+    if (!spreadsheetId || !range) {
+      res.status(400).json({ error: 'spreadsheet_id and range query params are required' }); return
+    }
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    // The existing helper strips the {range, majorDimension} envelope, so call
+    // Google directly here to preserve the full registry-declared output shape.
+    try {
+      const token = await getValidGoogleToken(tenant)
+      const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}`
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      const data = await r.json() as any
+      if (data.error) { res.status(502).json({ error: data.error.message }); return }
+      res.json({
+        range:          data.range,
+        majorDimension: data.majorDimension,
+        values:         data.values ?? [],
+      })
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
+
+// 4) Create calendar event → POST /api/google/calendar/events
+app.post('/api/google/calendar/events',
+  requireAuth, identifyTenant, checkPermission('google_calendar', 'edit'),
+  validateBody(GoogleCalendarEventSchema),
+  async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    const body = req.body as any
+    // Normalise attendees: accept JSON string, comma-separated string, or array
+    let attendeeEmails: string[] | undefined
+    if (body.attendees != null) {
+      if (Array.isArray(body.attendees)) {
+        attendeeEmails = body.attendees.map(String).filter(Boolean)
+      } else if (typeof body.attendees === 'string') {
+        const s: string = body.attendees.trim()
+        if (s.startsWith('[')) {
+          try { attendeeEmails = (JSON.parse(s) as any[]).map(String) }
+          catch { res.status(400).json({ error: 'attendees: invalid JSON' }); return }
+        } else if (s.length > 0) {
+          attendeeEmails = s.split(',').map((x: string) => x.trim()).filter(Boolean)
+        }
+      }
+    }
+    try {
+      const data = await calendarCreateEvent(tenant, body.calendar_id || 'primary', {
+        summary:        body.summary,
+        description:    body.description,
+        location:       body.location,
+        startTime:      body.start,
+        endTime:        body.end,
+        timeZone:       body.time_zone,
+        attendeeEmails,
+      })
+      res.json(data)  // { id, htmlLink, status, summary, start: {dateTime}, end: {dateTime}, … }
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
+
+// 5) Check availability → GET /api/google/calendar/availability?calendar_id=…&time_min=…&time_max=…
+app.get('/api/google/calendar/availability',
+  requireAuth, identifyTenant, checkPermission('google_calendar', 'view'),
+  async (req, res) => {
+    const calendarId = String(req.query.calendar_id ?? 'primary').trim() || 'primary'
+    const timeMin = String(req.query.time_min ?? '').trim()
+    const timeMax = String(req.query.time_max ?? '').trim()
+    if (!timeMin || !timeMax) {
+      res.status(400).json({ error: 'time_min and time_max query params are required (ISO 8601)' }); return
+    }
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    // calendarCheckAvailability() helper collapses to a single boolean — for
+    // the REST surface we want the raw freebusy response (per-calendar busy
+    // arrays), so call Google directly. Same OAuth refresh path via the
+    // shared getValidGoogleToken wrapper.
+    try {
+      const token = await getValidGoogleToken(tenant)
+      const r = await fetch('https://www.googleapis.com/calendar/v3/freeBusy', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timeMin, timeMax, items: [{ id: calendarId }] }),
+      })
+      const data = await r.json() as any
+      if (data.error) { res.status(502).json({ error: data.error.message }); return }
+      res.json({
+        timeMin:   data.timeMin,
+        timeMax:   data.timeMax,
+        calendars: data.calendars ?? {},
+      })
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
 
 app.post('/api/integrations/razorpay', requireAuth, identifyTenant, checkPermission('integrations', 'edit'), validateBody(RazorpayConnectSchema), async (req, res) => {
   const tenantId = (req as any).tenantId

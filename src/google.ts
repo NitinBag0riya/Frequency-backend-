@@ -34,6 +34,17 @@ export function decrypt(text: string): string {
 }
 
 // ── Token refresh ─────────────────────────────────────────────────────────────
+/**
+ * Returns a non-expired Google access token for the given tenant row, doing
+ * a refresh round-trip + DB writeback if the stored one is within 60s of
+ * expiry. Exported so REST capability handlers in index.ts can hit Google
+ * APIs directly (e.g. freebusy.query, sheets.values.get with full envelope)
+ * without re-implementing OAuth refresh.
+ */
+export async function getValidGoogleToken(tenant: any): Promise<string> {
+  return getValidToken(tenant)
+}
+
 async function getValidToken(tenant: any): Promise<string> {
   const expiry = tenant.google_token_expiry ? new Date(tenant.google_token_expiry) : null
   const accessToken = decrypt(tenant.google_access_token)
