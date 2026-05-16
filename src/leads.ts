@@ -229,6 +229,19 @@ async function notifyOnAssignment(
   tenantId: string,
   tableId: string,
   inserts: Array<{ assigned_to?: string | null; assigned_to_name?: string }>,
+  opts: {
+    // When set, skip notifying this user. Used by interactive paths
+    // (manual PATCH-assign, bulk apply) so the operator who clicked "Assign"
+    // doesn't get pinged when they assigned a row to themselves. The
+    // ingestion paths leave this undefined so they fall back to the
+    // legacy owner-exclude (rows ingested via webhook stamp `user_id` to
+    // the table owner; pinging the owner on their own rows is annoying).
+    excludeUserId?: string | null
+    // Context for the body template — defaults to "rule-routed" wording
+    // (the original use case). The bulk-apply and manual-assign paths
+    // override this to a more accurate "assigned to you" phrasing.
+    sourceKind?: 'rule' | 'manual' | 'bulk'
+  } = {},
 ): Promise<void> {
   // Group by recipient: { user_id: { count, sample_name } }
   const byRecipient = new Map<string, { count: number; name: string }>()
@@ -240,17 +253,18 @@ async function notifyOnAssignment(
   }
   if (byRecipient.size === 0) return
 
-  // Fetch table name + owner ONCE. Owner is excluded from notifications
-  // for ingestion paths since the row's user_id stamps to them anyway —
-  // pinging them on rows they "created" via webhook ingest is annoying.
+  // Fetch table name + owner ONCE. Owner-exclude applies only when the
+  // caller didn't override with an explicit excludeUserId — see opts
+  // docstring for the rationale.
   const { data: tbl } = await supabase.from('lead_tables')
     .select('name, user_id').eq('id', tableId).maybeSingle()
   const tableName = tbl?.name ?? 'Table'
-  const ownerId   = tbl?.user_id
+  const skipUserId = opts.excludeUserId ?? tbl?.user_id
+  const kind = opts.sourceKind ?? 'rule'
 
   await Promise.all(
     Array.from(byRecipient.entries())
-      .filter(([userId]) => userId !== ownerId)  // skip self-ping for owner
+      .filter(([userId]) => userId !== skipUserId)
       .map(([userId, agg]) =>
         emitNotification(supabase, {
           tenant_id: tenantId,
@@ -259,9 +273,16 @@ async function notifyOnAssignment(
           data: {
             table_name: tableName,
             // Caller-composed summary so the template stays simple ({{summary}}).
+            // Wording reflects the kind of assignment so the notification
+            // reads naturally — "a teammate assigned you a row" vs "a new
+            // rule routed a row to you" vs "Apply rules just routed 5 rows".
             summary: agg.count > 1
-              ? `${agg.count} new rows just landed — open My Queue`
-              : 'A new row matched a rule routed to you — open My Queue',
+              ? `${agg.count} rows ${kind === 'rule' ? 'just landed' : 'assigned to you'} — open My Queue`
+              : (
+                kind === 'manual' ? 'A teammate assigned a row to you — open My Queue'
+                : kind === 'bulk' ? 'Apply Rules routed a row to you — open My Queue'
+                :                   'A new row matched a rule routed to you — open My Queue'
+              ),
           },
           link: `/queue`,
         }),
@@ -607,27 +628,70 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
 
   router.patch('/lead-tables/:id/rows/:rowId', requireAuth, identifyTenant, checkPermission('leads', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId
+    const userId   = (req as any).user?.id as string | undefined
     const tableIdStr = String(req.params.id)
     // Whitelist body fields. Critically prevents callers from rewriting
     // tenant_id / user_id / id / created_at on the row (the .eq('tenant_id')
     // on the UPDATE only restricts the *target* row; the new value still lands).
     const safeBody = pickAllowed(req.body, ['data', 'assigned_to', 'assigned_to_name', 'tags', 'status'] as const)
+
+    // Status guardrail: if the caller passed a status, accept the canonical
+    // pipeline values plus whatever the table's "Status" select column
+    // declares as options (so tenants who customised the column still work).
+    // Anything else is rejected with 400 — prevents typos like `won` vs
+    // `Won` silently producing untracked statuses that MyQueue / dashboards
+    // then have to fall back to a "neutral" chip for. Free-form statuses
+    // were the way it worked before but produced a class of "why is my
+    // pipeline weird" support tickets; this fail-fast is cheaper than
+    // forensic SQL after the fact.
+    if ('status' in safeBody && typeof safeBody.status === 'string') {
+      const CANONICAL = new Set(['new', 'contacted', 'qualified', 'won', 'lost'])
+      let allowed = CANONICAL
+      // Table-specific Status column options (if the user customised it).
+      // Cheap query; one extra round-trip per status PATCH. Skip if the
+      // status is already canonical to keep the hot path fast.
+      if (!CANONICAL.has(safeBody.status)) {
+        const { data: statusCol } = await supabase
+          .from('lead_columns')
+          .select('options')
+          .eq('table_id', tableIdStr).eq('tenant_id', tenantId).eq('key', 'status')
+          .maybeSingle()
+        const customOpts = ((statusCol?.options as string[] | null) ?? []).filter(Boolean)
+        if (customOpts.length) allowed = new Set([...CANONICAL, ...customOpts])
+      }
+      if (!allowed.has(safeBody.status)) {
+        res.status(400).json({
+          error: `Invalid status "${safeBody.status}". Allowed: ${Array.from(allowed).join(', ')}`,
+          code: 'INVALID_STATUS',
+        }); return
+      }
+    }
+
     // Re-evaluate assignment rules if the row's `data` changed and the caller
     // didn't supply an explicit assigned_to. This keeps assignments live as
     // status / score / segment fields update.
     const dataChanged   = 'data' in safeBody
     const explicitAssign = 'assigned_to' in safeBody
     const patch: Record<string, unknown> = { ...safeBody, updated_at: new Date().toISOString() }
-    if (dataChanged && !explicitAssign && !req.body.skip_rules) {
-      const { data: existing } = await supabase
-        .from('lead_rows').select('tags').eq('id', req.params.rowId).eq('tenant_id', tenantId).maybeSingle()
-      const ruleResult = await evaluateRulesForRow(
-        supabase, tableIdStr, tenantId, (safeBody.data as Record<string, unknown>) ?? {}, (existing?.tags as string[]) ?? [],
-      )
-      if (ruleResult) {
-        patch.assigned_to      = ruleResult.assigned_to
-        patch.assigned_to_name = ruleResult.assigned_to_name
-        patch.tags             = ruleResult.tags
+
+    // Snapshot previous assignment to decide whether the PATCH represents
+    // an actual assignment change (we only notify when it changes — pinging
+    // the same person every time someone edits the row would be spam).
+    let prevAssignedTo: string | null = null
+    if (explicitAssign || dataChanged) {
+      const { data: prev } = await supabase
+        .from('lead_rows').select('assigned_to, tags')
+        .eq('id', req.params.rowId).eq('tenant_id', tenantId).maybeSingle()
+      prevAssignedTo = (prev?.assigned_to as string | null) ?? null
+      if (dataChanged && !explicitAssign && !req.body.skip_rules) {
+        const ruleResult = await evaluateRulesForRow(
+          supabase, tableIdStr, tenantId, (safeBody.data as Record<string, unknown>) ?? {}, (prev?.tags as string[]) ?? [],
+        )
+        if (ruleResult) {
+          patch.assigned_to      = ruleResult.assigned_to
+          patch.assigned_to_name = ruleResult.assigned_to_name
+          patch.tags             = ruleResult.tags
+        }
       }
     }
     const { data, error } = await supabase
@@ -638,6 +702,21 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .select()
       .single()
     if (error) { res.status(500).json({ error: error.message }); return }
+
+    // Notify the assignee if assignment actually changed (manual or rule-
+    // routed). Skip if the new assignee is the user making the change
+    // (self-assigns shouldn't ping yourself) and if the assignee is the
+    // same person as before (idempotent edit). Fire-and-forget — never
+    // block the response on notification delivery.
+    const newAssignedTo = (data?.assigned_to as string | null) ?? null
+    if (newAssignedTo && newAssignedTo !== prevAssignedTo && newAssignedTo !== userId) {
+      void notifyOnAssignment(
+        supabase, tenantId, tableIdStr,
+        [{ assigned_to: newAssignedTo, assigned_to_name: (data?.assigned_to_name as string) ?? '' }],
+        { excludeUserId: userId, sourceKind: explicitAssign ? 'manual' : 'rule' },
+      ).catch(e => console.warn('[patch-row] notify failed (non-fatal):', e?.message))
+    }
+
     res.json(data)
   })
 
@@ -853,9 +932,15 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
 
     // Fire `lead.assigned` notifications for any rule-routed assignments —
     // same dedup-by-recipient pattern as webhook ingest. Fire-and-forget.
+    // Pass the importer's user_id so they don't get pinged for rows that
+    // happen to route to themselves (a sales manager bulk-importing a CSV
+    // would otherwise see one notification per matched row).
     if (assigned > 0) {
-      void notifyOnAssignment(supabase, tenantId, String(req.params.id), transformed).catch(e =>
-        console.warn('[csv-import] notify failed (non-fatal):', e?.message))
+      const importerId = (req as any).user?.id as string | undefined
+      void notifyOnAssignment(
+        supabase, tenantId, String(req.params.id), transformed,
+        { excludeUserId: importerId, sourceKind: 'rule' },
+      ).catch(e => console.warn('[csv-import] notify failed (non-fatal):', e?.message))
     }
 
     // Calling feature (migration 035): mirror each newly-imported lead row
@@ -1360,6 +1445,8 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
   // Apply assignment rules to rows in a table (or a filtered segment)
   router.post('/lead-tables/:id/apply-assignments', requireAuth, identifyTenant, checkPermission('leads', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId
+    const userId   = (req as any).user?.id as string | undefined
+    const tableIdStr = String(req.params.id)
     const { row_ids, filter } = req.body as {
       row_ids?: string[]
       filter?: { status?: string; assigned_to?: string }
@@ -1368,17 +1455,17 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
     const { data: rules } = await supabase
       .from('lead_assignment_rules')
       .select('*')
-      .eq('table_id', req.params.id)
+      .eq('table_id', tableIdStr)
       .eq('tenant_id', tenantId)
       .eq('is_active', true)
       .order('priority')
 
-    if (!rules?.length) { res.json({ updated: 0 }); return }
+    if (!rules?.length) { res.json({ updated: 0, notified: 0 }); return }
 
     let q = supabase
       .from('lead_rows')
       .select('*')
-      .eq('table_id', req.params.id)
+      .eq('table_id', tableIdStr)
       .eq('tenant_id', tenantId)
 
     if (row_ids?.length) q = q.in('id', row_ids)
@@ -1386,13 +1473,18 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
     if (filter?.assigned_to) q = q.eq('assigned_to', filter.assigned_to)
 
     const { data: rows } = await q
-    if (!rows?.length) { res.json({ updated: 0 }); return }
+    if (!rows?.length) { res.json({ updated: 0, notified: 0 }); return }
 
     let updated = 0
+    // Track rows where assignment ACTUALLY CHANGED (vs idempotent re-write
+    // to the same assignee). The notification batch only fires for changes
+    // so re-running "Apply rules" doesn't double-notify everyone every time.
+    const assignmentChanges: Array<{ assigned_to: string; assigned_to_name: string }> = []
     for (const row of rows as any[]) {
       for (const rule of rules as any[]) {
         if (matchesConditions(row.data ?? {}, rule.conditions ?? [])) {
           const newTags = [...new Set([...(row.tags ?? []), ...(rule.apply_tags ?? [])])]
+          const prevAssignedTo = (row.assigned_to as string | null) ?? null
           await supabase.from('lead_rows').update({
             assigned_to:      rule.assign_to,
             assigned_to_name: rule.assign_to_name,
@@ -1400,11 +1492,36 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
             updated_at:       new Date().toISOString(),
           }).eq('id', row.id).eq('tenant_id', tenantId)
           updated++
+          if (rule.assign_to && rule.assign_to !== prevAssignedTo) {
+            assignmentChanges.push({
+              assigned_to:      rule.assign_to,
+              assigned_to_name: rule.assign_to_name ?? '',
+            })
+          }
           break // first matching rule wins (priority order)
         }
       }
     }
-    res.json({ updated })
+
+    // Fire `lead.assigned` notifications for each recipient whose row count
+    // > 0 in this batch — deduped per assignee with a count summary. The
+    // operator (caller) is excluded so clicking "Apply rules" doesn't ping
+    // yourself for the rows that just routed to you (which would happen
+    // for the table owner / a sales manager filling their own queue).
+    let notified = 0
+    if (assignmentChanges.length > 0 && userId) {
+      // Count recipients before firing so we can return a useful integer.
+      const recipients = new Set<string>()
+      for (const c of assignmentChanges) if (c.assigned_to && c.assigned_to !== userId) recipients.add(c.assigned_to)
+      notified = recipients.size
+      void notifyOnAssignment(
+        supabase, tenantId, tableIdStr,
+        assignmentChanges,
+        { excludeUserId: userId, sourceKind: 'bulk' },
+      ).catch(e => console.warn('[apply-assignments] notify failed (non-fatal):', e?.message))
+    }
+
+    res.json({ updated, notified })
   })
 
   // ── Field Mapping Presets ────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ import { createClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 import {
   sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets,
-  calendarCreateEvent, calendarCheckAvailability,
+  calendarCreateEvent, calendarCheckAvailability, gmailSendEmail,
   getValidGoogleToken,
 } from './google'
 import { createLeadsRouter } from './leads'
@@ -2926,6 +2926,244 @@ app.get('/api/google/calendar/availability',
       })
     } catch (err: any) { res.status(502).json({ error: err.message }) }
   })
+
+// ── Google capability handlers (added 2026-05) ───────────────────────────────
+// 6) Create new spreadsheet → POST /api/google/drive/spreadsheets
+// Drive files.create with the Sheets MIME type creates an empty Sheet in My
+// Drive. Response includes webViewLink so the user can open it immediately,
+// then come back to import it into Tables via the mirror_sheet flow.
+// Docs: https://developers.google.com/drive/api/reference/rest/v3/files/create
+const GoogleDriveCreateSpreadsheetSchema = z.object({
+  name: z.string().min(1, 'name is required').max(255, 'name is too long'),
+}).strict()
+
+app.post('/api/google/drive/spreadsheets',
+  requireAuth, identifyTenant, checkPermission('google_sheets', 'edit'),
+  validateBody(GoogleDriveCreateSpreadsheetSchema),
+  async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    try {
+      const token = await getValidGoogleToken(tenant)
+      const name = String((req.body as any).name)
+      // `fields` query param tells Drive which File-resource fields to return —
+      // by default the response is sparse (id, name, mimeType only). Request
+      // the ones our registry advertises in outputSchema.
+      const url = `https://www.googleapis.com/drive/v3/files?fields=${encodeURIComponent('id,name,mimeType,webViewLink,createdTime')}`
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.spreadsheet' }),
+      })
+      const data = await r.json() as any
+      if (!r.ok || data.error) {
+        res.status(502).json({ error: data.error?.message ?? 'Google Drive returned an error' }); return
+      }
+      res.json({
+        id:           data.id,
+        name:         data.name,
+        webViewLink:  data.webViewLink,
+        createdTime:  data.createdTime,
+      })
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
+
+// 7) List calendar events → GET /api/google/calendar/events
+// Read-side complement to create_event. Default window: now → +7 days.
+// Docs: https://developers.google.com/calendar/api/v3/reference/events/list
+app.get('/api/google/calendar/events',
+  requireAuth, identifyTenant, checkPermission('google_calendar', 'view'),
+  async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    const calendarId = String(req.query.calendar_id ?? 'primary').trim() || 'primary'
+    const now = new Date()
+    const sevenDays = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
+    const timeMin = String(req.query.time_min ?? now.toISOString()).trim()
+    const timeMax = String(req.query.time_max ?? sevenDays.toISOString()).trim()
+    const maxRaw = Number(req.query.max_results ?? 25)
+    const maxResults = Number.isFinite(maxRaw) && maxRaw > 0 ? Math.min(Math.floor(maxRaw), 250) : 25
+    const q = String(req.query.q ?? '').trim()
+
+    try {
+      const token = await getValidGoogleToken(tenant)
+      const params = new URLSearchParams({
+        timeMin,
+        timeMax,
+        maxResults: String(maxResults),
+        singleEvents: 'true',  // expand recurring events into instances
+        orderBy: 'startTime',  // only valid when singleEvents=true
+      })
+      if (q) params.set('q', q)
+      const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      const data = await r.json() as any
+      if (!r.ok || data.error) {
+        res.status(502).json({ error: data.error?.message ?? 'Google Calendar returned an error' }); return
+      }
+      res.json({
+        items:         data.items ?? [],
+        nextPageToken: data.nextPageToken,
+        timeZone:      data.timeZone,
+      })
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
+
+// 8) Quick add event → POST /api/google/calendar/quick-add
+// Natural-language event creator. Google parses the text into a structured
+// event (best for "Lunch with Priya tomorrow at 1pm"-style input).
+// Docs: https://developers.google.com/calendar/api/v3/reference/events/quickAdd
+const GoogleCalendarQuickAddSchema = z.object({
+  calendar_id: z.string().min(1).default('primary'),
+  text:        z.string().min(1, 'text is required').max(1024, 'text is too long'),
+}).strict()
+
+app.post('/api/google/calendar/quick-add',
+  requireAuth, identifyTenant, checkPermission('google_calendar', 'edit'),
+  validateBody(GoogleCalendarQuickAddSchema),
+  async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    const body = req.body as any
+    const calendarId = (body.calendar_id || 'primary').toString().trim() || 'primary'
+    const text = String(body.text)
+    try {
+      const token = await getValidGoogleToken(tenant)
+      const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/quickAdd?text=${encodeURIComponent(text)}`
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const data = await r.json() as any
+      if (!r.ok || data.error) {
+        res.status(502).json({ error: data.error?.message ?? 'Google Calendar quickAdd returned an error' }); return
+      }
+      res.json(data)  // { id, htmlLink, status, summary, start, end, … }
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
+
+// 9) Send Gmail message → POST /api/google/gmail/send
+// Builds an RFC 2822 MIME message and base64url-encodes it into the `raw`
+// field of users.messages.send. The From is always the connected Gmail —
+// Gmail API enforces this regardless of what header we set.
+// Docs: https://developers.google.com/gmail/api/reference/rest/v1/users.messages/send
+const GoogleGmailSendSchema = z.object({
+  to:        z.string().min(1, 'to is required'),
+  subject:   z.string().min(1, 'subject is required').max(998, 'subject is too long for RFC 2822'),
+  body_html: z.string().optional(),
+  body_text: z.string().optional(),
+  cc:        z.string().optional(),
+  bcc:       z.string().optional(),
+  reply_to:  z.string().optional(),
+}).strict().refine(
+  (v) => Boolean((v.body_html && v.body_html.length > 0) || (v.body_text && v.body_text.length > 0)),
+  { message: 'body_html or body_text is required' },
+)
+
+// Encode a header value that may contain non-ASCII (per RFC 2047) so we don't
+// silently drop Unicode characters when building the MIME envelope. Plain
+// ASCII passes through unchanged for readability.
+function encodeMimeHeader(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x00-\x7F]*$/.test(value)) return value
+  return `=?utf-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`
+}
+
+app.post('/api/google/gmail/send',
+  requireAuth, identifyTenant, checkPermission('google_gmail', 'edit'),
+  validateBody(GoogleGmailSendSchema),
+  async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
+    if (!tenant || !tenant.google_access_token) {
+      res.status(400).json({ error: 'Google account not connected' }); return
+    }
+    const body = req.body as any
+    const fromAddress = tenant.google_email as string | null
+    if (!fromAddress) {
+      res.status(400).json({ error: 'Connected Google account is missing an email address' }); return
+    }
+
+    // Build RFC 2822 MIME. Prefer multipart/alternative when both html + text
+    // are provided so clients can fall back to plain-text. Single-part
+    // otherwise — keeps the wire small and the envelope simple.
+    const headers: string[] = [
+      `From: ${fromAddress}`,
+      `To: ${body.to}`,
+    ]
+    if (body.cc)       headers.push(`Cc: ${body.cc}`)
+    if (body.bcc)      headers.push(`Bcc: ${body.bcc}`)
+    if (body.reply_to) headers.push(`Reply-To: ${body.reply_to}`)
+    headers.push(`Subject: ${encodeMimeHeader(String(body.subject))}`)
+    headers.push('MIME-Version: 1.0')
+
+    let mimeBody: string
+    if (body.body_html && body.body_text) {
+      const boundary = `frequency_${crypto.randomBytes(12).toString('hex')}`
+      headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`)
+      mimeBody = [
+        '',
+        `--${boundary}`,
+        'Content-Type: text/plain; charset=utf-8',
+        'Content-Transfer-Encoding: 7bit',
+        '',
+        body.body_text,
+        `--${boundary}`,
+        'Content-Type: text/html; charset=utf-8',
+        'Content-Transfer-Encoding: 7bit',
+        '',
+        body.body_html,
+        `--${boundary}--`,
+      ].join('\r\n')
+    } else if (body.body_html) {
+      headers.push('Content-Type: text/html; charset=utf-8')
+      mimeBody = '\r\n' + body.body_html
+    } else {
+      headers.push('Content-Type: text/plain; charset=utf-8')
+      mimeBody = '\r\n' + body.body_text
+    }
+
+    const mime = headers.join('\r\n') + mimeBody
+    const raw = Buffer.from(mime, 'utf8')
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '')
+
+    try {
+      const token = await getValidGoogleToken(tenant)
+      const r = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw }),
+      })
+      const data = await r.json() as any
+      if (!r.ok || data.error) {
+        res.status(502).json({ error: data.error?.message ?? 'Gmail returned an error' }); return
+      }
+      res.json({
+        id:       data.id,
+        threadId: data.threadId,
+        labelIds: data.labelIds ?? [],
+        from:     fromAddress,
+      })
+    } catch (err: any) { res.status(502).json({ error: err.message }) }
+  })
+
+// Suppress unused-import warning when the registry-side gmail helper isn't
+// referenced elsewhere. We build the MIME inline above so we get full envelope
+// control (cc/bcc/reply_to + multipart fallback) — the legacy helper supports
+// only `to/subject/body`. Keep it around for the workflow engine.
+void gmailSendEmail
 
 app.post('/api/integrations/razorpay', requireAuth, identifyTenant, checkPermission('integrations', 'edit'), validateBody(RazorpayConnectSchema), async (req, res) => {
   const tenantId = (req as any).tenantId

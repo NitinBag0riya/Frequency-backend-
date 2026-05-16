@@ -1014,17 +1014,40 @@ const GOOGLE_DRIVE: ConnectorDef = {
   authMode: 'oauth',
   brandColor: '#4285F4',
   iconName: 'HardDrive',
-  shortDescription: 'List sheets, read files, mirror sheets to Lead Tables.',
+  shortDescription: 'Browse + create Sheets, mirror sheets into Lead Tables.',
   docsUrl: 'https://developers.google.com/drive/api',
-  oauthScope: 'https://www.googleapis.com/auth/drive.readonly',
+  // Effective scopes granted on /api/auth/google: drive.readonly + drive.file.
+  // `drive.readonly` covers list_spreadsheets; `drive.file` covers create_spreadsheet
+  // (files our app creates).
+  oauthScope: 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file',
   capabilities: [
     { key: 'list_spreadsheets', label: 'My spreadsheets', description: 'Browse Google Sheets you own or have access to.',       iconName: 'FileSpreadsheet', apiPath: '/api/google/spreadsheets',      apiMethod: 'GET',                                        uiKind: 'list',   status: 'live',
+      // Docs: https://developers.google.com/drive/api/reference/rest/v3/files/list
       outputSchema: { fields: [
         { key: 'id',           label: 'Spreadsheet ID', type: 'string', sample: '1aBcD2eFgH3IjKlMnOpQ4rStUvWxYz' },
         { key: 'name',         label: 'Name',           type: 'string', sample: 'Lead intake — Oct' },
         { key: 'modifiedTime', label: 'Last modified',  type: 'string', sample: '2026-04-22T11:30:00Z' },
         { key: 'webViewLink',  label: 'Open in Sheets', type: 'string', sample: 'https://docs.google.com/spreadsheets/d/1aBcD…/edit' },
       ] },
+    },
+    // create_spreadsheet — Drive files.create with the Sheets MIME type creates
+    // a fresh empty Sheet in the user's My Drive. Returns the new file's id +
+    // webViewLink so the user can open it immediately, then come back and
+    // import it into Tables. Workflow: Create → Open & populate → "Import to
+    // Tables" via the existing list_spreadsheets/mirror_sheet flow.
+    // Docs: https://developers.google.com/drive/api/reference/rest/v3/files/create
+    { key: 'create_spreadsheet', label: 'Create new spreadsheet', description: 'Spin up an empty Google Sheet in your Drive — then import it as a Table.', iconName: 'FilePlus', apiPath: '/api/google/drive/spreadsheets', apiMethod: 'POST', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'name', label: 'Spreadsheet name', type: 'text', required: true, supportsVariables: true,
+          placeholder: 'Q3 Lead intake', description: 'Shows up in Drive — also becomes the default Sheet title.' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'id',           label: 'Spreadsheet ID', type: 'string', sample: '1aBcD2eFgH3IjKlMnOpQ4rStUvWxYz' },
+        { key: 'name',         label: 'Name',           type: 'string', sample: 'Q3 Lead intake' },
+        { key: 'webViewLink',  label: 'Open in Sheets', type: 'string', sample: 'https://docs.google.com/spreadsheets/d/1aBcD…/edit' },
+        { key: 'createdTime',  label: 'Created',        type: 'string', sample: '2026-05-15T11:30:00Z' },
+      ] },
+      testRunnable: true,
     },
     { key: 'mirror_sheet',      label: 'Mirror sheet to CRM', description: 'Auto-sync a sheet into a Lead Table every 5 min.', iconName: 'RefreshCw',       apiPath: '/api/data-sources/google-sheet/mirror', apiMethod: 'POST',                                uiKind: 'modal',  status: 'live',
       outputSchema: { fields: [
@@ -1037,6 +1060,23 @@ const GOOGLE_DRIVE: ConnectorDef = {
   ],
 }
 
+// IMPORTANT — the three Sheets capabilities below are marked `planned` on
+// purpose. They overlap with the Tables flow (create / view / edit / sync a
+// Sheet-backed Lead Table is a first-class product surface), so we don't want
+// duplicate one-shot "Run" buttons in AppsModal. The capabilities stay in the
+// registry — instead of being deleted — because:
+//
+//   1) their `workflowNodeType: 'update_sheet'` mapping is still consumed by
+//      the workflow builder (compositional pieces inside a flow), and
+//   2) the backend handlers at /api/google/sheets/{append,update,read} stay
+//      mounted so the workflow engine can call them, and so we can flip the
+//      status back to `live` later if we decide AppsModal should re-expose
+//      them.
+//
+// Net effect: capabilities marked `planned` won't render as Run buttons in the
+// AppsModal capability page, but the underlying plumbing (workflow nodes +
+// REST handlers) is fully functional. Users who want to read/edit Sheet data
+// today go through Tables (Apps → Drive → list/create spreadsheet → import).
 const GOOGLE_SHEETS: ConnectorDef = {
   key: 'google_sheets',
   name: 'Google Sheets',
@@ -1046,11 +1086,11 @@ const GOOGLE_SHEETS: ConnectorDef = {
   authMode: 'oauth',
   brandColor: '#0F9D58',
   iconName: 'FileSpreadsheet',
-  shortDescription: 'Append, update, read rows; trigger workflows from new rows.',
+  shortDescription: 'Use Sheets through Tables — sync, edit, and view rows from the Tables flow.',
   docsUrl: 'https://developers.google.com/sheets/api',
   oauthScope: 'https://www.googleapis.com/auth/spreadsheets',
   capabilities: [
-    { key: 'append_row', label: 'Append row',  description: 'Add a row at the bottom of a sheet.',  iconName: 'Plus', apiPath: '/api/google/sheets/append', apiMethod: 'POST', workflowNodeType: 'update_sheet', uiKind: 'modal', status: 'live',
+    { key: 'append_row', label: 'Append row',  description: 'Add a row at the bottom of a sheet. Run from Tables → row actions.',  iconName: 'Plus', apiPath: '/api/google/sheets/append', apiMethod: 'POST', workflowNodeType: 'update_sheet', uiKind: 'modal', status: 'planned',
       inputSchema: { fields: [
         { key: 'spreadsheet_id', label: 'Spreadsheet', type: 'resource', required: true,
           picker: { endpoint: '/api/google/spreadsheets', labelKey: 'name', valueKey: 'id' } },
@@ -1068,7 +1108,7 @@ const GOOGLE_SHEETS: ConnectorDef = {
       ] },
       testRunnable: true,
     },
-    { key: 'update_row', label: 'Update range', description: 'Update a specific cell range.',       iconName: 'Edit',  apiPath: '/api/google/sheets/update', apiMethod: 'POST', workflowNodeType: 'update_sheet', uiKind: 'modal', status: 'live',
+    { key: 'update_row', label: 'Update range', description: 'Update a specific cell range. Run from Tables → edit cell.',       iconName: 'Edit',  apiPath: '/api/google/sheets/update', apiMethod: 'POST', workflowNodeType: 'update_sheet', uiKind: 'modal', status: 'planned',
       inputSchema: { fields: [
         { key: 'spreadsheet_id', label: 'Spreadsheet', type: 'resource', required: true,
           picker: { endpoint: '/api/google/spreadsheets', labelKey: 'name', valueKey: 'id' } },
@@ -1087,7 +1127,7 @@ const GOOGLE_SHEETS: ConnectorDef = {
       ] },
       testRunnable: true,
     },
-    { key: 'read_range', label: 'Read range',  description: 'Read values from a range.',           iconName: 'Eye',  apiPath: '/api/google/sheets/read',   apiMethod: 'GET',                                  uiKind: 'modal', status: 'live',
+    { key: 'read_range', label: 'Read range',  description: 'Read values from a range. View Sheet data via Tables instead.',           iconName: 'Eye',  apiPath: '/api/google/sheets/read',   apiMethod: 'GET',                                  uiKind: 'modal', status: 'planned',
       inputSchema: { fields: [
         { key: 'spreadsheet_id', label: 'Spreadsheet', type: 'resource', required: true,
           picker: { endpoint: '/api/google/spreadsheets', labelKey: 'name', valueKey: 'id' } },
@@ -1147,6 +1187,53 @@ const GOOGLE_CALENDAR: ConnectorDef = {
       ] },
       testRunnable: true,
     },
+    // list_events — read-side complement to create_event. Default window of
+    // today → +7 days keeps the result small. Docs:
+    // https://developers.google.com/calendar/api/v3/reference/events/list
+    { key: 'list_events',       label: 'List events',      description: 'Read upcoming events in a calendar (default: next 7 days).', iconName: 'CalendarDays',  apiPath: '/api/google/calendar/events',     apiMethod: 'GET',                                                  uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'calendar_id', label: 'Calendar', type: 'text', required: false,
+          placeholder: 'primary', description: "Use 'primary' for your default calendar." },
+        { key: 'time_min',    label: 'From (ISO 8601)', type: 'text', required: false, supportsVariables: true,
+          placeholder: '2026-05-15T00:00:00+05:30', description: 'Defaults to now if blank.' },
+        { key: 'time_max',    label: 'To (ISO 8601)',   type: 'text', required: false, supportsVariables: true,
+          placeholder: '2026-05-22T23:59:59+05:30', description: 'Defaults to now + 7 days if blank.' },
+        { key: 'q',           label: 'Search text',     type: 'text', required: false, supportsVariables: true,
+          placeholder: 'demo call', description: 'Free-text search across title, description, attendees.' },
+        { key: 'max_results', label: 'Max results',     type: 'number', required: false,
+          placeholder: '25', description: 'Up to 250 per page. Defaults to 25.' },
+      ] },
+      // Mirrors Google Calendar API events.list response shape.
+      outputSchema: { fields: [
+        { key: 'items',         label: 'Events',         type: 'array',
+          sample: [{ id: 'abc123', summary: 'Demo call with Asha', start: { dateTime: '2026-05-16T15:00:00+05:30' }, end: { dateTime: '2026-05-16T15:30:00+05:30' }, htmlLink: 'https://calendar.google.com/event?eid=…' }] },
+        { key: 'nextPageToken', label: 'Next page token', type: 'string', sample: 'CiAKGjAwM…' },
+        { key: 'timeZone',      label: 'Calendar TZ',     type: 'string', sample: 'Asia/Kolkata' },
+      ] },
+      testRunnable: true,
+    },
+    // quick_add — Calendar's natural-language event creator. POST events/quickAdd
+    // takes a free-text string like "Lunch with Priya tomorrow at 1pm" and lets
+    // Google parse it into a structured event. Surprisingly high single-action
+    // value — much faster than filling create_event for ad-hoc events.
+    // Docs: https://developers.google.com/calendar/api/v3/reference/events/quickAdd
+    { key: 'quick_add',         label: 'Quick add (natural language)', description: 'Type "Coffee with Asha tomorrow at 4pm" — Google parses it.', iconName: 'Sparkles', apiPath: '/api/google/calendar/quick-add', apiMethod: 'POST',                                                            uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'calendar_id', label: 'Calendar', type: 'text', required: false,
+          placeholder: 'primary' },
+        { key: 'text',        label: 'Event text', type: 'textarea', required: true, supportsVariables: true,
+          placeholder: 'Demo call with Asha tomorrow at 3pm for 30 min',
+          description: 'Natural language — date, time, and title in one line. Google parses it.' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'id',             label: 'Event ID',  type: 'string', sample: 'abc123def456' },
+        { key: 'htmlLink',       label: 'Open in Calendar', type: 'string', sample: 'https://calendar.google.com/event?eid=…' },
+        { key: 'summary',        label: 'Title',     type: 'string', sample: 'Demo call with Asha' },
+        { key: 'start.dateTime', label: 'Starts at', type: 'string', sample: '2026-05-16T15:00:00+05:30' },
+        { key: 'end.dateTime',   label: 'Ends at',   type: 'string', sample: '2026-05-16T15:30:00+05:30' },
+      ] },
+      testRunnable: true,
+    },
     { key: 'check_availability',label: 'Check availability', description: 'Detect free/busy for a time window.',   iconName: 'Clock',         apiPath: '/api/google/calendar/availability', apiMethod: 'GET',  workflowNodeType: 'check_calendar_availability',  uiKind: 'modal', status: 'live',
       inputSchema: { fields: [
         { key: 'calendar_id', label: 'Calendar', type: 'text', required: false,
@@ -1170,6 +1257,13 @@ const GOOGLE_CALENDAR: ConnectorDef = {
   ],
 }
 
+// Gmail — Frequency's stance is "we just send". Reading inbox is best done in
+// Gmail itself (open in another tab), so list_threads / forward_email were
+// dropped from the registry. send_email uses users.messages.send under the
+// hood (RFC 2822 MIME, base64url-encoded into the `raw` field). The
+// gmail.modify scope we already grant on /api/auth/google is a superset of
+// gmail.send, so no OAuth changes needed.
+// Docs: https://developers.google.com/gmail/api/reference/rest/v1/users.messages/send
 const GMAIL: ConnectorDef = {
   key: 'google_gmail',
   name: 'Gmail',
@@ -1179,13 +1273,38 @@ const GMAIL: ConnectorDef = {
   authMode: 'oauth',
   brandColor: '#EA4335',
   iconName: 'Mail',
-  shortDescription: 'Send + receive email, trigger workflows on inbound.',
+  shortDescription: 'Send email from your Gmail. To read inbox, open Gmail in another tab.',
   docsUrl: 'https://developers.google.com/gmail/api',
   oauthScope: 'https://www.googleapis.com/auth/gmail.modify',
   capabilities: [
-    { key: 'send_email',     label: 'Send email',     description: 'Send a one-off email via your Gmail.',         iconName: 'Send',        apiPath: '/api/google/gmail/send',     apiMethod: 'POST', workflowNodeType: 'send_email',          uiKind: 'modal', status: 'planned' },
-    { key: 'forward_email',  label: 'Forward email',  description: 'Forward an inbound email to another address.', iconName: 'Forward',     apiPath: '/api/google/gmail/forward',  apiMethod: 'POST', workflowNodeType: 'forward_email',       uiKind: 'modal', status: 'planned' },
-    { key: 'list_threads',   label: 'Recent threads', description: 'Latest email threads matching a query.',       iconName: 'Mail',        apiPath: '/api/google/gmail/threads',  apiMethod: 'GET',                                          uiKind: 'list',  status: 'planned' as any },
+    { key: 'send_email', label: 'Send email', description: 'Send a one-off email via your Gmail. The From address is always your connected Gmail.', iconName: 'Send', apiPath: '/api/google/gmail/send', apiMethod: 'POST', workflowNodeType: 'send_email', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'to',       label: 'To',      type: 'text', required: true, supportsVariables: true,
+          placeholder: 'asha@example.com', description: 'Comma-separated for multiple recipients.' },
+        { key: 'subject',  label: 'Subject', type: 'text', required: true, supportsVariables: true,
+          placeholder: 'Quick follow-up on our chat' },
+        { key: 'body_html',label: 'HTML body',  type: 'textarea', required: false, supportsVariables: true,
+          placeholder: '<p>Hi Asha,</p><p>Following up on…</p>',
+          description: 'Either HTML body or plain-text body must be set. HTML takes priority if both are provided.' },
+        { key: 'body_text',label: 'Plain-text body', type: 'textarea', required: false, supportsVariables: true,
+          placeholder: 'Hi Asha,\n\nFollowing up on…' },
+        { key: 'cc',       label: 'Cc',  type: 'text', required: false, supportsVariables: true,
+          placeholder: 'ravi@example.com' },
+        { key: 'bcc',      label: 'Bcc', type: 'text', required: false, supportsVariables: true },
+        { key: 'reply_to', label: 'Reply-To', type: 'text', required: false, supportsVariables: true,
+          description: "Where replies should land. Defaults to your connected Gmail." },
+      ] },
+      // Mirrors Google Gmail API users.messages.send response shape (Message
+      // resource: id, threadId, labelIds, snippet). From is fixed to the
+      // authenticated user — Gmail API enforces that.
+      outputSchema: { fields: [
+        { key: 'id',         label: 'Message ID',  type: 'string', sample: '18f3a2c1b9d4e0f7' },
+        { key: 'threadId',   label: 'Thread ID',   type: 'string', sample: '18f3a2c1b9d4e0f7' },
+        { key: 'labelIds',   label: 'Labels',      type: 'array',  sample: ['SENT'] },
+        { key: 'from',       label: 'From',        type: 'string', sample: 'priya@acme.in' },
+      ] },
+      testRunnable: true,
+    },
   ],
 }
 
