@@ -8,10 +8,23 @@
 # Region: bom (Mumbai) — closest Fly region to Indian SMB users; saves
 # 60-90ms RTT vs Singapore for every WhatsApp / Razorpay / Supabase call.
 #
-# Auto-scaling: web scales 0→3 based on concurrent connections; worker
-# stays at 1 instance (BullMQ queues only need a single consumer per
-# queue type — we run all queues in the one worker process). Bump worker
-# to `count = 2` when broadcast volume sustains > 100/min.
+# Auto-scaling (May-2026 update):
+#   web    1→5 machines, concurrency-driven (soft 80, hard 200). Spikes
+#          past the soft limit make Fly spin up another machine; sustained
+#          calm collapses back to 1 (auto_stop_machines="suspend" keeps
+#          warm RAM around so the resume is sub-second vs cold-start
+#          "stop"). Webhook bursts no longer queue behind a single web
+#          machine.
+#   worker 1→3 machines, ALWAYS-on (auto_stop_machines="off"). BullMQ
+#          workers consume Redis lists — adding a second machine just
+#          parallelises consumption with no coordination needed. We don't
+#          auto-scale workers on a metric here because Fly doesn't expose
+#          a "queue depth" hook; the operator bumps the running count via
+#          `fly scale count worker=N` (N ≤ max_machines_running) when
+#          broadcast/webhook lag climbs in Bull Board. Per-worker
+#          concurrency is set in code (envs: WEBHOOK_INBOUND_CONCURRENCY
+#          default 20, WEBHOOK_OUTBOUND_CONCURRENCY default 10,
+#          MESSAGE_SEND limited by per-tenant rate-limit).
 #
 # Secrets: never commit env values here. Use `fly secrets set KEY=VALUE`
 # (or paste from .env.staging.example into Fly dashboard). Boot-checked
@@ -34,7 +47,8 @@ kill_timeout = "30s"
 # ─── Process model ────────────────────────────────────────────────────────
 # Two processes from the SAME image:
 #   web    → Express HTTP server (handles /api/*, /webhook/*, /health)
-#   worker → BullMQ job runner (workflow execution, broadcasts, polling)
+#   worker → BullMQ job runner (workflow execution, broadcasts, polling,
+#            webhook.inbound + webhook.outbound from migration 064)
 #
 # DISABLE_WORKERS=1 on web prevents it from also subscribing to queues;
 # DISABLE_WORKERS=0 on worker (the default) makes it the queue consumer.
@@ -50,17 +64,31 @@ kill_timeout = "30s"
 [http_service]
   internal_port = 3001
   force_https = true
-  # Single always-on web machine. Was 1-3 with HA standby; dropped the
-  # standby for cost (root-disk storage on stopped machines is small but
-  # nonzero, and an early-stage workload doesn't need the redundancy).
-  # When traffic justifies it, bump max_machines_running back to 2-3 and
-  # Fly will spin up extras automatically — no fly.toml redeploy needed
-  # if you set those via `fly scale count` instead.
-  auto_stop_machines = "stop"
+  # Autoscale 1→5 web machines on concurrent-connection pressure. With
+  # `suspend` (vs `stop`) idle machines keep RAM hot so the resume is
+  # sub-second; the per-machine root-disk cost is negligible. min=1 keeps
+  # one always serving; max=5 caps the blast radius if a webhook flood
+  # tries to spin us up to the moon.
+  auto_stop_machines = "suspend"
   auto_start_machines = true
   min_machines_running = 1
-  max_machines_running = 1
+  max_machines_running = 5
   processes = ["web"]
+
+  # Concurrency-based scaling. Fly's proxy counts in-flight connections per
+  # machine and bumps autoscale when ANY machine crosses `soft_limit`. The
+  # `hard_limit` is the per-machine ceiling — additional requests get
+  # queued in the Fly proxy until a slot frees up (better than 503-ing).
+  #
+  # Numbers picked for a 512mb shared-cpu-1x:
+  #   soft 80    Express + Node can easily hold this with the route mix here
+  #              (mostly fast Supabase reads); above this we want a peer.
+  #   hard 200   safety margin above soft so a quick burst doesn't 503 just
+  #              because the second machine is still booting (~2s on Fly).
+  [http_service.concurrency]
+    type        = "connections"
+    soft_limit  = 80
+    hard_limit  = 200
 
   [[http_service.checks]]
     interval = "30s"
@@ -72,8 +100,32 @@ kill_timeout = "30s"
     protocol = "http"
 
 # ─── Worker process (no public port) ──────────────────────────────────────
-# Worker doesn't expose HTTP — it just polls Redis (BullMQ). Keep one
-# instance running 24/7; auto-stop is OFF so queue lag doesn't accumulate.
+# Workers don't expose HTTP — they poll Redis (BullMQ). The worker pool is
+# horizontally scalable: BullMQ jobs are pulled off the Redis list with
+# BRPOPLPUSH, so each additional machine just parallelises consumption
+# with no coordination needed. Operators grow the pool via `fly scale
+# count worker=N` (N ≤ max_machines_running below).
+#
+# auto_stop_machines = "off" — never let Fly stop a worker between jobs;
+# queue lag would accumulate during cold-start (~2-4s for BullMQ to
+# reconnect, plus the cron-tick singletons need a warm Worker to fire).
+# auto_start_machines = false for the same reason: we don't want Fly
+# spinning extras up reactively on a metric it doesn't observe (queue
+# depth). Operator-driven scale is the right knob here.
+#
+# Trigger to bump from 1 → 2:
+#   - Bull Board shows webhook.inbound waiting > 100 sustained
+#   - broadcast volume > 100 msg/min for >15min
+#   - message.send average wait > 5s in p95
+[[services]]
+  processes             = ["worker"]
+  protocol              = "tcp"
+  internal_port         = 0
+  auto_stop_machines    = "off"
+  auto_start_machines   = false
+  min_machines_running  = 1
+  max_machines_running  = 3
+
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"
@@ -87,7 +139,7 @@ kill_timeout = "30s"
 # ─── Deployment ───────────────────────────────────────────────────────────
 [deploy]
   # Rolling strategy: replace one machine at a time so there's always a
-  # warm instance serving traffic. For ≤3 web machines this is safe.
+  # warm instance serving traffic. For ≤5 web machines this is safe.
   strategy = "rolling"
   # Run DB migrations BEFORE swapping traffic. Override with
   # `fly deploy --release-command-timeout 300` if migrations are slow.

@@ -26,15 +26,19 @@ import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
 import { createSuperAdminRouter }  from './routes/super-admin'
 import { createTeamsRouter }       from './routes/teams'
+import { createTenantAuditRouter } from './routes/tenant-audit'
 import { createNotificationsRouter } from './routes/notifications'
+import { createUsageRouter }         from './routes/usage'
 import { createApprovalsRouter, requireApproval } from './routes/approvals'
 import { createWorkflowRecosRouter } from './routes/workflow-recos'
 import { createWaCallingRouter }     from './routes/wa-calling'
+import { createAiResponderRouter }   from './routes/ai-responder'
 import {
   enqueueWorkflowExecution,
   workflowQueue, messageQueue, broadcastQueue, cronQueue,
   callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue,
   attachDebugListeners,
+  connection as redisConnection,
 } from './queue'
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
@@ -322,6 +326,7 @@ app.post('/api/workflows',              express.json({ limit: '5mb'  }))
 app.patch('/api/workflows/:id',         express.json({ limit: '5mb'  }))
 app.post('/api/workflows/preview',      express.json({ limit: '5mb'  }))
 app.post('/api/workflows/:id/dry-run',  express.json({ limit: '5mb'  }))
+app.post('/api/workflows/:id/simulate', express.json({ limit: '2mb'  }))
 // Skills + workflow-recos accept similar blueprint shapes.
 app.post('/api/skills/:id/apply',       express.json({ limit: '5mb'  }))
 app.post('/api/workflow-recos/:id/apply', express.json({ limit: '5mb' }))
@@ -1366,6 +1371,100 @@ app.post('/api/workflows/preview', requireAuth, identifyTenant, checkPermission(
   res.json(report)
 })
 
+// ── Workflow simulate (test mode / dry-run) ────────────────────────────────
+//
+// Runs the workflow end-to-end through the SAME executor as a live run, but
+// with ExecCtx.simulate=true so every side-effecting branch (send message,
+// HTTP, payment link, DB writes, AI inference, queue enqueue) is
+// short-circuited. The runner records a per-node trace into
+// workflow_simulation_runs.steps[]. The FE polls GET /:run_id for the result.
+//
+// `view` permission is enough — a simulation has no side effects, so any
+// member who can view the workflow can also test it.
+//
+// Request body: { trigger_input?: { ...vars seeded into session.variables } }
+//   trigger_input is OPTIONAL — empty {} works for triggerless smoke tests.
+//   The shape mirrors what would arrive in session.variables on a real run:
+//   e.g. { name: 'Asha', phone: '+919876543210', message: 'Hi' }
+//
+// Response: { run_id: uuid }
+//   The runner runs synchronously inside this request (simulations are
+//   fast because there's no real I/O — no fetch, no DB writes outside the
+//   final run row). The run is already in its terminal state by the time
+//   this responds, but the FE still polls GET /:run_id to fetch the trace
+//   so the API contract stays uniform with the future "long-running
+//   simulate" mode we may add later.
+app.post('/api/workflows/:id/simulate', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'view'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  const userId   = (req as any).user?.id ?? null
+  const wfId     = req.params.id
+  const triggerInput = (req.body as any)?.trigger_input ?? {}
+  if (typeof triggerInput !== 'object' || Array.isArray(triggerInput) || triggerInput == null) {
+    res.status(400).json({ error: 'trigger_input must be a JSON object' })
+    return
+  }
+
+  // Load workflow + tenant — service role bypasses RLS but we still scope
+  // the SELECT by tenant_id so a caller can't simulate another tenant's
+  // workflow even with a forged id.
+  const [{ data: wf, error: wfErr }, { data: tenant, error: tErr }] = await Promise.all([
+    supabase.from('workflows').select('id, tenant_id, name, nodes').eq('id', wfId).eq('tenant_id', tenantId).maybeSingle(),
+    supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle(),
+  ])
+  if (wfErr || tErr) { res.status(500).json({ error: wfErr?.message ?? tErr?.message ?? 'load failed' }); return }
+  if (!wf)     { res.status(404).json({ error: 'Workflow not found' }); return }
+  if (!tenant) { res.status(404).json({ error: 'Tenant not found' });   return }
+
+  // Insert the run row up-front so we always have a run_id to hand back even
+  // if the executor crashes mid-way. The runner's persistSimulationResult
+  // UPDATE-s the same row with the terminal status + trace.
+  const { data: runRow, error: insErr } = await supabase.from('workflow_simulation_runs').insert({
+    tenant_id: tenantId,
+    workflow_id: wfId,
+    started_by: userId,
+    trigger_input: triggerInput,
+    status: 'running',
+  }).select('id').single()
+  if (insErr || !runRow) { res.status(500).json({ error: insErr?.message ?? 'failed to start run' }); return }
+  const runId = runRow.id
+
+  // Drive the simulation synchronously — runner is in-memory only, no I/O
+  // (no fetch, no queue, no scheduled_jobs). Total wall time is bounded by
+  // the runner's internal step + wall-clock caps.
+  try {
+    const { runSimulation, persistSimulationResult } = await import('./engine/simulate-runner')
+    const result = await runSimulation({ tenant, workflow: wf, triggerInput })
+    await persistSimulationResult(supabase, runId, result)
+  } catch (err: any) {
+    // Persist a failed run so the FE can still render the failure cleanly.
+    try {
+      await supabase.from('workflow_simulation_runs').update({
+        status: 'failed',
+        finished_at: new Date().toISOString(),
+        error: err?.message ?? String(err),
+      }).eq('id', runId)
+    } catch { /* swallow — already in failure path */ }
+  }
+
+  res.status(202).json({ run_id: runId })
+})
+
+// GET a simulation run by id. FE polls this until status != 'running'.
+// Tenant-scoped: we resolved the tenant from the JWT, so the WHERE clause
+// rejects any cross-tenant lookup attempt.
+app.get('/api/workflow-simulations/:run_id', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'view'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  const { data, error } = await supabase
+    .from('workflow_simulation_runs')
+    .select('*')
+    .eq('id', req.params.run_id)
+    .eq('tenant_id', tenantId)
+    .maybeSingle()
+  if (error) { res.status(500).json({ error: error.message }); return }
+  if (!data) { res.status(404).json({ error: 'Simulation run not found' }); return }
+  res.json(data)
+})
+
 // ── Tenants CRUD ──────────────────────────────────────────────────────────────
 app.get('/api/tenants/:id/members', requireAuth, identifyTenant, async (req, res) => {
   // B1: cross-tenant data leak fix. The path param :id was previously trusted
@@ -2255,6 +2354,29 @@ app.post('/webhook/whatsapp', async (req, res) => {
   if (!verifyMetaSignature(rawBody, sigHeader, appSecret)) {
     console.warn('[wa-webhook] HMAC verification failed — rejecting')
     res.status(401).json({ error: 'invalid_signature' }); return
+  }
+
+  // ── Webhook queue handoff (migration 064) ────────────────────────────
+  // With WEBHOOK_QUEUE_ENABLED=1 the route enqueues the verified payload
+  // and ACKs immediately. The worker (workers/webhook-retry.ts) does the
+  // DB writes with 5-attempt exponential backoff + DLQ. Default OFF so
+  // existing behaviour is preserved until we flip the switch in prod.
+  if (process.env.WEBHOOK_QUEUE_ENABLED === '1') {
+    try {
+      const { enqueueWebhookInbound } = await import('./queue')
+      await enqueueWebhookInbound({
+        source:     'meta_whatsapp',
+        rawBodyB64: rawBody.toString('base64'),
+        receivedAt: new Date().toISOString(),
+      })
+      res.sendStatus(200)
+      return
+    } catch (e: any) {
+      // Redis down → fall through to inline path so we don't lose the
+      // delivery. Meta retries on >2s timeout, so the failover is the
+      // safer default vs returning 5xx.
+      console.warn(`[wa-webhook] queue enqueue failed, running inline: ${e?.message ?? e}`)
+    }
   }
 
   // ACK only AFTER signature verified so we don't lend our 200 to spoofed
@@ -3418,7 +3540,7 @@ app.use('/api/waitlist', createWaitlistRouter({ supabase }))
 app.use(createBillingRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Channel-specific feature endpoints (omnichannel) ─────────────────────────
-app.use(createWaFeaturesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+app.use(createWaFeaturesRouter({ supabase, requireAuth, identifyTenant, checkPermission, redis: redisConnection }))
 app.use(createTelegramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createInstagramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createMetaAdsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
@@ -3429,14 +3551,31 @@ app.use(createSuperAdminRouter({ supabase, requireAuth }))
 // ── Tenant team management (RBAC) ────────────────────────────────────────────
 app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))
 
+// ── Tenant audit log (per-tenant immutable log, populated by WA-calling +
+//    other DPDP-compliance writers; read-side for the AuditLogPage FE) ───────
+app.use(createTenantAuditRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
 // ── Notifications (in-app bell + preferences) ────────────────────────────────
 app.use(createNotificationsRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── Per-tenant usage / quota inspection ──────────────────────────────────────
+// Live token-bucket counters (the same numbers checkAndConsumeQuota gates
+// against). Powers the billing-page rate-limit bars + the "previous warnings"
+// panel on /settings/billing.
+app.use(createUsageRouter({ supabase, redis: redisConnection, requireAuth, identifyTenant, checkPermission }))
 
 // ── Approval requests (broadcast >threshold, bulk delete, etc.) ──────────────
 app.use(createApprovalsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Workflow recommendations (AI-generated once, cached forever) ─────────────
 app.use(createWorkflowRecosRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── AI Responder — opt-in auto-reply with per-tenant knowledge (RAG) ─────────
+// Settings + QA wizard + knowledge browser + test endpoint. The
+// `run_ai_responder` workflow node consumes the same per-tenant settings +
+// chunks. Strict tenant isolation: every helper in lib/ai-knowledge.ts
+// takes tenantId as the first filter on every read/write.
+app.use(createAiResponderRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── WhatsApp Business Calling (intent → initiate → dispatch → events) ───────
 // The router owns the public /webhook/wa-calls endpoint AND all /api/calls/*

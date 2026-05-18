@@ -388,6 +388,25 @@ export function createInstagramRouter(deps: Deps): express.Router {
       console.warn('[ig-webhook] HMAC verification failed — rejecting')
       res.status(401).json({ error: 'invalid_signature' }); return
     }
+
+    // ── Webhook queue handoff (migration 064) ──────────────────────────
+    // Same flag-gated pattern as /webhook/whatsapp. See queue.ts and
+    // workers/webhook-retry.ts for the retry + DLQ contract.
+    if (process.env.WEBHOOK_QUEUE_ENABLED === '1') {
+      try {
+        const { enqueueWebhookInbound } = await import('../queue')
+        await enqueueWebhookInbound({
+          source:     'meta_instagram',
+          rawBodyB64: rawBody.toString('base64'),
+          receivedAt: new Date().toISOString(),
+        })
+        res.sendStatus(200)
+        return
+      } catch (e: any) {
+        console.warn(`[ig-webhook] queue enqueue failed, running inline: ${e?.message ?? e}`)
+      }
+    }
+
     res.sendStatus(200)
     try {
       let body: any

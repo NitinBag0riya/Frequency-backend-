@@ -60,6 +60,21 @@ export const Q = {
   callEventIngest:      'call.event.ingest',
   callRecordingArchive: 'call.recording.archive',
   callTranscribe:       'call.transcribe',
+  // ── Webhook reliability (migration 064) ──────────────────────────────────
+  // inbound:  payloads we RECEIVE from external systems (Meta WA / IG /
+  //           Telegram / Razorpay / wa-calls). Route handlers verify the
+  //           signature inline, enqueue the raw bytes, then 200 OK so the
+  //           sender never sees a slow Supabase write.
+  // outbound: payloads we SEND (workflow http_request nodes, tenant
+  //           assignment-notification webhooks, etc).
+  // *.dead:   permanent failure sink for super-admin replay UI. We don't
+  //           consume these queues directly — the per-side worker writes a
+  //           webhook_dead_letter row + adds the job to *.dead so Bull
+  //           Board has it too for cross-reference.
+  webhookInbound:       'webhook.inbound',
+  webhookOutbound:      'webhook.outbound',
+  webhookInboundDead:   'webhook.inbound.dead',
+  webhookOutboundDead:  'webhook.outbound.dead',
 } as const
 
 // ── Job payload types ─────────────────────────────────────────────────────────
@@ -148,6 +163,69 @@ export interface CallTranscribeJob {
   storagePath:    string
 }
 
+// ── Webhook job payload types (migration 064) ───────────────────────────────
+/**
+ * Inbound webhook job. The route handler verifies the signature (HMAC for
+ * Meta/Razorpay, secret-token for Telegram) THEN enqueues. We carry the raw
+ * verified bytes so the worker can JSON.parse without re-verifying.
+ *
+ *   source       'meta_whatsapp' | 'meta_instagram' | 'telegram' |
+ *                'razorpay' | 'wa_calls'
+ *   rawBodyB64   base64 of the exact signed bytes (Buffer.from(rawBody)
+ *                .toString('base64')). Worker reverses with Buffer.from(
+ *                rawBodyB64, 'base64').
+ *   headers      stringified relevant headers (signature already verified —
+ *                kept for debugging + replay only)
+ *   query        ?tenant_id=… for Telegram, ?hub.* for Meta verification
+ *   receivedAt   ISO string set at enqueue time; worker uses it to detect
+ *                stale jobs (>30min old → log and drop)
+ */
+export interface WebhookInboundJob {
+  source:       'meta_whatsapp' | 'meta_instagram' | 'telegram' | 'razorpay' | 'wa_calls'
+  rawBodyB64:   string
+  headers?:     Record<string, string>
+  query?:       Record<string, string>
+  receivedAt:   string
+  // For Telegram (carries tenant in query) we lift it here so the DLQ row
+  // gets stamped immediately on dead-letter even if the worker never ran.
+  tenantId?:    string | null
+  // True when re-enqueued from the super-admin replay endpoint. Workers can
+  // skip Meta-style "stale (>30min)" gating for replays.
+  isReplay?:    boolean
+}
+
+/**
+ * Outbound webhook job. The enqueuer is anything that wants to POST to a
+ * tenant-supplied URL with retry + DLQ guarantees — workflow http_request
+ * nodes, lead-assignment notification pings, etc.
+ *
+ *   tenantId   nullable — system-level outbound (super-admin probes) leaves
+ *              it null. DLQ rows inherit this so the per-tenant view filters
+ *              correctly.
+ *   source     short label that groups related outbound URLs in the DLQ
+ *              UI ('workflow_http', 'lead_assignment_webhook', …)
+ *   url        full https URL
+ *   method     POST | PUT | PATCH | DELETE (GET typically doesn't need DLQ;
+ *              we accept it for completeness)
+ *   headers    arbitrary; never store secrets here — pass them via a
+ *              token-resolver hook on the worker side instead
+ *   body       string body (workflow node already interpolates {{vars}})
+ *   timeoutMs  per-attempt timeout; default 10000
+ *   idempotencyKey  optional — added as an `Idempotency-Key` header so
+ *              third-party endpoints can dedupe across retries
+ */
+export interface WebhookOutboundJob {
+  tenantId:        string | null
+  source:          string
+  url:             string
+  method:          'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  headers?:        Record<string, string>
+  body?:           string
+  timeoutMs?:      number
+  idempotencyKey?: string
+  isReplay?:       boolean
+}
+
 // ── Queue instances ───────────────────────────────────────────────────────────
 const defaultJobOpts = {
   removeOnComplete: { count: 1000, age: 24 * 60 * 60 },  // keep last 1000 / 24h
@@ -202,6 +280,72 @@ export const callTranscribeQueue = new Queue<CallTranscribeJob>(Q.callTranscribe
   defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 10000 } },
 })
 
+// ── Webhook queues (migration 064) ────────────────────────────────────────
+// Retry schedule per spec: 5 attempts, ~1s → 5s → 30s → 5m → 30m.
+// BullMQ exponential backoff uses delay * 2^(attempt-1), which doesn't fit
+// the 1s/5s/30s/5m/30m shape exactly. We use `type: 'custom'` via a small
+// backoff strategy registered on the Worker side (see workers/webhook-
+// retry.ts). Here we set `delay` to a sentinel and let the worker compute.
+//
+// Larger removeOnFail window than the default — we WANT to keep failed jobs
+// visible in Bull Board for ~14d alongside the webhook_dead_letter row, so
+// operators have two cross-referenceable sources of truth.
+
+const WEBHOOK_RETRY_SCHEDULE_MS = [1_000, 5_000, 30_000, 5 * 60_000, 30 * 60_000] as const
+export const WEBHOOK_RETRY_ATTEMPTS = WEBHOOK_RETRY_SCHEDULE_MS.length
+
+const webhookJobOpts = {
+  removeOnComplete: { count: 1000, age: 24 * 60 * 60 },
+  removeOnFail:     { count: 5000, age: 14 * 24 * 60 * 60 },
+  attempts:         WEBHOOK_RETRY_ATTEMPTS,
+  // 'webhookRetry' is the strategy name registered on each worker via
+  // `settings.backoffStrategies`. We bake the schedule above into that
+  // strategy so it stays in lockstep with this constant.
+  backoff:          { type: 'webhookRetry' } as const,
+}
+
+export const webhookInboundQueue = new Queue<WebhookInboundJob>(Q.webhookInbound, {
+  connection,
+  defaultJobOptions: webhookJobOpts,
+})
+
+export const webhookOutboundQueue = new Queue<WebhookOutboundJob>(Q.webhookOutbound, {
+  connection,
+  defaultJobOptions: webhookJobOpts,
+})
+
+// Dead-letter queues — write-only; we add a job here when a worker
+// permanently fails so Bull Board has a peer record of the
+// webhook_dead_letter row. No worker consumes these.
+export const webhookInboundDeadQueue = new Queue<WebhookInboundJob & { deadLetterId: string; lastError: string }>(
+  Q.webhookInboundDead, { connection, defaultJobOptions: {
+    removeOnComplete: false,
+    removeOnFail: false,
+    attempts: 1,
+  }},
+)
+export const webhookOutboundDeadQueue = new Queue<WebhookOutboundJob & { deadLetterId: string; lastError: string }>(
+  Q.webhookOutboundDead, { connection, defaultJobOptions: {
+    removeOnComplete: false,
+    removeOnFail: false,
+    attempts: 1,
+  }},
+)
+
+/**
+ * BullMQ custom backoff strategy used by webhook.inbound + webhook.outbound
+ * workers. Returns ms to wait before the NEXT attempt. attemptsMade is the
+ * 1-based count of attempts that have *already* completed (BullMQ semantics).
+ *
+ * Schedule: 1s → 5s → 30s → 5m → 30m. After the 5th failure BullMQ marks
+ * the job 'failed' and the failed-listener in workers/webhook-retry.ts
+ * writes the DLQ row.
+ */
+export function webhookRetryBackoff(attemptsMade: number): number {
+  const idx = Math.max(0, Math.min(WEBHOOK_RETRY_SCHEDULE_MS.length - 1, attemptsMade - 1))
+  return WEBHOOK_RETRY_SCHEDULE_MS[idx]
+}
+
 // ── Convenience helpers used by routes / engine ───────────────────────────────
 export async function enqueueWorkflowExecution(payload: WorkflowExecuteJob, delayMs = 0) {
   return workflowQueue.add('execute', payload, {
@@ -250,6 +394,31 @@ export async function enqueueCallTranscribe(payload: CallTranscribeJob) {
   })
 }
 
+// ── Webhook enqueue helpers ────────────────────────────────────────────────
+/**
+ * Enqueue a verified inbound webhook. Caller MUST have already validated
+ * the signature — we treat the bytes as trusted from this point.
+ *
+ * We do NOT dedupe via jobId here because Meta + Razorpay can legitimately
+ * resend the same body (network blip + retry), and we want both copies in
+ * the failed set if the worker breaks. Idempotency happens downstream in
+ * the worker via per-event keys (platform_message_id, event_id, …).
+ */
+export async function enqueueWebhookInbound(payload: WebhookInboundJob) {
+  return webhookInboundQueue.add(payload.source, payload, {
+    // Soft cap on the per-job priority — keeps healthy traffic from
+    // starving small tenants on shared workers. All inbound is priority 1
+    // (highest) by default; bump only if a queue is backed up.
+    priority: 1,
+  })
+}
+
+export async function enqueueWebhookOutbound(payload: WebhookOutboundJob) {
+  return webhookOutboundQueue.add(payload.source, payload, {
+    priority: 2, // outbound is lower-priority than inbound
+  })
+}
+
 // Optional: queue events listener for diagnostics in dev. Disabled in prod.
 export function attachDebugListeners() {
   if (process.env.NODE_ENV === 'production') return
@@ -272,6 +441,11 @@ export async function closeQueues() {
     callEventIngestQueue.close(),
     callRecordingArchiveQueue.close(),
     callTranscribeQueue.close(),
+    // Webhook queues
+    webhookInboundQueue.close(),
+    webhookOutboundQueue.close(),
+    webhookInboundDeadQueue.close(),
+    webhookOutboundDeadQueue.close(),
   ])
   await connection.quit().catch(() => {})
 }

@@ -16,9 +16,10 @@
  */
 
 import '../env'
-import { Worker, Job } from 'bullmq'
+import { Worker, UnrecoverableError, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, MessageSendJob, connection } from '../queue'
+import { checkAndConsumeQuota, RateLimitExceededError } from '../lib/quota'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -45,6 +46,61 @@ export function startMessageSenderWorker() {
     Q.message,
     async (job: Job<MessageSendJob>) => {
       const data = job.data
+
+      // ── Per-tenant rate-limit gate (migration 063 / lib/quota.ts) ────
+      // Runs BEFORE the channel dispatch so we never burn a Meta API token
+      // on a send that's about to fail anyway. Two checks per send:
+      //
+      //   1. per-day quota  → prevents the chatty tenant from exhausting
+      //                       their plan in an hour. Day boundary = IST so
+      //                       it matches /api/billing/usage's monthly count.
+      //   2. per-minute     → smoothing; matches Meta's per-WABA 80/sec
+      //                       so the API rarely sees an explicit 429.
+      //
+      // RateLimitExceededError is wrapped in BullMQ's UnrecoverableError so
+      // the job moves straight to the failed set instead of consuming all
+      // 5 retry attempts on a quota that won't reset for hours.
+      //
+      // Email + Telegram + Instagram also consume the same daily bucket —
+      // the goal is "messages out the door, regardless of channel" since
+      // every channel costs the tenant money one way or another.
+      try {
+        // Day quota first (cheaper short-circuit on enterprise / unlimited).
+        const dayCheck = await checkAndConsumeQuota(
+          supabase, connection, data.tenantId, 'messages_per_day',
+        )
+        if (!dayCheck.allowed) {
+          throw new RateLimitExceededError({
+            tenantId: data.tenantId, quotaKey: 'messages_per_day',
+            current: dayCheck.current_usage, cap: dayCheck.cap,
+            resetsAt: dayCheck.resets_at,
+          })
+        }
+        // Per-minute smoothing — only check if day passed (no point bumping
+        // both counters on a doomed send).
+        const minCheck = await checkAndConsumeQuota(
+          supabase, connection, data.tenantId, 'messages_per_minute',
+        )
+        if (!minCheck.allowed) {
+          throw new RateLimitExceededError({
+            tenantId: data.tenantId, quotaKey: 'messages_per_minute',
+            current: minCheck.current_usage, cap: minCheck.cap,
+            resetsAt: minCheck.resets_at,
+          })
+        }
+      } catch (e: any) {
+        if (e instanceof RateLimitExceededError) {
+          // Log to outbound messages table so the UI shows the failure
+          // reason — without this, broadcasts silently dropped messages
+          // and the tenant just saw the `failed` counter tick up.
+          await logRateLimitRejection(data, e).catch(() => {})
+          throw new UnrecoverableError(
+            `quota ${e.quotaKey} exceeded (${e.current}/${e.cap}); resets at ${e.resetsAt}`,
+          )
+        }
+        throw e
+      }
+
       switch (data.channel) {
         case 'email':     return sendEmailViaProvider(data)
         case 'instagram': return sendInstagram(data)
@@ -56,9 +112,11 @@ export function startMessageSenderWorker() {
     {
       connection,
       concurrency: Number(process.env.MESSAGE_CONCURRENCY ?? 5),
-      // Global rate limit. Meta cap is 80 msg/sec per WABA; we stay at 50/sec.
-      // Per-tenant grouping is a Phase 4 task (use BullMQ groups + queue.add({group}))
-      limiter: { max: 50, duration: 1000 },
+      // Per-tenant rate-limiting is enforced inline by checkAndConsumeQuota
+      // (above) rather than BullMQ's global `limiter`. The previous global
+      // 50/sec cap was the very problem this work fixes: one noisy tenant
+      // would starve all others. With the per-tenant token bucket each
+      // tenant gets their own plan's per-minute budget enforced atomically.
     }
   )
 
@@ -159,6 +217,36 @@ async function sendWhatsApp(data: MessageSendJob) {
   const waMessageId = body.messages?.[0]?.id ?? null
   await logOutbound(tenant, to, payload, waMessageId, 'sent', null, data.sessionId ?? null, data.broadcastId ?? null, 'whatsapp')
   return { wa_message_id: waMessageId }
+}
+
+/**
+ * Record a rate-limit-rejected message attempt to public.messages so the
+ * inbox + broadcast UI shows the failure reason instead of silently dropping
+ * the row. Mirrors logOutbound's shape so existing FE readers (which expect
+ * status='failed' + content.error) keep working without changes.
+ *
+ * Best-effort — if the tenant lookup fails (shouldn't happen for a job that
+ * already passed validation but defensive), we swallow rather than retry.
+ */
+async function logRateLimitRejection(data: MessageSendJob, err: RateLimitExceededError): Promise<void> {
+  const recipient = data.channel === 'email' ? (data.email?.to ?? '') : data.to
+  await supabase.from('messages').insert({
+    tenant_id: data.tenantId,
+    session_id: data.sessionId ?? null,
+    broadcast_id: data.broadcastId ?? null,
+    direction: 'outbound',
+    contact_phone: recipient,
+    channel: data.channel,
+    wa_message_id: null,
+    platform_message_id: null,
+    content: {
+      error: err.message,
+      code: 'rate_limit_exceeded',
+      quota_key: err.quotaKey,
+      current: err.current, cap: err.cap, resets_at: err.resetsAt,
+    },
+    status: 'failed',
+  })
 }
 
 async function logOutbound(

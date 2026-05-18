@@ -22,11 +22,14 @@ import { startTemplateSyncWorker }     from './workers/template-sync'
 import { startDataSourceSyncWorker }   from './workers/data-source-sync'
 import { startTrialEndingWorker }      from './workers/trial-ending'
 import { startGmailPollerWorker }      from './workers/gmail-poller'
+import { startLookalikeRefreshWorker } from './workers/lookalike-refresh'
 // WA Business Calling — migration 035
 import { startCallDispatchWorker }         from './workers/call-dispatch'
 import { startCallEventIngestWorker }      from './workers/call-event-ingest'
 import { startCallRecordingArchiveWorker } from './workers/call-recording-archive'
 import { startCallTranscribeWorker }       from './workers/call-transcribe'
+// Webhook retry queues — migration 064
+import { startWebhookInboundWorker, startWebhookOutboundWorker } from './workers/webhook-retry'
 import { createClient } from '@supabase/supabase-js'
 import { closeQueues, attachCallDispatchFailureListener } from './queue'
 
@@ -44,12 +47,21 @@ async function main() {
   const ds  = await startDataSourceSyncWorker()
   const te  = await startTrialEndingWorker()
   const gp  = await startGmailPollerWorker()
+  const lr  = await startLookalikeRefreshWorker()
 
   // WA Calling workers — concurrency per env (defaults in `01-backend-design.md` §11).
   const cd = startCallDispatchWorker()
   const ce = startCallEventIngestWorker()
   const ca = startCallRecordingArchiveWorker()
   const ct = startCallTranscribeWorker()
+
+  // Webhook retry / DLQ workers (migration 064). Always run when the worker
+  // process is up — the WEBHOOK_QUEUE_ENABLED flag gates the *route* side
+  // (whether handlers enqueue or run inline), not the worker side. Keeping
+  // the workers running unconditionally means a flip-the-switch cutover
+  // doesn't require a worker redeploy.
+  const wi = startWebhookInboundWorker()
+  const wo = startWebhookOutboundWorker()
 
   // Failure listener for call.dispatch — when BullMQ permanently fails a
   // dispatch job, flip call_sessions.status='failed' so the agent's UI
@@ -74,10 +86,12 @@ async function main() {
     console.log(`[worker] received ${signal} — draining…`)
     await Promise.allSettled([
       wf.close(), ms.close(), bw.close(),
-      sp.close(), ts.close(), ds.close(), te.close(), gp.close(),
+      sp.close(), ts.close(), ds.close(), te.close(), gp.close(), lr.close(),
       // WA Calling
       cd.close(), ce.close(), ca.close(), ct.close(),
       dispatchFailureListener.close(),
+      // Webhook retry / DLQ
+      wi.close(), wo.close(),
     ])
     await closeQueues()
     process.exit(0)

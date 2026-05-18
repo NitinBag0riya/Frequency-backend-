@@ -17,9 +17,10 @@
  */
 
 import '../env'
-import { Worker, Job } from 'bullmq'
+import { Worker, UnrecoverableError, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, BroadcastBatchJob, connection, enqueueMessageSend } from '../queue'
+import { checkAndConsumeQuota } from '../lib/quota'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -48,6 +49,23 @@ export function startBroadcastWorker() {
       if (!tenant?.access_token) {
         await markFailed(broadcast.id, 'tenant has no WhatsApp credentials')
         throw new Error('tenant has no WhatsApp credentials')
+      }
+
+      // ── Per-tenant broadcast quota gate (migration 063 / lib/quota.ts) ─
+      // Consumed BEFORE we resolve the audience + fan out so a tenant who
+      // has exhausted their daily broadcast count gets a single clean
+      // failure with reason instead of N per-message rate-limit rejections
+      // cluttering /api/messages. The per-message quota still applies to
+      // each fanned-out send (enforced in message-sender.ts).
+      const bCheck = await checkAndConsumeQuota(
+        supabase, connection, broadcast.tenant_id, 'broadcasts_per_day',
+      )
+      if (!bCheck.allowed) {
+        const reason = bCheck.reason === 'feature_disabled'
+          ? `Broadcasts are not included in your plan — upgrade to ${bCheck.upgrade_to ?? 'starter'}.`
+          : `Daily broadcast quota reached (${bCheck.current_usage}/${bCheck.cap}); resets at ${bCheck.resets_at}.`
+        await markFailed(broadcast.id, reason)
+        throw new UnrecoverableError(reason)
       }
 
       // 2. Resolve audience → contact list

@@ -40,6 +40,7 @@ export type AiUsageSource =
   | 'skill_match'
   | 'call_transcript'
   | 'call_sentiment'
+  | 'wa_flow_chat_edit'
 
 /**
  * Anthropic SDK's usage shape. Cache fields are optional and only present

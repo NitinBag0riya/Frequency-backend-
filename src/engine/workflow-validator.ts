@@ -104,11 +104,12 @@ const NODE_CONNECTOR_MAP: Record<string, NodeConnectorReq> = {
   check_calendar_availability:'google',
 
   // Connector-specific
-  payment:                    'razorpay',
-  razorpay_list_payments:     'razorpay',
-  razorpay_get_payment:       'razorpay',
-  razorpay_refund_payment:    'razorpay',
-  razorpay_list_subscriptions:'razorpay',
+  payment:                       'razorpay',
+  razorpay_create_payment_link:  'razorpay',
+  razorpay_list_payments:        'razorpay',
+  razorpay_get_payment:          'razorpay',
+  razorpay_refund_payment:       'razorpay',
+  razorpay_list_subscriptions:   'razorpay',
   airtable_list_records:      'airtable',
   airtable_create_record:     'airtable',
   airtable_update_record:     'airtable',
@@ -226,9 +227,14 @@ function validateNodeConfig(node: any): NodeIssue[] {
       break
     case 'send_email':
     case 'forward_email':
-      if (!cfg.to_email) issues.push(err(`${t}: cfg.to_email is required`))
-      if (!cfg.subject)  issues.push(warn(`${t}: cfg.subject is empty — will send "(no subject)"`))
-      if (!cfg.body && !cfg.body_template) issues.push(err(`${t}: cfg.body or cfg.body_template is required`))
+      // Accept registry's modern shape (to / body_text / body_html) AND the
+      // legacy fields (to_email / body / body_template) — the executor
+      // handles both, the validator should too.
+      if (!cfg.to && !cfg.to_email) issues.push(err(`${t}: cfg.to (or cfg.to_email) is required`))
+      if (!cfg.subject)             issues.push(warn(`${t}: cfg.subject is empty — will send "(no subject)"`))
+      if (!cfg.body_text && !cfg.body_html && !cfg.body && !cfg.body_template) {
+        issues.push(err(`${t}: cfg.body_text, cfg.body_html, cfg.body, or cfg.body_template is required`))
+      }
       break
     case 'wait_delay': {
       const m = Number(cfg.delay_minutes ?? 0), s = Number(cfg.delay_seconds ?? 0)
@@ -258,6 +264,10 @@ function validateNodeConfig(node: any): NodeIssue[] {
     case 'payment':
       if (!cfg.amount)      issues.push(err('payment: cfg.amount (INR rupees) is required'))
       if (!cfg.description) issues.push(warn('payment: cfg.description is empty — Razorpay will show generic label'))
+      break
+    case 'razorpay_create_payment_link':
+      if (!cfg.amount)      issues.push(err('razorpay_create_payment_link: cfg.amount (INR rupees) is required'))
+      if (!cfg.description) issues.push(warn('razorpay_create_payment_link: cfg.description is empty — Razorpay will show generic label'))
       break
     case 'followup': {
       const m = Number(cfg.delay_minutes ?? 0), s = Number(cfg.delay_seconds ?? 0)

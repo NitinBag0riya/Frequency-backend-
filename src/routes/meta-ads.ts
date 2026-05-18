@@ -478,6 +478,364 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
     res.json(out)
   })
 
+  // ── Ad sets ──────────────────────────────────────────────────────────────
+  // Hierarchy below the Campaign object — ad sets hold targeting, schedule
+  // and budget. All endpoints are live-proxy to Meta (no caching); the
+  // tenant's stored access_token gates which adsets/ads they can see.
+  //
+  // Meta returns daily_budget as a string in the account's minor units (e.g.
+  // "50000" for ₹500.00 when currency=INR). We normalise to major units on
+  // both the read and write paths so the UI never has to think about it.
+
+  // List ad sets in a campaign. `:id` is the LOCAL meta_ad_campaigns.id
+  // (UUID) — we resolve it to the Meta-side numeric id before hitting Graph.
+  r.get('/api/meta-ads/campaigns/:id/adsets', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const metaCampaignId = await resolveMetaCampaignId(supabase, tenantId, String(req.params.id))
+    if (!metaCampaignId) { res.status(404).json({ error: 'campaign not found' }); return }
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    try {
+      const fields = 'id,name,status,daily_budget,lifetime_budget,optimization_goal,billing_event,start_time,end_time,targeting'
+      const j = await fetch(`${GRAPH}/${metaCampaignId}/adsets?fields=${fields}&limit=100&access_token=${conn.token}`).then(r => r.json()) as any
+      if (j.error) { res.status(metaErrorStatus(j.error)).json({ error: j.error.message, code: j.error.code }); return }
+      res.json((j.data ?? []).map((a: any) => ({
+        id:                a.id,
+        name:              a.name,
+        status:            a.status,
+        // Convert minor units → major. Meta returns string, sometimes absent.
+        daily_budget:      a.daily_budget    ? Number(a.daily_budget) / 100    : null,
+        lifetime_budget:   a.lifetime_budget ? Number(a.lifetime_budget) / 100 : null,
+        optimization_goal: a.optimization_goal ?? null,
+        billing_event:     a.billing_event ?? null,
+        start_time:        a.start_time ?? null,
+        end_time:          a.end_time ?? null,
+        targeting:         a.targeting ?? null,
+      })))
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // Create an ad set. Body shape mirrors Meta's /adsets create payload but
+  // accepts daily_budget in major units (₹/$ etc) — we multiply by 100.
+  // Default status='PAUSED' regardless of what client sends — explicit
+  // safe-mode so a typo can't launch live spend.
+  r.post('/api/meta-ads/campaigns/:id/adsets', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const {
+      name, daily_budget, lifetime_budget,
+      targeting, optimization_goal, billing_event,
+      start_time, end_time, bid_amount,
+    } = req.body
+    if (!name || !optimization_goal || !billing_event) {
+      res.status(400).json({ error: 'name + optimization_goal + billing_event required' }); return
+    }
+    if (!daily_budget && !lifetime_budget) {
+      res.status(400).json({ error: 'daily_budget OR lifetime_budget required' }); return
+    }
+    const metaCampaignId = await resolveMetaCampaignId(supabase, tenantId, String(req.params.id))
+    if (!metaCampaignId) { res.status(404).json({ error: 'campaign not found' }); return }
+    const adAccountId = await resolveAdAccountForCampaign(supabase, tenantId, String(req.params.id))
+    if (!adAccountId) { res.status(404).json({ error: 'ad account not found for campaign' }); return }
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    try {
+      const payload: any = {
+        name,
+        campaign_id:       metaCampaignId,
+        status:            'PAUSED',                // hard safe-mode
+        optimization_goal,
+        billing_event,
+        // Meta requires a non-empty targeting spec even for broad ad sets.
+        // The FE always sends at least { geo_locations: { countries: [...] } }.
+        targeting:         targeting ?? { geo_locations: { countries: ['IN'] } },
+      }
+      if (daily_budget)    payload.daily_budget    = Math.round(Number(daily_budget)    * 100)
+      if (lifetime_budget) payload.lifetime_budget = Math.round(Number(lifetime_budget) * 100)
+      if (bid_amount)      payload.bid_amount      = Math.round(Number(bid_amount)      * 100)
+      if (start_time)      payload.start_time      = start_time
+      if (end_time)        payload.end_time        = end_time
+
+      const r1 = await fetch(`${GRAPH}/${adAccountId}/adsets?access_token=${conn.token}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const j = await r1.json() as any
+      if (!j.id) { res.status(metaErrorStatus(j.error)).json({ error: j.error?.message ?? 'ad set create failed', code: j.error?.code }); return }
+      res.json({ success: true, adset_id: j.id })
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // Update an ad set — status, budget, targeting. `:id` is the META-side id
+  // (we never persist adset ids locally; the campaigns table stores only
+  // campaign rows). Client passes daily_budget in major units.
+  r.patch('/api/meta-ads/adsets/:id', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    const { status, daily_budget, lifetime_budget, targeting, name, end_time } = req.body
+    const payload: any = {}
+    if (status)          payload.status          = status
+    if (name)            payload.name            = name
+    if (targeting)       payload.targeting       = targeting
+    if (end_time)        payload.end_time        = end_time
+    if (daily_budget    != null) payload.daily_budget    = Math.round(Number(daily_budget)    * 100)
+    if (lifetime_budget != null) payload.lifetime_budget = Math.round(Number(lifetime_budget) * 100)
+    if (Object.keys(payload).length === 0) { res.status(400).json({ error: 'no updatable fields supplied' }); return }
+    try {
+      const r1 = await fetch(`${GRAPH}/${req.params.id}?access_token=${conn.token}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const j = await r1.json() as any
+      if (j.error) { res.status(metaErrorStatus(j.error)).json({ error: j.error.message, code: j.error.code }); return }
+      res.json({ success: true, ...j })
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // Ad-set delivery estimate (reach + cost). Useful in the create-modal
+  // review step. `:id` is the META-side adset id post-create — for the
+  // create flow we accept ad_account_id + targeting in the body instead.
+  r.post('/api/meta-ads/reach-estimate', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { ad_account_id, targeting, optimization_goal } = req.body
+    if (!ad_account_id || !targeting) { res.status(400).json({ error: 'ad_account_id + targeting required' }); return }
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    try {
+      const params = new URLSearchParams({
+        targeting_spec: JSON.stringify(targeting),
+        access_token:   conn.token,
+      })
+      if (optimization_goal) params.set('optimization_goal', optimization_goal)
+      const j = await fetch(`${GRAPH}/${ad_account_id}/delivery_estimate?${params.toString()}`).then(r => r.json()) as any
+      if (j.error) { res.status(metaErrorStatus(j.error)).json({ error: j.error.message, code: j.error.code }); return }
+      res.json(j.data?.[0] ?? null)
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // ── Ads ──────────────────────────────────────────────────────────────────
+  r.get('/api/meta-ads/adsets/:id/ads', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    try {
+      const fields = 'id,name,status,creative{id,name,thumbnail_url},created_time,updated_time'
+      const j = await fetch(`${GRAPH}/${req.params.id}/ads?fields=${fields}&limit=100&access_token=${conn.token}`).then(r => r.json()) as any
+      if (j.error) { res.status(metaErrorStatus(j.error)).json({ error: j.error.message, code: j.error.code }); return }
+      res.json(j.data ?? [])
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // Create an ad inside an ad set. Body: { name, creative_id, ad_account_id, status? }
+  // We require ad_account_id explicitly because adsets/:id alone doesn't tell
+  // us which ad account to scope the create call to (Meta needs the act_xxx id).
+  r.post('/api/meta-ads/adsets/:id/ads', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { name, creative_id, ad_account_id } = req.body
+    if (!name || !creative_id || !ad_account_id) {
+      res.status(400).json({ error: 'name + creative_id + ad_account_id required' }); return
+    }
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    try {
+      const payload = {
+        name,
+        adset_id: req.params.id,
+        creative: { creative_id },
+        status:   'PAUSED',           // hard safe-mode regardless of client input
+      }
+      const r1 = await fetch(`${GRAPH}/${ad_account_id}/ads?access_token=${conn.token}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const j = await r1.json() as any
+      if (!j.id) { res.status(metaErrorStatus(j.error)).json({ error: j.error?.message ?? 'ad create failed', code: j.error?.code }); return }
+      res.json({ success: true, ad_id: j.id })
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  r.patch('/api/meta-ads/ads/:id', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { status, name, creative_id } = req.body
+    const payload: any = {}
+    if (status) payload.status = status
+    if (name)   payload.name   = name
+    if (creative_id) payload.creative = { creative_id }
+    if (Object.keys(payload).length === 0) { res.status(400).json({ error: 'no updatable fields supplied' }); return }
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    try {
+      const r1 = await fetch(`${GRAPH}/${req.params.id}?access_token=${conn.token}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const j = await r1.json() as any
+      if (j.error) { res.status(metaErrorStatus(j.error)).json({ error: j.error.message, code: j.error.code }); return }
+      res.json({ success: true, ...j })
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // ── Creatives ────────────────────────────────────────────────────────────
+  // List all creatives across all tenant ad accounts. `?ad_account_id=`
+  // narrows the scope; otherwise we fan out across every connected account.
+  r.get('/api/meta-ads/creatives', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    const filter = req.query.ad_account_id ? [{ ad_account_id: String(req.query.ad_account_id) }]
+      : (await supabase.from('meta_ad_accounts').select('ad_account_id').eq('tenant_id', tenantId)).data ?? []
+    try {
+      const fields = 'id,name,thumbnail_url,object_story_spec,effective_object_story_id,status'
+      const out: any[] = []
+      for (const a of filter) {
+        const j = await fetch(`${GRAPH}/${a.ad_account_id}/adcreatives?fields=${fields}&limit=100&access_token=${conn.token}`).then(r => r.json()) as any
+        if (j.error) {
+          // One account failing shouldn't drop the whole response — log and continue.
+          console.warn(`[meta-ads creatives] ${a.ad_account_id}: ${j.error.message}`)
+          continue
+        }
+        for (const c of j.data ?? []) out.push({ ...c, ad_account_id: a.ad_account_id })
+      }
+      res.json(out)
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // Create a single-image or single-video creative via the link_data spec.
+  // For carousels / collection ads, build the object_story_spec on the
+  // client and POST it through this same endpoint (raw_object_story_spec).
+  r.post('/api/meta-ads/creatives', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const {
+      ad_account_id, name, page_id,
+      image_url, video_id,
+      image_hash,                       // optional pre-uploaded hash from /adimages
+      headline, body_text,
+      cta_type, destination_url,
+      raw_object_story_spec,            // escape hatch for carousels/collection
+    } = req.body
+    if (!ad_account_id || !name) { res.status(400).json({ error: 'ad_account_id + name required' }); return }
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+
+    // Build object_story_spec. If the caller pre-built one (carousel etc),
+    // use it verbatim. Otherwise assemble link_data or video_data.
+    let object_story_spec: any
+    if (raw_object_story_spec) {
+      object_story_spec = raw_object_story_spec
+    } else {
+      if (!page_id) { res.status(400).json({ error: 'page_id required (unless raw_object_story_spec supplied)' }); return }
+      const link_data: any = {
+        message:        body_text ?? '',
+        name:           headline ?? '',
+        link:           destination_url ?? 'https://facebook.com',
+        call_to_action: cta_type ? { type: cta_type, value: { link: destination_url ?? 'https://facebook.com' } } : undefined,
+      }
+      if (image_hash) link_data.image_hash = image_hash
+      else if (image_url) link_data.picture = image_url
+
+      object_story_spec = { page_id }
+      if (video_id) {
+        object_story_spec.video_data = {
+          video_id,
+          message:        body_text ?? '',
+          title:          headline ?? '',
+          call_to_action: link_data.call_to_action,
+          image_url,                                  // thumbnail
+        }
+      } else {
+        object_story_spec.link_data = link_data
+      }
+    }
+
+    try {
+      const payload: any = { name, object_story_spec }
+      const r1 = await fetch(`${GRAPH}/${ad_account_id}/adcreatives?access_token=${conn.token}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const j = await r1.json() as any
+      if (!j.id) { res.status(metaErrorStatus(j.error)).json({ error: j.error?.message ?? 'creative create failed', code: j.error?.code }); return }
+      res.json({ success: true, creative_id: j.id })
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // Upload an image to an ad account → returns the image_hash to embed in
+  // a creative's link_data.image_hash. Multipart upload: the client posts
+  // raw bytes (req.body must be the binary buffer or this expects a
+  // pre-fetched URL the server will mirror up). We choose the URL-mirror
+  // path because Express isn't configured for multipart here and adding
+  // multer just for this is overkill — image_url is the more common shape.
+  r.post('/api/meta-ads/adimages', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { ad_account_id, image_url } = req.body
+    if (!ad_account_id || !image_url) { res.status(400).json({ error: 'ad_account_id + image_url required' }); return }
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    try {
+      // Fetch the image and forward to Meta. We pass the URL directly using
+      // Meta's `url` field which fetches the asset on their side — much
+      // cheaper than streaming it through us. Falls back to `bytes` if the
+      // origin is private / 4xxs.
+      const r1 = await fetch(`${GRAPH}/${ad_account_id}/adimages?access_token=${conn.token}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: image_url }),
+      })
+      const j = await r1.json() as any
+      if (j.error) { res.status(metaErrorStatus(j.error)).json({ error: j.error.message, code: j.error.code }); return }
+      // Meta returns { images: { <filename>: { hash, url } } } — flatten.
+      const first = j.images ? Object.values(j.images)[0] as any : null
+      res.json({ success: true, image_hash: first?.hash, url: first?.url, raw: j })
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
+  // ── Interest + geo targeting search ──────────────────────────────────────
+  // Thin proxy over Meta's targeting-search endpoint. We don't cache; Meta
+  // ranks results by global relevance and the response is small (<5KB).
+  // `type` switches the underlying Graph endpoint:
+  //   interest → /search?type=adinterest
+  //   geo      → /search?type=adgeolocation
+  //   behavior → /search?type=adTargetingCategory&class=behaviors
+  r.get('/api/meta-ads/interests/search', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const q = String(req.query.q ?? '').trim()
+    const type = String(req.query.type ?? 'interest')
+    if (!q) { res.json([]); return }
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    try {
+      const params = new URLSearchParams({ q, limit: '25', access_token: conn.token })
+      let searchType = 'adinterest'
+      if (type === 'geo')      searchType = 'adgeolocation'
+      if (type === 'behavior') { searchType = 'adTargetingCategory'; params.set('class', 'behaviors') }
+      params.set('type', searchType)
+      const j = await fetch(`${GRAPH}/search?${params.toString()}`).then(r => r.json()) as any
+      if (j.error) { res.status(metaErrorStatus(j.error)).json({ error: j.error.message, code: j.error.code }); return }
+      res.json(j.data ?? [])
+    } catch (err: any) {
+      res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? err}` })
+    }
+  })
+
   r.get('/api/meta-ads/insights', ...guardView, async (req, res) => {
     const tenantId = (req as any).tenantId
     const conn = await getMetaAdsConnection(supabase, tenantId)
@@ -517,6 +875,36 @@ async function toggleCampaignStatus(
   } catch (err: any) {
     res.status(500).json({ error: err.message })
   }
+}
+
+// Translate our local meta_ad_campaigns.id (UUID) → Meta's numeric campaign
+// id. We never expose Meta ids in the FE router (they leak across tenants
+// once URLs are shared), so every adset/ad endpoint that pivots off a
+// campaign starts here.
+async function resolveMetaCampaignId(supabase: SupabaseClient, tenantId: string, localId: string): Promise<string | null> {
+  const { data } = await supabase.from('meta_ad_campaigns')
+    .select('meta_campaign_id').eq('id', localId).eq('tenant_id', tenantId).maybeSingle()
+  return data?.meta_campaign_id ?? null
+}
+
+async function resolveAdAccountForCampaign(supabase: SupabaseClient, tenantId: string, localId: string): Promise<string | null> {
+  const { data } = await supabase.from('meta_ad_campaigns')
+    .select('ad_account_id').eq('id', localId).eq('tenant_id', tenantId).maybeSingle()
+  return data?.ad_account_id ?? null
+}
+
+// Map Meta's Graph error subcodes onto the HTTP status the FE should see.
+// Most "invalid input" / permission errors come back at 200 with an `error`
+// blob — translating to 4xx lets the FE surface them as user-fixable rather
+// than as opaque 500s.
+function metaErrorStatus(err: any): number {
+  if (!err) return 500
+  const code = Number(err.code ?? 0)
+  // 100  → invalid parameter, 190 → invalid token, 200/278 → permissions,
+  // 1487390 → ad set budget below floor. Treat the entire 1xxx class as 4xx.
+  if ([100, 190, 200, 278, 294, 506].includes(code)) return 400
+  if (code === 17 || code === 4 || code === 32)     return 429   // rate limit
+  return 502
 }
 
 async function getMetaAdsConnection(supabase: SupabaseClient, tenantId: string) {

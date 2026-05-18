@@ -246,7 +246,11 @@ export function createRazorpayConnector(deps: Deps): express.Router {
   // flat customer_* fields) and translates it to Razorpay's wire format
   // (amount in paise, nested `customer` object). Keeps schema drift across
   // registry ↔ handler at zero — the registry stays the single source of
-  // truth for what the FE sends.
+  // truth for what the FE sends. The wire-format builder is exported so the
+  // workflow-node executor path (engine/connector-ops.ts → razorpay.create_payment_link)
+  // can call into the same logic without re-implementing the INR→paise math
+  // and the conditional-field hygiene that Razorpay requires (it 400s on
+  // empty customer / notify objects).
   r.post('/api/connectors/razorpay/payment-links',
     requireAuth, identifyTenant, checkPermission('integrations', 'edit'),
     validateBody(PaymentLinkSchema),
@@ -254,35 +258,7 @@ export function createRazorpayConnector(deps: Deps): express.Router {
       try {
         const auth = await getRazorpayAuthHeader(supabase, (req as any).tenantId)
         const input = req.body as z.infer<typeof PaymentLinkSchema>
-
-        // INR (rupees) → paise. Razorpay rejects non-integer amounts, so round
-        // defensively for any fractional-rupee input that slipped past Zod.
-        const amountPaise = Math.round(input.amount * 100)
-
-        // Build nested customer only if at least one sub-field is present —
-        // Razorpay 400s on an empty {} customer object.
-        const customer: Record<string, string> = {}
-        if (input.customer_name)  customer.name    = input.customer_name
-        if (input.customer_email) customer.email   = input.customer_email
-        if (input.customer_phone) customer.contact = input.customer_phone
-
-        // Same for notify — only emit if explicitly set.
-        const notify: Record<string, boolean> = {}
-        if (typeof input.notify_sms   === 'boolean') notify.sms   = input.notify_sms
-        if (typeof input.notify_email === 'boolean') notify.email = input.notify_email
-
-        const wirePayload: Record<string, unknown> = {
-          amount:   amountPaise,
-          currency: input.currency,
-        }
-        if (input.description)              wirePayload.description     = input.description
-        if (Object.keys(customer).length)   wirePayload.customer        = customer
-        if (Object.keys(notify).length)     wirePayload.notify          = notify
-        if (input.reminder_enable !== undefined) wirePayload.reminder_enable = input.reminder_enable
-        if (input.notes)                    wirePayload.notes           = input.notes
-        if (input.callback_url)             wirePayload.callback_url    = input.callback_url
-        if (input.callback_method)          wirePayload.callback_method = input.callback_method
-        if (input.expire_by)                wirePayload.expire_by       = input.expire_by
+        const wirePayload = buildPaymentLinkWirePayload(input)
 
         const r2 = await fetch(`${RZP}/payment_links`, {
           method: 'POST',
@@ -375,6 +351,80 @@ export function createRazorpayConnector(deps: Deps): express.Router {
     })
 
   return r
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Payment-link wire-payload builder.
+//
+// Single source of truth for the flat-INR → nested-paise transformation that
+// Razorpay's POST /v1/payment_links expects. Used by both the REST handler
+// above AND the workflow-node executor (engine/connector-ops.ts) so the two
+// entry points stay in lockstep — if Razorpay tweaks a required field, we
+// fix it here once.
+//
+// Razorpay is strict about empty sub-objects:
+//   - `customer: {}` → 400 "field customer is required"
+//   - `notify: {}`   → silently uses defaults (true for both)
+// We only emit these keys when the caller supplied at least one sub-field
+// so a partial input doesn't accidentally trigger SMS/email side effects.
+// ─────────────────────────────────────────────────────────────────────────────
+export type PaymentLinkInput = z.infer<typeof PaymentLinkSchema>
+
+// The workflow-node path constructs the input from cfg + interpolated vars,
+// not from a Zod-validated HTTP body — accept the raw shape (a superset of
+// PaymentLinkInput) so callers can pass `notes: { run_id, node_id }` for
+// lineage without first re-parsing through the strict() schema.
+export interface PaymentLinkInputLoose {
+  amount:           number | string
+  currency?:        string
+  description?:     string
+  customer_name?:   string
+  customer_email?:  string
+  customer_phone?:  string
+  notify_sms?:      boolean
+  notify_email?:    boolean
+  reminder_enable?: boolean
+  notes?:           Record<string, string>
+  callback_url?:    string
+  callback_method?: 'get'
+  expire_by?:       number
+}
+
+export function buildPaymentLinkWirePayload(input: PaymentLinkInput | PaymentLinkInputLoose): Record<string, unknown> {
+  // INR (rupees) → paise. Razorpay rejects non-integer amounts, so round
+  // defensively for any fractional-rupee input that slipped past Zod.
+  // Workflow-node callers can pass numeric strings (e.g. an interpolated
+  // "{{order.total}}" → "1499") — coerce here so the executor doesn't
+  // need a per-call Number() cast.
+  const amountNum = typeof input.amount === 'string' ? Number(input.amount) : input.amount
+  if (!Number.isFinite(amountNum) || amountNum <= 0) {
+    throw new Error(`razorpay.create_payment_link: invalid amount '${input.amount}' (expected positive number, INR rupees)`)
+  }
+  const amountPaise = Math.round(amountNum * 100)
+  const currency = input.currency ?? 'INR'
+
+  const customer: Record<string, string> = {}
+  if (input.customer_name)  customer.name    = input.customer_name
+  if (input.customer_email) customer.email   = input.customer_email
+  if (input.customer_phone) customer.contact = input.customer_phone
+
+  const notify: Record<string, boolean> = {}
+  if (typeof input.notify_sms   === 'boolean') notify.sms   = input.notify_sms
+  if (typeof input.notify_email === 'boolean') notify.email = input.notify_email
+
+  const wire: Record<string, unknown> = {
+    amount:   amountPaise,
+    currency,
+  }
+  if (input.description)                   wire.description     = input.description
+  if (Object.keys(customer).length)        wire.customer        = customer
+  if (Object.keys(notify).length)          wire.notify          = notify
+  if (input.reminder_enable !== undefined) wire.reminder_enable = input.reminder_enable
+  if (input.notes)                         wire.notes           = input.notes
+  if (input.callback_url)                  wire.callback_url    = input.callback_url
+  if (input.callback_method)               wire.callback_method = input.callback_method
+  if (input.expire_by)                     wire.expire_by       = input.expire_by
+  return wire
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

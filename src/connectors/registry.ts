@@ -812,7 +812,8 @@ const META_ADS: ConnectorDef = {
   // (Campaign Manager, Lead Ads, Audiences, …) that read better in the
   // sidebar as a curated nav rather than as raw capabilities.
   channelFeatures: [
-    { key: 'campaigns',   label: 'Campaign Manager', iconName: 'BarChart3', route: '/ads/meta/campaigns' },
+    { key: 'campaigns',   label: 'Campaign Manager', iconName: 'BarChart3',     route: '/ads/meta/campaigns' },
+    { key: 'creatives',   label: 'Ad Creatives',     iconName: 'Image',         route: '/ads/meta/creatives' },
     { key: 'ctwa',        label: 'CTWA Campaigns',   iconName: 'MessageSquare', route: '/ads/meta/ctwa' },
     { key: 'lead_ads',    label: 'Lead Ads',         iconName: 'UserCheck',     route: '/ads/meta/lead-ads' },
     { key: 'audiences',   label: 'Audiences',        iconName: 'Users',         route: '/ads/meta/audiences' },

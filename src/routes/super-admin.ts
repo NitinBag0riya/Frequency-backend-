@@ -599,5 +599,99 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       })
     })
 
+  // ─── Webhook dead-letter (migration 064) ─────────────────────────────────
+  // Permanent failures from webhook.inbound + webhook.outbound queues. The
+  // worker writes one row here when a job exhausts all 5 retries
+  // (workers/webhook-retry.ts). This endpoint powers the super-admin
+  // "Webhook failures" view + the per-row replay button.
+  //
+  // Reuses the same 'audit' platform feature key — anyone allowed to read
+  // the platform audit log can read webhook failures (they're operationally
+  // similar: "what went wrong in our infra").
+  r.get('/api/super-admin/webhook-failures',
+    requireAuth, requirePlatformPerm(supabase, 'audit', 'view'),
+    async (req, res) => {
+      const { source, direction, tenant_id, replayed, page = '1', pageSize = '50' } = req.query as Record<string, string>
+      const p = Math.max(1, parseInt(page, 10) || 1)
+      const ps = Math.min(200, Math.max(1, parseInt(pageSize, 10) || 50))
+      const offset = (p - 1) * ps
+
+      let q = supabase.from('webhook_dead_letter')
+        .select('id, tenant_id, source, direction, attempts, last_error, created_at, replayed_at, replayed_by, replay_count',
+                { count: 'exact' })
+        .order('created_at', { ascending: false })
+        .range(offset, offset + ps - 1)
+      if (source)    q = q.eq('source', source)
+      if (direction) q = q.eq('direction', direction)
+      if (tenant_id) q = q.eq('tenant_id', tenant_id)
+      if (replayed === 'true')  q = q.not('replayed_at', 'is', null)
+      if (replayed === 'false') q = q.is('replayed_at', null)
+
+      const { data, error, count } = await q
+      if (error) { res.status(500).json({ error: error.message }); return }
+      res.json({
+        data: data ?? [],
+        total: count ?? 0,
+        page: p, pageSize: ps,
+        totalPages: Math.max(1, Math.ceil((count ?? 0) / ps)),
+      })
+    })
+
+  // Fetch one row including the full payload (only revealed on demand to
+  // keep list responses cheap and avoid logging payloads in normal browse).
+  r.get('/api/super-admin/webhook-failures/:id',
+    requireAuth, requirePlatformPerm(supabase, 'audit', 'view'),
+    async (req, res) => {
+      const { data, error } = await supabase.from('webhook_dead_letter')
+        .select('*').eq('id', String(req.params.id)).maybeSingle()
+      if (error) { res.status(500).json({ error: error.message }); return }
+      if (!data)  { res.status(404).json({ error: 'not_found' }); return }
+      res.json(data)
+    })
+
+  // Replay — re-enqueue the original payload onto the matching queue. The
+  // worker sees `isReplay=true` so it skips the stale-job guard. We do NOT
+  // delete the row on replay; we bump replay_count and stamp replayed_at +
+  // replayed_by so the audit trail survives.
+  r.post('/api/super-admin/webhook-failures/:id/replay',
+    requireAuth, requirePlatformPerm(supabase, 'audit', 'edit'),
+    async (req, res) => {
+      const id = String(req.params.id)
+      const { data: row, error } = await supabase.from('webhook_dead_letter')
+        .select('*').eq('id', id).maybeSingle()
+      if (error) { res.status(500).json({ error: error.message }); return }
+      if (!row)  { res.status(404).json({ error: 'not_found' }); return }
+
+      try {
+        const { enqueueWebhookInbound, enqueueWebhookOutbound } = await import('../queue')
+        if (row.direction === 'inbound') {
+          const payload = { ...(row.payload as any), isReplay: true, receivedAt: new Date().toISOString() }
+          await enqueueWebhookInbound(payload)
+        } else if (row.direction === 'outbound') {
+          const payload = { ...(row.payload as any), isReplay: true }
+          await enqueueWebhookOutbound(payload)
+        } else {
+          res.status(400).json({ error: `unknown direction: ${row.direction}` }); return
+        }
+      } catch (e: any) {
+        res.status(503).json({ error: `enqueue failed: ${e?.message ?? e}` }); return
+      }
+
+      const user = (req as any).user
+      await supabase.from('webhook_dead_letter').update({
+        replayed_at:  new Date().toISOString(),
+        replayed_by:  user?.id ?? null,
+        replay_count: (row.replay_count ?? 0) + 1,
+      }).eq('id', id)
+
+      await audit(supabase, req, {
+        action: 'webhook_failures.replay',
+        payload: { id, source: row.source, direction: row.direction, tenant_id: row.tenant_id },
+        target_tenant_id: row.tenant_id,
+      })
+
+      res.json({ ok: true, replayed: id })
+    })
+
   return r
 }

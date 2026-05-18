@@ -348,6 +348,26 @@ export function createWaCallingRouter(deps: Deps): express.Router {
       res.status(401).json({ error: 'invalid signature' }); return
     }
 
+    // ── Webhook queue handoff (migration 064) ────────────────────────────
+    // Same flag-gated cutover as the messages webhook. The downstream
+    // call.event.ingest queue still does the heavy state-machine work; the
+    // queue we hand off to here just guards the receive→insert step against
+    // Supabase blips, with retry + DLQ.
+    if (process.env.WEBHOOK_QUEUE_ENABLED === '1') {
+      try {
+        const { enqueueWebhookInbound } = await import('../queue')
+        await enqueueWebhookInbound({
+          source:     'wa_calls',
+          rawBodyB64: raw.toString('base64'),
+          receivedAt: new Date().toISOString(),
+        })
+        res.sendStatus(200)
+        return
+      } catch (e: any) {
+        console.warn(`[wa-calls.webhook] queue enqueue failed, running inline: ${e?.message ?? e}`)
+      }
+    }
+
     let body: any
     try { body = JSON.parse(raw.toString('utf8')) }
     catch { res.status(400).json({ error: 'invalid json' }); return }

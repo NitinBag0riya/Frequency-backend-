@@ -17,6 +17,14 @@
 
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
+import type IORedis from 'ioredis'
+import Anthropic from '@anthropic-ai/sdk'
+import {
+  validateDefinition, FLOW_SPEC_FOR_PROMPT, DEFAULT_DEFINITION,
+  type FlowDefinition,
+} from '../lib/wa-flow-schema'
+import { checkAndConsumeQuota } from '../lib/quota'
+import { recordAiUsage } from '../lib/ai-usage'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -25,13 +33,25 @@ interface Deps {
   requireAuth: Middleware
   identifyTenant: Middleware
   checkPermission: (feature: string, action: 'view' | 'edit' | 'delete') => Middleware
+  /**
+   * Required only for the chat-edit endpoint (quota enforcement). Passed in
+   * from index.ts; we keep it optional in the interface so unit tests and
+   * the catalog/QR routes can mount the router without spinning up Redis.
+   */
+  redis?: IORedis
 }
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
 
+// Same default as ai-responder.ts. Overridable via env for ops.
+const FLOW_EDIT_MODEL = process.env.WA_FLOW_EDIT_MODEL || 'claude-opus-4-7'
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null
+
 export function createWaFeaturesRouter(deps: Deps): express.Router {
   const r = express.Router()
-  const { supabase, requireAuth, identifyTenant, checkPermission } = deps
+  const { supabase, requireAuth, identifyTenant, checkPermission, redis } = deps
   const guard = [requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit')]
   const guardView = [requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'view')]
 
@@ -182,9 +202,12 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
     const { name, category, definition } = req.body
     if (!name) { res.status(400).json({ error: 'name required' }); return }
 
+    // Seed with a valid single-screen DRAFT so the chat-edit loop can start
+    // from a clean baseline that already passes validateDefinition().
+    const seed = definition ?? DEFAULT_DEFINITION
     const { data, error } = await supabase.from('wa_flows').insert({
       tenant_id: tenantId, name, category: category ?? null, status: 'DRAFT',
-      definition: definition ?? { version: '7.1', screens: [] },
+      definition: seed,
     }).select().single()
     if (error) { res.status(500).json({ error: error.message }); return }
 
@@ -259,6 +282,269 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       .order('created_at', { ascending: false })
     if (error) { res.status(500).json({ error: error.message }); return }
     res.json(data ?? [])
+  })
+
+  /**
+   * POST /api/wa-flows/:id/chat-edit
+   *
+   * Chat-driven editing: the user types natural language ("Add an email screen
+   * before Confirm with a Continue button"). We ship the current definition +
+   * the Meta Flows v7.1 spec to Claude and ask it to return the COMPLETE new
+   * definition (not a patch — patches are brittle on screen reshuffles).
+   *
+   * Validation gate:
+   *   - We run validateDefinition() on Claude's output BEFORE writing to DB.
+   *   - On failure we return { ok:false, error, claude_attempted_definition }
+   *     so the FE can show the error and the user can rephrase. Crucially we
+   *     do NOT update wa_flows.definition on invalid output — the DB stays
+   *     on the last known-good state.
+   *
+   * Quota:
+   *   - Hits checkAndConsumeQuota('ai_requests_per_day') BEFORE the Claude
+   *     call so a chatty user can't blow through their plan in an hour.
+   *   - Records token usage via recordAiUsage so /api/usage reflects spend.
+   */
+  r.post('/api/wa-flows/:id/chat-edit', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const instruction = String(req.body?.instruction ?? '').trim()
+    if (!instruction) { res.status(400).json({ error: 'instruction is required' }); return }
+    if (instruction.length > 4_000) {
+      res.status(400).json({ error: 'instruction too long (max 4000 chars)' }); return
+    }
+    if (!anthropic) {
+      res.status(503).json({ error: 'AI not configured on this deployment (ANTHROPIC_API_KEY missing)' }); return
+    }
+    if (!redis) {
+      res.status(503).json({ error: 'AI quota service not available' }); return
+    }
+
+    // Plan-quota gate (migration 063). Free tier = 50 ai requests/day.
+    const q = await checkAndConsumeQuota(supabase, redis, tenantId, 'ai_requests_per_day')
+    if (!q.allowed) {
+      res.status(429).json({
+        error: q.reason === 'feature_disabled'
+          ? 'AI editing is not included on your current plan'
+          : `Daily AI request quota exhausted (${q.current_usage}/${q.cap}). Resets at ${q.resets_at}.`,
+        upgrade_to: q.upgrade_to,
+        resets_at: q.resets_at,
+      })
+      return
+    }
+
+    // Load current flow.
+    const { data: flow, error: flowErr } = await supabase.from('wa_flows')
+      .select('id, definition, status').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (flowErr) { res.status(500).json({ error: flowErr.message }); return }
+    if (!flow) { res.status(404).json({ error: 'flow not found' }); return }
+    if (flow.status === 'PUBLISHED') {
+      res.status(400).json({ error: 'Published flows cannot be edited. Create a new draft.' }); return
+    }
+
+    const currentDef = (flow.definition as FlowDefinition | null) ?? DEFAULT_DEFINITION
+
+    const systemPrompt = [
+      'You are a WhatsApp Flows JSON editor. You receive the current Flow definition and a natural-language instruction.',
+      'Apply the instruction and respond with ONLY the new full Flow definition as raw JSON — no prose, no markdown fences, no commentary.',
+      'Preserve every screen and component the instruction did not mention. Edits are additive unless the user says "delete" or "replace".',
+      '',
+      FLOW_SPEC_FOR_PROMPT,
+    ].join('\n')
+
+    const userMessage = [
+      'Current definition:',
+      '```json',
+      JSON.stringify(currentDef, null, 2),
+      '```',
+      '',
+      `Instruction: ${instruction}`,
+      '',
+      'Return the complete new definition as raw JSON.',
+    ].join('\n')
+
+    let claudeJsonText = ''
+    let attempted: unknown = null
+    try {
+      const resp = await anthropic.messages.create({
+        model: FLOW_EDIT_MODEL,
+        max_tokens: 4096,
+        // Note: `temperature` is deprecated on claude-opus-4-7 (returns 400);
+        // the model is deterministic enough at default settings for this task.
+        system: [
+          // System prompt is cached — same for every chat-edit call so we
+          // only pay full token cost on the first request per 5-minute window.
+          { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
+        ] as any,
+        messages: [{ role: 'user', content: userMessage }],
+      })
+      claudeJsonText = (resp.content as any[])
+        .filter(b => b.type === 'text').map(b => b.text).join('\n').trim()
+
+      // Record cost regardless of whether the JSON parses — we still paid Anthropic.
+      void recordAiUsage(supabase, tenantId, resp.usage as any, 'wa_flow_chat_edit', FLOW_EDIT_MODEL)
+    } catch (e: any) {
+      res.status(502).json({ error: `Claude call failed: ${e?.message ?? e}` }); return
+    }
+
+    // Strip accidental markdown fences before parsing.
+    const cleaned = claudeJsonText
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```\s*$/i, '')
+      .trim()
+
+    try {
+      attempted = JSON.parse(cleaned)
+    } catch (e: any) {
+      res.status(422).json({
+        ok: false,
+        error: `Claude returned invalid JSON: ${e?.message ?? e}`,
+        claude_raw: claudeJsonText,
+      })
+      return
+    }
+
+    const { valid, errors } = validateDefinition(attempted)
+    if (!valid) {
+      res.status(422).json({
+        ok: false,
+        error: 'Generated definition failed Meta Flows v7.1 validation',
+        validation_errors: errors,
+        claude_attempted_definition: attempted,
+      })
+      return
+    }
+
+    // Compute which screens changed (by deep-equality on id-keyed maps) so the
+    // FE can highlight them. Cheap because Flow defs are tiny (< 10 screens).
+    const oldScreensById = Object.fromEntries(
+      (currentDef.screens ?? []).map(s => [s.id, JSON.stringify(s)]),
+    )
+    const newScreensById = Object.fromEntries(
+      ((attempted as FlowDefinition).screens ?? []).map(s => [s.id, JSON.stringify(s)]),
+    )
+    const screensChanged: string[] = []
+    for (const id of Object.keys(newScreensById)) {
+      if (oldScreensById[id] !== newScreensById[id]) screensChanged.push(id)
+    }
+    for (const id of Object.keys(oldScreensById)) {
+      if (!(id in newScreensById)) screensChanged.push(`-${id}`)  // deleted
+    }
+
+    const { error: updErr } = await supabase.from('wa_flows')
+      .update({ definition: attempted, updated_at: new Date().toISOString() })
+      .eq('id', flow.id).eq('tenant_id', tenantId)
+    if (updErr) { res.status(500).json({ error: updErr.message }); return }
+
+    res.json({
+      ok: true,
+      definition: attempted,
+      screens_changed: screensChanged,
+      quota: { used: q.current_usage, cap: q.cap, resets_at: q.resets_at },
+    })
+  })
+
+  /**
+   * POST /api/wa-flows/:id/publish-to-meta
+   *
+   * Two-step publish:
+   *   1. Validate the local definition against our embedded Meta Flows v7.1
+   *      schema. If invalid → 400 with errors, no Meta call attempted.
+   *   2. If the flow already has a meta_flow_id, PUSH the new definition to
+   *      Meta with a POST /{flow_id}/assets (file=flow.json, asset_type=FLOW_JSON).
+   *      Else, CREATE the flow on Meta first (POST /{waba_id}/flows), then
+   *      upload the assets, then publish (POST /{flow_id}/publish).
+   *   3. Flip status='PUBLISHED' locally. Meta publish is irreversible — once
+   *      published, the only way to edit is to deprecate + create new.
+   */
+  r.post('/api/wa-flows/:id/publish-to-meta', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+
+    const { data: flow, error: flowErr } = await supabase.from('wa_flows')
+      .select('*').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (flowErr) { res.status(500).json({ error: flowErr.message }); return }
+    if (!flow) { res.status(404).json({ error: 'flow not found' }); return }
+
+    // 1. Local validation gate.
+    const { valid, errors } = validateDefinition(flow.definition)
+    if (!valid) {
+      res.status(400).json({
+        error: 'Flow definition failed local validation; fix errors before publishing.',
+        validation_errors: errors,
+      })
+      return
+    }
+
+    const { data: tenant } = await supabase.from('tenants')
+      .select('waba_id, access_token').eq('id', tenantId).maybeSingle()
+    if (!tenant?.waba_id || !tenant?.access_token) {
+      res.status(400).json({ error: 'WhatsApp Business Account not connected — connect WhatsApp first.' })
+      return
+    }
+
+    try {
+      let metaFlowId: string | null = flow.meta_flow_id
+
+      // 2a. Create on Meta if first publish.
+      if (!metaFlowId) {
+        const createRes = await fetch(`${GRAPH}/${tenant.waba_id}/flows`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: flow.name,
+            categories: flow.category ? [flow.category] : ['OTHER'],
+          }),
+        })
+        const j = await createRes.json() as any
+        if (!createRes.ok || !j.id) {
+          res.status(502).json({ error: `Meta create flow failed: ${JSON.stringify(j)}` }); return
+        }
+        metaFlowId = j.id as string
+      }
+
+      // 2b. Upload the flow.json asset. Meta's /assets endpoint expects
+      //     multipart with the JSON as a file part named "file".
+      const form = new FormData()
+      const fileBlob = new Blob([JSON.stringify(flow.definition)], { type: 'application/json' })
+      form.append('file', fileBlob, 'flow.json')
+      form.append('name', 'flow.json')
+      form.append('asset_type', 'FLOW_JSON')
+      const assetRes = await fetch(`${GRAPH}/${metaFlowId}/assets`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tenant.access_token}` },
+        body: form as any,
+      })
+      const assetJson = await assetRes.json() as any
+      if (!assetRes.ok) {
+        res.status(502).json({ error: `Meta upload assets failed: ${JSON.stringify(assetJson)}` }); return
+      }
+
+      // 2c. Publish — irreversible at Meta.
+      const pubRes = await fetch(`${GRAPH}/${metaFlowId}/publish`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tenant.access_token}` },
+      })
+      const pubJson = await pubRes.json() as any
+      if (!pubRes.ok) {
+        // Meta sometimes returns 200 with success:true; sometimes 4xx with details.
+        // We surface the Meta error verbatim so the user sees the actual reason.
+        res.status(502).json({ error: `Meta publish failed: ${JSON.stringify(pubJson)}`, meta_flow_id: metaFlowId })
+        return
+      }
+
+      // 3. Reflect locally.
+      const { data: updated, error: updErr } = await supabase.from('wa_flows')
+        .update({
+          status: 'PUBLISHED',
+          meta_flow_id: metaFlowId,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', flow.id).eq('tenant_id', tenantId)
+        .select().single()
+      if (updErr) { res.status(500).json({ error: updErr.message }); return }
+
+      res.json({ ok: true, flow: updated, meta_response: pubJson })
+    } catch (e: any) {
+      res.status(502).json({ error: `Publish failed: ${e?.message ?? e}` })
+    }
   })
 
   // ── QR codes ──────────────────────────────────────────────────────────────

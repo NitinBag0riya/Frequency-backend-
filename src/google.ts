@@ -242,6 +242,122 @@ export async function gmailSendEmail(tenant: any, to: string, subject: string, b
   return data
 }
 
+// ── Gmail — rich send (cc/bcc/reply_to + multipart/alternative) ─────────────
+// Shared between:
+//   • REST: POST /api/google/gmail/send (index.ts)
+//   • Workflow node: send_email when provider resolves to Gmail
+//   • Connector op: gmail.send_email (engine/connector-ops.ts)
+//
+// Returns the full users.messages.send response so callers can surface
+// { id (= message_id), threadId } to the workflow execution row + the FE
+// inspector. Throws on a Gmail error so the caller can decide whether to
+// halt the workflow or branch on the failure.
+//
+// Why a separate helper instead of patching gmailSendEmail above: the
+// legacy 3-arg signature is used in several places and the safe move is to
+// add a richer surface alongside rather than break callers. The simple
+// gmailSendEmail still works for one-off "subject + body" use cases.
+export interface GmailSendRichInput {
+  to:        string
+  subject:   string
+  body_text?: string
+  body_html?: string
+  cc?:       string
+  bcc?:      string
+  reply_to?: string
+}
+
+export interface GmailSendRichResult {
+  id:       string
+  threadId: string
+  labelIds: string[]
+  from:     string
+}
+
+export async function gmailSendEmailRich(tenant: any, input: GmailSendRichInput): Promise<GmailSendRichResult> {
+  if (!input.body_text && !input.body_html) {
+    throw new Error('gmail.send: body_text or body_html is required')
+  }
+  const fromAddress = tenant.google_email as string | null
+  if (!fromAddress) {
+    throw new Error('gmail.send: connected Google account is missing an email address')
+  }
+
+  const token = await getValidToken(tenant)
+
+  // Build RFC 2822 MIME. Multipart/alternative when both html + text are
+  // provided so the recipient's client falls back to plain-text gracefully.
+  const headers: string[] = [
+    `From: ${fromAddress}`,
+    `To: ${input.to}`,
+  ]
+  if (input.cc)       headers.push(`Cc: ${input.cc}`)
+  if (input.bcc)      headers.push(`Bcc: ${input.bcc}`)
+  if (input.reply_to) headers.push(`Reply-To: ${input.reply_to}`)
+  headers.push(`Subject: ${encodeMimeHeader(String(input.subject ?? '(no subject)'))}`)
+  headers.push('MIME-Version: 1.0')
+
+  let mimeBody: string
+  if (input.body_html && input.body_text) {
+    // Random boundary string — collisions with body content are astronomically
+    // unlikely with 24 hex chars (96 bits of entropy).
+    const boundary = `frequency_${Math.random().toString(16).slice(2, 14)}${Date.now().toString(16)}`
+    headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`)
+    mimeBody = [
+      '',
+      `--${boundary}`,
+      'Content-Type: text/plain; charset=utf-8',
+      'Content-Transfer-Encoding: 7bit',
+      '',
+      input.body_text,
+      `--${boundary}`,
+      'Content-Type: text/html; charset=utf-8',
+      'Content-Transfer-Encoding: 7bit',
+      '',
+      input.body_html,
+      `--${boundary}--`,
+    ].join('\r\n')
+  } else if (input.body_html) {
+    headers.push('Content-Type: text/html; charset=utf-8')
+    mimeBody = '\r\n' + input.body_html
+  } else {
+    headers.push('Content-Type: text/plain; charset=utf-8')
+    mimeBody = '\r\n' + (input.body_text ?? '')
+  }
+
+  const mime = headers.join('\r\n') + mimeBody
+  const raw = Buffer.from(mime, 'utf8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+
+  const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ raw }),
+  })
+  const data = await res.json() as any
+  if (!res.ok || data.error) {
+    throw new Error(`Gmail send failed: ${data.error?.message ?? `HTTP ${res.status}`}`)
+  }
+  return {
+    id:       data.id,
+    threadId: data.threadId,
+    labelIds: data.labelIds ?? [],
+    from:     fromAddress,
+  }
+}
+
+// Encode a header value that may contain non-ASCII (per RFC 2047) so we
+// don't silently drop Unicode characters when building the MIME envelope.
+// Plain ASCII passes through unchanged for readability.
+function encodeMimeHeader(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (/^[\x00-\x7F]*$/.test(value)) return value
+  return `=?utf-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`
+}
+
 /**
  * List new INBOX messages since the tenant's last poll.
  *

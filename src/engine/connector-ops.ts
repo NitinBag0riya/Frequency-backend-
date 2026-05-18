@@ -143,7 +143,44 @@ const OPS: Record<string, OpHandler> = {
     return { output: body, primary: body.draft_order }
   },
 
-  // ── Razorpay (beyond the dedicated `payment` node which creates payment_links) ──
+  // ── Razorpay ──────────────────────────────────────────────────────────────
+  // create_payment_link — registry-aligned name for the workflow node that
+  // generates a hosted payment URL. The dedicated legacy `payment` node also
+  // creates payment_links + sends the URL on the session's channel; this op
+  // returns the link to the caller (executor) without auto-sending, so the
+  // next workflow node can branch on the response (e.g. log to Sheet,
+  // assign to agent, then conditionally send the link).
+  //
+  // Idempotency / lineage: Razorpay charges nothing for create, so we don't
+  // dedupe — but we attach `notes: { run_id, node_id, ... }` so the
+  // Razorpay dashboard's payment-link detail page shows exactly which
+  // workflow run created the link. Helpful when reconciling failed runs.
+  'razorpay.create_payment_link': async (supabase, tenantId, args) => {
+    const { getRazorpayAuthHeader, buildPaymentLinkWirePayload } = await import('../routes/connectors/razorpay')
+    const auth = await getRazorpayAuthHeader(supabase, tenantId)
+    const wire = buildPaymentLinkWirePayload(args as any)
+    const r = await fetch(`${RZP}/payment_links`, {
+      method: 'POST',
+      headers: { Authorization: auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify(wire),
+    })
+    const body = await r.json() as any
+    if (!r.ok) throw new Error(`Razorpay create_payment_link ${r.status}: ${body.error?.description ?? 'failed'}`)
+    // Surface the most-used fields as `primary` so the executor's
+    // response_variable cfg can pull just the link without an extra hop.
+    return {
+      output: {
+        payment_link_id: body.id,
+        short_url:       body.short_url ?? body.url ?? null,
+        amount:          typeof body.amount === 'number' ? body.amount / 100 : null,
+        currency:        body.currency ?? 'INR',
+        status:          body.status ?? null,
+      },
+      primary: body.short_url ?? body.url ?? body.id,
+    }
+  },
+
+  // ── Razorpay (beyond create_payment_link) ─────────────────────────────────
   'razorpay.list_payments':  async (supabase, tenantId, args) => {
     const { getRazorpayAuthHeader } = await import('../routes/connectors/razorpay')
     const auth = await getRazorpayAuthHeader(supabase, tenantId)

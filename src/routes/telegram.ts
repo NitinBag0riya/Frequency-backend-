@@ -367,6 +367,30 @@ export function createTelegramRouter(deps: Deps): express.Router {
       // operator knows to apply the migration.
       console.warn(`[telegram-webhook] could not read webhook_secret (tenant=${tenantId}): ${e?.message}`)
     }
+
+    // ── Webhook queue handoff (migration 064) ──────────────────────────
+    // Telegram bodies arrive as parsed JSON (express.json), not raw Buffer.
+    // We serialise back to a string + base64 it so the queue payload shape
+    // matches Meta's (worker decodes uniformly). Same flag-gated cutover
+    // pattern; falls back to inline on Redis failure.
+    if (process.env.WEBHOOK_QUEUE_ENABLED === '1') {
+      try {
+        const { enqueueWebhookInbound } = await import('../queue')
+        const json = JSON.stringify(req.body ?? {})
+        await enqueueWebhookInbound({
+          source:     'telegram',
+          rawBodyB64: Buffer.from(json, 'utf8').toString('base64'),
+          tenantId,
+          query:      { tenant_id: tenantId },
+          receivedAt: new Date().toISOString(),
+        })
+        res.sendStatus(200)
+        return
+      } catch (e: any) {
+        console.warn(`[telegram-webhook] queue enqueue failed, running inline: ${e?.message ?? e}`)
+      }
+    }
+
     try {
       const update: any = req.body
       const msg = update.message ?? update.edited_message

@@ -257,6 +257,26 @@ export function createBillingRouter(deps: Deps): express.Router {
         console.warn('[billing.webhook] HMAC verification failed')
         res.status(401).json({ error: 'invalid signature' }); return
       }
+
+      // ── Webhook queue handoff (migration 064) ─────────────────────────
+      // Razorpay retries on >2s timeout. Same flag-gated cutover pattern as
+      // Meta WA / IG: enqueue verified bytes, 200 OK, worker processes with
+      // retry + DLQ. Falls back to inline on Redis failure.
+      if (process.env.WEBHOOK_QUEUE_ENABLED === '1') {
+        try {
+          const { enqueueWebhookInbound } = await import('../queue')
+          await enqueueWebhookInbound({
+            source:     'razorpay',
+            rawBodyB64: raw.toString('base64'),
+            receivedAt: new Date().toISOString(),
+          })
+          res.json({ received: true, queued: true })
+          return
+        } catch (e: any) {
+          console.warn(`[billing.webhook] queue enqueue failed, running inline: ${e?.message ?? e}`)
+        }
+      }
+
       let payload: any
       try { payload = JSON.parse(raw.toString('utf8')) }
       catch { res.status(400).json({ error: 'invalid json' }); return }
