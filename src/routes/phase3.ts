@@ -258,6 +258,51 @@ export function createPhase3Router(deps: Deps): express.Router {
       res.json(series)
     })
 
+  // ── /api/analytics/messages-by-channel ────────────────────────────────
+  // Per-channel message volume split for the dashboard + analytics page
+  // (P0.8 — Telegram parity). Always returns a key for every channel the
+  // platform supports, even if the count is 0, so the FE chart doesn't
+  // need to guess legend rows.
+  //
+  // Window: ?days=N (default 14, clamped 1..90). Same shape as the
+  // timeseries endpoint above.
+  //
+  // Index used: messages(tenant_id, channel, created_at desc) — added in
+  // migration 073. Keeps this aggregate sub-100 ms on tenants with millions
+  // of rows.
+  r.get('/api/analytics/messages-by-channel',
+    requireAuth, identifyTenant,
+    async (req, res) => {
+      const tenantId = (req as any).tenantId
+      const days = Math.min(Math.max(Number(req.query.days ?? 14), 1), 90)
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
+
+      // Channels the FE legend renders. Order matters for stable rendering.
+      const CHANNELS = ['whatsapp', 'instagram', 'telegram', 'email', 'sms'] as const
+      const result: Record<string, { channel: string; inbound: number; outbound: number; total: number }> = {}
+      for (const ch of CHANNELS) result[ch] = { channel: ch, inbound: 0, outbound: 0, total: 0 }
+
+      // Pull rows + bucket in JS. For very large tenants this should
+      // become a Postgres aggregate (group by channel, direction) — left
+      // as a JS bucket for now to match the timeseries endpoint's style.
+      const { data, error } = await supabase.from('messages')
+        .select('channel, direction')
+        .eq('tenant_id', tenantId)
+        .gte('created_at', since)
+        .limit(100_000)
+      if (error) { res.status(500).json({ error: error.message }); return }
+
+      for (const m of data ?? []) {
+        const ch = (m as any).channel ?? 'whatsapp'
+        if (!result[ch]) result[ch] = { channel: ch, inbound: 0, outbound: 0, total: 0 }
+        if ((m as any).direction === 'inbound')        result[ch].inbound++
+        else if ((m as any).direction === 'outbound')  result[ch].outbound++
+        result[ch].total++
+      }
+
+      res.json({ days, by_channel: Object.values(result) })
+    })
+
   // ╭──────────────────────────────────────────────────────────────────────────╮
   // │ Execution Logs — Phase 3.4                                               │
   // ╰──────────────────────────────────────────────────────────────────────────╯

@@ -151,20 +151,23 @@ export function createTelegramRouter(deps: Deps): express.Router {
         allowed_updates: ['message', 'callback_query', 'pre_checkout_query'],
         secret_token: secretToken,
       })
-      // Persist the secret on the bot row. The column SHOULD be `webhook_secret`
-      // on the tg_bots table; if the migration hasn't landed yet, the update
-      // becomes a no-op and the inbound handler falls through to legacy
-      // (unverified) behaviour. TODO(secret-token-column): once the DB agent
-      // adds the column we can drop the try/catch below.
-      try {
-        await supabase.from('tg_bots').update({
-          webhook_url: webhook,
-          webhook_secret: secretToken,
-        }).eq('tenant_id', tenantId)
-      } catch {
-        // Likely "column does not exist" until the migration lands. Persist
-        // the URL alone so the existing functionality still works.
-        await supabase.from('tg_bots').update({ webhook_url: webhook }).eq('tenant_id', tenantId)
+      // Persist the secret on the bot row. tg_bots.webhook_secret landed in
+      // migration 073 — the legacy try/catch fallback was removed once that
+      // applied. If the update fails now it's a real error (likely no row
+      // for this tenant — meaning getBot() should have already 404'd).
+      const { error: persistErr } = await supabase.from('tg_bots').update({
+        webhook_url: webhook,
+        webhook_secret: secretToken,
+      }).eq('tenant_id', tenantId)
+      if (persistErr) {
+        // Don't leak the secret to the client — the webhook is set on
+        // Telegram's side but we couldn't store the verifier. Force a retry
+        // so the operator doesn't end up with an unverifiable webhook.
+        res.status(500).json({
+          error: 'webhook set on Telegram but secret could not be persisted; retry',
+          detail: persistErr.message,
+        })
+        return
       }
       res.json({ success: true, webhook })
     } catch (err: any) {

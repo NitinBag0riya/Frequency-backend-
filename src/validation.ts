@@ -97,13 +97,24 @@ export const WorkflowPatchSchema = WorkflowCreateSchema.partial().strict()
 
 export const BroadcastCreateSchema = z.object({
   name: z.string().min(1).max(200),
-  template_name: z.string().min(1).max(200).optional().nullable(),
+  template_name: z.string().min(1).max(2000).optional().nullable(),
   template_id: z.string().uuid().optional().nullable(),
   language: z.string().max(20).optional(),
+  // P0.8 — Telegram parity. The DB CHECK constraint (migration 016) is the
+  // authoritative whitelist; this enum keeps the API response cleaner than
+  // a generic 500 on bad channel values. Default 'whatsapp' to preserve
+  // legacy clients that POST without `channel`.
+  channel: z.enum(['whatsapp', 'instagram', 'telegram', 'email', 'sms']).optional(),
   audience: z.object({
     tags:         z.array(z.string()).optional(),
     exclude_tags: z.array(z.string()).optional(),
   }).passthrough().optional(),
+  // P1 #18 — optional saved-segment target. When present, broadcast-worker
+  // resolves the audience via lib/segment-filter.ts instead of the legacy
+  // audience.tags shape. Both can coexist on a broadcast row; segment_id
+  // wins if both are set. The server validates the segment is in the
+  // caller's tenant before linking.
+  segment_id:   z.string().uuid().optional().nullable(),
   variable_map: z.record(z.string(), z.string()).optional(),
   scheduled_at: z.string().datetime().optional().nullable(),
   status: z.enum(['draft', 'scheduled', 'sending', 'sent', 'failed']).optional(),
@@ -248,3 +259,23 @@ export const CallEndSchema = z.object({
 export const PromoteToContactSchema = z.object({
   preserve_tags: z.boolean().optional(),
 }).strict()
+
+// ── Mobile push device registration (P0.10) ─────────────────────────────────
+//
+// Mobile (mobile/src/lib/push.ts) POSTs this shape to /api/devices/register
+// after sign-in. Token format matches Expo's published spec:
+//   ExponentPushToken[base64url-ish chars]
+// We validate strictly at the route boundary so a malformed token never
+// hits the Expo push service (which would 400 every batch it lands in).
+//
+// `web` is in the platform enum for future PWA support — mobile only ever
+// sends 'ios' or 'android' today.
+export const DeviceRegisterSchema = z.object({
+  expo_push_token: z.string()
+    .regex(/^ExponentPushToken\[[A-Za-z0-9_-]+\]$/, 'Invalid Expo push token format')
+    .max(200),
+  platform:        z.enum(['ios', 'android', 'web']),
+  app_version:     z.string().max(40).optional(),
+  device_label:    z.string().max(120).optional(),
+}).strict()
+

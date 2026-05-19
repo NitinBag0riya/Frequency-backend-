@@ -41,6 +41,9 @@ export type AiUsageSource =
   | 'call_transcript'
   | 'call_sentiment'
   | 'wa_flow_chat_edit'
+  // P1 #14 — plain-English flow explainer (one call per (workflow, version),
+  // cached on workflow_versions.explainer_text afterward).
+  | 'explain_workflow'
 
 /**
  * Anthropic SDK's usage shape. Cache fields are optional and only present

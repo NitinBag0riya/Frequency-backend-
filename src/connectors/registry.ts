@@ -444,12 +444,49 @@ const INSTAGRAM: ConnectorDef = {
   isChannel: true,
   channelFeatures: [
     { key: 'broadcasts',  label: 'Broadcasts',          iconName: 'Send',       route: '/channels/instagram/broadcasts' },
+    { key: 'triggers',    label: 'Triggers',            iconName: 'Zap',        route: '/channels/instagram/triggers' },
     { key: 'comments',    label: 'Comment automation',  iconName: 'MessageCircle', route: '/channels/instagram/comments' },
     { key: 'publishing',  label: 'Content publishing',  iconName: 'ImagePlus',  route: '/channels/instagram/publishing' },
     { key: 'insights',    label: 'Insights',            iconName: 'BarChart3',  route: '/channels/instagram/insights' },
     { key: 'shopping',    label: 'Shopping',            iconName: 'ShoppingBag',route: '/channels/instagram/shopping' },
   ],
   capabilities: [
+    // ── Triggers (P0.9 — IG-unique workflow entry points) ────────────────
+    // These are surfaced as workflow trigger node types. The chat-driven
+    // workflow builder picks them up from the registry and lets users
+    // author "When someone story-replies, DM them …" entirely in prose.
+    // outputSchema is the variable shape the trigger emits — workflow
+    // steps reference these as {{trigger.story_id}}, {{trigger.text}}, etc.
+    { key: 'trigger_story_reply',  label: 'Story reply',            description: 'Fire when someone replies to one of your IG stories.',         iconName: 'Sparkles',      apiPath: '/api/instagram/story-replies',      apiMethod: 'GET',  workflowNodeType: 'instagram_story_reply', uiKind: 'list',   status: 'live',
+      outputSchema: { fields: [
+        { key: 'contact.ig_id', label: 'Sender IG ID',    type: 'string', sample: '178414112233' },
+        { key: 'text',          label: 'Reply text',      type: 'string', sample: 'Loving this!' },
+        { key: 'story_id',      label: 'Story ID',        type: 'string', sample: '17912345678901234' },
+        { key: 'story_url',     label: 'Story media URL', type: 'string', sample: 'https://lookaside.fbsbx.com/ig_messaging/CACSIb…' },
+      ] },
+    },
+    { key: 'trigger_comment',      label: 'New comment',            description: 'Fire when someone comments on one of your monitored posts.',   iconName: 'MessageCircle', apiPath: '/api/instagram/comment-events',     apiMethod: 'GET',  workflowNodeType: 'instagram_comment',     uiKind: 'list',   status: 'live',
+      inputSchema: { fields: [
+        { key: 'keywords', label: 'Filter by keyword(s)', type: 'text', supportsVariables: false,
+          description: 'Optional. Comma-separated. Leave blank to fire on every new comment.' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'comment_id',     label: 'Comment ID',     type: 'string', sample: '17912345678901234_1' },
+        { key: 'post_id',        label: 'Post ID',        type: 'string', sample: '17912345678901234' },
+        { key: 'text',           label: 'Comment text',   type: 'string', sample: 'How much?' },
+        { key: 'username',       label: 'Commenter @',    type: 'string', sample: 'priya_98' },
+        { key: 'contact.ig_id',  label: 'Commenter IG ID',type: 'string', sample: '178414112233' },
+      ] },
+    },
+    { key: 'trigger_mention',      label: 'Brand mention',          description: 'Fire when someone @-tags your brand on their story/post/comment.', iconName: 'AtSign',     apiPath: '/api/instagram/mention-events',     apiMethod: 'GET',  workflowNodeType: 'instagram_mention',     uiKind: 'list',   status: 'live',
+      outputSchema: { fields: [
+        { key: 'media_id',      label: 'Source media ID', type: 'string', sample: '17912345678901234' },
+        { key: 'mention_type',  label: 'Mention type',    type: 'string', sample: 'story' },
+        { key: 'text',          label: 'Caption / text',  type: 'string', sample: 'Loving my @frequency_labs setup' },
+        { key: 'username',      label: 'Mentioner @',     type: 'string', sample: 'priya_98' },
+        { key: 'contact.ig_id', label: 'Mentioner IG ID', type: 'string', sample: '178414112233' },
+      ] },
+    },
     // Messaging
     { key: 'send_dm',              label: 'Send DM',                description: 'Send a direct message to a contact.',                          iconName: 'Send',          apiPath: '/api/instagram/dm',                 apiMethod: 'POST', workflowNodeType: 'instagram_send_dm',    uiKind: 'modal',  status: 'live',
       inputSchema: { fields: [
@@ -463,10 +500,50 @@ const INSTAGRAM: ConnectorDef = {
       ] },
     },
     { key: 'send_dm_media',        label: 'Send media DM',          description: 'Image / video / story reply via DM.',                          iconName: 'Image',         apiPath: '/api/instagram/dm/media',           apiMethod: 'POST',                                        uiKind: 'modal',  status: 'planned' },
-    { key: 'send_dm_quick',        label: 'Send quick replies',     description: 'Quick-reply buttons in DM.',                                   iconName: 'MousePointer',  apiPath: '/api/instagram/dm/interactive',     apiMethod: 'POST',                                        uiKind: 'modal',  status: 'planned' },
+    { key: 'send_dm_quick',        label: 'Send quick replies',     description: 'Up to 13 quick-reply buttons in DM (Meta hard limit).',        iconName: 'MousePointer',  apiPath: '/api/instagram/dm/quick-replies',   apiMethod: 'POST', workflowNodeType: 'instagram_send_quick',  uiKind: 'modal',  status: 'live',
+      inputSchema: { fields: [
+        { key: 'recipient_id', label: 'Recipient PSID', type: 'text',     required: true, supportsVariables: true },
+        { key: 'text',         label: 'Message',        type: 'textarea', required: true, supportsVariables: true },
+        { key: 'options',      label: 'Options (JSON array)', type: 'textarea', required: true,
+          description: 'JSON array of {title, payload} — max 13 items.' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'success',    label: 'Success',    type: 'boolean', sample: true },
+        { key: 'message_id', label: 'Message ID', type: 'string',  sample: 'aWQ6MTIzNDU2Nzg5MA==' },
+      ] },
+    },
     // Comments
-    { key: 'list_comments',        label: 'Recent comments',        description: 'Comments across your posts.',                                  iconName: 'MessageCircle', apiPath: '/api/instagram/comments',           apiMethod: 'GET',                                         uiKind: 'list',   status: 'planned' },
-    { key: 'reply_comment',        label: 'Reply to comment',       description: 'Public reply to a comment.',                                   iconName: 'CornerUpLeft',  apiPath: '/api/instagram/comments/reply',     apiMethod: 'POST',                                        uiKind: 'modal',  status: 'planned' },
+    { key: 'list_comments',        label: 'Recent comments',        description: 'Comments across your posts — webhook + poller fed.',           iconName: 'MessageCircle', apiPath: '/api/instagram/comment-events',     apiMethod: 'GET',                                         uiKind: 'list',   status: 'live',
+      outputSchema: { fields: [
+        { key: 'comment_id',         label: 'Comment ID',     type: 'string', sample: '17912345678901234_1' },
+        { key: 'post_id',            label: 'Post ID',        type: 'string', sample: '17912345678901234' },
+        { key: 'text',               label: 'Comment',        type: 'string', sample: 'How much?' },
+        { key: 'commenter_username', label: 'Username',       type: 'string', sample: 'priya_98' },
+        { key: 'created_at',         label: 'Received at',    type: 'string', sample: '2026-05-18T10:00:00Z' },
+        { key: 'dm_sent_at',         label: 'DM sent at',     type: 'string', sample: '2026-05-18T10:01:12Z' },
+      ] },
+    },
+    { key: 'reply_comment',        label: 'Reply to comment',       description: 'Public reply to a comment on one of your posts.',              iconName: 'CornerUpLeft',  apiPath: '/api/instagram/comments/:comment_id/reply', apiMethod: 'POST', workflowNodeType: 'instagram_reply_comment', uiKind: 'modal',  status: 'live',
+      inputSchema: { fields: [
+        { key: 'comment_id', label: 'Comment ID', type: 'text', required: true, supportsVariables: true },
+        { key: 'body',       label: 'Reply text', type: 'textarea', required: true, supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'success', label: 'Success', type: 'boolean', sample: true },
+        { key: 'id',      label: 'Reply ID', type: 'string',  sample: '17912345_1' },
+      ] },
+    },
+    { key: 'dm_commenter',         label: 'DM commenter',           description: 'Send a private reply (DM) to someone who commented. Within 7 days of the comment.', iconName: 'Send', apiPath: '/api/instagram/comments/:comment_id/dm', apiMethod: 'POST', workflowNodeType: 'instagram_dm_commenter', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'comment_id', label: 'Comment ID', type: 'text', required: true, supportsVariables: true },
+        { key: 'body',       label: 'DM text',    type: 'textarea', required: true, supportsVariables: true,
+          description: 'Meta limits this to ONE private reply per comment, within 7 days of the original comment.' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'success',    label: 'Success',    type: 'boolean', sample: true },
+        { key: 'message_id', label: 'Message ID', type: 'string',  sample: 'aWQ6MTIzNDU2Nzg5MA==' },
+      ] },
+    },
     { key: 'hide_comment',         label: 'Hide comment',           description: 'Hide a comment without deleting.',                             iconName: 'EyeOff',        apiPath: '/api/instagram/comments/hide',      apiMethod: 'POST',                                        uiKind: 'action', status: 'planned' },
     { key: 'list_comment_rules',   label: 'Comment rules',          description: 'Keyword → auto-reply + auto-DM rules.',                        iconName: 'Filter',        apiPath: '/api/instagram/comment-rules',      apiMethod: 'GET',                                         uiKind: 'list',   status: 'live',
       outputSchema: { fields: [
@@ -1459,16 +1536,18 @@ const SHOPIFY: ConnectorDef = {
   name: 'Shopify',
   category: 'commerce',
   tier: 0,
-  status: 'beta',
+  // P1 #11 — bumped from 'beta' to 'live': OAuth + webhook + abandoned-cart
+  // poller + six event triggers + fulfill action all wired in 078.
+  status: 'live',
   authMode: 'oauth',
   brandColor: '#5E8E3E',
   iconName: 'ShoppingBag',
-  shortDescription: 'Read orders + customers, listen for new-order events to trigger flows.',
+  shortDescription: 'Order events, abandoned-cart recovery, COD confirmations — wired to WA / Telegram / Instagram flows.',
   docsUrl: 'https://shopify.dev/docs/api/admin-rest',
   consoleUrl: 'https://partners.shopify.com/',
   requiresPartnerRegistration: true,
-  setupNote: 'Requires Shopify Partner app registration. Custom-app token paste fallback works today.',
-  oauthScope: 'read_orders,read_customers,read_products,write_draft_orders',
+  setupNote: 'Requires Shopify Partner app + SHOPIFY_API_KEY/SECRET/APP_URL env vars set on the server. See docs/SHOPIFY_INTEGRATION.md.',
+  oauthScope: 'read_orders,write_orders,read_customers,read_checkouts,read_fulfillments',
   capabilities: [
     { key: 'list_orders',         label: 'Orders',            description: 'Recent orders with filters.',                           iconName: 'ShoppingCart', apiPath: '/api/connectors/shopify/orders',                 apiMethod: 'GET',                                                  uiKind: 'list',  status: 'live',
       // Shopify Admin REST returns { orders: [...] }. FE list renderer unwraps
@@ -1538,6 +1617,87 @@ const SHOPIFY: ConnectorDef = {
         { key: 'draft_order.currency',     label: 'Currency',        type: 'string', sample: 'INR' },
         { key: 'draft_order.status',       label: 'Status',          type: 'string', sample: 'open' },
         { key: 'draft_order.created_at',   label: 'Created at',      type: 'string', sample: '2026-04-22T11:30:00+05:30' },
+      ] },
+    },
+    // ── P1 #11 — Shopify event triggers ─────────────────────────────────
+    // Surfaced as workflow trigger node types. The chat-driven workflow
+    // builder picks them up from the registry — author types e.g. "When
+    // a Shopify order is paid, send WhatsApp template confirm-order with
+    // {{trigger.order_number}} …" and the builder pre-populates the entry
+    // node with the matching trigger type. NO visual canvas — these are
+    // just rows the builder reads from.
+    //
+    // outputSchema is the variable shape the trigger emits — workflow
+    // steps reference these as {{trigger.order_number}}, {{trigger.total_inr_paise}}, etc.
+    { key: 'trigger_order_created',   label: 'Order created',           description: 'Fire when a new Shopify order is created (any payment state).', iconName: 'ShoppingCart',  apiPath: '/api/shopify/orders/recent',   apiMethod: 'GET',  workflowNodeType: 'shopify_order_created',   uiKind: 'list',  status: 'live',
+      outputSchema: { fields: [
+        { key: 'order_id',          label: 'Order ID',       type: 'string', sample: '5012345678901' },
+        { key: 'order_number',      label: 'Order number',   type: 'string', sample: '#1042' },
+        { key: 'total_inr_paise',   label: 'Total (paise)',  type: 'number', sample: 149900 },
+        { key: 'currency',          label: 'Currency',       type: 'string', sample: 'INR' },
+        { key: 'contactPhone',      label: 'Customer phone', type: 'string', sample: '919876543210' },
+        { key: 'contactEmail',      label: 'Customer email', type: 'string', sample: 'asha@example.com' },
+        { key: 'financial_status',  label: 'Payment status', type: 'string', sample: 'pending' },
+      ] },
+    },
+    { key: 'trigger_order_paid',      label: 'Order paid',              description: 'Fire when a Shopify order is marked paid.',                    iconName: 'CheckCircle',   apiPath: '/api/shopify/orders/recent',   apiMethod: 'GET',  workflowNodeType: 'shopify_order_paid',      uiKind: 'list',  status: 'live',
+      outputSchema: { fields: [
+        { key: 'order_id',          label: 'Order ID',       type: 'string', sample: '5012345678901' },
+        { key: 'order_number',      label: 'Order number',   type: 'string', sample: '#1042' },
+        { key: 'total_inr_paise',   label: 'Total (paise)',  type: 'number', sample: 149900 },
+        { key: 'currency',          label: 'Currency',       type: 'string', sample: 'INR' },
+        { key: 'contactPhone',      label: 'Customer phone', type: 'string', sample: '919876543210' },
+        { key: 'contactEmail',      label: 'Customer email', type: 'string', sample: 'asha@example.com' },
+      ] },
+    },
+    { key: 'trigger_order_cancelled', label: 'Order cancelled',         description: 'Fire when a Shopify order is cancelled.',                      iconName: 'XCircle',       apiPath: '/api/shopify/orders/recent',   apiMethod: 'GET',  workflowNodeType: 'shopify_order_cancelled', uiKind: 'list',  status: 'live',
+      outputSchema: { fields: [
+        { key: 'order_id',     label: 'Order ID',       type: 'string', sample: '5012345678901' },
+        { key: 'order_number', label: 'Order number',   type: 'string', sample: '#1042' },
+        { key: 'contactPhone', label: 'Customer phone', type: 'string', sample: '919876543210' },
+      ] },
+    },
+    { key: 'trigger_order_fulfilled', label: 'Order fulfilled',         description: 'Fire when a Shopify order is fulfilled (shipped).',            iconName: 'PackageCheck',  apiPath: '/api/shopify/orders/recent',   apiMethod: 'GET',  workflowNodeType: 'shopify_order_fulfilled', uiKind: 'list',  status: 'live',
+      outputSchema: { fields: [
+        { key: 'order_id',           label: 'Order ID',         type: 'string', sample: '5012345678901' },
+        { key: 'order_number',       label: 'Order number',     type: 'string', sample: '#1042' },
+        { key: 'fulfillment_status', label: 'Fulfillment',      type: 'string', sample: 'fulfilled' },
+        { key: 'contactPhone',       label: 'Customer phone',   type: 'string', sample: '919876543210' },
+      ] },
+    },
+    { key: 'trigger_abandoned_cart',  label: 'Abandoned cart',          description: 'Fire 10 min after a checkout is abandoned (poller-driven).',   iconName: 'ShoppingBag',   apiPath: '/api/shopify/orders/recent',   apiMethod: 'GET',  workflowNodeType: 'shopify_abandoned_cart',  uiKind: 'list',  status: 'live',
+      outputSchema: { fields: [
+        { key: 'checkout_id',      label: 'Checkout ID',    type: 'string', sample: '29384712384' },
+        { key: 'checkout_url',     label: 'Recovery URL',   type: 'string', sample: 'https://acme.myshopify.com/checkouts/cn/abc123' },
+        { key: 'first_name',       label: 'First name',     type: 'string', sample: 'Asha' },
+        { key: 'total_inr_paise',  label: 'Total (paise)',  type: 'number', sample: 149900 },
+        { key: 'contactPhone',     label: 'Customer phone', type: 'string', sample: '919876543210' },
+      ] },
+    },
+    { key: 'trigger_cod_order',       label: 'COD order placed',        description: 'Fire on a new Cash-on-Delivery order — pair with WA confirm template.', iconName: 'Banknote',  apiPath: '/api/shopify/orders/recent',   apiMethod: 'GET',  workflowNodeType: 'shopify_cod_order',       uiKind: 'list',  status: 'live',
+      outputSchema: { fields: [
+        { key: 'order_id',         label: 'Order ID',       type: 'string', sample: '5012345678901' },
+        { key: 'order_number',     label: 'Order number',   type: 'string', sample: '#1042' },
+        { key: 'total_inr_paise',  label: 'Total (paise)',  type: 'number', sample: 149900 },
+        { key: 'contactPhone',     label: 'Customer phone', type: 'string', sample: '919876543210' },
+      ] },
+    },
+    // ── P1 #11 — fulfill action ────────────────────────────────────────────
+    { key: 'fulfill_order',           label: 'Fulfill order',           description: 'Mark a Shopify order as fulfilled (optionally with tracking number).', iconName: 'Truck',    apiPath: '/api/connectors/shopify/fulfill-order', apiMethod: 'POST', workflowNodeType: 'shopify_fulfill_order',   uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'store_id',         label: 'Store',           type: 'resource', required: true,
+          picker: { endpoint: '/api/shopify/stores', labelKey: 'shop_name', valueKey: 'id' },
+          description: 'Pick the connected Shopify store this order belongs to.' },
+        { key: 'order_id',         label: 'Order ID',        type: 'text', required: true, supportsVariables: true, placeholder: '{{trigger.order_id}}' },
+        { key: 'tracking_number',  label: 'Tracking number', type: 'text', supportsVariables: true },
+        { key: 'tracking_company', label: 'Carrier',         type: 'text', supportsVariables: true, placeholder: 'DTDC / Delhivery / India Post' },
+        { key: 'notify_customer',  label: 'Notify customer via Shopify', type: 'boolean' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'success',                  label: 'Success',         type: 'boolean', sample: true },
+        { key: 'fulfillment.id',           label: 'Fulfillment ID',  type: 'number',  sample: 4567891234567 },
+        { key: 'fulfillment.status',       label: 'Status',          type: 'string',  sample: 'success' },
+        { key: 'fulfillment.tracking_url', label: 'Tracking URL',    type: 'string',  sample: 'https://www.dtdc.in/tracking/123' },
       ] },
     },
   ],

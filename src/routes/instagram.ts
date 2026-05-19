@@ -333,6 +333,240 @@ export function createInstagramRouter(deps: Deps): express.Router {
     res.json([])    // surface real tags once Catalog Commerce Manager is wired
   })
 
+  // ── P0.9 IG triggers ─────────────────────────────────────────────────────
+  //
+  // The three IG-unique trigger surfaces — story replies, comments,
+  // mentions — show up here as REST endpoints the Triggers page reads.
+  // Underlying storage:
+  //   • story replies   → messages with content.kind='story_reply'
+  //   • comments        → instagram_comment_events (webhook + poller)
+  //   • mentions        → instagram_mention_events (webhook)
+  //
+  // All three lists are tenant-scoped, paginated by `?limit` (default 50)
+  // and sorted desc by event time.
+
+  r.get('/api/instagram/story-replies', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const limit = clampLimit(req.query.limit, 50, 200)
+    const { data, error } = await supabase.from('messages')
+      .select('id, contact_phone, content, metadata, created_at')
+      .eq('tenant_id', tenantId)
+      .eq('channel', 'instagram')
+      .eq('direction', 'inbound')
+      .filter('content->>kind', 'eq', 'story_reply')
+      .order('created_at', { ascending: false })
+      .limit(limit)
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data ?? [])
+  })
+
+  r.get('/api/instagram/comment-events', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const limit = clampLimit(req.query.limit, 50, 200)
+    const onlyPending = String(req.query.pending ?? '') === '1'
+    let q = supabase.from('instagram_comment_events')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: false })
+      .limit(limit)
+    if (onlyPending) q = q.is('dm_sent_at', null).is('replied_at', null)
+    const { data, error } = await q
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data ?? [])
+  })
+
+  r.get('/api/instagram/mention-events', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const limit = clampLimit(req.query.limit, 50, 200)
+    const { data, error } = await supabase.from('instagram_mention_events')
+      .select('*').eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false }).limit(limit)
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data ?? [])
+  })
+
+  // ── DM a commenter via Meta private_replies ──────────────────────────────
+  // Meta's policy: brands have a 7-day window after the comment was posted
+  // to send ONE private reply. Outside that window the API returns
+  // (#100) Object cannot be private replied to anymore. We enforce
+  // server-side so the FE warning can't be bypassed.
+  r.post('/api/instagram/comments/:comment_id/dm', ...guard, async (req, res) => {
+    const tenantId  = (req as any).tenantId
+    const commentId = req.params.comment_id
+    const body = String(req.body?.body ?? '').trim()
+    if (!body) { res.status(400).json({ error: 'body required' }); return }
+    if (body.length > 1000) { res.status(400).json({ error: 'body too long (max 1000 chars)' }); return }
+
+    // Look up the event so we can (a) check the 7-day window and (b)
+    // resolve the commenter to write a `messages` row for the inbox.
+    const { data: evt, error: evtErr } = await supabase.from('instagram_comment_events')
+      .select('*').eq('tenant_id', tenantId).eq('comment_id', commentId).maybeSingle()
+    if (evtErr) { res.status(500).json({ error: evtErr.message }); return }
+    if (!evt)   { res.status(404).json({ error: 'comment not found' }); return }
+
+    const createdAt = evt.ig_created_at ?? evt.created_at
+    if (createdAt && Date.now() - new Date(createdAt).getTime() > 7 * 24 * 60 * 60 * 1000) {
+      res.status(422).json({
+        error: 'private_reply_window_expired',
+        message: 'Instagram only allows a private reply within 7 days of the original comment.',
+      })
+      return
+    }
+    if (evt.dm_sent_at) {
+      res.status(422).json({
+        error: 'already_dm_sent',
+        message: 'A private reply has already been sent for this comment. Meta allows only one per comment.',
+      })
+      return
+    }
+
+    const conn = await getIgConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Instagram not connected' }); return }
+
+    try {
+      const r1 = await fetch(`${GRAPH}/${commentId}/private_replies?access_token=${conn.token}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: body }),
+      })
+      const data = await r1.json() as any
+      if (!r1.ok || data.error) {
+        throw new Error(data.error?.message ?? `private_replies failed (${r1.status})`)
+      }
+      // Mark + mirror to messages so it shows up in the inbox.
+      await supabase.from('instagram_comment_events').update({
+        dm_sent_at: new Date().toISOString(),
+      }).eq('id', evt.id)
+
+      if (evt.commenter_ig_id) {
+        await supabase.from('messages').insert({
+          tenant_id:           tenantId,
+          channel:             'instagram',
+          direction:           'outbound',
+          contact_phone:       evt.commenter_ig_id,
+          platform_message_id: data.id ?? data.message_id ?? null,
+          content:             { type: 'text', text: body, kind: 'private_reply' },
+          metadata:            { kind: 'private_reply', source_comment_id: commentId, post_id: evt.post_id },
+          status:              'sent',
+        })
+      }
+      res.json({ success: true, message_id: data.id ?? data.message_id ?? null })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message ?? 'private_replies failed' })
+    }
+  })
+
+  // ── Public reply to a comment (kept for parity) ──────────────────────────
+  r.post('/api/instagram/comments/:comment_id/reply', ...guard, async (req, res) => {
+    const tenantId  = (req as any).tenantId
+    const commentId = req.params.comment_id
+    const body = String(req.body?.body ?? '').trim()
+    if (!body) { res.status(400).json({ error: 'body required' }); return }
+
+    const { data: evt } = await supabase.from('instagram_comment_events')
+      .select('id').eq('tenant_id', tenantId).eq('comment_id', commentId).maybeSingle()
+    if (!evt) { res.status(404).json({ error: 'comment not found' }); return }
+
+    const conn = await getIgConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Instagram not connected' }); return }
+
+    try {
+      const r1 = await fetch(`${GRAPH}/${commentId}/replies?access_token=${conn.token}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: body }),
+      })
+      const data = await r1.json() as any
+      if (!r1.ok || data.error) throw new Error(data.error?.message ?? `comment reply failed (${r1.status})`)
+      await supabase.from('instagram_comment_events').update({
+        replied_at: new Date().toISOString(),
+      }).eq('id', evt.id)
+      res.json({ success: true, id: data.id ?? null })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message ?? 'comment reply failed' })
+    }
+  })
+
+  // ── Reply to a mention (story / post media) ──────────────────────────────
+  // Implemented as a comment on the original media. Mentions in DMs are
+  // handled via the regular send-DM path (story_mention attachments).
+  r.post('/api/instagram/mentions/:mention_id/reply', ...guard, async (req, res) => {
+    const tenantId  = (req as any).tenantId
+    const mentionId = req.params.mention_id
+    const body = String(req.body?.body ?? '').trim()
+    if (!body) { res.status(400).json({ error: 'body required' }); return }
+
+    const { data: evt } = await supabase.from('instagram_mention_events')
+      .select('id, media_id, comment_id, mention_type').eq('tenant_id', tenantId).eq('id', mentionId).maybeSingle()
+    if (!evt) { res.status(404).json({ error: 'mention not found' }); return }
+
+    const conn = await getIgConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Instagram not connected' }); return }
+
+    // If the mention was inside a comment, reply to that comment;
+    // otherwise post a comment on the mention's media.
+    const targetId   = evt.comment_id ?? evt.media_id
+    const targetKind = evt.comment_id ? 'replies' : 'comments'
+    if (!targetId) { res.status(400).json({ error: 'mention has no media or comment target' }); return }
+
+    try {
+      const r1 = await fetch(`${GRAPH}/${targetId}/${targetKind}?access_token=${conn.token}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: body }),
+      })
+      const data = await r1.json() as any
+      if (!r1.ok || data.error) throw new Error(data.error?.message ?? `mention reply failed (${r1.status})`)
+      await supabase.from('instagram_mention_events').update({
+        processed_at: new Date().toISOString(),
+      }).eq('id', evt.id)
+      res.json({ success: true, id: data.id ?? null })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message ?? 'mention reply failed' })
+    }
+  })
+
+  // ── Quick-reply DM send (IG supports up to 13 QR buttons) ────────────────
+  // Meta's `messages` endpoint accepts a `quick_replies` array on message.
+  // This endpoint normalizes the input so workflow nodes don't have to
+  // construct the full Meta payload.
+  r.post('/api/instagram/dm/quick-replies', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { recipient_id, text, options } = req.body ?? {}
+    if (!recipient_id || !text || !Array.isArray(options) || options.length === 0) {
+      res.status(400).json({ error: 'recipient_id + text + options[] required' }); return
+    }
+    if (options.length > 13) {
+      res.status(400).json({ error: 'Instagram allows at most 13 quick-reply options' }); return
+    }
+    const conn = await getIgConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Instagram not connected' }); return }
+    try {
+      const quick_replies = options.slice(0, 13).map((o: any) => ({
+        content_type: 'text',
+        title:        String(o.title ?? o.label ?? o).slice(0, 20),
+        payload:      String(o.payload ?? o.value ?? o.title ?? o).slice(0, 1000),
+      }))
+      const resp = await fetch(`${GRAPH}/${conn.igUserId}/messages?access_token=${conn.token}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: { id: String(recipient_id) }, message: { text, quick_replies } }),
+      })
+      const data = await resp.json() as any
+      if (!resp.ok || data.error) throw new Error(data.error?.message ?? `IG quick-reply send failed (${resp.status})`)
+      await supabase.from('messages').insert({
+        tenant_id: tenantId, channel: 'instagram', direction: 'outbound',
+        contact_phone: String(recipient_id),
+        platform_message_id: data.message_id ?? null,
+        content: { type: 'interactive', text, quick_replies }, status: 'sent',
+      })
+      res.json({ success: true, message_id: data.message_id })
+    } catch (err: any) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   // ── Inbound webhook ──────────────────────────────────────────────────────
   // Meta delivers IG DM events here. Configure in Meta App Dashboard →
   // Instagram → Webhooks → Subscribe to `messages` (and `comments` if you
@@ -435,8 +669,36 @@ export function createInstagramRouter(deps: Deps): express.Router {
           // Skip echoes (our own outbound messages mirrored back).
           if (m.message?.is_echo) continue
           const senderId = String(m.sender?.id ?? '')
-          const text     = m.message?.text ?? ''
           if (!senderId) continue
+
+          // ── Story-reply / shared-post / replied-message branches ────
+          // Meta surfaces these as additional fields on `message`:
+          //   reply_to.story.id + .url → user replied to OUR story
+          //   reply_to.mid             → user replied to a specific msg
+          //   attachments[].type='share' / 'story_mention'
+          // We stamp a `kind` on content so the inbox can render an
+          // inline story-thumbnail preview, and dump the refs into
+          // metadata so workflow nodes can reference them by variable.
+          // P0.9: also fires `instagram_story_reply` trigger downstream.
+          const replyToStory = m.message?.reply_to?.story
+          const attachments  = Array.isArray(m.message?.attachments) ? m.message.attachments : []
+          const storyMention = attachments.find((a: any) => a?.type === 'story_mention')
+          const sharedPost   = attachments.find((a: any) => a?.type === 'share')
+
+          let kind: 'text' | 'story_reply' | 'shared_post' | 'story_mention' = 'text'
+          let metadata: Record<string, any> | null = null
+          if (replyToStory?.id) {
+            kind = 'story_reply'
+            metadata = { kind: 'story_reply', story_id: String(replyToStory.id), story_url: replyToStory.url ?? null }
+          } else if (storyMention) {
+            kind = 'story_mention'
+            metadata = { kind: 'story_mention', story_url: storyMention.payload?.url ?? null }
+          } else if (sharedPost) {
+            kind = 'shared_post'
+            metadata = { kind: 'shared_post', media_id: sharedPost.payload?.id ?? null, media_url: sharedPost.payload?.url ?? null }
+          }
+
+          const text = m.message?.text ?? ''
 
           // Log the inbound message + upsert contact.
           await supabase.from('messages').insert({
@@ -445,7 +707,8 @@ export function createInstagramRouter(deps: Deps): express.Router {
             direction:           'inbound',
             contact_phone:       senderId,
             platform_message_id: String(m.message?.mid ?? ''),
-            content:             { type: 'text', text, raw: m },
+            content:             { type: 'text', text, kind, raw: m },
+            metadata:            metadata,
           })
           await supabase.from('contacts').upsert({
             tenant_id:       tenant.id,
@@ -456,17 +719,53 @@ export function createInstagramRouter(deps: Deps): express.Router {
           }, { onConflict: 'tenant_id,phone' })
 
           // Workflow trigger + session resume (shared with WhatsApp + Telegram).
+          // For story replies we ALSO fire the IG-specific trigger so workflows
+          // authored with `instagram_story_reply` as the entry-point can match
+          // even when the text doesn't hit a keyword.
+          if (kind === 'story_reply') {
+            try {
+              const { fireIgEventTrigger } = await import('../engine/inbound-router')
+              await fireIgEventTrigger(supabase, tenant, 'instagram_story_reply', {
+                contactId: senderId,
+                text,
+                story_id: metadata?.story_id ?? null,
+                story_url: metadata?.story_url ?? null,
+                raw: m,
+              })
+            } catch (e: any) {
+              console.warn(`[ig-webhook] story_reply trigger fan-out failed (non-fatal): ${e?.message ?? e}`)
+            }
+          }
           if (text) {
             const { routeInboundToWorkflow } = await import('../engine/inbound-router')
             await routeInboundToWorkflow(supabase, tenant, 'instagram', senderId, text, m)
           }
         }
 
-        // ── Comment events (auto-reply rules) ──────────────────────────
-        // We don't trigger workflows from comments yet — the existing
-        // comment_rules table handles keyword → DM/comment-reply.
-        // Future: route inbound comments through routeInboundToWorkflow
-        // with a separate trigger_inbound_comment node type.
+        // ── changes[] (comments, mentions, feed updates) ───────────────
+        // Meta delivers comment + mention events under entry.changes[].
+        // Field values we handle:
+        //   'comments'  — { value.from, value.text, value.id, value.media.id, … }
+        //   'mentions'  — { value.media_id, value.comment_id, … }
+        //   'feed'      — wider feed change stream; we only act on item='comment'
+        //
+        // Anything else logs at info level and is dropped — the goal is
+        // honesty + room to extend, not exhaustive coverage on day one.
+        for (const ch of (entry.changes ?? [])) {
+          try {
+            const field = String(ch?.field ?? '')
+            const value: any = ch?.value ?? {}
+            if (field === 'comments' || (field === 'feed' && value?.item === 'comment')) {
+              await handleIncomingComment(supabase, tenant, value)
+            } else if (field === 'mentions') {
+              await handleIncomingMention(supabase, tenant, value)
+            }
+          } catch (e: any) {
+            // Per-event swallow — one bad change-row shouldn't poison the
+            // rest of the entry. Already 200'd to Meta either way.
+            console.warn(`[ig-webhook] change-event handler failed: ${e?.message ?? e}`)
+          }
+        }
       }
     } catch (err) {
       console.error('[ig-webhook] processing error', err)
@@ -475,6 +774,209 @@ export function createInstagramRouter(deps: Deps): express.Router {
   })
 
   return r
+}
+
+// ─── P0.9 helpers — comment + mention event handlers ─────────────────────────
+//
+// Both are best-effort: they swallow errors after logging because the IG
+// webhook MUST 200 to Meta. Re-running the same webhook event is fine
+// thanks to unique(comment_id) on instagram_comment_events.
+
+async function handleIncomingComment(
+  supabase: SupabaseClient,
+  tenant: any,
+  value: any,
+): Promise<void> {
+  const commentId = String(value?.id ?? value?.comment_id ?? '')
+  if (!commentId) return
+
+  // Resolve post id — Meta sometimes nests it under media.id, sometimes
+  // surfaces it as parent_id/post_id depending on the webhook channel.
+  const postId = String(
+    value?.media?.id ??
+    value?.media_id ??
+    value?.post_id ??
+    value?.parent_id ??
+    ''
+  )
+  const text     = value?.text ?? value?.message ?? null
+  const fromId   = String(value?.from?.id ?? '')
+  const fromUser = value?.from?.username ?? null
+
+  // Insert; idempotent via unique(comment_id). On conflict we still update
+  // the username/text fields in case the poller saw it first with less data.
+  const { error: insertErr } = await supabase.from('instagram_comment_events').insert({
+    tenant_id:          tenant.id,
+    post_id:            postId,
+    comment_id:         commentId,
+    parent_comment_id:  value?.parent_id ? String(value.parent_id) : null,
+    commenter_ig_id:    fromId || null,
+    commenter_username: fromUser,
+    text,
+    permalink:          value?.permalink ?? null,
+    source:             'webhook',
+    ig_created_at:      value?.created_time ? new Date(value.created_time).toISOString() : null,
+    raw:                value,
+  })
+  if (insertErr && !/duplicate key/i.test(insertErr.message)) {
+    console.warn(`[ig-comment] insert failed: ${insertErr.message}`)
+    return
+  }
+
+  // Fire the per-tenant comment rules. Existing ig_comment_rules powers
+  // keyword → auto-reply + auto-DM. We piggy-back on the webhook path so
+  // rules fire even when no poller is running.
+  if (text) {
+    await applyCommentRules(supabase, tenant, commentId, postId, fromId, text)
+  }
+
+  // Fan out to the workflow trigger as well so users can author chat-based
+  // workflows on the `instagram_comment` trigger.
+  try {
+    const { fireIgEventTrigger } = await import('../engine/inbound-router')
+    await fireIgEventTrigger(supabase, tenant, 'instagram_comment', {
+      contactId: fromId || `ig-comment:${commentId}`,
+      text:      text ?? '',
+      comment_id: commentId,
+      post_id:   postId,
+      username:  fromUser,
+      raw:       value,
+    })
+  } catch (e: any) {
+    console.warn(`[ig-comment] workflow fan-out failed: ${e?.message ?? e}`)
+  }
+}
+
+async function handleIncomingMention(
+  supabase: SupabaseClient,
+  tenant: any,
+  value: any,
+): Promise<void> {
+  const mediaId   = value?.media_id ? String(value.media_id) : null
+  const commentId = value?.comment_id ? String(value.comment_id) : null
+  if (!mediaId && !commentId) return
+
+  const mentionType: 'media' | 'comment' | 'story' =
+    commentId ? 'comment' : (value?.media_type === 'STORY' ? 'story' : 'media')
+
+  const { data: row, error } = await supabase.from('instagram_mention_events').insert({
+    tenant_id:          tenant.id,
+    media_id:           mediaId,
+    comment_id:         commentId,
+    mention_type:       mentionType,
+    mentioner_ig_id:    value?.from?.id ? String(value.from.id) : null,
+    mentioner_username: value?.from?.username ?? null,
+    text:               value?.text ?? value?.caption ?? null,
+    permalink:          value?.permalink ?? null,
+    ig_created_at:      value?.created_time ? new Date(value.created_time).toISOString() : null,
+    raw:                value,
+  }).select('id').single()
+  if (error) {
+    console.warn(`[ig-mention] insert failed: ${error.message}`)
+    return
+  }
+
+  try {
+    const { fireIgEventTrigger } = await import('../engine/inbound-router')
+    await fireIgEventTrigger(supabase, tenant, 'instagram_mention', {
+      contactId:  value?.from?.id ? String(value.from.id) : `ig-mention:${row?.id ?? ''}`,
+      text:       value?.text ?? value?.caption ?? '',
+      media_id:   mediaId,
+      comment_id: commentId,
+      mention_type: mentionType,
+      username:   value?.from?.username ?? null,
+      raw:        value,
+    })
+  } catch (e: any) {
+    console.warn(`[ig-mention] workflow fan-out failed: ${e?.message ?? e}`)
+  }
+}
+
+// Applies the configured ig_comment_rules to an incoming comment. Re-uses
+// the same Graph API endpoints the FE comment-reply / DM endpoints use,
+// so behaviour stays consistent (and respects the 7-day window because
+// we run this synchronously off the webhook = always within window).
+async function applyCommentRules(
+  supabase: SupabaseClient,
+  tenant: any,
+  commentId: string,
+  postId: string,
+  commenterIgId: string,
+  text: string,
+): Promise<void> {
+  const { data: rules } = await supabase.from('ig_comment_rules')
+    .select('*').eq('tenant_id', tenant.id).eq('enabled', true)
+  if (!rules || rules.length === 0) return
+
+  const lower = text.toLowerCase()
+  for (const rule of rules as any[]) {
+    const kws: string[] = rule.trigger_keywords ?? []
+    const matched = kws.some(kw => {
+      const k = String(kw).toLowerCase()
+      switch (rule.match_kind) {
+        case 'exact':       return lower === k
+        case 'starts_with': return lower.startsWith(k)
+        case 'any':         return true
+        case 'contains':
+        default:            return lower.includes(k)
+      }
+    })
+    if (!matched) continue
+
+    const conn = await getIgConnection(supabase, tenant.id)
+    if (!conn) return
+
+    // Public reply (optional)
+    if (rule.reply_text) {
+      try {
+        await fetch(`${GRAPH}/${commentId}/replies?access_token=${conn.token}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: rule.reply_text }),
+        })
+        await supabase.from('instagram_comment_events').update({
+          replied_at: new Date().toISOString(), rule_id: rule.id,
+        }).eq('comment_id', commentId).eq('tenant_id', tenant.id)
+      } catch (e: any) {
+        console.warn(`[ig-comment-rule] public reply failed: ${e?.message ?? e}`)
+      }
+    }
+    // Auto-DM via private_replies (optional). Mirror to messages for inbox.
+    if (rule.auto_dm_text) {
+      try {
+        await fetch(`${GRAPH}/${commentId}/private_replies?access_token=${conn.token}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: rule.auto_dm_text }),
+        })
+        await supabase.from('instagram_comment_events').update({
+          dm_sent_at: new Date().toISOString(), rule_id: rule.id,
+        }).eq('comment_id', commentId).eq('tenant_id', tenant.id)
+        if (commenterIgId) {
+          await supabase.from('messages').insert({
+            tenant_id: tenant.id, channel: 'instagram', direction: 'outbound',
+            contact_phone: commenterIgId,
+            content: { type: 'text', text: rule.auto_dm_text, kind: 'private_reply' },
+            metadata: { kind: 'private_reply', source_comment_id: commentId, post_id: postId, rule_id: rule.id },
+            status: 'sent',
+          })
+        }
+      } catch (e: any) {
+        console.warn(`[ig-comment-rule] auto DM failed: ${e?.message ?? e}`)
+      }
+    }
+    // Bump counters
+    await supabase.from('ig_comment_rules').update({
+      fired_count: (rule.fired_count ?? 0) + 1,
+      last_fired_at: new Date().toISOString(),
+    }).eq('id', rule.id)
+    // First match wins — same semantics as keyword workflow triggers.
+    break
+  }
+}
+
+function clampLimit(raw: unknown, fallback: number, max: number): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(Math.floor(n), max)
 }
 
 async function getIgConnection(supabase: SupabaseClient, tenantId: string) {

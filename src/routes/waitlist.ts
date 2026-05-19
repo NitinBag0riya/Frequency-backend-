@@ -52,7 +52,9 @@ export function createWaitlistRouter({ supabase }: Deps): express.Router {
     max: 10,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => req.ip ?? 'unknown',
+    // Default keyGenerator handles IPv4 + IPv6 correctly (collapses IPv6 to
+    // its /64 prefix), so an attacker can't rotate inside their own /64 to
+    // bypass the limit. Don't override unless you need a composite key.
     message: { error: { code: 'rate_limited', message: 'Too many waitlist signups from this IP. Try again in a minute.' } },
   })
 

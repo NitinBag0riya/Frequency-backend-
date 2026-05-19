@@ -21,8 +21,13 @@ import { startBroadcastWorker }        from './workers/broadcast-worker'
 import { startTemplateSyncWorker }     from './workers/template-sync'
 import { startDataSourceSyncWorker }   from './workers/data-source-sync'
 import { startTrialEndingWorker }      from './workers/trial-ending'
+import { startConsentExpirySweepWorker } from './workers/consent-expiry-sweep'
 import { startGmailPollerWorker }      from './workers/gmail-poller'
 import { startLookalikeRefreshWorker } from './workers/lookalike-refresh'
+// P0.9 — Instagram comment poller (60s tick, safety net for webhook gaps)
+import { startInstagramCommentPollerWorker } from './workers/instagram-comment-poller'
+// P0.7 — DPDPA breach notification fan-out (migration 075)
+import { startBreachNotificationSenderWorker } from './workers/breach-notification-sender'
 // WA Business Calling — migration 035
 import { startCallDispatchWorker }         from './workers/call-dispatch'
 import { startCallEventIngestWorker }      from './workers/call-event-ingest'
@@ -30,6 +35,14 @@ import { startCallRecordingArchiveWorker } from './workers/call-recording-archiv
 import { startCallTranscribeWorker }       from './workers/call-transcribe'
 // Webhook retry queues — migration 064
 import { startWebhookInboundWorker, startWebhookOutboundWorker } from './workers/webhook-retry'
+// P1 #11 — Shopify abandoned-cart poller (migration 078)
+import { startShopifyAbandonedCartPollerWorker } from './workers/shopify-abandoned-cart-poller'
+// P1 #12 — Agency monthly revshare payout aggregator (migration 079)
+import { startAgencyPayoutAggregatorWorker } from './workers/agency-payout-aggregator'
+// P1 #18 — Bulk contact import processor (migration 084)
+import { startContactImportProcessorWorker } from './workers/contact-import-processor'
+// P2 #20 — Voice note transcription (migration 086)
+import { startVoiceNoteTranscribeWorker } from './workers/voice-note-transcribe'
 import { createClient } from '@supabase/supabase-js'
 import { closeQueues, attachCallDispatchFailureListener } from './queue'
 
@@ -46,8 +59,11 @@ async function main() {
   const ts  = await startTemplateSyncWorker()
   const ds  = await startDataSourceSyncWorker()
   const te  = await startTrialEndingWorker()
+  const ces = await startConsentExpirySweepWorker()
   const gp  = await startGmailPollerWorker()
   const lr  = await startLookalikeRefreshWorker()
+  const igp = await startInstagramCommentPollerWorker()
+  const bns = await startBreachNotificationSenderWorker()
 
   // WA Calling workers — concurrency per env (defaults in `01-backend-design.md` §11).
   const cd = startCallDispatchWorker()
@@ -62,6 +78,26 @@ async function main() {
   // doesn't require a worker redeploy.
   const wi = startWebhookInboundWorker()
   const wo = startWebhookOutboundWorker()
+
+  // P1 #11 — Shopify abandoned-cart poller. Runs every 5 min; fires the
+  // shopify_abandoned_cart trigger for checkouts older than 10 min that
+  // have a phone number and haven't been recovered or nudged yet.
+  const sac = await startShopifyAbandonedCartPollerWorker()
+
+  // P1 #12 — Agency revshare monthly payout aggregator. Daily 24h tick;
+  // gates on date-of-month=1 inside the handler. Emits one agency_payouts
+  // row per agency aggregating last month's accrued ledger entries.
+  const apa = await startAgencyPayoutAggregatorWorker()
+
+  // P1 #18 — Bulk contact import processor. BullMQ-driven; one job per
+  // contact_import_jobs row. Two phases: dry-run (parse + validate +
+  // preview) and execute (UPSERT contacts + INSERT per-contact consent_events).
+  const cip = startContactImportProcessorWorker()
+
+  // P2 #20 — Voice note transcription. BullMQ worker; one job per inbound
+  // audio message. Calls OpenAI Whisper, writes voice_note_transcripts.
+  // Best-effort — failures here never affect message persistence.
+  const vnt = startVoiceNoteTranscribeWorker()
 
   // Failure listener for call.dispatch — when BullMQ permanently fails a
   // dispatch job, flip call_sessions.status='failed' so the agent's UI
@@ -86,12 +122,20 @@ async function main() {
     console.log(`[worker] received ${signal} — draining…`)
     await Promise.allSettled([
       wf.close(), ms.close(), bw.close(),
-      sp.close(), ts.close(), ds.close(), te.close(), gp.close(), lr.close(),
+      sp.close(), ts.close(), ds.close(), te.close(), ces.close(), gp.close(), lr.close(), igp.close(), bns.close(),
       // WA Calling
       cd.close(), ce.close(), ca.close(), ct.close(),
       dispatchFailureListener.close(),
       // Webhook retry / DLQ
       wi.close(), wo.close(),
+      // Shopify abandoned-cart poller (P1 #11)
+      sac.close(),
+      // Agency payout aggregator (P1 #12)
+      apa.close(),
+      // Bulk contact import processor (P1 #18)
+      cip.close(),
+      // Voice note transcription (P2 #20)
+      vnt.close(),
     ])
     await closeQueues()
     process.exit(0)

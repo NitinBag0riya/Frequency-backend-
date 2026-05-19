@@ -57,6 +57,7 @@ import {
   webhookOutboundDeadQueue,
   WebhookInboundJob,
   WebhookOutboundJob,
+  enqueueVoiceNoteTranscribe,
 } from '../queue'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
@@ -102,18 +103,35 @@ async function processMetaWhatsAppInbound(payload: WebhookInboundJob): Promise<P
         const text  = msg.text?.body ?? msg.button?.text ?? msg.interactive?.button_reply?.title ?? ''
         const contactProfile = value.contacts?.[0]
 
-        const { error: msgErr } = await supabase.from('messages').insert({
+        const { data: insertedMsg, error: msgErr } = await supabase.from('messages').insert({
           tenant_id:           tenant.id,
           channel:             'whatsapp',
           direction:           'inbound',
           contact_phone:       phone,
           platform_message_id: msg.id,
           content:             msg,
-        })
+        }).select('id').maybeSingle()
         // Unique constraint on platform_message_id means a retry that ran
         // after a partial success will conflict — treat as already-processed.
         if (msgErr && !/duplicate key|unique/i.test(msgErr.message)) {
           throw new Error(`messages insert failed: ${msgErr.message}`)
+        }
+
+        // P2 #20 — enqueue voice transcription for WhatsApp voice notes.
+        // Best-effort: a failure here MUST NOT block message persistence
+        // or workflow routing. The shape we look for is the standard WA
+        // webhook payload: msg.type === 'audio' with msg.audio = {id, ...}.
+        // We skip when insert was a duplicate (already_processed branch
+        // above silently leaves insertedMsg null).
+        if (insertedMsg?.id && (msg?.type === 'audio' || msg?.audio || msg?.voice)) {
+          try {
+            await enqueueVoiceNoteTranscribe({
+              tenantId:  tenant.id,
+              messageId: insertedMsg.id,
+            })
+          } catch (e: any) {
+            console.warn(`[wa-inbound] voice-note enqueue failed (msg=${insertedMsg.id}): ${e?.message ?? e}`)
+          }
         }
 
         await supabase.from('contacts').upsert({
@@ -158,17 +176,32 @@ async function processMetaInstagramInbound(payload: WebhookInboundJob): Promise<
       const text     = m.message?.text ?? ''
       if (!senderId) continue
 
-      const { error: msgErr } = await supabase.from('messages').insert({
+      // IG attachments — look for an audio attachment. Webhook shape:
+      // m.message.attachments = [{ type: 'audio', payload: { url: '…' } }].
+      const igAttachments: any[] = Array.isArray(m.message?.attachments) ? m.message.attachments : []
+      const hasAudio = igAttachments.some(a => a?.type === 'audio' || a?.type === 'audio/voice')
+
+      const { data: insertedIg, error: msgErr } = await supabase.from('messages').insert({
         tenant_id:           tenant.id,
         channel:             'instagram',
         direction:           'inbound',
         contact_phone:       senderId,
         platform_message_id: String(m.message?.mid ?? ''),
         content:             { type: 'text', text, raw: m },
-      })
+      }).select('id').maybeSingle()
       if (msgErr && !/duplicate key|unique/i.test(msgErr.message)) {
         throw new Error(`ig messages insert: ${msgErr.message}`)
       }
+
+      // P2 #20 — enqueue voice transcription for IG voice messages.
+      if (insertedIg?.id && hasAudio) {
+        try {
+          await enqueueVoiceNoteTranscribe({ tenantId: tenant.id, messageId: insertedIg.id })
+        } catch (e: any) {
+          console.warn(`[ig-inbound] voice-note enqueue failed (msg=${insertedIg.id}): ${e?.message ?? e}`)
+        }
+      }
+
       await routeInboundToWorkflow(supabase, tenant, 'instagram', senderId, text, m)
     }
   }
@@ -200,14 +233,28 @@ async function processTelegramInbound(payload: WebhookInboundJob): Promise<Proce
       channel_primary: 'telegram',
     })
   }
-  const { error: msgErr } = await supabase.from('messages').insert({
+  // Telegram voice notes arrive as msg.voice ({ file_id, duration, mime_type })
+  // and audio uploads as msg.audio. Both are valid trigger shapes for the
+  // transcription worker.
+  const tgHasAudio = !!(msg.voice || msg.audio)
+
+  const { data: insertedTg, error: msgErr } = await supabase.from('messages').insert({
     tenant_id: tenantId, channel: 'telegram', direction: 'inbound',
     contact_phone: fromId,
     platform_message_id: String(msg.message_id),
     content: { type: 'text', text, raw: msg },
-  })
+  }).select('id').maybeSingle()
   if (msgErr && !/duplicate key|unique/i.test(msgErr.message)) {
     throw new Error(`tg messages insert: ${msgErr.message}`)
+  }
+
+  // P2 #20 — enqueue voice transcription for Telegram voice notes.
+  if (insertedTg?.id && tgHasAudio) {
+    try {
+      await enqueueVoiceNoteTranscribe({ tenantId, messageId: insertedTg.id })
+    } catch (e: any) {
+      console.warn(`[tg-inbound] voice-note enqueue failed (msg=${insertedTg.id}): ${e?.message ?? e}`)
+    }
   }
 
   if (text) {

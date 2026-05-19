@@ -75,6 +75,19 @@ export const Q = {
   webhookOutbound:      'webhook.outbound',
   webhookInboundDead:   'webhook.inbound.dead',
   webhookOutboundDead:  'webhook.outbound.dead',
+  // ── Voice note transcription (migration 086) ───────────────────────────
+  // Inbound WA / IG / Telegram voice notes get queued here after the
+  // messages row lands. Worker downloads the audio, calls OpenAI Whisper,
+  // writes the transcript to voice_note_transcripts. Best-effort — a
+  // failure here NEVER blocks message persistence.
+  voiceNoteTranscribe:  'voice-note.transcribe',
+  // ── DPDPA §8(6) breach fan-out (migration 075) ──────────────────────────
+  // One job per breach. Worker expands the breach into per-tenant per-
+  // recipient sends, inserts breach_notification_recipients rows, and
+  // emails via Resend. jobId = `breach-notification:${breach_id}` for
+  // idempotency — BullMQ rejects duplicate adds for the same logical
+  // breach, the enqueuer swallows the error.
+  breachNotification:   'breach-notification',
 } as const
 
 // ── Job payload types ─────────────────────────────────────────────────────────
@@ -163,6 +176,16 @@ export interface CallTranscribeJob {
   storagePath:    string
 }
 
+// ── Voice note transcription payload (migration 086) ───────────────────────
+// Tiny payload — the worker re-reads the message row from DB to pick up
+// content.media_url (or WA media id). jobId is the message_id so BullMQ
+// dedupes retries / accidental double-enqueues from the inbound webhook
+// (Meta legitimately resends a webhook on receipt timeout).
+export interface VoiceNoteTranscribeJob {
+  tenantId:  string
+  messageId: string
+}
+
 // ── Webhook job payload types (migration 064) ───────────────────────────────
 /**
  * Inbound webhook job. The route handler verifies the signature (HMAC for
@@ -226,6 +249,13 @@ export interface WebhookOutboundJob {
   isReplay?:       boolean
 }
 
+// ── Breach notification fan-out job (migration 075) ────────────────────────
+// Tiny payload — worker re-reads the breach row to avoid stale-job drift if
+// the super-admin edits the breach between enqueue and run.
+export interface BreachNotificationJob {
+  breachId: string
+}
+
 // ── Queue instances ───────────────────────────────────────────────────────────
 const defaultJobOpts = {
   removeOnComplete: { count: 1000, age: 24 * 60 * 60 },  // keep last 1000 / 24h
@@ -280,6 +310,16 @@ export const callTranscribeQueue = new Queue<CallTranscribeJob>(Q.callTranscribe
   defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 10000 } },
 })
 
+// ── Voice note transcription queue (migration 086) ─────────────────────────
+// 2 attempts only — Whisper failures are mostly permanent (corrupted audio,
+// unsupported format, expired media URL). Hammering OpenAI with retries on
+// a bad file just burns budget. 30s backoff between the two tries handles
+// transient OpenAI 5xx.
+export const voiceNoteTranscribeQueue = new Queue<VoiceNoteTranscribeJob>(Q.voiceNoteTranscribe, {
+  connection,
+  defaultJobOptions: { ...defaultJobOpts, attempts: 2, backoff: { type: 'exponential', delay: 30_000 } },
+})
+
 // ── Webhook queues (migration 064) ────────────────────────────────────────
 // Retry schedule per spec: 5 attempts, ~1s → 5s → 30s → 5m → 30m.
 // BullMQ exponential backoff uses delay * 2^(attempt-1), which doesn't fit
@@ -332,6 +372,16 @@ export const webhookOutboundDeadQueue = new Queue<WebhookOutboundJob & { deadLet
   }},
 )
 
+// ── Breach notification fan-out queue (migration 075) ──────────────────────
+// 3 attempts, 30s/2m/10m backoff. The PER-RECIPIENT send-status is tracked
+// in breach_notification_recipients (worker writes 'sent' / 'failed'); the
+// JOB itself only fails if the whole expansion + iteration crashes (DB
+// outage, etc.) — Resend send errors are caught per-recipient.
+export const breachNotificationQueue = new Queue<BreachNotificationJob>(Q.breachNotification, {
+  connection,
+  defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 30_000 } },
+})
+
 /**
  * BullMQ custom backoff strategy used by webhook.inbound + webhook.outbound
  * workers. Returns ms to wait before the NEXT attempt. attemptsMade is the
@@ -370,28 +420,55 @@ export async function enqueueBroadcast(broadcastId: string) {
 // adds for an existing jobId — the route/worker callers swallow that and
 // treat as already-enqueued.
 
+// IMPORTANT: jobIds below use `--` separator, not `:`. BullMQ 5.x
+// rejects custom jobIds containing `:` because the Lua scripts treat
+// `:` as a Redis-key delimiter (`bull:<queue>:<jobId>:<phase>`) — an
+// embedded colon corrupts the parse and the add silently no-ops. This
+// regression caught us out: a parallel agent on voice-note-transcribe
+// flagged it after observing breach-notification deduplication failing
+// in the wild. The pattern below mirrors what the voice-note helper
+// uses (`voice-note-transcribe--<id>`) and what `enqueueBreachNotification`
+// was updated to use; the underscore variant keeps the visual prefix-id
+// separation while staying inside BullMQ's allowed jobId charset.
 export async function enqueueCallDispatch(payload: CallDispatchJob) {
   return callDispatchQueue.add('dispatch', payload, {
-    jobId: `call.dispatch:${payload.callSessionId}`,
+    jobId: `call-dispatch--${payload.callSessionId}`,
   })
 }
 
 export async function enqueueCallEventIngest(payload: CallEventIngestJob) {
   return callEventIngestQueue.add('ingest', payload, {
-    jobId: `call.event.ingest:${payload.callEventId}`,
+    jobId: `call-event-ingest--${payload.callEventId}`,
   })
 }
 
 export async function enqueueCallRecordingArchive(payload: CallRecordingArchiveJob) {
   return callRecordingArchiveQueue.add('archive', payload, {
-    jobId: `call.recording.archive:${payload.callSessionId}`,
+    jobId: `call-recording-archive--${payload.callSessionId}`,
   })
 }
 
 export async function enqueueCallTranscribe(payload: CallTranscribeJob) {
   return callTranscribeQueue.add('transcribe', payload, {
-    jobId: `call.transcribe:${payload.callSessionId}`,
+    jobId: `call-transcribe--${payload.callSessionId}`,
   })
+}
+
+// ── Voice note transcribe enqueue helper (migration 086) ───────────────────
+// jobId keys on message_id so a duplicate enqueue from the same inbound
+// webhook retry collapses to the same job. BullMQ rejects duplicate adds —
+// we swallow the conflict and treat as already-queued.
+export async function enqueueVoiceNoteTranscribe(payload: VoiceNoteTranscribeJob) {
+  try {
+    return await voiceNoteTranscribeQueue.add('transcribe', payload, {
+      // BullMQ 5.x rejects `:` in custom jobIds (regression vs older v4).
+      // Use a `--` separator instead so the per-message dedupe still works.
+      jobId: `voice-note-transcribe--${payload.messageId}`,
+    })
+  } catch (err: any) {
+    if (String(err?.message ?? err).toLowerCase().includes('already')) return null
+    throw err
+  }
 }
 
 // ── Webhook enqueue helpers ────────────────────────────────────────────────
@@ -419,6 +496,27 @@ export async function enqueueWebhookOutbound(payload: WebhookOutboundJob) {
   })
 }
 
+// ── Breach notification enqueue helper ─────────────────────────────────────
+// jobId is the breach id — BullMQ rejects duplicate adds, so a re-PATCH that
+// somehow gets past the fanout_queued_at guard still can't double-enqueue.
+// We catch the duplicate-id error and treat it as "already enqueued".
+//
+// Separator is `--` not `:` — BullMQ 5.x rejects `:` in custom jobIds
+// because the Lua scripts treat it as a Redis-key delimiter.
+export async function enqueueBreachNotification(payload: BreachNotificationJob) {
+  try {
+    return await breachNotificationQueue.add('fanout', payload, {
+      jobId: `breach-notification--${payload.breachId}`,
+    })
+  } catch (err: any) {
+    // BullMQ throws when adding a job with an existing jobId — treat as
+    // already-queued and return null. The DB column fanout_queued_at is the
+    // primary guard; this is just a belt-and-braces dedupe.
+    if (String(err?.message ?? err).toLowerCase().includes('already')) return null
+    throw err
+  }
+}
+
 // Optional: queue events listener for diagnostics in dev. Disabled in prod.
 export function attachDebugListeners() {
   if (process.env.NODE_ENV === 'production') return
@@ -441,6 +539,8 @@ export async function closeQueues() {
     callEventIngestQueue.close(),
     callRecordingArchiveQueue.close(),
     callTranscribeQueue.close(),
+    // Voice note transcription
+    voiceNoteTranscribeQueue.close(),
     // Webhook queues
     webhookInboundQueue.close(),
     webhookOutboundQueue.close(),

@@ -766,93 +766,13 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
     res.json({ deleted: ids.length })
   }
 
-  // ── My Queue ─────────────────────────────────────────────────────────────────
-  // Cross-table view of rows assigned to the current user, plus per-table
-  // counts. Powers:
-  //   • the /queue page (full list with quick actions)
-  //   • the sidebar badge ("5 new for you") via .pending count
-  //   • the dashboard widget ("Your queue: X pending")
-  // Without this, an assignee like "Nitin" had no way to discover the rows
-  // routed to them — assignments were a write-only feature.
-  router.get('/leads/my-queue', requireAuth, identifyTenant, checkPermission('leads', 'view'), async (req, res) => {
-    const tenantId = (req as any).tenantId
-    const userId   = (req as any).user.id
-    const limit  = Math.min(Number(req.query.limit ?? 50), 200)
-    const status = req.query.status as string | undefined  // optional filter
-
-    // ── Counts ──────────────────────────────────────────────────────────
-    // Per-status counts via parallel head-only count queries — much cheaper
-    // than the previous "select * then loop" pattern which scaled with the
-    // user's total assigned rows. Each query returns just the count + 200
-    // bytes of headers, no row payload.
-    const STATUSES = ['new', 'contacted', 'qualified', 'lost', 'won'] as const
-    const countQueries = await Promise.all([
-      // total
-      supabase.from('lead_rows')
-        .select('id', { count: 'exact', head: true })
-        .eq('tenant_id', tenantId).eq('assigned_to', userId),
-      // per-status
-      ...STATUSES.map(s =>
-        supabase.from('lead_rows')
-          .select('id', { count: 'exact', head: true })
-          .eq('tenant_id', tenantId).eq('assigned_to', userId).eq('status', s),
-      ),
-    ])
-    const counts: Record<string, number> = {
-      total:     countQueries[0].count ?? 0,
-      new:       countQueries[1].count ?? 0,
-      contacted: countQueries[2].count ?? 0,
-      qualified: countQueries[3].count ?? 0,
-      lost:      countQueries[4].count ?? 0,
-      won:       countQueries[5].count ?? 0,
-    }
-
-    // ── Per-table real counts ───────────────────────────────────────────
-    // Previously computed from the paginated `rows` slice — so for a user
-    // with 500 assigned rows across 10 tables, the "by table" breakdown
-    // only reflected the first 50 fetched, not the truth. Now uses a
-    // grouped count via Supabase's `count: 'exact'` per table_id.
-    const { data: tableRows } = await supabase
-      .from('lead_rows')
-      .select('table_id, lead_tables!inner(id,name)')
-      .eq('tenant_id', tenantId)
-      .eq('assigned_to', userId)
-    const byTableMap = new Map<string, { table_id: string; table_name: string; count: number }>()
-    for (const r of (tableRows ?? []) as any[]) {
-      const tid = r.table_id
-      const existing = byTableMap.get(tid)
-      if (existing) { existing.count++ }
-      else { byTableMap.set(tid, { table_id: tid, table_name: r.lead_tables?.name ?? 'Untitled', count: 1 }) }
-    }
-
-    // ── Paginated list of actual row data ───────────────────────────────
-    let q = supabase
-      .from('lead_rows')
-      .select('id, table_id, data, status, tags, assigned_to_name, created_at, updated_at, lead_tables!inner(id,name)')
-      .eq('tenant_id', tenantId)
-      .eq('assigned_to', userId)
-      .order('created_at', { ascending: false })
-      .limit(limit)
-    if (status) q = q.eq('status', status)
-    const { data: rows, error } = await q
-    if (error) { res.status(500).json({ error: error.message }); return }
-
-    res.json({
-      counts,
-      by_table: Array.from(byTableMap.values()),
-      rows: (rows ?? []).map((r: any) => ({
-        id: r.id,
-        table_id: r.table_id,
-        table_name: r.lead_tables?.name ?? '',
-        data: r.data,
-        status: r.status,
-        tags: r.tags,
-        assigned_to_name: r.assigned_to_name,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-      })),
-    })
-  })
+  // ── My Queue (removed) ───────────────────────────────────────────────────────
+  // The cross-table assigned-rows view formerly at GET /api/leads/my-queue
+  // was merged INTO the Sales CRM Pipeline. The unified surface now lives at
+  // GET /api/crm/deals?include_leads=true (see src/routes/crm.ts), which
+  // returns lead-table rows alongside CRM deals as discriminated cards.
+  // The legacy endpoint, the /queue FE route, and the sidebar's myQueue
+  // badge poller were all deleted as part of the merge cleanup.
 
   // ── Bulk Import ──────────────────────────────────────────────────────────────
 

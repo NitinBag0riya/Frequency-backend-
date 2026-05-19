@@ -101,6 +101,25 @@ export function startMessageSenderWorker() {
         throw e
       }
 
+      // ── DPDPA marketing-consent gate (P0.7) ────────────────────────────
+      // Before we burn a Meta API token on a marketing template, check
+      // contact_consent_state for (contact, channel, 'marketing'). If the
+      // contact has not opted in, log a `status=blocked_no_consent` row
+      // with `blocked_reason='No marketing consent on file (DPDPA)'` and
+      // skip the actual send. Transactional / utility / service_updates
+      // templates are NOT gated — they're allowed under DPDPA "necessary
+      // processing" once the contact has initiated a conversation (the
+      // inbound webhook seeds those purposes; see handleInboundMessage).
+      //
+      // The gate runs ONLY for kind='template' with category='marketing'.
+      // Text/interactive/media sends are session messages (replies inside
+      // the 24h window) which fall under transactional consent and don't
+      // need the marketing flag.
+      if (data.kind === 'template' && data.template?.name) {
+        const blocked = await checkMarketingConsent(data)
+        if (blocked) return blocked
+      }
+
       switch (data.channel) {
         case 'email':     return sendEmailViaProvider(data)
         case 'instagram': return sendInstagram(data)
@@ -247,6 +266,94 @@ async function logRateLimitRejection(data: MessageSendJob, err: RateLimitExceede
     },
     status: 'failed',
   })
+}
+
+/**
+ * DPDPA marketing-consent gate. Returns a "blocked" outcome (object) when
+ * the send should NOT proceed, or null when it should. The caller short-
+ * circuits the channel dispatch on a non-null return.
+ *
+ * Lookup order:
+ *   1. Resolve template category from wa_templates by (tenant_id, name).
+ *      If the template doesn't exist (older flow / generic name) or isn't
+ *      marketing, return null (allow).
+ *   2. Look up contact by (tenant_id, phone) — try multiple phone formats.
+ *      If no contact row, return null (allow — pre-contact sends are rare
+ *      and the broadcast worker has its own audience-membership gate).
+ *   3. Look up contact_consent_state for (contact_id, channel, 'marketing').
+ *      If status='opted_in', allow. Otherwise block.
+ *
+ * Block outcome writes a `messages` row with status='blocked_no_consent'
+ * and blocked_reason set so the inbox shows the failure reason.
+ */
+async function checkMarketingConsent(data: MessageSendJob): Promise<{ blocked: true; reason: string } | null> {
+  if (data.kind !== 'template' || !data.template?.name) return null
+  // Only WA + IG carry templates; email/telegram are session-style so the
+  // marketing-consent gate doesn't apply the same way today.
+  if (data.channel !== 'whatsapp' && data.channel !== 'instagram') return null
+
+  try {
+    // 1. Resolve template category.
+    const { data: tpl } = await supabase
+      .from('wa_templates')
+      .select('category')
+      .eq('tenant_id', data.tenantId)
+      .eq('name', data.template.name)
+      .maybeSingle()
+    const category = String((tpl as any)?.category ?? '').toLowerCase()
+    if (category !== 'marketing') return null
+
+    // 2. Resolve contact by phone (the job carries `to` not contact_id).
+    const phoneNoPlus = String(data.to).replace(/^\+/, '')
+    const variants = [`+${phoneNoPlus}`, phoneNoPlus]
+    const { data: contact } = await supabase
+      .from('contacts')
+      .select('id')
+      .eq('tenant_id', data.tenantId)
+      .in('phone', variants)
+      .maybeSingle()
+    if (!contact?.id) return null  // unknown contact — allow (audience gate elsewhere)
+
+    // 3. Consent lookup.
+    const { data: state } = await supabase
+      .from('contact_consent_state')
+      .select('status')
+      .eq('contact_id', contact.id)
+      .eq('channel', data.channel)
+      .eq('purpose', 'marketing')
+      .maybeSingle()
+
+    if (state?.status === 'opted_in') return null
+
+    // Block. Log a messages row + return.
+    const reason = state?.status === 'opted_out'
+      ? 'Recipient has opted out of marketing (DPDPA)'
+      : 'No marketing consent on file (DPDPA)'
+    await supabase.from('messages').insert({
+      tenant_id: data.tenantId,
+      session_id: data.sessionId ?? null,
+      broadcast_id: data.broadcastId ?? null,
+      direction: 'outbound',
+      contact_phone: `+${phoneNoPlus}`,
+      channel: data.channel,
+      content: {
+        template: { name: data.template.name, language: data.template.language },
+        blocked_at: new Date().toISOString(),
+        blocked_reason: reason,
+      },
+      status: 'blocked_no_consent',
+      blocked_reason: reason,
+    })
+    console.warn(`[consent-gate] BLOCKED tenant=${data.tenantId} contact=${contact.id} template=${data.template.name} reason="${reason}"`)
+    return { blocked: true, reason }
+  } catch (e: any) {
+    // Fail-open: if the consent layer is broken (migration not applied,
+    // RLS misconfigured), don't block sends — that's a worse failure mode
+    // for the tenant than a single non-compliant message. Log loudly so
+    // ops sees it.
+    console.warn(`[consent-gate] check failed (allow): ${e?.message ?? e}`)
+    return null
+  }
 }
 
 async function logOutbound(

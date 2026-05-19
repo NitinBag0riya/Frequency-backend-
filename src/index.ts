@@ -1,11 +1,12 @@
 import './env'   // must be first — loads .env with override=true
+import { logger } from './lib/logger'
 import express from 'express'
 import fs from 'fs'
 import path from 'path'
 import cors from 'cors'
 import crypto from 'crypto'
 import helmet from 'helmet'
-import rateLimit from 'express-rate-limit'
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import { createClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 import {
@@ -19,8 +20,11 @@ import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
 import { createConnectorsRouter }  from './routes/connectors'
 import { createBillingRouter }     from './routes/billing'
+import { createCtwaAnalyticsRouter } from './routes/ctwa-analytics'
 import { createWaitlistRouter }    from './routes/waitlist'
+import { createPublicStatusRouter } from './routes/public-status'
 import { createWaFeaturesRouter }  from './routes/wa-features'
+import { createWaTemplatesRouter } from './routes/wa-templates'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
@@ -28,11 +32,45 @@ import { createSuperAdminRouter }  from './routes/super-admin'
 import { createTeamsRouter }       from './routes/teams'
 import { createTenantAuditRouter } from './routes/tenant-audit'
 import { createNotificationsRouter } from './routes/notifications'
+import { createDevicesRouter }       from './routes/devices'
 import { createUsageRouter }         from './routes/usage'
+import { createWedgeSurfaceRouter }  from './routes/wedge-surface'
 import { createApprovalsRouter, requireApproval } from './routes/approvals'
 import { createWorkflowRecosRouter } from './routes/workflow-recos'
+import { createWorkflowTemplatesRouter } from './routes/workflow-templates'
+import { createWorkflowVersionsRouter } from './routes/workflow-versions'
 import { createWaCallingRouter }     from './routes/wa-calling'
 import { createAiResponderRouter }   from './routes/ai-responder'
+import { createDsrRouter }           from './routes/dsr'
+import { createBreachNotificationsRouter } from './routes/breach-notifications'
+import { createDataResidencyRouter } from './routes/data-residency'
+// P1 #16 — Inbox agent-collision presence audit. Live presence is in Supabase
+// Realtime channels (ephemeral); this router only persists the audit trail.
+import { createInboxPresenceRouter }   from './routes/inbox-presence'
+import { createVoiceTranscriptsRouter } from './routes/voice-transcripts'
+import { createPrivacyCenterRouter } from './routes/privacy-center'
+// P1 #11 — Shopify integration (OAuth start/callback, webhook receiver,
+// tenant-facing list/disconnect/fulfill endpoints).
+import { createShopifyOAuthRouter }   from './routes/shopify-oauth'
+import { createShopifyWebhookRouter } from './routes/shopify-webhook'
+import { createShopifyRouter }        from './routes/shopify'
+// P1 #12 — Agency white-label dashboard (migration 079). Lifecycle, members,
+// sub-accounts, revshare ledger, payouts. Single router, requireAuth on every
+// route; membership + role gates enforced in-handler.
+import { createAgencyRouter }         from './routes/agency'
+// P1 #18 — Bulk contact import + saved segments (migration 084).
+// The router is thin; heavy lifting is in workers/contact-import-processor.ts
+// which the API process enqueues against via enqueueContactImport.
+import { createContactImportRouter }  from './routes/contact-import'
+import { createSegmentsRouter }       from './routes/segments'
+// P2 #19 — Click-tracking on broadcast links (migration 085).
+//   r-redirect:                public GET /r/:token, logs a click + 302s.
+//   broadcast-link-analytics:  tenant-scoped read-side rollups for the FE.
+import { createRedirectRouter }                from './routes/r-redirect'
+import { createBroadcastLinkAnalyticsRouter } from './routes/broadcast-link-analytics'
+// P2 #22 — Sales CRM Lite (migration 087). Pipeline view tied to conversations.
+import { createCrmRouter }                     from './routes/crm'
+import { enqueueContactImport }       from './workers/contact-import-processor'
 import {
   enqueueWorkflowExecution,
   workflowQueue, messageQueue, broadcastQueue, cronQueue,
@@ -305,6 +343,15 @@ app.use(WA_CALLS_WEBHOOK_PATH, express.raw({ type: 'application/json', limit: '1
 app.use('/webhook/whatsapp', express.raw({ type: 'application/json', limit: '5mb' }))
 app.use('/webhook/instagram', express.raw({ type: 'application/json', limit: '5mb' }))
 
+// P1 #11 — Shopify webhook. Same raw-body requirement: Shopify HMAC-signs the
+// exact byte sequence. We attach rawBody via the express.json `verify` hook
+// so downstream middlewares still see a parsed object on req.body AND the
+// handler can re-hash the original bytes via (req as any).rawBody.
+app.use('/api/webhooks/shopify', express.json({
+  limit: '5mb',
+  verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
+}))
+
 // F2: tight global body limit. Default to 1 MB for every JSON endpoint —
 // far more than any normal API call needs, but small enough to stop a
 // malicious client from exhausting memory with a 50 MB payload. The routes
@@ -327,6 +374,11 @@ app.patch('/api/workflows/:id',         express.json({ limit: '5mb'  }))
 app.post('/api/workflows/preview',      express.json({ limit: '5mb'  }))
 app.post('/api/workflows/:id/dry-run',  express.json({ limit: '5mb'  }))
 app.post('/api/workflows/:id/simulate', express.json({ limit: '2mb'  }))
+// P1 #14 — publish-preview / revert / explain take the full nodes_json blob,
+// so they share the same 5mb cap as POST /api/workflows.
+app.post('/api/workflows/:id/publish-preview', express.json({ limit: '5mb' }))
+app.post('/api/workflows/:id/revert',          express.json({ limit: '1mb' }))
+app.post('/api/workflows/:id/explain',         express.json({ limit: '1mb' }))
 // Skills + workflow-recos accept similar blueprint shapes.
 app.post('/api/skills/:id/apply',       express.json({ limit: '5mb'  }))
 app.post('/api/workflow-recos/:id/apply', express.json({ limit: '5mb' }))
@@ -389,6 +441,10 @@ const SENSITIVE_LOG_PATHS = new Set([
   '/api/auth/airtable/callback',
   '/api/auth/shopify/callback',
   '/api/auth/razorpay/callback',
+  // P1 #11 — Shopify direct OAuth callback + inbound webhook. Both carry
+  // signed payloads (state HMAC and Shopify HMAC respectively).
+  '/api/shopify/callback',
+  '/api/webhooks/shopify',
 ])
 const SECRET_KEY_NAMES = new Set([
   'token', 'secret', 'password', 'code', 'access_token', 'refresh_token',
@@ -430,10 +486,13 @@ app.use((req, res, next) => {
     // Find the base path that matched and log only that.
     const matched = Array.from(SENSITIVE_LOG_PATHS).find(p => req.path === p || req.path.startsWith(p + '/')) ?? req.path
     logToFile(`${req.method} ${matched} [body+query suppressed]`)
-    console.log(`[request] ${req.method} ${matched} [body+query suppressed]`)
+    // Per-request console line is debug-only — fires on every request,
+    // which floods log aggregators. The file log above keeps the on-disk
+    // audit trail intact. Flip DEBUG=1 to mirror to stdout.
+    logger.debug(`[request] ${req.method} ${matched} [body+query suppressed]`)
   } else {
     logToFile(`${req.method} ${req.path}`)
-    console.log(`[request] ${req.method} ${req.path}`)
+    logger.debug(`[request] ${req.method} ${req.path}`)
   }
   next()
 })
@@ -470,11 +529,14 @@ function makeLimiter(opts: { windowMs: number; max: number; perUser?: boolean })
     standardHeaders: true,
     legacyHeaders: false,
     skip: isPlatformRequest,
+    // Use the library's ipKeyGenerator helper so IPv6 addresses are collapsed
+    // to /64 prefix — otherwise an attacker can rotate within their own /64
+    // to bypass the limit (ERR_ERL_KEY_GEN_IPV6).
     keyGenerator: (req) => {
-      const ip = req.ip ?? 'unknown'
-      if (!opts.perUser) return ip
+      const ipKey = ipKeyGenerator(req.ip ?? 'unknown')
+      if (!opts.perUser) return ipKey
       const userId = (req as any).user?.id ?? 'anon'
-      return `${ip}:${userId}`
+      return `${ipKey}:${userId}`
     },
     handler: (req, res) => {
       return apiError(
@@ -591,7 +653,9 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
   if (req.query.tenant_id && !headerTenantId) {
     console.warn(`[identifyTenant] DEPRECATED: caller sent ?tenant_id= query param without X-Tenant-ID header — ignoring. path=${req.path}`)
   }
-  console.log(`[identifyTenant] user=${user.id}, header_tenant=${headerTenantId || '(none)'}`)
+  // Per-request resolution trace. Silenced by default — fires 1× per
+  // authed request, ~100 req/min on a quiet tenant. Flip DEBUG=1 to see.
+  logger.debug(`[identifyTenant] user=${user.id}, header_tenant=${headerTenantId || '(none)'}`)
 
   // 0. Platform-scoped role check — runs first so Platform Console actions
   //    bypass per-tenant permission checks entirely. Two paths:
@@ -634,7 +698,7 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
       .maybeSingle()
     const assignmentRole = (assignmentForHeader as any)?.role_definitions?.key
     if (assignmentRole) {
-      console.log(`[identifyTenant] resolved via user_role_assignments: tenant=${headerTenantId}, role=${assignmentRole}`)
+      logger.debug(`[identifyTenant] resolved via user_role_assignments: tenant=${headerTenantId}, role=${assignmentRole}`)
       ;(req as any).tenantId = headerTenantId
       ;(req as any).userRole = assignmentRole
       next()
@@ -648,7 +712,7 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
       .eq('tenant_id', headerTenantId)
       .maybeSingle()
     if (roleForHeader) {
-      console.log(`[identifyTenant] resolved via user_roles: tenant=${headerTenantId}, role=${roleForHeader.role}`)
+      logger.debug(`[identifyTenant] resolved via user_roles: tenant=${headerTenantId}, role=${roleForHeader.role}`)
       ;(req as any).tenantId = headerTenantId
       ;(req as any).userRole = roleForHeader.role
       next()
@@ -663,13 +727,13 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
       .eq('status', 'active')
       .maybeSingle()
     if (ownedCheck) {
-      console.log(`[identifyTenant] resolved via tenant ownership: tenant=${headerTenantId}, role=owner`)
+      logger.debug(`[identifyTenant] resolved via tenant ownership: tenant=${headerTenantId}, role=owner`)
       ;(req as any).tenantId = headerTenantId
       ;(req as any).userRole = 'owner'
       next()
       return
     }
-    console.log(`[identifyTenant] header tenant ${headerTenantId} not accessible by user, falling through`)
+    logger.debug(`[identifyTenant] header tenant ${headerTenantId} not accessible by user, falling through`)
   }
 
   // 2. Auto-detect: Check new RBAC user_role_assignments first
@@ -683,7 +747,7 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
     .maybeSingle()
   if (assignmentAuto?.tenant_id) {
     const role = (assignmentAuto as any).role_definitions?.key || 'member'
-    console.log(`[identifyTenant] resolved via user_role_assignments auto: tenant=${assignmentAuto.tenant_id}, role=${role}`)
+    logger.debug(`[identifyTenant] resolved via user_role_assignments auto: tenant=${assignmentAuto.tenant_id}, role=${role}`)
     ;(req as any).tenantId = assignmentAuto.tenant_id
     ;(req as any).userRole = role
     next()
@@ -701,7 +765,7 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
     .maybeSingle()
 
   if (userRole?.tenant_id) {
-    console.log(`[identifyTenant] resolved via user_roles auto: tenant=${userRole.tenant_id}, role=${userRole.role}`)
+    logger.debug(`[identifyTenant] resolved via user_roles auto: tenant=${userRole.tenant_id}, role=${userRole.role}`)
     ;(req as any).tenantId = userRole.tenant_id
     ;(req as any).userRole = userRole.role
     next()
@@ -718,14 +782,15 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
     .limit(1)
     .maybeSingle()
   if (ownedTenant) {
-    console.log(`[identifyTenant] resolved via tenant ownership fallback: tenant=${ownedTenant.id}`)
+    logger.debug(`[identifyTenant] resolved via tenant ownership fallback: tenant=${ownedTenant.id}`)
     ;(req as any).tenantId = ownedTenant.id
     ;(req as any).userRole = 'admin'
     next()
     return
   }
 
-  console.log(`[identifyTenant] FAILED for user=${user.id} — no tenant found via any path`)
+  // This one is a real auth failure — keep at warn so it surfaces in prod.
+  logger.warn(`[identifyTenant] FAILED for user=${user.id} — no tenant found via any path`)
   apiError(res, 403, 'no_active_tenant', 'No active tenant found. Please complete onboarding to connect your WhatsApp account.')
 }
 
@@ -1113,7 +1178,53 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
         recordAiUsage(supabase, tenantId, usage as any, 'parse_workflow', 'claude-sonnet-4-6'))
     }
 
+    // ── P1 #14: emit a `preview` event before [DONE] ───────────────────────
+    // Existing FE consumers (parseWorkflowStream) ignore unknown event keys
+    // by inspecting `json.text` / `json.error` / `json.done` only — so
+    // adding `{ type: 'preview', ... }` is non-breaking. New consumers that
+    // want the preview-before-publish UX can opt in to handling it.
+    //
+    // We do BEST-EFFORT parsing + validation here. If the assistant's reply
+    // doesn't parse cleanly, we still close the stream normally — the FE
+    // continues to work the old way (the streamed text IS the result).
     if (!clientGone) {
+      try {
+        const assistantText = final?.content
+          ?.filter(b => b.type === 'text')
+          .map(b => (b as any).text as string)
+          .join('') ?? ''
+        const trimmed = assistantText.trim()
+        if (trimmed.startsWith('{')) {
+          const parsed = JSON.parse(trimmed)
+          const proposedNodes = Array.isArray(parsed?.nodes) ? parsed.nodes : []
+          if (proposedNodes.length > 0) {
+            const { validateWorkflow } = await import('./engine/workflow-validator')
+            const report = await validateWorkflow(supabase, tenantId, proposedNodes)
+            // Confidence heuristic — entirely deterministic so the FE can
+            // trust the chip. low ↔ structural errors present; medium ↔ no
+            // errors but at least one warning OR a missing connector; high
+            // ↔ ok + no warnings.
+            const hasError   = report.node_issues.some(i => i.severity === 'error')
+            const hasWarning = report.node_issues.some(i => i.severity === 'warning')
+            const confidence: 'low' | 'medium' | 'high' =
+              hasError ? 'low'
+              : (hasWarning || report.missing_connectors.length > 0) ? 'medium'
+              : 'high'
+            writeEvent({
+              type: 'preview',
+              nodes_json: proposedNodes,
+              blueprint: parsed,
+              validation: report,
+              confidence,
+            })
+          }
+        }
+      } catch (e: any) {
+        // Don't break the stream on a parse / validate failure — the FE
+        // already has the full text and will degrade gracefully.
+        console.warn('[parse-workflow] preview emit skipped:', e?.message?.slice(0, 120))
+      }
+
       writeEvent({ done: true })
       res.write('data: [DONE]\n\n')
       res.end()
@@ -1851,7 +1962,23 @@ app.get('/api/wa-templates', requireAuth, identifyTenant, checkPermission('whats
     if (t.body) components.push({ type: 'BODY', text: t.body })
     if (t.footer) components.push({ type: 'FOOTER', text: t.footer })
     if (t.buttons?.length) components.push({ type: 'BUTTONS', buttons: t.buttons })
-    return { id: t.id, name: t.name, status: t.status?.toUpperCase() ?? 'DRAFT', category: t.category?.toUpperCase() ?? 'MARKETING', language: t.language ?? 'en', components }
+    return {
+      id: t.id,
+      name: t.name,
+      status: t.status?.toUpperCase() ?? 'DRAFT',
+      category: t.category?.toUpperCase() ?? 'MARKETING',
+      language: t.language ?? 'en',
+      components,
+      // Surfaced on the WATemplatesPage rejection-state banner — when Meta
+      // rejects a template, the rejected_reason field is what the user
+      // needs to understand what to change. Null when status != rejected
+      // or for templates created before the rejection_reason column.
+      rejection_reason: t.rejection_reason ?? null,
+      // Category-change diff (template-sync worker stamps these when Meta
+      // reclassifies the template). The wedge-surface banner reads them.
+      previous_category:   t.previous_category ?? null,
+      category_changed_at: t.category_changed_at ?? null,
+    }
   })
 
   res.json(formatted)
@@ -1937,6 +2064,21 @@ app.get('/api/broadcasts', requireAuth, identifyTenant, checkPermission('whatsap
 
 app.post('/api/broadcasts', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), validateBody(BroadcastCreateSchema), async (req, res) => {
   const tenantId = (req as any).tenantId
+  // P1 #18: if segment_id is supplied, validate that the segment belongs
+  // to this tenant before we link it. Defense-in-depth — RLS would block
+  // a stranger's segment from being readable anyway, but a 400 here is a
+  // cleaner failure mode than a downstream resolve-zero-contacts.
+  const incoming = req.body as any
+  if (incoming.segment_id) {
+    const { data: seg, error: segErr } = await supabase.from('contact_segments')
+      .select('id').eq('id', incoming.segment_id).eq('tenant_id', tenantId)
+      .is('archived_at', null).maybeSingle()
+    if (segErr) { res.status(500).json({ error: segErr.message }); return }
+    if (!seg) {
+      res.status(400).json({ error: 'segment_id does not belong to this tenant (or is archived)' })
+      return
+    }
+  }
   const { data, error } = await supabase.from('broadcasts')
     .insert({ ...req.body, tenant_id: tenantId }).select().single()
   if (error) { res.status(500).json({ error: error.message }); return }
@@ -2459,12 +2601,93 @@ async function handleInboundMessage(tenant: any, msg: any, contact: any) {
   })
 
   // Upsert contact (tenant-scoped — fixes the user_id vs tenant_id leak from 008)
-  await supabase.from('contacts').upsert({
+  // Capture whether this was a new insert so we can write the implicit
+  // DPDPA opt-in consent_events row (migration 072) only on first contact.
+  const { data: existingContact } = await supabase.from('contacts')
+    .select('id, created_at').eq('tenant_id', tenant.id).eq('phone', `+${phone}`).maybeSingle()
+  const isNewContact = !existingContact
+
+  const { data: contactRow } = await supabase.from('contacts').upsert({
     tenant_id: tenant.id,
     user_id:   tenant.user_id,            // kept for legacy RLS policies
     phone:     `+${phone}`,
     name:      contact?.profile?.name ?? `+${phone}`,
-  }, { onConflict: 'tenant_id,phone' })
+  }, { onConflict: 'tenant_id,phone' }).select('id').maybeSingle()
+
+  // ── Implicit DPDPA opt-in on first inbound message (P0.7) ─────────────
+  // When a contact initiates a conversation, DPDPA treats that as consent
+  // for SERVICE_UPDATES + TRANSACTIONAL processing under "necessary
+  // processing for a stated purpose" (§4(2)(b)). We do NOT auto-opt-in
+  // for marketing — the tenant must capture explicit marketing consent
+  // via POST /api/contacts/:id/consent. Fail-soft so the inbound flow
+  // never breaks because of a missing migration.
+  if (isNewContact && contactRow?.id) {
+    try {
+      const snippet = String(text ?? '').slice(0, 200)
+      const proofText = snippet
+        ? `Initiated conversation by sending: ${snippet}`
+        : 'Initiated conversation via WhatsApp'
+      // Two rows: service_updates + transactional. Both come from the
+      // same inbound message; the trigger materializes per-purpose state.
+      await supabase.from('consent_events').insert([
+        {
+          tenant_id: tenant.id,
+          contact_id: contactRow.id,
+          channel: 'whatsapp',
+          event_type: 'opt_in',
+          purpose: 'service_updates',
+          source: 'whatsapp_inbound',
+          source_detail: { wa_message_id: msg.id, wa_profile_name: contact?.profile?.name ?? null },
+          proof_text: proofText,
+        },
+        {
+          tenant_id: tenant.id,
+          contact_id: contactRow.id,
+          channel: 'whatsapp',
+          event_type: 'opt_in',
+          purpose: 'transactional',
+          source: 'whatsapp_inbound',
+          source_detail: { wa_message_id: msg.id, wa_profile_name: contact?.profile?.name ?? null },
+          proof_text: proofText,
+        },
+      ])
+    } catch (e: any) {
+      console.warn(`[wa-webhook] consent_events seed failed (non-fatal): ${e?.message ?? e}`)
+    }
+  }
+
+  // ── CTWA attribution (P0.6 — Indian SMB Omnichannel Wedge) ────────────
+  // Meta passes a `referral` object on the first inbound message of any
+  // Click-to-WhatsApp ad conversation. We capture it once per ctwa_clid
+  // (deduped by the unique index on tenant_id+ctwa_clid) so analytics can
+  // attribute the resulting revenue back to the ad-set later. Fail-soft —
+  // if the insert errors (RLS, schema drift), the WA flow continues
+  // unimpaired. Done inline so we don't lose the referral if the engine
+  // chain fails downstream.
+  const referral = msg.referral
+  if (referral && (referral.source_id || referral.ctwa_clid)) {
+    try {
+      await supabase.from('ctwa_attribution').upsert({
+        tenant_id:           tenant.id,
+        contact_id:          contactRow?.id ?? null,
+        meta_ad_id:          referral.source_id ?? referral.ad_id ?? null,
+        // Meta sends adset/campaign IDs under variable keys depending on
+        // referral source. Probe the most common shapes; defaults to null.
+        meta_adset_id:       referral.adgroup_id ?? referral.adset_id ?? null,
+        meta_campaign_id:    referral.campaign_id ?? null,
+        ctwa_clid:           referral.ctwa_clid ?? null,
+        referral_headline:   referral.headline ?? null,
+        referral_body:       referral.body ?? null,
+        source_url:          referral.source_url ?? null,
+        image_url:           referral.image?.link ?? referral.image_url ?? null,
+        referral_source_type: referral.source_type ?? null,
+        first_message_at:    new Date().toISOString(),
+        raw_referral:        referral,
+      }, { onConflict: 'tenant_id,ctwa_clid', ignoreDuplicates: true })
+    } catch (e: any) {
+      console.warn(`[wa-webhook] CTWA attribution insert failed (non-fatal): ${e?.message ?? e}`)
+    }
+  }
 
   // Channel-aware delegation. Routes session-resume + keyword-trigger via
   // the shared helper used by Telegram + Instagram webhooks.
@@ -3534,16 +3757,81 @@ app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPer
 // Mounted at /api/waitlist. Per-IP rate limit lives inside the router.
 app.use('/api/waitlist', createWaitlistRouter({ supabase }))
 
+// ── Public status (no auth) ──────────────────────────────────────────────────
+// Powers the public /status page. Three endpoints under /api/public/:
+//   GET /uptime?days=N · /response-time?days=N · /incidents?days=N
+// Per-IP rate limit + 30s edge cache live inside the router. Safe to
+// deploy before migration 067_public_incidents.sql is applied — the
+// incidents handler treats a missing table as "no incidents" rather
+// than 500ing.
+app.use('/api/public', createPublicStatusRouter({ supabase }))
+
+// ── P2 #19 — Broadcast short-link redirect (public, no auth) ────────────────
+// Mounted at /r/:token. The recipient clicks a short link in a broadcast,
+// we resolve it to the original URL via service-role Supabase + 302. Click
+// is logged async after the response; never blocks the redirect.
+app.use(createRedirectRouter({ supabase }))
+
+// ── P2 #19 — Broadcast click analytics (tenant-scoped, auth required) ───────
+// Read-only rollups over broadcast_links + broadcast_link_clicks. Powers
+// the "Click analytics" section on BroadcastsPage.
+app.use(createBroadcastLinkAnalyticsRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── P2 #22 — Sales CRM Lite (tenant-scoped, auth required) ──────────────────
+// Pipeline view tied to conversations. Stages + deals + append-only events.
+// Migration 087_sales_crm_lite.sql.
+app.use(createCrmRouter({ supabase, requireAuth, identifyTenant }))
+
 // ── Billing (Razorpay subscriptions + webhook) ───────────────────────────────
 // NOTE: the webhook route inside this router uses express.raw() to bypass the
 // global JSON parser — needed for HMAC signature verification on raw bytes.
 app.use(createBillingRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
+// ── CTWA → WhatsApp attribution analytics ───────────────────────────────────
+// Reads from ctwa_attribution (written by the WA inbound webhook above when a
+// referral object is present) and meta_ad_campaigns. Powers the new Analytics
+// tab that shows ROAS per ad-set + funnel totals (P0.6).
+app.use(createCtwaAnalyticsRouter({ supabase, requireAuth, identifyTenant }))
+
 // ── Channel-specific feature endpoints (omnichannel) ─────────────────────────
 app.use(createWaFeaturesRouter({ supabase, requireAuth, identifyTenant, checkPermission, redis: redisConnection }))
+// Template Approval Assistant (P1 #15) — policy-check + rejection-explainer +
+// resubmit-draft. Mounts /api/wa-templates/policy-check, /api/wa-templates/
+// :name/explain-rejection, /api/wa-templates/:name/resubmit-draft alongside
+// the inline GET/POST/DELETE /api/wa-templates routes above.
+app.use(createWaTemplatesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createTelegramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createInstagramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createMetaAdsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Shopify (P1 #11) ────────────────────────────────────────────────────────
+// Three routers, deliberately split so the signature-verified write paths
+// can never be reached by a logged-in tenant crafting an OAuth replay or by
+// a generic POST without HMAC headers:
+//   - shopify-oauth:   /api/shopify/install (requireAuth) + /api/shopify/callback (public, state+HMAC verified)
+//   - shopify-webhook: /api/webhooks/shopify (public, per-store HMAC verified, always-200)
+//   - shopify:         /api/shopify/stores, /api/shopify/orders/recent, disconnect, fulfill (tenant-auth)
+app.use(createShopifyOAuthRouter({ supabase, requireAuth, identifyTenant }))
+app.use(createShopifyWebhookRouter({ supabase }))
+app.use(createShopifyRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// P1 #12 — Agency white-label routes. requireAuth only (no identifyTenant)
+// because agency routes are cross-tenant by definition — the handler resolves
+// the agency via :id and gates on agency_members membership + role.
+app.use(createAgencyRouter({ supabase, requireAuth }))
+
+// ── P1 #18 — Bulk contact import + saved segments (migration 084) ─────────
+// Two routers:
+//   contact-import: /api/contacts/import* — async job lifecycle (POST/cancel/commit/status/dry-run).
+//   segments:       /api/segments*        — saved filter CRUD + count/preview evaluation.
+// The contact-import router enqueues to BullMQ via enqueueContactImport so
+// parsing happens off the request thread; the worker writes per-contact
+// consent_events rows for DPDPA provenance.
+app.use(createContactImportRouter({
+  supabase, requireAuth, identifyTenant, checkPermission,
+  enqueueImport: enqueueContactImport,
+}))
+app.use(createSegmentsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Super-admin API (platform-level operations) ──────────────────────────────
 app.use(createSuperAdminRouter({ supabase, requireAuth }))
@@ -3558,17 +3846,72 @@ app.use(createTenantAuditRouter({ supabase, requireAuth, identifyTenant, checkPe
 // ── Notifications (in-app bell + preferences) ────────────────────────────────
 app.use(createNotificationsRouter({ supabase, requireAuth, identifyTenant }))
 
+// ── Inbox agent-collision presence audit (P1 #16) ───────────────────────────
+// Live "Agent X is already replying" toast is driven by Supabase Realtime
+// presence + broadcast channels keyed by conversation_key. This router only
+// persists an append-only audit trail (inbox_agent_activity, migration 083)
+// so we can post-incident answer "who handled this thread". Fire-and-forget
+// from the FE; advisory only, never gates a send.
+app.use(createInboxPresenceRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── P2 #20 — Voice note transcripts (read + retry) ──────────────────────────
+// GET /api/messages/:id/transcript and POST /api/messages/:id/retry-transcript.
+// Read powers the inbox audio-bubble "Show transcript" toggle; retry powers
+// the "Transcription unavailable" → Try again affordance. The transcription
+// itself runs async in workers/voice-note-transcribe.ts (BullMQ).
+app.use(createVoiceTranscriptsRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── Mobile push device registration (P0.10) ──────────────────────────────────
+// The mobile app POSTs an Expo push token after sign-in fire-and-forget.
+// Stored under (user_id, expo_push_token) with RLS so users can only manage
+// their own device tokens. sendExpoPush() in src/lib/expo-push.ts reads
+// from this table to fan out new-message / broadcast notifications.
+app.use(createDevicesRouter({ supabase, requireAuth, identifyTenant }))
+
 // ── Per-tenant usage / quota inspection ──────────────────────────────────────
 // Live token-bucket counters (the same numbers checkAndConsumeQuota gates
 // against). Powers the billing-page rate-limit bars + the "previous warnings"
 // panel on /settings/billing.
 app.use(createUsageRouter({ supabase, redis: redisConnection, requireAuth, identifyTenant, checkPermission }))
 
+// ── Wedge surface — markup-saved card, SLA badge, consent capture audit,
+// campaign auto-resume. All read-side dashboards or single-row writes;
+// no quota / Meta calls. Mounted alongside usage because the FE consumes
+// them from the same component layer.
+app.use(createWedgeSurfaceRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── DPDPA-ready consent layer (P0.7) ─────────────────────────────────────────
+// Three sibling routers, all gated by RLS at the table level (migration 072):
+//   - DSR (Data Subject Rights) — erasure / access / portability / rectification
+//   - Breach notifications — super-admin write, tenant read for affected breaches
+//   - Data residency — IN / EU / US tenant flag (informational today)
+// PrivacyCenterPage on the FE consumes all three.
+app.use(createDsrRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+app.use(createBreachNotificationsRouter({ supabase, requireAuth, identifyTenant, isPlatformUser }))
+app.use(createDataResidencyRouter({ supabase, requireAuth, identifyTenant }))
+// Privacy Center adapters — short paths the FE PrivacyCenterPage consumes
+// (POST /api/contacts/:id/dsr, GET /api/me/dsr-requests, GET /api/dsr/:id/download,
+// GET+PATCH /api/me/residency, GET /api/admin/breach, PATCH /api/admin/breach/:id).
+app.use(createPrivacyCenterRouter({ supabase, requireAuth, identifyTenant, checkPermission, isPlatformUser }))
+
 // ── Approval requests (broadcast >threshold, bulk delete, etc.) ──────────────
 app.use(createApprovalsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Workflow recommendations (AI-generated once, cached forever) ─────────────
 app.use(createWorkflowRecosRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── Workflow template library (P1 #13) ───────────────────────────────────────
+// Public catalog of pre-authored playbooks (D2C abandoned cart, EdTech course
+// launch, clinic appointment reminder, real-estate site-visit pack). List +
+// detail are anon-readable (catalog is curated public content); only the
+// /clone route requires auth + tenant context.
+app.use(createWorkflowTemplatesRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── Workflow versions / publish-preview / revert / explain / trace ──────────
+// P1 #14 — chat-driven AI workflow author v1 improvements. NO visual canvas.
+// Diffs are rendered plain-English-first on the FE with a collapsible JSON
+// fallback. Versions table is append-only (migration 081).
+app.use(createWorkflowVersionsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── AI Responder — opt-in auto-reply with per-tenant knowledge (RAG) ─────────
 // Settings + QA wizard + knowledge browser + test endpoint. The
