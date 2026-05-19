@@ -599,6 +599,239 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       })
     })
 
+  // ─── GET /api/super-admin/agencies ─────────────────────────────────────
+  // Platform-team-facing listing of every agency on the platform. Differs
+  // from /api/agencies/me (which filters to memberships) — super-admins
+  // need to see ALL agencies for support / triage / abuse review.
+  //
+  // Returns one row per agency with:
+  //   - identity (id, name, slug, owner_user_id, status)
+  //   - sub_account_count (active sub-accounts only — soft-removed
+  //     entries don't count toward the agency's footprint)
+  //   - mrr_inr (sum of monthly_price_inr from active subs across all
+  //     sub-account tenants) — used by the agency-tab MRR column
+  //   - has_subscription (boolean — whether the agency itself pays a
+  //     platform fee, distinct from sub-account billing)
+  //
+  // Pagination + search + status filter mirror /api/super-admin/tenants.
+  r.get('/api/super-admin/agencies',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (req, res) => {
+      const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1)
+      // Security audit P1: cap pageSize at 25 (was 100) so a single
+      // request can't fan-out 100 parallel `auth.admin.getUserById`
+      // calls — that path was both rate-limit-risky against the Supabase
+      // Auth API and a PII-sweep amplifier for a compromised platform
+      // token. 25 is the size used by Stripe Dashboard tables; matches
+      // pagination UX expectations.
+      const pageSize = Math.min(25, Math.max(1, parseInt(String(req.query.pageSize ?? '24'), 10) || 24))
+      const offset = (page - 1) * pageSize
+      const search = String(req.query.search ?? '').trim()
+      const status = String(req.query.status ?? 'all')
+
+      let q = supabase.from('agencies')
+        .select('id, name, slug, owner_user_id, status, default_revshare_pct, agency_paid_by_default, created_at, plan_id, current_subscription_id', { count: 'exact' })
+        .order('created_at', { ascending: false })
+        .range(offset, offset + pageSize - 1)
+      if (search)             q = q.ilike('name', `%${search}%`)
+      if (status !== 'all')   q = q.eq('status', status)
+      const { data: agencies, error, count } = await q
+      if (error) { res.status(500).json({ error: error.message }); return }
+      if (!agencies || agencies.length === 0) {
+        res.json({ data: [], page, pageSize, total: count ?? 0, totalPages: Math.max(1, Math.ceil((count ?? 0) / pageSize)) }); return
+      }
+
+      // Sub-account count + MRR aggregation per agency. Two queries in
+      // parallel against agency_sub_accounts → tenant_subscriptions →
+      // plans. Best-effort: a failure here just leaves these columns at 0.
+      const agencyIds = agencies.map(a => a.id)
+      const { data: subAccounts } = await supabase.from('agency_sub_accounts')
+        .select('agency_id, tenant_id, removed_at')
+        .in('agency_id', agencyIds)
+        .is('removed_at', null)
+      const countByAgency: Record<string, number> = {}
+      const tenantIdsByAgency: Record<string, string[]> = {}
+      for (const sa of (subAccounts ?? []) as any[]) {
+        countByAgency[sa.agency_id] = (countByAgency[sa.agency_id] ?? 0) + 1
+        ;(tenantIdsByAgency[sa.agency_id] = tenantIdsByAgency[sa.agency_id] ?? []).push(sa.tenant_id)
+      }
+      const allTenantIds = Object.values(tenantIdsByAgency).flat()
+      const mrrByAgency: Record<string, number> = {}
+      if (allTenantIds.length > 0) {
+        const { data: subs } = await supabase.from('tenant_subscriptions')
+          .select('tenant_id, status, plans!inner(monthly_price_inr)')
+          .in('tenant_id', allTenantIds)
+          .eq('status', 'active')
+        const mrrByTenant: Record<string, number> = {}
+        for (const s of (subs ?? []) as any[]) {
+          const p = Array.isArray(s.plans) ? s.plans[0] : s.plans
+          mrrByTenant[s.tenant_id] = Number(p?.monthly_price_inr ?? 0)
+        }
+        for (const [agencyId, tIds] of Object.entries(tenantIdsByAgency)) {
+          mrrByAgency[agencyId] = tIds.reduce((sum, tid) => sum + (mrrByTenant[tid] ?? 0), 0)
+        }
+      }
+
+      // Resolve owner email per agency for support contact use. One
+      // auth.admin.getUserById call per unique owner.
+      const ownerIds = Array.from(new Set(agencies.map(a => a.owner_user_id).filter(Boolean) as string[]))
+      const emailByOwner: Record<string, string> = {}
+      if (ownerIds.length > 0) {
+        const lookups = await Promise.all(ownerIds.map(uid => supabase.auth.admin.getUserById(uid).catch(() => null)))
+        for (let i = 0; i < ownerIds.length; i++) {
+          const e = lookups[i]?.data?.user?.email
+          if (e) emailByOwner[ownerIds[i]] = e
+        }
+      }
+
+      const enriched = agencies.map(a => ({
+        ...a,
+        sub_account_count: countByAgency[a.id] ?? 0,
+        mrr_inr:           mrrByAgency[a.id] ?? 0,
+        has_subscription:  !!a.current_subscription_id,
+        owner_email:       a.owner_user_id ? (emailByOwner[a.owner_user_id] ?? null) : null,
+      }))
+      res.json({
+        data: enriched,
+        page, pageSize,
+        total: count ?? 0,
+        totalPages: Math.max(1, Math.ceil((count ?? 0) / pageSize)),
+      })
+    })
+
+  // ─── GET /api/super-admin/agencies/:id ─────────────────────────────────
+  // Single-agency lookup for super-admins. Bypasses the agency_members
+  // gate that /api/agencies/:id enforces — used so a super-admin can
+  // open an agency console (/agency/:slug) for support purposes even
+  // though they aren't a member of the agency.
+  r.get('/api/super-admin/agencies/:id',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (req, res) => {
+      const agencyId = String(req.params.id)
+      const { data, error } = await supabase.from('agencies').select('*').eq('id', agencyId).maybeSingle()
+      if (error) { res.status(500).json({ error: error.message }); return }
+      if (!data) { res.status(404).json({ error: 'not found' }); return }
+      res.json({ agency: data })
+    })
+
+  // ─── GET /api/super-admin/agencies/by-slug/:slug ────────────────────────
+  // Slug-based variant — AgencyShell resolves the URL's :slug to an
+  // agency without first calling /api/agencies/me (which would 403
+  // a super-admin who isn't a member).
+  r.get('/api/super-admin/agencies/by-slug/:slug',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (req, res) => {
+      // Security audit P2: validate the slug against the same regex used
+      // at creation BEFORE hitting the DB. Without this, an over-sized
+      // attacker-controlled string is forwarded through PostgREST as a
+      // parameter — parameterized so not injectable, but still a
+      // probing surface. Reject malformed slugs at the edge.
+      const slug = String(req.params.slug)
+      if (!/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(slug)) {
+        res.status(400).json({ error: 'invalid slug format' }); return
+      }
+      const { data, error } = await supabase.from('agencies').select('*').eq('slug', slug).maybeSingle()
+      if (error) { res.status(500).json({ error: error.message }); return }
+      if (!data) { res.status(404).json({ error: 'not found' }); return }
+      res.json({ agency: data })
+    })
+
+  // ─── GET /api/super-admin/recent-signups ───────────────────────────────
+  // Returns the last N (default 10) tenant + agency signups across the
+  // platform, sorted newest-first. Drives the "Recent signups" feed on
+  // the platform dashboard so the platform team can spot anomalies (e.g.
+  // a sudden burst of fake signups) or celebrate wins.
+  //
+  // Reuses the 'tenants:view' perm — anyone with visibility into the
+  // tenant list also gets the signups feed.
+  r.get('/api/super-admin/recent-signups',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (req, res) => {
+      const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit ?? '10'), 10) || 10))
+      const [t, a] = await Promise.all([
+        supabase.from('tenants')
+          .select('id, business_name, slug, created_at, status')
+          .order('created_at', { ascending: false })
+          .limit(limit),
+        supabase.from('agencies')
+          .select('id, name, slug, created_at, status')
+          .order('created_at', { ascending: false })
+          .limit(limit),
+      ])
+      // Merge + sort by created_at; cap to limit. Tag each row with kind
+      // so the FE can render a different icon/color per type.
+      const tenants = (t.data ?? []).map(r => ({ kind: 'tenant' as const, id: r.id, name: r.business_name, slug: r.slug, created_at: r.created_at, status: r.status }))
+      const agencies = (a.data ?? []).map(r => ({ kind: 'agency' as const, id: r.id, name: r.name, slug: r.slug, created_at: r.created_at, status: r.status }))
+      const merged = [...tenants, ...agencies]
+        .sort((x, y) => new Date(y.created_at).getTime() - new Date(x.created_at).getTime())
+        .slice(0, limit)
+      res.json({ signups: merged })
+    })
+
+  // ─── GET /api/super-admin/mrr-trend ────────────────────────────────────
+  // Returns daily MRR snapshots for the last N days (default 30). Approach:
+  // for each day, sum monthly_price_inr from tenant_subscriptions that were
+  // ACTIVE on that day (i.e. created on/before AND not yet cancelled). This
+  // is an approximation — true MRR-on-date would require a snapshot table
+  // we don't keep yet — but matches the spirit of "is platform revenue
+  // growing?" for the dashboard chart.
+  //
+  // Single round-trip: pull all tenant_subscriptions with their created_at
+  // + cancelled_at + plan price, then compute the daily series in memory.
+  // For <50k subs this is fine; beyond that we'd materialize a daily
+  // snapshot table (TODO when we hit that scale).
+  r.get('/api/super-admin/mrr-trend',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (req, res) => {
+      const days = Math.min(90, Math.max(7, parseInt(String(req.query.days ?? '30'), 10) || 30))
+      // Security audit P1: previously this fetched the FULL
+      // tenant_subscriptions table on every request — fine at <5k subs
+      // but linearly degrades. Pre-filter to subs that COULD have been
+      // active during the window: created on/before the window's end,
+      // and not cancelled before the window's start.
+      const now = new Date()
+      const windowStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (days - 1))
+      const windowEnd   = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999)
+      const windowStartIso = windowStart.toISOString()
+      const windowEndIso   = windowEnd.toISOString()
+      const { data: subs, error: subErr } = await supabase.from('tenant_subscriptions')
+        .select('created_at, cancelled_at, status, plans!inner(monthly_price_inr)')
+        .lte('created_at', windowEndIso)
+        .or(`cancelled_at.is.null,cancelled_at.gte.${windowStartIso}`)
+        .limit(50000) // hard ceiling — defends against runaway tenant-subs growth
+      if (subErr) { res.status(500).json({ error: subErr.message }); return }
+      if (!subs) { res.json({ trend: [] }); return }
+      // Log row count so ops can spot the cliff before users feel it.
+      // Once subs > 20k start materializing a daily-snapshot table.
+      console.log(`[mrr-trend] window=${days}d subs=${subs.length}`)
+
+      // Walk each day in the window and sum the price of every sub that
+      // was active on that day. "Active on day D" = created_at <= D AND
+      // (cancelled_at IS NULL OR cancelled_at > D). `now` is already
+      // computed above (line 790-ish) for the window boundaries.
+      const trend: Array<{ date: string; mrr_inr: number }> = []
+      for (let i = days - 1; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i)
+        const dayEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999)
+        const dayEndIso = dayEnd.toISOString()
+        let sum = 0
+        for (const s of subs as any[]) {
+          if (s.created_at && s.created_at <= dayEndIso) {
+            const cancelled = s.cancelled_at
+            if (!cancelled || cancelled > dayEndIso) {
+              const p = Array.isArray(s.plans) ? s.plans[0] : s.plans
+              sum += Number(p?.monthly_price_inr ?? 0)
+            }
+          }
+        }
+        trend.push({
+          date: d.toISOString().slice(0, 10), // YYYY-MM-DD
+          mrr_inr: sum,
+        })
+      }
+      res.json({ trend })
+    })
+
   // ─── Webhook dead-letter (migration 064) ─────────────────────────────────
   // Permanent failures from webhook.inbound + webhook.outbound queues. The
   // worker writes one row here when a job exhausts all 5 retries

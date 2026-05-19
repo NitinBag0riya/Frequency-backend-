@@ -22,10 +22,28 @@ export async function processRazorpayWebhookPayload(
   const event = String(payload?.event ?? '')
   const sub   = payload?.payload?.subscription?.entity
   const pay   = payload?.payload?.payment?.entity
-  const subscriptionId = sub?.id ?? pay?.subscription_id
+  const inv   = payload?.payload?.invoice?.entity
+  const ref   = payload?.payload?.refund?.entity
+  const subscriptionId = sub?.id ?? pay?.subscription_id ?? inv?.subscription_id
+
+  // Refund events: keyed by refund.id (we stashed refund_razorpay_id at
+  // refund-initiation). Mirror the inline route's branch.
+  if (event === 'refund.processed' || event === 'refund.failed') {
+    if (ref?.id) {
+      const { data: subRow } = await supabase.from('tenant_subscriptions')
+        .select('tenant_id, refund_amount_inr').eq('refund_razorpay_id', ref.id).maybeSingle()
+      if (subRow) {
+        await supabase.from('tenant_subscriptions').update({
+          refund_completed_at: event === 'refund.processed' ? new Date().toISOString() : null,
+          updated_at:          new Date().toISOString(),
+        }).eq('tenant_id', subRow.tenant_id)
+      }
+    }
+    return
+  }
 
   if (!subscriptionId) {
-    // refund.processed etc. — ack and ignore.
+    // Other events without a subscription_id — ack and ignore.
     return
   }
 

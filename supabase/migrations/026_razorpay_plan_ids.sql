@@ -1,4 +1,15 @@
 -- ─────────────────────────────────────────────────────────────────────────────
+-- NOTE (added 2026-05-18): This migration was stamped applied in
+-- supabase_migrations.schema_migrations on both local + remote, but the DDL
+-- below never actually executed on the live `plans` table (probable
+-- interrupted earlier `db push` that committed the migration-tracking row
+-- before the ALTER). The columns and index declared here were healed
+-- idempotently by 077_fix_plans_razorpay_columns.sql. DO NOT re-run this
+-- file or modify its DDL; if you're reading this because you wonder why
+-- the columns "already exist", that's why.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Migration 026 — Razorpay plan IDs on `plans`
 --
 -- Razorpay Subscriptions require a Razorpay-side `plan_id` (created once in

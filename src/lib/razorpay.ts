@@ -124,6 +124,119 @@ export async function createSubscription(args: {
   })
 }
 
+// ─── Plans (created on the fly for quarterly billing) ──────────────────
+//
+// Razorpay docs: POST /v1/plans accepts period ∈ ('daily','weekly','monthly','yearly')
+// and an `interval` multiplier. Quarterly = period:'monthly' + interval:3 OR
+// period:'quarterly' on newer accounts. We use monthly+interval:3 because
+// the explicit 'quarterly' period isn't enabled on every Razorpay account
+// and monthly+interval:3 is universally supported with identical effect.
+export interface RpPlan {
+  id: string                    // 'plan_XXX'
+  entity: 'plan'
+  interval: number
+  period: 'daily' | 'weekly' | 'monthly' | 'yearly'
+  item: { name: string; amount: number; currency: 'INR'; description?: string }
+  notes?: Record<string, string>
+  created_at: number
+}
+
+/** Create a Razorpay Plan. `amount_paise` is per-period (per-quarter for
+ *  monthly×3). Idempotency: Razorpay doesn't dedup plan creates — caller is
+ *  responsible for caching the returned id so we don't multi-create. */
+export async function createPlan(args: {
+  period: 'monthly' | 'yearly'
+  interval: number               // 3 for quarterly when period=monthly
+  amount_paise: number           // per-period charge in paise
+  name: string                   // human label e.g. "Frequency Growth — Quarterly"
+  description?: string
+  notes?: Record<string, string>
+}): Promise<RpPlan> {
+  return rpFetch<RpPlan>('/plans', {
+    method: 'POST',
+    body: JSON.stringify({
+      period:   args.period,
+      interval: args.interval,
+      item: {
+        name:        args.name,
+        amount:      args.amount_paise,
+        currency:    'INR',
+        description: args.description,
+      },
+      notes: args.notes,
+    }),
+  })
+}
+
+// ─── Payments / Refunds ────────────────────────────────────────────────
+
+export interface RpPayment {
+  id: string
+  entity: 'payment'
+  amount: number                // paise
+  currency: 'INR'
+  status: 'created' | 'authorized' | 'captured' | 'refunded' | 'failed'
+  invoice_id?: string
+  subscription_id?: string
+  email?: string
+  contact?: string
+  /** Sum of all refunds against this payment, in paise. Razorpay only
+   *  populates this on the GET /payments/:id detail endpoint — list
+   *  variants may not include it. Treat undefined as 0 for safety. */
+  amount_refunded?: number
+  refund_status?: 'null' | 'partial' | 'full' | null
+  created_at: number
+}
+
+/** List payments for a subscription. Used by the refund flow to find the
+ *  most recent captured payment to refund. Razorpay returns newest-first. */
+export async function listSubscriptionPayments(subscriptionId: string): Promise<RpPayment[]> {
+  const r = await rpFetch<{ items: RpPayment[]; count: number }>(
+    `/subscriptions/${subscriptionId}/payments?count=10`,
+  )
+  return r.items ?? []
+}
+
+/** Fetch a single payment by id. Returns the authoritative `amount`
+ *  and (critically) the current `amount_refunded` — both needed to
+ *  compute the *remaining* refundable balance before issuing another
+ *  partial refund. Security audit 2026-05-19 flagged that revshare
+ *  credit was using the webhook-supplied payment.amount as the cap,
+ *  which is stale if anyone else (manual ops, customer-initiated
+ *  refund) has already partially refunded the same payment. */
+export async function fetchPayment(paymentId: string): Promise<RpPayment> {
+  return rpFetch<RpPayment>(`/payments/${paymentId}`)
+}
+
+export interface RpRefund {
+  id: string                    // 'rfnd_XXX'
+  entity: 'refund'
+  amount: number                // paise
+  currency: 'INR'
+  payment_id: string
+  status: 'pending' | 'processed' | 'failed'
+  speed_processed?: 'normal' | 'instant'
+  notes?: Record<string, string>
+  created_at: number
+}
+
+/** Initiate a refund on a captured payment. Omit `amount_paise` to refund
+ *  the full payment. Razorpay processes refunds in 5-7 business days unless
+ *  speed='optimum' (which requires opt-in on the account). */
+export async function createRefund(args: {
+  payment_id: string
+  amount_paise?: number           // omit for full refund
+  notes?: Record<string, string>
+}): Promise<RpRefund> {
+  const body: any = { speed: 'normal' }
+  if (args.amount_paise) body.amount = args.amount_paise
+  if (args.notes)        body.notes  = args.notes
+  return rpFetch<RpRefund>(`/payments/${args.payment_id}/refund`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
 /** Schedule cancellation at the end of the current billing period. Razorpay
  *  passes `cancel_at_cycle_end=1` to defer the actual cancel until period_end,
  *  so the user keeps access until the renewal date they already paid for. */
