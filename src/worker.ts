@@ -39,6 +39,19 @@ import { startWebhookInboundWorker, startWebhookOutboundWorker } from './workers
 import { startShopifyAbandonedCartPollerWorker } from './workers/shopify-abandoned-cart-poller'
 // P1 #12 — Agency monthly revshare payout aggregator (migration 079)
 import { startAgencyPayoutAggregatorWorker } from './workers/agency-payout-aggregator'
+// Phase 3 — SLA monitor (migration 095). Every 30s scans open
+// conversations + emits sla_breaches rows on threshold crossings.
+import { startSlaMonitorWorker } from './workers/sla-monitor'
+// Phase 2 v1.1 — AI Agent embeddings worker (migration 099). Embeds
+// new kb_chunks via OpenAI text-embedding-3-small so the /test endpoint
+// can use vector retrieval instead of keyword overlap. Backfill cron
+// catches anything that fell off the queue.
+import { startKbEmbedWorker } from './workers/kb-embed'
+// Phase 4 v1.3 — governance janitor (migration 100/102). Hourly tick
+// flips pending → expired for actions whose expires_at < now(). Closes
+// the "ghost proposer" attack surface where an offboarded user's
+// stale proposal could become single-approver.
+import { startGovernanceJanitorWorker } from './workers/governance-janitor'
 // P1 #18 — Bulk contact import processor (migration 084)
 import { startContactImportProcessorWorker } from './workers/contact-import-processor'
 // P2 #20 — Voice note transcription (migration 086)
@@ -88,6 +101,19 @@ async function main() {
   // gates on date-of-month=1 inside the handler. Emits one agency_payouts
   // row per agency aggregating last month's accrued ledger entries.
   const apa = await startAgencyPayoutAggregatorWorker()
+
+  // Phase 3 — SLA monitor. Runs every 30s, computes breach state for
+  // every open conversation in every tenant with sla_configs rows.
+  const slam = await startSlaMonitorWorker()
+
+  // Phase 2 v1.1 — KB chunk embeddings. Job-driven (POST /api/ai-agent/
+  // sources/qa fires kbEmbedQueue.add per new chunk) + 5-min backfill
+  // cron for anything that fell off the queue.
+  const kbe = await startKbEmbedWorker()
+
+  // Phase 4 v1.3 — governance janitor. Hourly tick to expire stale
+  // pending governance proposals (audit fix H5).
+  const gov = await startGovernanceJanitorWorker()
 
   // P1 #18 — Bulk contact import processor. BullMQ-driven; one job per
   // contact_import_jobs row. Two phases: dry-run (parse + validate +

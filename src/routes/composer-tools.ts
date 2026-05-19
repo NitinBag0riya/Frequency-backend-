@@ -334,7 +334,14 @@ export function createComposerToolsRouter(deps: Deps): express.Router {
   r.get('/api/quick-replies/suggest', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const userId   = (req as any).user?.id as string
+    // Two accepted context inputs (caller passes whichever they have):
+    //   conversation_id — uuid; FE that has a conversations row
+    //   contact_phone   — string; FE inbox composer doesn't get a
+    //                     conversation_id today, keys on (channel, phone)
+    // Both resolve to the same downstream context (contact + deal + last
+    // inbound intent). When both are supplied, conversation_id wins.
     const conversationId = String(req.query.conversation_id ?? '')
+    const contactPhone   = String(req.query.contact_phone ?? '').trim()
     const limit = Math.min(20, Math.max(1, parseInt(String(req.query.limit ?? '5'), 10) || 5))
 
     // Pull candidate library (workspace + team + own personal).
@@ -350,47 +357,67 @@ export function createComposerToolsRouter(deps: Deps): express.Router {
     let intents: string[] = []
     let contactCtx: InterpolationContext['contact'] = {}
     let dealCtx: InterpolationContext['deal'] = {}
+
+    // Step 1: resolve the contact row.
+    //   conversation_id path → look up conversations.contact_id
+    //   contact_phone path  → look up contacts by (tenant, phone)
+    let contactId: string | null = null
+    let contactName = ''
+    let contactPhoneResolved = ''
     if (conversationId) {
-      // Get the conversation's contact + linked deal + last inbound msg.
       const { data: convo } = await supabase.from('conversations')
         .select('contact_id')
         .eq('id', conversationId).eq('tenant_id', tenantId)
         .maybeSingle()
-      if (convo?.contact_id) {
+      contactId = convo?.contact_id ?? null
+    } else if (contactPhone) {
+      const { data: c } = await supabase.from('contacts')
+        .select('id, name, phone')
+        .eq('tenant_id', tenantId).eq('phone', contactPhone)
+        .maybeSingle()
+      contactId           = c?.id ?? null
+      contactName         = c?.name ?? ''
+      contactPhoneResolved = c?.phone ?? contactPhone
+    }
+    if (contactId) {
+      if (!contactName) {
         const { data: contact } = await supabase.from('contacts')
           .select('name, phone')
-          .eq('id', convo.contact_id).maybeSingle()
-        if (contact) {
-          const parts = String(contact.name ?? '').trim().split(/\s+/)
-          contactCtx = {
-            first_name: parts[0] ?? '',
-            last_name:  parts.slice(1).join(' '),
-            full_name:  contact.name ?? '',
-            phone:      contact.phone ?? '',
-          }
+          .eq('id', contactId).maybeSingle()
+        contactName = contact?.name ?? ''
+        contactPhoneResolved = contact?.phone ?? contactPhoneResolved
+      }
+      const parts = String(contactName).trim().split(/\s+/)
+      contactCtx = {
+        first_name: parts[0] ?? '',
+        last_name:  parts.slice(1).join(' '),
+        full_name:  contactName,
+        phone:      contactPhoneResolved,
+      }
+      // Most-recent deal for this contact in any non-closed stage.
+      const { data: deal } = await supabase.from('crm_deals')
+        .select('title, stage_id, value_inr_paise, owner_user_id, crm_stages:stage_id(name)')
+        .eq('contact_id', contactId)
+        .eq('tenant_id', tenantId)
+        .is('closed_at', null)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (deal) {
+        const stageRow = Array.isArray((deal as any).crm_stages) ? (deal as any).crm_stages[0] : (deal as any).crm_stages
+        dealStage = stageRow?.name ?? null
+        dealCtx = {
+          title:      deal.title ?? '',
+          stage:      dealStage ?? '',
+          amount_inr: Number(deal.value_inr_paise ?? 0) / 100,
         }
-        // Most-recent deal for this contact in any non-closed stage.
-        const { data: deal } = await supabase.from('crm_deals')
-          .select('title, stage_id, value_inr_paise, owner_user_id, crm_stages:stage_id(name)')
-          .eq('contact_id', convo.contact_id)
-          .eq('tenant_id', tenantId)
-          .is('closed_at', null)
-          .order('updated_at', { ascending: false })
-          .limit(1)
-          .maybeSingle()
-        if (deal) {
-          const stageRow = Array.isArray((deal as any).crm_stages) ? (deal as any).crm_stages[0] : (deal as any).crm_stages
-          dealStage = stageRow?.name ?? null
-          dealCtx = {
-            title:      deal.title ?? '',
-            stage:      dealStage ?? '',
-            amount_inr: Number(deal.value_inr_paise ?? 0) / 100,
-          }
-        }
-        // Intent from the last inbound message.
+      }
+      // Intent from the last inbound message — keyed on contact_phone
+      // which the messages table indexes on (no contact_id FK there).
+      if (contactPhoneResolved) {
         const { data: lastInbound } = await supabase.from('messages')
           .select('content')
-          .eq('contact_phone', contactCtx.phone)
+          .eq('contact_phone', contactPhoneResolved)
           .eq('direction', 'inbound')
           .order('created_at', { ascending: false })
           .limit(1)

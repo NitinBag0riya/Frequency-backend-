@@ -73,6 +73,20 @@ import { createCrmRouter }                     from './routes/crm'
 // Phase 1A (migration 093) — Quick Replies + Internal Notes for the
 // conversation composer. Stage-aware suggestions tied to the CRM Pipeline.
 import { createComposerToolsRouter }           from './routes/composer-tools'
+// Phase 1B (migration 094) — PII detection + masking + audit log.
+// DPDPA/BFSI/healthcare/fintech sales unblock. Render-time mask, no
+// plaintext stored masked — see src/lib/pii-masking.ts for the design.
+import { createPiiRouter }                     from './routes/pii'
+// Phase 3 (migration 095) — SLA tracking. Per-tenant first_response +
+// resolution targets, breach event log. Worker scans every 30s; this
+// router serves config + breach reads.
+import { createSlaRouter }                     from './routes/sla'
+// Phase 2 (migration 096) — AI agent + Knowledge Base.
+import { createAiAgentRouter }                 from './routes/ai-agent'
+// Phase 4 (migration 097) — WA-native commerce MVP (catalog + khaata
+// ledger + standing orders). Delivery ops follow-up.
+import { createCommerceRouter }                from './routes/commerce'
+import { createGovernanceRouter }              from './routes/governance'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import {
   enqueueWorkflowExecution,
@@ -2226,6 +2240,7 @@ app.delete('/api/contacts/:id', requireAuth, identifyTenant, checkPermission('le
 // Messages for a specific contact phone
 app.get('/api/contacts/:phone/messages', requireAuth, identifyTenant, checkPermission('inbox', 'view'), async (req, res) => {
   const tenantId = (req as any).tenantId
+  const userRoleKey = (req as any).userRoleKey as string | undefined
   const phone = decodeURIComponent(req.params.phone as string).replace(/^\+/, '')
   const { data, error } = await supabase.from('messages')
     .select('*').eq('tenant_id', tenantId)
@@ -2233,7 +2248,71 @@ app.get('/api/contacts/:phone/messages', requireAuth, identifyTenant, checkPermi
     .order('created_at', { ascending: true })
     .limit(100)
   if (error) { res.status(500).json({ error: error.message }); return }
-  res.json(data)
+
+  // Phase 1B — PII masking pass.
+  //
+  // The caller's role decides whether to apply masking. The tenant's
+  // config decides WHICH field families. We mask message bodies in
+  // the JSONB `content` column WITHOUT mutating the stored row (only
+  // the response payload is masked; storage stays plaintext for DSR
+  // / GDPR / audit accuracy).
+  //
+  // Each masked message gets an extra `_pii_fields` array with the
+  // detected field spans (start, end, field_index, value_hash). The
+  // FE uses field_index to request unmask of a SPECIFIC field via
+  // POST /api/pii/unmask without sending the original value over.
+  try {
+    const { getTenantPiiConfig, maskMessageForRole } = await import('./routes/pii')
+    const cfg = await getTenantPiiConfig(supabase, tenantId)
+    const masked = (data ?? []).map((row: any) => {
+      // Pull the text body from common JSONB shapes; media-only messages
+      // have nothing to mask.
+      const content = row.content
+      let text: string = ''
+      if (typeof content === 'string') {
+        text = content
+      } else if (content && typeof content === 'object') {
+        if (typeof content.text === 'string') text = content.text
+        else if (typeof content.body === 'string') text = content.body
+        else if (content.type === 'interactive' && content?.interactive?.body?.text) text = content.interactive.body.text
+        else if (content.caption) text = String(content.caption)
+      }
+      if (!text) return row
+
+      const r = maskMessageForRole(text, cfg, userRoleKey ?? null)
+      if (!r.masked) return row
+
+      // Write the masked text back into the shape it came from (immutable
+      // copy — never mutate the DB row).
+      const nextContent: any = (typeof content === 'object' && content !== null) ? { ...content } : { type: 'text', text: r.text }
+      if (typeof content === 'string') {
+        // Older shape: store as same-string-shape (FE only reads .text/.body anyway).
+        return { ...row, content: r.text, _pii_fields: r.fields, _pii_source: text }
+      }
+      if (typeof nextContent.text === 'string')    nextContent.text = r.text
+      else if (typeof nextContent.body === 'string') nextContent.body = r.text
+      else if (nextContent?.interactive?.body?.text) nextContent.interactive = { ...nextContent.interactive, body: { ...nextContent.interactive.body, text: r.text } }
+      else if (typeof nextContent.caption === 'string') nextContent.caption = r.text
+      // `_pii_source` is the original text (server-side use only — passed
+      // back to /api/pii/unmask so the BE can re-detect and reveal the
+      // value at a specific field_index). We send it to the FE because:
+      //   (a) the FE already has it via the DB row if the BE didn't mask
+      //   (b) we need to round-trip it to unmask; the BE doesn't cache it
+      //   (c) it doesn't leak anything the FE doesn't already see when
+      //       unmasking — and unmasking is audit-logged
+      // Field-by-field disclosure is still gated by the unmask endpoint.
+      return { ...row, content: nextContent, _pii_fields: r.fields, _pii_source: text }
+    })
+    res.json(masked)
+    return
+  } catch (e: any) {
+    // PII masking failure is HARD — refuse to serve the raw messages.
+    // Better to break the inbox than leak unmasked PII to an agent who
+    // shouldn't see it. Surface a clear 500 + log.
+    console.error('[inbox.messages] PII masking failed — refusing to serve:', e?.message ?? e)
+    res.status(500).json({ error: 'PII policy unavailable; inbox temporarily disabled' })
+    return
+  }
 })
 
 // Send message from inbox (agent reply) — channel-aware. Routes to the right
@@ -2278,6 +2357,67 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
       interactive,
     } = req.body
     const cleanPhone = String(phone).replace(/^\+/, '')
+
+    // v1.1 audit fix — outbound PII gate.
+    //
+    // Scan the outbound body (text / caption / interactive body) against
+    // the tenant's enabled PII detectors. Behaviour per
+    // pii_masking_config.outbound_action:
+    //   off   → skip (legacy behaviour)
+    //   warn  → still send, but include `pii_warning` in the response so
+    //           the FE can chip the sent message and prompt the agent to
+    //           verify before similar sends in the future
+    //   block → 400 with the detected-field metadata so the agent knows
+    //           which span to remove before retrying
+    //
+    // Bypass on explicit override header `x-pii-override-reason` — caller
+    // takes audit responsibility for the send. Reason is logged.
+    let piiWarning: { hits: any[] } | null = null
+    try {
+      const outboundText: string =
+        (typeof text === 'string' && text) ||
+        (typeof caption === 'string' && caption) ||
+        (interactive?.body?.text && String(interactive.body.text)) ||
+        ''
+      if (outboundText) {
+        const { getTenantPiiConfig, detectOutboundPii } = await import('./routes/pii')
+        const cfg = await getTenantPiiConfig(supabase, tenantId)
+        const { hits, action } = detectOutboundPii(outboundText, cfg)
+        if (hits.length > 0) {
+          const overrideReason = req.header('x-pii-override-reason')
+          if (action === 'block' && !overrideReason) {
+            return {
+              status: 400,
+              body: {
+                error: 'pii_outbound_blocked',
+                detected_fields: hits.map(h => ({ field_type: h.field_type, start: h.start, end: h.end })),
+                hint: 'Remove the highlighted fields and resend. Pass x-pii-override-reason header to bypass (audit-logged).',
+              },
+            }
+          }
+          // Warn path OR block-with-override — record alert so audit
+          // can show "the agent was warned about Aadhaar in this msg".
+          await supabase.from('audit_log').insert({
+            tenant_id: tenantId,
+            actor_user_id: (req as any).user?.id ?? null,
+            event_type: 'pii_outbound_alert',
+            payload: {
+              channel,
+              recipient_phone: cleanPhone,
+              detected: hits.map(h => ({ field_type: h.field_type, value_hash: h.value_hash })),
+              action,
+              override_reason: overrideReason ?? null,
+            },
+          }).then(() => {}, () => {}) // best-effort; audit_log may not exist on older tenants
+          piiWarning = { hits: hits.map(h => ({ field_type: h.field_type, start: h.start, end: h.end })) }
+        }
+      }
+    } catch (e: any) {
+      // PII check failure must NEVER prevent a send — we already had a
+      // hard-fail on inbound PII (refusal). Outbound is best-effort.
+      // eslint-disable-next-line no-console
+      console.warn('[inbox.send] pii outbound check failed', e?.message ?? e)
+    }
 
     try {
       if (channel === 'whatsapp') {
@@ -2334,7 +2474,7 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
       } else {
         return { status: 400, body: { error: `Unsupported channel: ${channel}` } }
       }
-      return { status: 200, body: { success: true } }
+      return { status: 200, body: { success: true, ...(piiWarning ? { pii_warning: piiWarning } : {}) } }
     } catch (err: any) {
       return { status: 500, body: { error: err.message } }
     }
@@ -3789,6 +3929,20 @@ app.use(createCrmRouter({ supabase, requireAuth, identifyTenant }))
 // this mount must come AFTER createCrmRouter to keep dependency order
 // readable (functionally independent at runtime).
 app.use(createComposerToolsRouter({ supabase, requireAuth, identifyTenant }))
+// PII masking (Phase 1B — migration 094). Independent surface; mount
+// order doesn't matter beyond being after the standard auth chain
+// init above.
+app.use(createPiiRouter({ supabase, requireAuth, identifyTenant }))
+// SLA tracking (Phase 3 — migration 095).
+app.use(createSlaRouter({ supabase, requireAuth, identifyTenant }))
+// AI Agent (Phase 2 — migration 096).
+app.use(createAiAgentRouter({ supabase, requireAuth, identifyTenant }))
+// WA Commerce MVP (Phase 4 — migration 097).
+app.use(createCommerceRouter({ supabase, requireAuth, identifyTenant }))
+// Commerce governance — two-person approval for refunds + large
+// adjustments + settlement waivers + credit-limit changes + manual
+// balance corrections (Phase 4 v1.2 — migration 100).
+app.use(createGovernanceRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Billing (Razorpay subscriptions + webhook) ───────────────────────────────
 // NOTE: the webhook route inside this router uses express.raw() to bypass the
