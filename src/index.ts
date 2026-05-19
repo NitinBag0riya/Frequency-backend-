@@ -70,6 +70,9 @@ import { createRedirectRouter }                from './routes/r-redirect'
 import { createBroadcastLinkAnalyticsRouter } from './routes/broadcast-link-analytics'
 // P2 #22 — Sales CRM Lite (migration 087). Pipeline view tied to conversations.
 import { createCrmRouter }                     from './routes/crm'
+// Phase 1A (migration 093) — Quick Replies + Internal Notes for the
+// conversation composer. Stage-aware suggestions tied to the CRM Pipeline.
+import { createComposerToolsRouter }           from './routes/composer-tools'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import {
   enqueueWorkflowExecution,
@@ -3781,6 +3784,11 @@ app.use(createBroadcastLinkAnalyticsRouter({ supabase, requireAuth, identifyTena
 // Pipeline view tied to conversations. Stages + deals + append-only events.
 // Migration 087_sales_crm_lite.sql.
 app.use(createCrmRouter({ supabase, requireAuth, identifyTenant }))
+// Quick Replies + Internal Notes (Phase 1A — migration 093). Stage-aware
+// composer suggestions reuse the CRM tables crm_deals + crm_stages, so
+// this mount must come AFTER createCrmRouter to keep dependency order
+// readable (functionally independent at runtime).
+app.use(createComposerToolsRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Billing (Razorpay subscriptions + webhook) ───────────────────────────────
 // NOTE: the webhook route inside this router uses express.raw() to bypass the
