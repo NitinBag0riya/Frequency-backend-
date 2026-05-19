@@ -298,7 +298,40 @@ export function createCrmRouter(deps: Deps): express.Router {
         payload:     ev.payload,
       })
     }
+
+    // v1.1 audit fix — drop an internal note on the deal so the next
+    // agent opening the conversation sees the lifecycle event inline
+    // with their other notes. Best-effort: if conversation_notes is
+    // missing on older tenants or the insert fails for any reason,
+    // we log + continue (the audit-log event from logEvent is still
+    // the source of truth).
+    try {
+      const fromName = await stageNameById(existing.stage_id)
+      const toName   = await stageNameById(target.id)
+      const isWonLost = events.some(e => e.type === 'won' || e.type === 'lost')
+      const verb = isWonLost
+        ? (target.is_won ? 'won the deal' : 'marked the deal lost')
+        : `moved this deal: ${fromName ?? '?'} → ${toName ?? '?'}`
+      await supabase.from('conversation_notes').insert({
+        tenant_id:   tenantId,
+        target_type: 'deal',
+        target_id:   dealId,
+        body:        verb,
+        mentions:    [],
+        attachments: [],
+        visibility:  'internal',
+        created_by:  userId,
+      }).then(() => {}, () => {})
+    } catch { /* best effort */ }
+
     return { ok: true, deal: updated }
+  }
+
+  /** Look up a stage's human-readable name. Used by the auto-note builder. */
+  async function stageNameById(stageId: string | null | undefined): Promise<string | null> {
+    if (!stageId) return null
+    const { data } = await supabase.from('crm_stages').select('name').eq('id', stageId).maybeSingle()
+    return (data?.name as string | undefined) ?? null
   }
 
   // ── GET /api/crm/stages ────────────────────────────────────────────────────
