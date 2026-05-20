@@ -926,54 +926,5 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       res.json({ ok: true, replayed: id })
     })
 
-  // ── Governance audit (Phase 4 v1.3) ──────────────────────────────────
-  //
-  // Read-only cross-tenant view of commerce_governance_actions for
-  // compliance audit. Filters: status, action_type, tenant_id (optional),
-  // date range. Joined with tenants + agency_sub_accounts so the FE can
-  // render "which workspace", "linked to which agency", "current
-  // approval mode" without round-tripping.
-  //
-  // We DELIBERATELY don't expose write actions here. Super-admins
-  // approving on behalf of a tenant would defeat the two-person rule.
-  // If a tenant + their agency are both stuck, the right path is to
-  // help them resolve it inside one of their consoles — not to
-  // shortcut from the platform.
-  r.get('/api/super-admin/governance/actions',
-    requireAuth, requirePlatformPerm(supabase, 'audit', 'view'),
-    async (req, res) => {
-      const status      = req.query.status      ? String(req.query.status)      : null
-      const actionType  = req.query.action_type ? String(req.query.action_type) : null
-      const tenantId    = req.query.tenant_id   ? String(req.query.tenant_id)   : null
-      const limit       = Math.min(parseInt(String(req.query.limit ?? '200'), 10) || 200, 1000)
-      let q = supabase.from('commerce_governance_actions')
-        .select('*, tenants:tenant_id(id, business_name, slug)')
-        .order('created_at', { ascending: false })
-        .limit(limit)
-      if (status)     q = q.eq('status', status)
-      if (actionType) q = q.eq('action_type', actionType)
-      if (tenantId)   q = q.eq('tenant_id', tenantId)
-      const { data, error } = await q
-      if (error) { res.status(500).json({ error: error.message }); return }
-      res.json({ data: data ?? [] })
-    })
-
-  // Aggregate counts for the audit dashboard hero strip.
-  r.get('/api/super-admin/governance/summary',
-    requireAuth, requirePlatformPerm(supabase, 'audit', 'view'),
-    async (_req, res) => {
-      const statuses = ['pending', 'applied', 'rejected', 'expired', 'failed'] as const
-      const out: Record<string, number> = {}
-      // One head-count query per status. Five small queries is fine here;
-      // the result feeds a hero strip on a low-frequency page.
-      for (const s of statuses) {
-        const { count } = await supabase.from('commerce_governance_actions')
-          .select('id', { count: 'exact', head: true })
-          .eq('status', s)
-        out[s] = count ?? 0
-      }
-      res.json({ data: out })
-    })
-
   return r
 }

@@ -81,12 +81,6 @@ import { createPiiRouter }                     from './routes/pii'
 // resolution targets, breach event log. Worker scans every 30s; this
 // router serves config + breach reads.
 import { createSlaRouter }                     from './routes/sla'
-// Phase 2 (migration 096) — AI agent + Knowledge Base.
-import { createAiAgentRouter }                 from './routes/ai-agent'
-// Phase 4 (migration 097) — WA-native commerce MVP (catalog + khaata
-// ledger + standing orders). Delivery ops follow-up.
-import { createCommerceRouter }                from './routes/commerce'
-import { createGovernanceRouter }              from './routes/governance'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import {
   enqueueWorkflowExecution,
@@ -3935,14 +3929,6 @@ app.use(createComposerToolsRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createPiiRouter({ supabase, requireAuth, identifyTenant }))
 // SLA tracking (Phase 3 — migration 095).
 app.use(createSlaRouter({ supabase, requireAuth, identifyTenant }))
-// AI Agent (Phase 2 — migration 096).
-app.use(createAiAgentRouter({ supabase, requireAuth, identifyTenant }))
-// WA Commerce MVP (Phase 4 — migration 097).
-app.use(createCommerceRouter({ supabase, requireAuth, identifyTenant }))
-// Commerce governance — two-person approval for refunds + large
-// adjustments + settlement waivers + credit-limit changes + manual
-// balance corrections (Phase 4 v1.2 — migration 100).
-app.use(createGovernanceRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Billing (Razorpay subscriptions + webhook) ───────────────────────────────
 // NOTE: the webhook route inside this router uses express.raw() to bypass the

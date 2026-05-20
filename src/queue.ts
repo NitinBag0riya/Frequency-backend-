@@ -88,13 +88,6 @@ export const Q = {
   // idempotency — BullMQ rejects duplicate adds for the same logical
   // breach, the enqueuer swallows the error.
   breachNotification:   'breach-notification',
-  // ── AI Agent KB embeddings (migration 096 + 099) ─────────────────────────
-  // Fired when a new kb_chunks row needs an embedding. Worker calls
-  // OpenAI text-embedding-3-small (1536 dim → matches schema), writes
-  // the vector back, and the /api/ai-agent/test endpoint switches to
-  // vector retrieval via match_kb_chunks RPC. Keyword overlap remains
-  // the fallback when chunks haven't been embedded yet.
-  kbEmbed:              'kb.embed',
 } as const
 
 // ── Job payload types ─────────────────────────────────────────────────────────
@@ -387,20 +380,6 @@ export const webhookOutboundDeadQueue = new Queue<WebhookOutboundJob & { deadLet
 export const breachNotificationQueue = new Queue<BreachNotificationJob>(Q.breachNotification, {
   connection,
   defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 30_000 } },
-})
-
-// ── KB embedding queue (migration 099) ─────────────────────────────────────
-// One job per kb_chunks row that lacks an embedding. The route handlers
-// (POST /api/ai-agent/sources/qa) enqueue immediately after insert; a
-// backfill cron in workers/kb-embed.ts scans for stale rows every 5min.
-// Idempotency: jobId = `kb-embed:${chunk_id}` so an in-flight or queued
-// job for the same chunk dedupes.
-export interface KbEmbedJob {
-  chunk_id: string
-}
-export const kbEmbedQueue = new Queue<KbEmbedJob>(Q.kbEmbed, {
-  connection,
-  defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 5_000 } },
 })
 
 /**
