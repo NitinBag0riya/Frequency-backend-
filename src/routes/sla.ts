@@ -95,13 +95,19 @@ export function createSlaRouter(deps: Deps): express.Router {
     // Destructure and re-assemble so tenant_id (route-derived) is the
     // SOURCE OF TRUTH and never overridable by client body.
     const { team_id, channel, first_response_seconds, resolution_seconds, working_hours_json, paused } = parsed.data
+    // working_hours_json is NOT NULL with default '{}'::jsonb (migration
+    // 095). Sending `null` explicitly violates the constraint and returns
+    // 500. Pass {} when omitted so the upsert respects the default-on-
+    // insert / leaves-untouched-on-update semantics the schema intended.
+    // (Caught by the behavioral smoke harness: POST /api/sla/config 500
+    // 'null value in column "working_hours_json"…'.)
     const { data, error } = await supabase.from('sla_configs').upsert({
       tenant_id: tenantId,
       team_id:   team_id ?? null,
       channel,
       first_response_seconds,
       resolution_seconds,
-      working_hours_json: working_hours_json ?? null,
+      working_hours_json: working_hours_json ?? {},
       paused:    paused ?? false,
       updated_at: new Date().toISOString(),
     }, {
