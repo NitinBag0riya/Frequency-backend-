@@ -81,6 +81,9 @@ import { createPiiRouter }                     from './routes/pii'
 // resolution targets, breach event log. Worker scans every 30s; this
 // router serves config + breach reads.
 import { createSlaRouter }                     from './routes/sla'
+import {
+  PICKER_CATALOG, composePickerPromptSection, flattenPickers,
+} from './connectors/picker-catalog'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import {
   enqueueWorkflowExecution,
@@ -975,6 +978,23 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete' | s
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'Frequency-server' }))
 
+// ── Workflow Builder · Picker Catalog ──────────────────────────────────────
+// Single source of truth for which fields back live-data dropdowns in
+// the AI-generated workflow blueprint. The FE reads this on mount and
+// dispatches to DynamicLiveDataPicker for any missing_config field whose
+// name matches a catalog entry. Adding a new app to Frequency's
+// workflow builder is a 10-line edit to connectors/picker-catalog.ts —
+// the prompt composer + this endpoint + the FE picker all read from
+// that same registry, no other files change. No auth gate — the catalog
+// describes shape, not tenant data. Live-data resolution still goes
+// through the auth-gated app endpoints (e.g. /api/google/spreadsheets).
+app.get('/api/workflow-builder/picker-catalog', (_req, res) => {
+  res.json({
+    categories: PICKER_CATALOG,
+    fields: flattenPickers(),
+  })
+})
+
 // ── NLP Parse (streaming) ─────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are a workflow architect for Frequency — a WhatsApp Business automation platform that also integrates with email, Google Sheets, CRMs, and payment systems.
 
@@ -1004,132 +1024,8 @@ EMAIL RULES (enforce for trigger_email_received / send_email / forward_email nod
 - Always flag missing OAuth / API credentials in missing_config
 - forward_email should preserve original sender in the forwarded body when possible
 
-PICKER FIELDS (CRITICAL — universal catalog covering every Frequency surface):
+${composePickerPromptSection()}
 
-When the user's intent implies a SPECIFIC resource the FE can select from a live list,
-DO NOT emit a free-form text field. Emit a \`missing_config\` entry with the EXACT
-field name + EXACT \`type\` value below. The FE renders a live picker for each one,
-pre-populated from the tenant's data. Always mark these \`required: true\` — the
-workflow cannot run without them.
-
-═══════════════════════════════════════════════════════════════════════════════
-A. FREQUENCY TABLES (internal lead_tables — the user's own database tables)
-═══════════════════════════════════════════════════════════════════════════════
-Trigger phrases: "my leads table", "my contacts table", "my data table",
-                 "rows in my [name] table", "when a row is created/updated"
-
-- field: "table_id",              type: "select", placeholder: "Pick a table"
-- field: "operation_table",       type: "select", placeholder: "Pick an operation",
-                                  options: ["find_row","create_row","update_row","upsert_row","delete_row","filter_rows"]
-- field: "column_name_<purpose>", type: "select", placeholder: "Pick the <purpose> column", depends_on: "table_id"
-- field: "column_value_<purpose>",type: "select", placeholder: "Pick the <purpose> value", depends_on: "column_name_<purpose>"
-- field: "row_id",                type: "text",   placeholder: "Row ID or {{variable}}"   (used by update/delete)
-
-═══════════════════════════════════════════════════════════════════════════════
-B. CONVERSATIONS / INBOX
-═══════════════════════════════════════════════════════════════════════════════
-Trigger phrases: "assign to agent", "tag conversation", "use my quick reply",
-                 "send via my WhatsApp number", "mark as snoozed/closed"
-
-- field: "channel",               type: "select", options: ["whatsapp","instagram","telegram"]
-- field: "from_phone_number_id",  type: "select", placeholder: "Pick the sending WA number"
-- field: "quick_reply_id",        type: "select", placeholder: "Pick a quick reply"
-- field: "assigned_agent_id",     type: "select", placeholder: "Pick an agent"
-- field: "team_id",               type: "select", placeholder: "Pick a team"
-- field: "tag_id",                type: "select", placeholder: "Pick a tag"
-- field: "inbox_folder",          type: "select", options: ["open","snoozed","closed","mine","unassigned"]
-
-═══════════════════════════════════════════════════════════════════════════════
-C. CAMPAIGNS / BROADCASTS / SEGMENTS
-═══════════════════════════════════════════════════════════════════════════════
-Trigger phrases: "send a campaign", "trigger broadcast", "all hot leads",
-                 "premium customers segment"
-
-- field: "campaign_id",           type: "select", placeholder: "Pick a campaign"
-- field: "broadcast_id",          type: "select", placeholder: "Pick a broadcast"
-- field: "segment_id",            type: "select", placeholder: "Pick a contact segment"
-- field: "template_name",         type: "template_picker", placeholder: "Pick an approved WA template"
-- field: "template_language",     type: "select", options: ["en","en_US","hi","hi_IN","mr","ta","te","bn","gu"]
-
-═══════════════════════════════════════════════════════════════════════════════
-D. CRM PIPELINE (deals, stages)
-═══════════════════════════════════════════════════════════════════════════════
-Trigger phrases: "move to [stage] stage", "won deal", "close lost", "kanban"
-
-- field: "pipeline_stage_id",     type: "select", placeholder: "Pick a CRM stage"
-- field: "deal_id",               type: "text",   placeholder: "Deal ID or {{variable}}"
-- field: "operation_deal",        type: "select",
-                                  options: ["move_stage","assign_owner","add_tag","add_note","mark_won","mark_lost"]
-
-═══════════════════════════════════════════════════════════════════════════════
-E. GOOGLE WORKSPACE (Sheets, Calendar, Gmail)
-═══════════════════════════════════════════════════════════════════════════════
-Trigger phrases: "Google Sheet", "spreadsheet", "calendar booking", "Gmail filter"
-
-- field: "spreadsheet_id",        type: "select", placeholder: "Pick a Google Sheet"
-- field: "sheet_tab_name",        type: "select", placeholder: "Pick a tab",        depends_on: "spreadsheet_id"
-- field: "column_name_<purpose>", type: "select", placeholder: "Pick the <purpose> column", depends_on: "sheet_tab_name"
-- field: "column_value_<purpose>",type: "select", placeholder: "Pick the <purpose> value", depends_on: "column_name_<purpose>"
-- field: "operation_sheet",       type: "select",
-                                  options: ["append_row","update_row","read_range","find_row","upsert_row"]
-- field: "calendar_id",           type: "select", placeholder: "Pick a calendar"
-- field: "gmail_account_id",      type: "select", placeholder: "Pick a Gmail account"
-
-═══════════════════════════════════════════════════════════════════════════════
-F. PAYMENTS (Razorpay — extensible to Stripe/PayPal etc.)
-═══════════════════════════════════════════════════════════════════════════════
-Trigger phrases: "Razorpay", "payment link", "subscription", "refund",
-                 "check payment status"
-
-ALWAYS emit operation_razorpay FIRST. Then emit ONLY the additional fields
-the chosen operation needs (see conditional column).
-
-- field: "operation_razorpay",    type: "select", REQUIRED FIRST,
-                                  options: ["create_payment_link","check_payment_status","refund_payment",
-                                            "create_subscription","cancel_subscription","fetch_payment"]
-Then per-op:
-  create_payment_link → amount_paise (number), customer_email (email), description (text)
-  check_payment_status / refund_payment / fetch_payment → razorpay_payment_id (text)
-  create_subscription / cancel_subscription → razorpay_plan_id (select), razorpay_subscription_id (text)
-
-═══════════════════════════════════════════════════════════════════════════════
-G. EMAIL (Gmail / Outlook / Resend / SendGrid)
-═══════════════════════════════════════════════════════════════════════════════
-- field: "email_provider",        type: "select", options: ["gmail","outlook","resend","sendgrid","mailgun","ses","smtp"]
-- field: "from_email",            type: "email"
-- field: "to_email" / "to_list_segment_id"
-- field: "filter_subject" / "filter_from_email"
-
-═══════════════════════════════════════════════════════════════════════════════
-H. GENERIC CONNECTORS (Shopify, custom HTTP, webhooks)
-═══════════════════════════════════════════════════════════════════════════════
-- field: "integration_<key>",     type: "integration_picker", placeholder: "Connect <App>"
-- field: "api_endpoint",          type: "url"
-- field: "http_method",           type: "select", options: ["GET","POST","PUT","PATCH","DELETE"]
-- field: "webhook_url",           type: "url"
-- field: "webhook_secret",        type: "text"
-
-═══════════════════════════════════════════════════════════════════════════════
-OPERATION-PICKER PATTERN (universal rule)
-═══════════════════════════════════════════════════════════════════════════════
-For any resource that supports MULTIPLE operations (table, sheet, razorpay, deal):
-1. Emit the operation_<resource> picker first.
-2. Emit ONLY the additional pickers the chosen operation needs.
-3. The FE refreshes the dependent picker set when the operation changes.
-
-═══════════════════════════════════════════════════════════════════════════════
-CASCADING RULE (universal)
-═══════════════════════════════════════════════════════════════════════════════
-When a picker depends on an upstream picker's value, emit them ALL in the same
-node's missing_config[] AND set \`depends_on\` to the upstream field's name.
-The FE walks the chain automatically — without \`depends_on\` the FE has to
-guess.
-
-CHAIN EXAMPLES (memorize these patterns):
-- Sheets:  spreadsheet_id → sheet_tab_name → column_name_status → column_value_status
-- Tables:  table_id → column_name_status → column_value_status
-- Razorpay:operation_razorpay → (per-op fields)
-- Deal:    deal_id → operation_deal → (stage_id when op=move_stage)
 
 OUTPUT SCHEMA (omit keys with null / empty array values):
 {
