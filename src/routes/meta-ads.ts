@@ -267,10 +267,13 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
   })
 
   r.get('/api/meta-ads/leads', ...guardView, async (req, res) => {
-    // Leads land in `leads` (lead_table-backed). Surface those that came in
-    // through Meta Lead Ads — tagged with source='meta_lead_ad'.
+    // Leads land in `lead_rows` (was `leads` pre multi-tenant migration —
+    // 008/013 renamed; this handler still pointed at the dropped name
+    // and 500'd in production until smoke caught it). Surface rows that
+    // came in through Meta Lead Ads — tagged with source='meta_lead_ad'
+    // in the jsonb `data` column.
     const tenantId = (req as any).tenantId
-    const { data, error } = await supabase.from('leads')
+    const { data, error } = await supabase.from('lead_rows')
       .select('*').eq('tenant_id', tenantId).contains('data', { source: 'meta_lead_ad' })
       .order('created_at', { ascending: false }).limit(100)
     if (error) { res.status(500).json({ error: error.message }); return }

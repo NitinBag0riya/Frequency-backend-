@@ -68,6 +68,9 @@ const PUBLIC_PATHS = new Set<string>([
   '/api/ping',
   '/api/features',
   '/api/workflow-templates',
+  // Public invite preview — drives AcceptInvitePage with ?token=. 400 'token
+  // required' is the correct response when no token supplied.
+  '/api/team/invite-info',
 ])
 
 // Paths where the auto-probe should SKIP entirely (require special data

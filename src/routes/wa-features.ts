@@ -166,8 +166,12 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       const tableId = req.body.lead_table_id
       const mapping = req.body.mapping ?? {}   // { name: 'col_name', price: 'col_price', ... }
       if (!tableId) { res.status(400).json({ error: 'lead_table_id required' }); return }
-      const { data: leads } = await supabase.from('leads')
-        .select('id, data').eq('lead_table_id', tableId).eq('tenant_id', tenantId)
+      // `leads` table was renamed to `lead_rows`; the join column was
+      // `lead_table_id` then but is plain `table_id` on lead_rows. Both
+      // were stale — fixed together. Caught by behavioral smoke (other
+      // call sites with the same anti-pattern fixed in the same commit).
+      const { data: leads } = await supabase.from('lead_rows')
+        .select('id, data').eq('table_id', tableId).eq('tenant_id', tenantId)
       if (!leads) { res.status(404).json({ error: 'Table empty or not found' }); return }
       const inserts = leads.map(l => ({
         tenant_id: tenantId,

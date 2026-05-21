@@ -1065,8 +1065,12 @@ export function createWaCallingRouter(deps: Deps): express.Router {
     async (req, res) => {
       const tenantId = (req as any).tenantId as string
       const leadId   = String(req.params.id)
+      // The 'leads' table was renamed to 'lead_rows' by the multi-tenant
+      // migrations (008–013); this handler still referenced the old name
+      // and always 500'd in production. Caught by the behavioral smoke
+      // harness. lead_rows has the same id/tenant_id/data columns.
       const { data: lead, error } = await supabase
-        .from('leads')
+        .from('lead_rows')
         .select('id, tenant_id, data')
         .eq('id', leadId).eq('tenant_id', tenantId).maybeSingle()
       if (error) { res.status(500).json({ error: error.message }); return }
