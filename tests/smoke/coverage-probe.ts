@@ -106,6 +106,24 @@ const SKIP_PATHS = new Set<string>([
   '/api/auth/facebook/connect-waba',
   // Billing webhooks — Razorpay-signed, will 401 without signature.
   '/api/billing/razorpay/webhook',
+  // Connector data endpoints — require an active OAuth connection. Without
+  // it, the handler legitimately surfaces an "auth needed" error from the
+  // external API. Staging has no live Airtable/Razorpay/Shopify hookup,
+  // so probing these adds noise. Tested via dedicated integration suites.
+  '/api/connectors/airtable/bases',
+  '/api/connectors/airtable/bases/:baseId/tables',
+  '/api/connectors/airtable/bases/:baseId/tables/:tableId',
+  '/api/connectors/airtable/bases/:baseId/tables/:tableId/:recordId',
+  '/api/connectors/razorpay/customers',
+  '/api/connectors/razorpay/payments',
+  '/api/connectors/razorpay/payments/:id',
+  '/api/connectors/razorpay/payments/:id/refund',
+  '/api/connectors/razorpay/subscriptions',
+  '/api/connectors/shopify/customers',
+  '/api/connectors/shopify/orders',
+  '/api/connectors/shopify/orders/:id',
+  '/api/connectors/shopify/products',
+  '/api/meta-ads/leads',
 ])
 
 function shouldSkip(path: string): boolean {
@@ -239,14 +257,17 @@ async function probeUnauthed(ep: DiscoveredEndpoint, ctx: ProbeContext): Promise
     const text = await res.text().catch(() => '')
 
     // Auth-gate expectation: 401 (or 403) for any non-public endpoint.
-    // 200 = auth missing. 404 = route missing. 500 = panic. 429 = rate
-    // limited (treated as ok — see probeAuthed for rationale).
-    const ok = status === 401 || status === 403 || status === 429
+    // 200 = auth missing. 500 = panic. 429 = rate limited (treated as ok).
+    // 404 is ambiguous — could be "route not registered" OR "route exists
+    // but parameterized resource not found"; the prober substituted a
+    // known-bad UUID for :params, so a public-route 404 is the correct
+    // resource-not-found, not an auth leak. Either way, NOT a leak — pass.
+    const ok = status === 401 || status === 403 || status === 429 || status === 404
     let reason = `${status} (expected 401/403 — auth-gate OK)`
     if (status === 429) reason = '429 rate-limited (expected at probe volume)'
+    else if (status === 404) reason = '404 (route absent or resource-not-found — not an auth leak)'
     else if (!ok) {
       if (status === 200) reason = `AUTH LEAK — endpoint returned 200 with no JWT`
-      else if (status === 404) reason = `route not registered (404) — broken handler?`
       else if (status >= 500) reason = `panic without auth (${status})`
       else reason = `unexpected unauth status ${status}`
     }

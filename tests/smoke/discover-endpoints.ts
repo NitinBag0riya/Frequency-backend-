@@ -30,6 +30,18 @@ export interface DiscoveredEndpoint {
 
 const ROUTE_RE = /(?:^|\s)(?:app|r)\s*\.(get|post|put|patch|delete)\s*\(\s*['"`](\/api\/[^'"`]+)['"`]/g
 
+/**
+ * Comment-line filter. Without this, docstring examples like
+ *   * Apply with: app.post('/api/x', requireAuth, ...)
+ * get matched by the regex and end up in the discovered set as
+ * "POST /api/x", which then 404s on every probe.
+ */
+function isLikelyComment(line: string, startIdx: number): boolean {
+  // Look at the chars before the match for a // or * comment marker.
+  const before = line.slice(0, startIdx)
+  return /(?:^|\s)\/\/|^\s*\*/.test(before)
+}
+
 function* walk(dir: string): Generator<string> {
   for (const entry of readdirSync(dir)) {
     if (entry === 'node_modules' || entry.startsWith('.')) continue
@@ -51,6 +63,7 @@ export function discoverEndpoints(): DiscoveredEndpoint[] {
       ROUTE_RE.lastIndex = 0
       let m: RegExpExecArray | null
       while ((m = ROUTE_RE.exec(line)) !== null) {
+        if (isLikelyComment(line, m.index)) continue
         out.push({
           method: m[1].toUpperCase() as DiscoveredEndpoint['method'],
           path: m[2],
