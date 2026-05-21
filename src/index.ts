@@ -1735,7 +1735,20 @@ app.get('/api/tenants/:id/members', requireAuth, identifyTenant, async (req, res
 
 app.post('/api/onboarding', requireAuth, async (req, res) => {
   const user = (req as any).user
-  const { business_name, full_name, phone } = req.body
+  const { business_name, full_name, phone } = req.body ?? {}
+
+  // Defensive validation — caller must supply business_name + full_name.
+  // Previously this handler would crash deep in the slugify / upsert path
+  // when called with an empty body (smoke harness exposed it as a 500
+  // panic on POST /api/onboarding with body=`{}`).
+  if (typeof business_name !== 'string' || business_name.trim().length === 0) {
+    res.status(400).json({ error: 'business_name is required' })
+    return
+  }
+  if (typeof full_name !== 'string' || full_name.trim().length === 0) {
+    res.status(400).json({ error: 'full_name is required' })
+    return
+  }
 
   // Update Profile
   await supabase.from('profiles').update({
@@ -3812,15 +3825,27 @@ app.get('/api/roles', requireAuth, identifyTenant, checkPermission('settings', '
 
 app.post('/api/roles/permissions', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
   const tenantId = (req as any).tenantId
-  const { role, feature, can_view, can_edit, can_delete } = req.body
-  
-  const { data, error } = await supabase.from('role_permissions').upsert({
+  const { role, feature, can_view, can_edit, can_delete } = req.body ?? {}
+
+  // Defensive validation — empty body would otherwise upsert null into
+  // role + feature (both NOT NULL on role_permissions) and 500. Caught
+  // by the behavioral smoke harness as a coverage-probe panic.
+  if (typeof role !== 'string' || role.trim().length === 0) {
+    res.status(400).json({ error: 'role is required' })
+    return
+  }
+  if (typeof feature !== 'string' || feature.trim().length === 0) {
+    res.status(400).json({ error: 'feature is required' })
+    return
+  }
+
+  const { error } = await supabase.from('role_permissions').upsert({
     tenant_id: tenantId,
     role,
     feature,
-    can_view,
-    can_edit,
-    can_delete,
+    can_view:   typeof can_view === 'boolean'   ? can_view   : false,
+    can_edit:   typeof can_edit === 'boolean'   ? can_edit   : false,
+    can_delete: typeof can_delete === 'boolean' ? can_delete : false,
     updated_at: new Date().toISOString()
   })
 
