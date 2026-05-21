@@ -54,12 +54,17 @@ interface ProbeContext {
 }
 
 // Paths we KNOW are unauthenticated by design (don't fail them for 401-skip).
+// Confirmed by reading the handlers — agency-plans is the public pricing
+// list, connectors/registry feeds the FE AppsModal for logged-out users.
 const PUBLIC_PATHS = new Set<string>([
   '/api/workflow-builder/picker-catalog',
   '/api/changelog',
   '/api/public/incidents',
   '/api/incidents/active',
-  '/api/wa-templates/public', // some are public
+  '/api/wa-templates/public',
+  '/api/agency-plans',
+  '/api/connectors/registry',
+  '/api/plans',
 ])
 
 // Paths where the auto-probe should SKIP entirely (require special data

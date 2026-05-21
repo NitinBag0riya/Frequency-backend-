@@ -67,9 +67,16 @@ export function discoverEndpoints(): DiscoveredEndpoint[] {
     const key = `${e.method} ${e.path}`
     if (!seen.has(key)) seen.set(key, e)
   }
-  return [...seen.values()].sort((a, b) =>
-    a.path === b.path ? a.method.localeCompare(b.method) : a.path.localeCompare(b.path)
-  )
+  // Filter out template-literal noise: routes built with ${var} interpolation
+  // (e.g. `r.get(\`/api/auth/${key}/start\`, ...)`) get matched by the regex
+  // and produce paths like "/api/auth/${key}/start" which are never the
+  // actual mounted route. Real routes are emitted via siblings in the same
+  // loop and already in the set.
+  return [...seen.values()]
+    .filter(e => !e.path.includes('${'))
+    .sort((a, b) =>
+      a.path === b.path ? a.method.localeCompare(b.method) : a.path.localeCompare(b.path)
+    )
 }
 
 if (require.main === module) {
