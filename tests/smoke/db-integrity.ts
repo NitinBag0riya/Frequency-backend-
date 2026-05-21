@@ -151,11 +151,21 @@ export async function runIntegrityChecks(sb: SupabaseClient): Promise<IntegrityR
     const { error } = await sb.from(tbl).select('*', { count: 'exact', head: true })
     // We WANT this to error (table doesn't exist). If it succeeds, the
     // table is back — which means migration 103 was reverted.
-    const pass = !!error && /does not exist|not found|42P01/i.test(error.message)
+    // PostgREST returns "Could not find the table" with code PGRST205
+    // when the table is dropped. The earlier regex only matched
+    // "does not exist" / "not found" / "42P01" and missed PostgREST's
+    // wording, producing false positives that flagged every dropped
+    // table as a regression.
+    const errMsg = error?.message ?? ''
+    const errCode = (error as any)?.code ?? ''
+    const tableAbsent =
+      /does not exist|not found|could not find|42P01/i.test(errMsg) ||
+      errCode === 'PGRST205' || errCode === '42P01'
+    const pass = !!error && tableAbsent
     out.push({
       check: `dropped table ${tbl} stays dropped`,
       pass,
-      detail: pass ? 'OK (table absent)' : `regression: table is back — ${error?.message ?? 'select succeeded'}`,
+      detail: pass ? 'OK (table absent)' : `regression: table is back — ${errMsg || 'select succeeded'}`,
     })
   }
 
