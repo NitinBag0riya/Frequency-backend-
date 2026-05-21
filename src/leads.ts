@@ -344,7 +344,22 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       is_primary:  c.is_primary || i === 0,
       position:    i,
     }))
-    await supabase.from('lead_columns').insert(colRows)
+    // Same silent-failure anti-pattern that bit the Sheets import: a
+    // swallowed insert error left users with a table-but-no-columns
+    // (smoke run caught it returning 200 with 0 columns landing). Surface
+    // the error AND roll back the bare table so the user can retry cleanly.
+    const { error: colErr } = await supabase.from('lead_columns').insert(colRows)
+    if (colErr) {
+      // Roll back the table create — leaving an orphaned table is worse
+      // than a clean failure, and the user will retry from a clean state.
+      await supabase.from('lead_tables').delete().eq('id', table.id)
+      res.status(500).json({
+        error: 'failed to insert columns',
+        detail: colErr.message,
+        hint: 'table was rolled back; please retry'
+      })
+      return
+    }
 
     res.json(table)
   })
