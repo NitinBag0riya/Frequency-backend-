@@ -311,7 +311,17 @@ export function createComposerToolsRouter(deps: Deps): express.Router {
       agent_id:        userId,
       edited:          parsed.data.edited,
     })
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) {
+      // 23503 = foreign_key_violation; caller pointed at a quick_reply that
+      // doesn't exist (or doesn't belong to their tenant). Return 404, not
+      // 500 — same reasoning as the PGRST116 normalization in 5d5a2ca.
+      // Caught by the behavioral smoke harness's coverage probe substituting
+      // a synthetic UUID for :id.
+      const code = (error as any).code
+      const status = code === '23503' ? 404 : 500
+      res.status(status).json({ error: code === '23503' ? 'quick_reply not found' : error.message })
+      return
+    }
     res.json({ success: true })
   })
 
