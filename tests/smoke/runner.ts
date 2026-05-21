@@ -669,21 +669,25 @@ async function testDeals(fx: Fixture): Promise<void> {
 }
 
 /**
- * Killed features — migration 103 dropped commerce + governance + KB
- * schemas. If a route returns 200 from one of those paths it means
- * someone re-added the table. Anything except 404 here is a regression.
+ * Killed features — migration 103 + the commerce/governance/ai-agent
+ * deletion (commit 6c585f7) removed these routes. If any returns
+ * anything except 404 here, someone re-added the file. Routes verified
+ * against the deleted-file diffs to ensure these were REAL endpoints.
  */
 async function testKilledFeatures(fx: Fixture): Promise<void> {
   const killed = [
-    'GET /api/khata/accounts',
-    'GET /api/khata/transactions',
-    'GET /api/catalog',
-    'GET /api/catalog/items',
-    'GET /api/commerce/governance/queue',
-    'GET /api/governance/queue',
-    'GET /api/knowledge-bases',
-    'GET /api/kb/sources',
-    'GET /api/ai-agents/list',
+    // commerce.ts
+    'GET /api/commerce/catalog',
+    'GET /api/commerce/accounts',
+    'GET /api/commerce/standing-orders',
+    'GET /api/commerce/settlements',
+    'POST /api/commerce/match',
+    // governance.ts
+    'GET /api/commerce/governance/actions',
+    'GET /api/commerce/governance/thresholds',
+    // ai-agent.ts (replaced by /api/ai/* in AISettingsPage rewrite)
+    'GET /api/ai-agent/config',
+    'GET /api/ai-agent/sources',
   ]
   for (const entry of killed) {
     const [method, path] = entry.split(' ') as [string, string]
