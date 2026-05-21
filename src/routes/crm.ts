@@ -471,7 +471,7 @@ export function createCrmRouter(deps: Deps): express.Router {
       .eq('tenant_id', tenantId)
       .select('id')
       .single()
-    if (error)  { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     if (!data)  { res.status(404).json({ error: 'stage not found' }); return }
     res.json({ ok: true })
   })

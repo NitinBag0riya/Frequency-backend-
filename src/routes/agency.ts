@@ -256,7 +256,7 @@ export function createAgencyRouter(deps: Deps): express.Router {
       .update({ ...parsed.data, updated_at: new Date().toISOString() })
       .eq('id', agencyId)
       .select('*').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json({ agency: data })
   })
 
@@ -302,7 +302,7 @@ export function createAgencyRouter(deps: Deps): express.Router {
       .update({ status: 'archived', updated_at: new Date().toISOString() })
       .eq('id', agencyId)
       .select('id, status, updated_at').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json({ success: true, agency: data })
   })
 

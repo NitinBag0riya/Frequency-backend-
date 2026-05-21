@@ -319,7 +319,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .insert({ name: name.trim(), description, source, tenant_id: tenantId, user_id: userId })
       .select()
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
     // Insert columns
     const defaultCols = columns.length > 0 ? columns : [
@@ -435,7 +435,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .eq('tenant_id', tenantId)
       .select()
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -533,7 +533,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .eq('tenant_id', tenantId)
       .select()
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -624,7 +624,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       })
       .select()
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
     // Notify the assignee (if a rule placed them on the row). Manual create
     // path — UI flow, so the toast in the FE confirms the create; this
@@ -725,7 +725,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .eq('tenant_id', tenantId)
       .select()
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
     // Notify the assignee if assignment actually changed (manual or rule-
     // routed). Skip if the new assignee is the user making the change
@@ -1243,7 +1243,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
         .eq('tenant_id', tenantId)
         .select('ingest_token')
         .single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.json({ ingest_token: data.ingest_token })
     })
 
@@ -1354,7 +1354,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .insert({ ...safe, table_id: req.params.id, tenant_id: tenantId, user_id: (req as any).user.id })
       .select()
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -1371,7 +1371,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .eq('tenant_id', tenantId)
       .select()
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -1501,7 +1501,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .insert({ ...safe, table_id: req.params.id, tenant_id: tenantId, user_id: (req as any).user.id })
       .select()
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 

@@ -276,7 +276,7 @@ export function createComposerToolsRouter(deps: Deps): express.Router {
       .eq('id', req.params.id)
       .eq('tenant_id', tenantId)
       .select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     if (!data) { res.status(404).json({ error: 'not found' }); return }
     res.json({ data })
   })
@@ -515,7 +515,7 @@ export function createComposerToolsRouter(deps: Deps): express.Router {
       visibility:   b.visibility,
       created_by:   userId,
     }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
     // Best-effort in-app notification fan-out — failures non-fatal. The
     // DB trigger ensures note_mentions rows exist for read-tracking even
@@ -557,7 +557,7 @@ export function createComposerToolsRouter(deps: Deps): express.Router {
       .eq('tenant_id', tenantId)
       .eq('created_by', userId)
       .select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     if (!data) { res.status(404).json({ error: 'not found or not yours' }); return }
     res.json({ data })
   })
@@ -588,7 +588,7 @@ export function createComposerToolsRouter(deps: Deps): express.Router {
       .eq('id', req.params.id)
       .eq('tenant_id', tenantId)
       .select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     if (!data) { res.status(404).json({ error: 'not found' }); return }
     res.json({ data })
   })

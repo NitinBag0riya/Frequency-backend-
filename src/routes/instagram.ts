@@ -209,7 +209,7 @@ export function createInstagramRouter(deps: Deps): express.Router {
       caption: caption ?? null, media_urls,
       scheduled_at: scheduled_at ?? null, status,
     }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
     // Real publish path: queue on the schedule poller. For "publish now" we
     // attempt the Meta call inline; failures fall back to draft + a note.
@@ -267,7 +267,7 @@ export function createInstagramRouter(deps: Deps): express.Router {
       auto_dm_text: auto_dm_text ?? null,
       enabled: enabled !== false,
     }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -278,7 +278,7 @@ export function createInstagramRouter(deps: Deps): express.Router {
     for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
     const { data, error } = await supabase.from('ig_comment_rules').update(patch)
       .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 

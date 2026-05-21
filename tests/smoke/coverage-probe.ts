@@ -89,6 +89,20 @@ const SKIP_PATHS = new Set<string>([
   '/api/wa-templates/submit',
   '/api/ai/test',                  // would burn Anthropic tokens
   '/api/razorpay/payment-links',   // would actually create a link
+  // OAuth init flows that require external service env vars (Airtable,
+  // Shopify, Meta Ads, Instagram, Razorpay, Google). Staging deliberately
+  // has them unconfigured — the handlers correctly return 503 'not
+  // configured'. Not a probe target.
+  '/api/auth/airtable/start', '/api/auth/airtable/callback',
+  '/api/auth/instagram/start', '/api/auth/instagram/callback',
+  '/api/auth/meta_ads/start', '/api/auth/meta_ads/callback',
+  '/api/auth/razorpay/start', '/api/auth/razorpay/callback',
+  '/api/auth/shopify/start', '/api/auth/shopify/callback',
+  '/api/auth/google',         '/api/auth/google/callback',
+  '/api/shopify/install', '/api/shopify/callback',
+  '/api/auth/facebook/connect-waba',
+  // Billing webhooks — Razorpay-signed, will 401 without signature.
+  '/api/billing/razorpay/webhook',
 ])
 
 function shouldSkip(path: string): boolean {

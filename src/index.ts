@@ -1470,7 +1470,7 @@ app.post('/api/workflows', requireAuth, identifyTenant, checkPermission('whatsap
   // authenticated session so the FE never has to know about the DB shape.
   const { data, error } = await supabase.from('workflows')
     .insert({ ...req.body, tenant_id: tenantId, user_id: userId }).select().single()
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
@@ -1538,7 +1538,7 @@ app.patch('/api/workflows/:id', requireAuth, identifyTenant, checkPermission('wh
   const { data, error } = await supabase.from('workflows')
     .update({ ...patch, updated_at: new Date().toISOString() })
     .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
@@ -1760,7 +1760,7 @@ app.post('/api/onboarding', requireAuth, async (req, res) => {
     status: 'active'
   }).select().single()
 
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
   // Mock sending email
   console.log(`[onboarding:email] Sending welcome email to ${user.email}`)
@@ -2202,7 +2202,7 @@ app.post('/api/broadcasts', requireAuth, identifyTenant, checkPermission('whatsa
   }
   const { data, error } = await supabase.from('broadcasts')
     .insert({ ...req.body, tenant_id: tenantId }).select().single()
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
@@ -2318,7 +2318,7 @@ app.post('/api/contacts', requireAuth, identifyTenant, checkPermission('leads', 
       status: 'active'
     }).select().single()
 
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
@@ -2330,7 +2330,7 @@ app.patch('/api/contacts/:id', requireAuth, identifyTenant, checkPermission('lea
   const patch = req.body as z.infer<typeof ContactPatchSchema>
   const { data, error } = await supabase.from('contacts')
     .update(patch).eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
@@ -2626,7 +2626,7 @@ app.patch('/api/contacts/:id/bot-pause', requireAuth, identifyTenant, checkPermi
     .update({ bot_paused })
     .eq('id', req.params.id).eq('tenant_id', tenantId)
     .select().single()
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
@@ -2662,7 +2662,7 @@ app.post('/api/skills', requireAuth, identifyTenant, checkPermission('whatsapp_a
       is_global: false,
     })
     .select().single()
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
@@ -3159,7 +3159,7 @@ app.post('/api/campaigns', requireAuth, identifyTenant, checkPermission('whatsap
   const tenantId = (req as any).tenantId
   const { data, error } = await supabase.from('campaigns')
     .insert({ ...req.body, tenant_id: tenantId }).select().single()
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
@@ -3174,7 +3174,7 @@ app.patch('/api/campaigns/:id', requireAuth, identifyTenant, checkPermission('wh
   const { data, error } = await supabase.from('campaigns')
     .update({ ...patch, updated_at: new Date().toISOString() })
     .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
-  if (error) { res.status(500).json({ error: error.message }); return }
+  if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
   res.json(data)
 })
 
