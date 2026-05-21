@@ -176,11 +176,12 @@ async function provisionUserAndTenant(label: string): Promise<Provisioned> {
   if (signinErr || !signin.session) throw new Error(`Failed to sign in ${label} user: ${signinErr?.message}`)
   const userToken = signin.session.access_token
 
-  // tenants schema (migrations/002_tenants.sql) has 3 NOT NULL fields beyond
-  // user_id: waba_id, phone_number_id, access_token. We provide
-  // unambiguously-fake-but-shape-correct values so the row passes constraints
-  // without ever masquerading as a real WhatsApp account. waba_id is unique,
-  // so we randomize per provision.
+  // Required NOT NULL columns on public.tenants (verified via PostgREST
+  // OpenAPI 'required' set against staging): user_id, waba_id,
+  // phone_number_id, access_token, status, slug. We pass all of them as
+  // unambiguously-fake placeholders prefixed `smoke-` so this row can never
+  // be confused for a real WhatsApp account. Columns with DB-side defaults
+  // are omitted (csat_*, data_residency, etc).
   const fakeWabaId = `smoke-waba-${label}-${stamp}-${randomUUID().slice(0, 8)}`
   const { data: tenant, error: tenantErr } = await sb.from('tenants').insert({
     user_id: userId,
@@ -189,6 +190,7 @@ async function provisionUserAndTenant(label: string): Promise<Provisioned> {
     phone_number_id: `smoke-pn-${stamp}`,
     access_token: 'smoke-fake-token-do-not-use',
     status: 'active',
+    slug: `smoke-${label}-${stamp}-${randomUUID().slice(0, 6)}`.toLowerCase(),
   }).select('id').single()
   if (tenantErr || !tenant) throw new Error(`Failed to create ${label} tenant: ${tenantErr?.message}`)
   const tenantId = tenant.id
