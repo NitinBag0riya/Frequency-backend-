@@ -8,7 +8,10 @@
     "dev:worker": "tsx watch src/worker.ts",
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
-    "build": "tsc"
+    "build": "tsc",
+    "smoke": "tsx tests/smoke/runner.ts",
+    "smoke:local": "SMOKE_BASE_URL=http://localhost:3000 tsx tests/smoke/runner.ts",
+    "smoke:stage": "SMOKE_BASE_URL=https://api.getfrequency.app tsx tests/smoke/runner.ts"
   },
   "keywords": [],
   "author": "",

@@ -213,20 +213,39 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
         }
         table = created
 
-        // Build columns from the header row.
-        const cols = headerRow.map((label, i) => ({
-          tenant_id:   tenantId,
-          user_id:     userId,
-          table_id:    table.id,
-          name:        String(label || `Column ${i + 1}`).slice(0, 100),
-          key:         keyify(String(label || `col_${i + 1}`)),
-          type:        'text',
-          is_primary:  i === 0,
-          is_required: false,
-          position:    i,
-        }))
+        // Bug fix — dedupe keys so headers like ["Name","name","NAME"] don't
+        // collide on the (table_id, key) unique constraint. We append a
+        // numeric suffix to the second+ occurrence.
+        const seen = new Map<string, number>()
+        const cols = headerRow.map((label, i) => {
+          const baseKey = keyify(String(label || `col_${i + 1}`))
+          const count = seen.get(baseKey) ?? 0
+          seen.set(baseKey, count + 1)
+          const finalKey = count === 0 ? baseKey : `${baseKey}_${count + 1}`
+          return {
+            tenant_id:   tenantId,
+            user_id:     userId,
+            table_id:    table.id,
+            name:        String(label || `Column ${i + 1}`).slice(0, 100),
+            key:         finalKey,
+            type:        'text',
+            is_primary:  i === 0,
+            is_required: false,
+            position:    i,
+          }
+        })
         if (cols.length > 0) {
-          await supabase.from('lead_columns').insert(cols)
+          // Bug fix — check the insert error explicitly. Previously a
+          // failure here (constraint violation, RLS denial, etc.) was
+          // silently swallowed, leaving the user with an orphan lead_table
+          // and no columns. Now we clean up and 500 with the real cause.
+          const { error: colErr } = await supabase.from('lead_columns').insert(cols)
+          if (colErr) {
+            // Roll back the just-created table so the user can retry cleanly.
+            await supabase.from('lead_tables').delete().eq('id', table.id)
+            res.status(500).json({ error: `Failed to create columns: ${colErr.message}` })
+            return
+          }
         }
       }
 
@@ -252,8 +271,12 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
         .update({ synced_from_subscription_id: sub.id, updated_at: new Date().toISOString() })
         .eq('id', table.id)
 
-      // 5. Run the first import inline — best-effort; if it fails, the worker
-      //    will retry within 5 minutes and surface the error in last_error.
+      // 5. Run the first import inline. On failure, surface the actual error
+      //    in the response — previously the response returned 200 with the
+      //    sub snapshot even when the import had crashed, leaving the user
+      //    with an empty table and no idea why. The worker retries every
+      //    5 min so this is still recoverable, but the FE should know.
+      let importResult: { imported: number; updated: number; error?: string }
       try {
         const result = await runFirstImport({ supabase, sub, headerRow, dataRows, tenantId, userId, tableId: table.id })
         await supabase.from('data_source_subscriptions').update({
@@ -262,13 +285,20 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
           rows_imported:  result.imported,
           rows_updated:   result.updated,
         }).eq('id', sub.id)
+        importResult = result
       } catch (err: any) {
+        const errorMessage = err?.message ?? String(err)
         await supabase.from('data_source_subscriptions').update({
-          status: 'error', last_error: err?.message ?? String(err),
+          status: 'error', last_error: errorMessage,
         }).eq('id', sub.id)
+        importResult = { imported: 0, updated: 0, error: errorMessage }
       }
 
-      res.json({ subscription: sub, lead_table: table })
+      res.json({
+        subscription: sub,
+        lead_table: table,
+        import: importResult,
+      })
     })
 
   // ── Mirror an Airtable table ──────────────────────────────────────────────
@@ -444,29 +474,75 @@ async function runFirstImport(opts: {
   tableId: string
 }) {
   const { supabase, headerRow, dataRows, tenantId, userId, tableId } = opts
-  const keys = headerRow.map(keyify)
+  // Dedupe keys the same way mirror() does, so column→data alignment stays
+  // consistent with the columns we just inserted.
+  const seen = new Map<string, number>()
+  const keys = headerRow.map((label, i) => {
+    const base = keyify(String(label || `col_${i + 1}`))
+    const count = seen.get(base) ?? 0
+    seen.set(base, count + 1)
+    return count === 0 ? base : `${base}_${count + 1}`
+  })
   const primaryKey = keys[0]
+  if (!primaryKey) return { imported: 0, updated: 0 }
 
-  let imported = 0
+  // ── Set-based dedupe ────────────────────────────────────────────────
+  // Previously this function ran ONE SELECT per data row (N+1) — a 500-row
+  // sheet meant 500 round-trips serialized over the Supabase REST API.
+  // That routinely blew past Express's 120s default and made the import
+  // appear to "silently fail". We now batch-fetch existing primary
+  // values in a single round-trip per table and dedupe in memory.
+  const existingPrimaryValues = new Set<string>()
+  {
+    // Paginate the existing-row fetch in case the table is huge. 1000 at
+    // a time keeps the URL filter list under PostgREST's typical 8KB cap.
+    const PAGE = 1000
+    let offset = 0
+    while (true) {
+      const { data: page, error } = await supabase.from('lead_rows')
+        .select('data')
+        .eq('table_id', tableId)
+        .range(offset, offset + PAGE - 1)
+      if (error) throw new Error(`failed to fetch existing rows: ${error.message}`)
+      if (!page || page.length === 0) break
+      for (const r of page) {
+        const v = (r as any).data?.[primaryKey]
+        if (typeof v === 'string' && v.trim()) existingPrimaryValues.add(v.trim())
+      }
+      if (page.length < PAGE) break
+      offset += PAGE
+    }
+  }
+
+  // Build the new rows in memory, then bulk-insert in batches.
+  const toInsert: Array<{ tenant_id: string; user_id: string; table_id: string; data: Record<string,string>; status: string; tags: string[] }> = []
+  const seenInThisImport = new Set<string>()
   for (const row of dataRows) {
     const data: Record<string, string> = {}
     for (let i = 0; i < keys.length; i++) {
       data[keys[i]] = String(row[i] ?? '')
     }
-    if (!data[primaryKey]?.trim()) continue
-    // Skip if a row with the same primary already exists (best-effort dedupe)
-    const { data: existing } = await supabase.from('lead_rows')
-      .select('id')
-      .eq('table_id', tableId)
-      .filter(`data->>${primaryKey}`, 'eq', data[primaryKey])
-      .limit(1)
-      .maybeSingle()
-    if (existing) continue
-    await supabase.from('lead_rows').insert({
+    const pv = data[primaryKey]?.trim()
+    if (!pv) continue
+    if (existingPrimaryValues.has(pv)) continue
+    if (seenInThisImport.has(pv)) continue  // dedupe within this single import too
+    seenInThisImport.add(pv)
+    toInsert.push({
       tenant_id: tenantId, user_id: userId, table_id: tableId,
       data, status: 'new', tags: [],
     })
-    imported++
+  }
+
+  // Bulk insert in batches of 500. Past the inflight Postgres connection
+  // limit this would otherwise queue arbitrarily — staying under 1MB
+  // payload also avoids Supabase's edge limit.
+  let imported = 0
+  const BATCH = 500
+  for (let i = 0; i < toInsert.length; i += BATCH) {
+    const batch = toInsert.slice(i, i + BATCH)
+    const { error } = await supabase.from('lead_rows').insert(batch)
+    if (error) throw new Error(`row insert batch ${i}-${i + batch.length} failed: ${error.message}`)
+    imported += batch.length
   }
   return { imported, updated: 0 }
 }

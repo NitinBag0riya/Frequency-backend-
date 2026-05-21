@@ -1,0 +1,77 @@
+name: smoke
+
+# Behavioral smoke test — runs after every push to stage so we catch
+# regressions like the recent Google Sheets N+1 bug before they get
+# promoted to prod. The static `tsc` typecheck only catches type
+# errors; this hits real endpoints and verifies DB state.
+
+on:
+  push:
+    branches: [stage, production-readiness-audit]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'API base URL to probe (default: stage)'
+        required: false
+        default: 'https://api.getfrequency.app'
+      only:
+        description: 'Optional comma-separated group filter (e.g. sla,pii)'
+        required: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Wait for BE to be reachable
+        env:
+          BASE: ${{ github.event.inputs.base || 'https://api.getfrequency.app' }}
+        # Up to 3 minutes for the deploy to land — Fly.io can take a
+        # while to propagate. If /health still 502s after that, the
+        # smoke step below will fail fast anyway.
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/health" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "BE reachable after ${i}×3s"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "BE never returned 200 from /health within 180s"
+          exit 1
+
+      - name: Smoke run
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SMOKE_BASE_URL: ${{ github.event.inputs.base || 'https://api.getfrequency.app' }}
+        run: |
+          if [ -n "${{ github.event.inputs.only }}" ]; then
+            npm run smoke -- --only "${{ github.event.inputs.only }}"
+          else
+            npm run smoke
+          fi
+
+      # When the smoke run fails, attach the run log + a brief diagnostic
+      # to the workflow summary so the failure is debuggable without
+      # re-running. (GH already keeps the stdout in the run logs; this
+      # just surfaces it in the Summary tab.)
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "## Smoke failed"  >> "$GITHUB_STEP_SUMMARY"
+          echo ""                 >> "$GITHUB_STEP_SUMMARY"
+          echo "Base: $SMOKE_BASE_URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "See the **Smoke run** step above for the failing assertions." >> "$GITHUB_STEP_SUMMARY"
