@@ -2666,7 +2666,17 @@ app.get('/api/skills', requireAuth, identifyTenant, async (req, res) => {
 app.post('/api/skills', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), async (req, res) => {
   const user = (req as any).user
   const tenantId = (req as any).tenantId
-  const { name, description, tags, workflow_json } = req.body
+  const { name, description, tags, workflow_json } = req.body ?? {}
+  // Defensive validation — name + workflow_json are NOT NULL on
+  // workflow_skills; without these the insert 500s on the DB constraint.
+  if (typeof name !== 'string' || name.trim().length === 0) {
+    res.status(400).json({ error: 'name is required' })
+    return
+  }
+  if (!workflow_json || typeof workflow_json !== 'object') {
+    res.status(400).json({ error: 'workflow_json is required (object)' })
+    return
+  }
   const { data, error } = await supabase.from('workflow_skills')
     .insert({
       tenant_id: tenantId,
@@ -3862,8 +3872,18 @@ app.get('/api/team', requireAuth, identifyTenant, checkPermission('settings', 'v
 
 app.post('/api/team/invite', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
   const tenantId = (req as any).tenantId
-  const { email, role } = req.body
-  
+  const { email, role } = req.body ?? {}
+  // Defensive validation — inviteUserByEmail(undefined) throws inside the
+  // supabase admin SDK with an unhelpful 500. Caller must supply email + role.
+  if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    res.status(400).json({ error: 'valid email is required' })
+    return
+  }
+  if (typeof role !== 'string' || role.trim().length === 0) {
+    res.status(400).json({ error: 'role is required' })
+    return
+  }
+
   try {
     // 1. Trigger Supabase Invitation
     const { data: invite, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(email, {

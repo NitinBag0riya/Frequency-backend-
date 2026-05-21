@@ -194,7 +194,7 @@ export function createPiiRouter(deps: Deps): express.Router {
       .upsert({ tenant_id: tenantId, ...parsed.data, updated_at: new Date().toISOString() }, { onConflict: 'tenant_id' })
       .select('enabled_types, unmask_roles, require_reason, regex_overrides, outbound_action')
       .single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     // Invalidate cache so the next message fetch picks up the change.
     configCache.delete(tenantId)
     res.json({ data })

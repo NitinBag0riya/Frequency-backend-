@@ -276,7 +276,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
         limits: limits ?? {},
         freemium_caps: freemium_caps ?? {},
       }).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: 'plan.create', payload: data })
       res.json(data)
     })
@@ -287,7 +287,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       const patch: Record<string, any> = { updated_at: new Date().toISOString() }
       for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
       const { data, error } = await supabase.from('plans').update(patch).eq('id', String(req.params.id)).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: 'plan.update', payload: { id: String(req.params.id), changes: patch } })
       res.json(data)
     })
@@ -321,7 +321,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       const patch: Record<string, any> = { updated_at: new Date().toISOString() }
       for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
       const { data, error } = await supabase.from('role_definitions').update(patch).eq('id', String(req.params.id)).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: 'role.update', payload: { id: String(req.params.id), changes: patch } })
       res.json(data)
     })
@@ -507,7 +507,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       const patch: Record<string, any> = { updated_by: userId, updated_at: new Date().toISOString() }
       for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
       const { data, error } = await supabase.from('feature_flags').update(patch).eq('key', String(req.params.key)).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: 'feature_flag.update', payload: { key: String(req.params.key), changes: patch } })
       res.json(data)
     })
@@ -529,7 +529,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
         audience: audience ?? 'all', starts_at: starts_at ?? null, ends_at: ends_at ?? null,
         created_by: (req as any).user.id,
       }).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: 'announcement.create', payload: data })
       res.json(data)
     })
@@ -555,7 +555,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       const patch: Record<string, any> = { updated_at: new Date().toISOString() }
       for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
       const { data, error } = await supabase.from('approval_rules').update(patch).eq('id', String(req.params.id)).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: 'approval_rule.update', payload: { id: String(req.params.id), changes: patch } })
       res.json(data)
     })
@@ -575,7 +575,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
         patch.trial_ends_at = base.toISOString()
       }
       const { data, error } = await supabase.from('tenant_subscriptions').update(patch).eq('tenant_id', tenantId).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: plan_id ? 'plan.change' : 'subscription.update', target_tenant_id: tenantId, payload: { changes: patch }, reason })
       res.json(data)
     })

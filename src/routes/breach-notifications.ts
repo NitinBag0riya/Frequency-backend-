@@ -94,7 +94,7 @@ export function createBreachNotificationsRouter(deps: Deps): express.Router {
       created_by: user.id,
       status: 'investigating',
     }).select('*').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.status(201).json(data)
   })
 
@@ -114,7 +114,7 @@ export function createBreachNotificationsRouter(deps: Deps): express.Router {
     const { data, error } = await supabase.from('breach_notifications')
       .update({ notified_authority_at: new Date().toISOString(), status: 'notified' })
       .eq('id', id).select('*').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -153,7 +153,7 @@ export function createBreachNotificationsRouter(deps: Deps): express.Router {
 
     const { data, error } = await supabase.from('breach_notifications')
       .update(patch).eq('id', id).select('*').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json({ ...data, fanout_enqueued: enqueued })
   })
 
@@ -197,7 +197,7 @@ export function createBreachNotificationsRouter(deps: Deps): express.Router {
     const { data, error } = await supabase.from('breach_notifications')
       .update({ status: 'resolved' })
       .eq('id', id).select('*').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     if (!data) { res.status(404).json({ error: 'breach not found' }); return }
     res.json(data)
   })

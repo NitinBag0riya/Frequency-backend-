@@ -124,7 +124,7 @@ export function createNotificationsRouter(deps: Deps): express.Router {
     if (typeof is_muted === 'boolean') patch.is_muted = is_muted
     if (quiet_hours)      patch.quiet_hours = quiet_hours
     const { data, error } = await supabase.from('notification_preferences').upsert(patch, { onConflict: 'user_id,tenant_id,event_key' as any }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 

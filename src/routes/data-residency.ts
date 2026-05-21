@@ -76,7 +76,7 @@ export function createDataResidencyRouter(deps: Deps): express.Router {
       .update({ data_residency: residency })
       .eq('id', tenantId)
       .select('id, data_residency').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json({ residency: data.data_residency })
   })
 

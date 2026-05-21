@@ -113,7 +113,7 @@ export function createPrivacyCenterRouter(deps: Deps): express.Router {
         reason,
         status:          'pending',
       }).select('*').single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.status(201).json(data)
     },
   )
@@ -241,7 +241,7 @@ export function createPrivacyCenterRouter(deps: Deps): express.Router {
       .update({ data_residency: region })
       .eq('id', tenantId)
       .select('id, data_residency').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
     // Audit log — best-effort, never fails the request. Uses the same
     // append_tenant_audit RPC the wedge-surface consent handler uses.
@@ -342,7 +342,7 @@ export function createPrivacyCenterRouter(deps: Deps): express.Router {
     }
     const { data, error } = await supabase.from('breach_notifications')
       .update(patch).eq('id', id).select('*').single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 

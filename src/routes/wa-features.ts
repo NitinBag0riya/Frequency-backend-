@@ -80,7 +80,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       source_ref: source_ref ?? null,
       metadata: metadata ?? {},
     }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -92,7 +92,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
     patch.updated_at = new Date().toISOString()
     const { data, error } = await supabase.from('wa_catalog_products').update(patch)
       .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -209,7 +209,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       tenant_id: tenantId, name, category: category ?? null, status: 'DRAFT',
       definition: seed,
     }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
     // Best-effort: try to register the flow on Meta. If WABA credentials
     // missing or call fails, keep the local DRAFT row — user can publish
@@ -241,7 +241,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
     patch.updated_at = new Date().toISOString()
     const { data, error } = await supabase.from('wa_flows').update(patch)
       .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -263,7 +263,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
     const { data, error } = await supabase.from('wa_flows')
       .update({ status: 'PUBLISHED', updated_at: new Date().toISOString() })
       .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -608,7 +608,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       updated_at: new Date().toISOString(),
     }
     const { data, error } = await supabase.from('wa_business_profiles').upsert(row).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
     // Best-effort push to Meta
     const { data: tenant } = await supabase.from('tenants')

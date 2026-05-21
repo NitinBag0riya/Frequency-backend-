@@ -146,7 +146,7 @@ export function createDsrRouter(deps: Deps): express.Router {
         reason,
         status: 'pending',
       }).select('*').single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.status(201).json(data)
     },
   )
@@ -181,7 +181,7 @@ export function createDsrRouter(deps: Deps): express.Router {
         reason,
         status: 'pending',
       }).select('*').single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.status(201).json(data)
     },
   )
@@ -213,7 +213,7 @@ export function createDsrRouter(deps: Deps): express.Router {
         .update({ status: 'in_progress', verified_at: new Date().toISOString(), notes })
         .eq('id', id).eq('tenant_id', tenantId)
         .select('*').single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.json(data)
     },
   )
@@ -419,7 +419,7 @@ export function createDsrRouter(deps: Deps): express.Router {
         .update({ status: 'rejected', notes, executed_by: userId, completed_at: new Date().toISOString() })
         .eq('id', id).eq('tenant_id', tenantId)
         .select('*').single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.json(data)
     },
   )

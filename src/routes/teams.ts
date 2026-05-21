@@ -363,7 +363,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const { data, error } = await supabase.from('user_role_assignments')
         .update(patch).eq('id', String(req.params.assignmentId)).eq('tenant_id', tenantId)
         .select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.json(data)
     })
 
@@ -469,7 +469,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const { data, error } = await supabase.from('role_label_overrides').upsert({
         tenant_id: tenantId, role_id, custom_label,
       }).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.json(data)
     })
 

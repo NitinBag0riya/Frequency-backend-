@@ -152,7 +152,7 @@ Output STRICT JSON: { "recommendations": [...] }. No markdown, no commentary.`
       blueprint: blueprint ?? original.blueprint,
       generated_by_ai: false,
     }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 

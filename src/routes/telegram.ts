@@ -218,7 +218,7 @@ export function createTelegramRouter(deps: Deps): express.Router {
       template_name: text.slice(0, 200),
       status: 'draft',
     }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -238,7 +238,7 @@ export function createTelegramRouter(deps: Deps): express.Router {
     const { data, error } = await supabase.from('tg_mini_apps').insert({
       tenant_id: tenantId, name, url, short_name: short_name ?? null,
     }).select().single()
-    if (error) { res.status(500).json({ error: error.message }); return }
+    if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
     res.json(data)
   })
 
@@ -292,7 +292,7 @@ export function createTelegramRouter(deps: Deps): express.Router {
         payload, title, description,
         status: 'pending', invoice_link: link,
       }).select().single()
-      if (error) { res.status(500).json({ error: error.message }); return }
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       res.json(data)
     } catch (err: any) {
       res.status(500).json({ error: err.message })
