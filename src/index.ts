@@ -1004,50 +1004,132 @@ EMAIL RULES (enforce for trigger_email_received / send_email / forward_email nod
 - Always flag missing OAuth / API credentials in missing_config
 - forward_email should preserve original sender in the forwarded body when possible
 
-PICKER FIELDS (CRITICAL — read carefully):
-When the user's intent implies a SPECIFIC resource the FE can select from a live list
-(a specific spreadsheet, a specific calendar, a specific WA template, a specific lead
-table, a specific column value), DO NOT emit a free-form text field. Instead, emit a
-\`missing_config\` entry with one of these EXACT field names + EXACT \`type\` values.
-The FE renders a live picker for each one, pre-populated from the user's connected
-account. Always mark these \`required: true\` — the workflow cannot run without them.
+PICKER FIELDS (CRITICAL — universal catalog covering every Frequency surface):
 
-Google Sheets — when intent mentions a Google Sheet, leads-from-sheet, sheet-row trigger:
-- field: "spreadsheet_id",       type: "select", placeholder: "Pick a Google Sheet"
-- field: "sheet_tab_name",       type: "select", placeholder: "Pick a tab",        depends_on: "spreadsheet_id"
-- field: "column_name_<purpose>",type: "select", placeholder: "Pick the <purpose> column", depends_on: "sheet_tab_name"
-  (e.g. column_name_status, column_name_email, column_name_amount)
+When the user's intent implies a SPECIFIC resource the FE can select from a live list,
+DO NOT emit a free-form text field. Emit a \`missing_config\` entry with the EXACT
+field name + EXACT \`type\` value below. The FE renders a live picker for each one,
+pre-populated from the tenant's data. Always mark these \`required: true\` — the
+workflow cannot run without them.
+
+═══════════════════════════════════════════════════════════════════════════════
+A. FREQUENCY TABLES (internal lead_tables — the user's own database tables)
+═══════════════════════════════════════════════════════════════════════════════
+Trigger phrases: "my leads table", "my contacts table", "my data table",
+                 "rows in my [name] table", "when a row is created/updated"
+
+- field: "table_id",              type: "select", placeholder: "Pick a table"
+- field: "operation_table",       type: "select", placeholder: "Pick an operation",
+                                  options: ["find_row","create_row","update_row","upsert_row","delete_row","filter_rows"]
+- field: "column_name_<purpose>", type: "select", placeholder: "Pick the <purpose> column", depends_on: "table_id"
 - field: "column_value_<purpose>",type: "select", placeholder: "Pick the <purpose> value", depends_on: "column_name_<purpose>"
-  (e.g. column_value_status with options like "New", "Contacted", "Qualified" — the FE
-   resolves the dropdown from distinct values in that column at config time)
+- field: "row_id",                type: "text",   placeholder: "Row ID or {{variable}}"   (used by update/delete)
 
-Google Calendar — when intent mentions calendar, scheduling, booking:
-- field: "calendar_id",          type: "select", placeholder: "Pick a calendar"
+═══════════════════════════════════════════════════════════════════════════════
+B. CONVERSATIONS / INBOX
+═══════════════════════════════════════════════════════════════════════════════
+Trigger phrases: "assign to agent", "tag conversation", "use my quick reply",
+                 "send via my WhatsApp number", "mark as snoozed/closed"
 
-WhatsApp Templates — when intent requires a template (outside 24h, marketing, etc.):
-- field: "template_name",        type: "template_picker", placeholder: "Pick an approved template"
-- field: "template_language",    type: "select", placeholder: "Pick language", options: ["en","en_US","hi","hi_IN"]
+- field: "channel",               type: "select", options: ["whatsapp","instagram","telegram"]
+- field: "from_phone_number_id",  type: "select", placeholder: "Pick the sending WA number"
+- field: "quick_reply_id",        type: "select", placeholder: "Pick a quick reply"
+- field: "assigned_agent_id",     type: "select", placeholder: "Pick an agent"
+- field: "team_id",               type: "select", placeholder: "Pick a team"
+- field: "tag_id",                type: "select", placeholder: "Pick a tag"
+- field: "inbox_folder",          type: "select", options: ["open","snoozed","closed","mine","unassigned"]
 
-Lead Tables (Frequency's internal CRM tables) — when intent mentions "my contacts table",
-"leads table", "data table":
-- field: "table_id",             type: "select", placeholder: "Pick a lead table"
-- field: "column_name_<purpose>",type: "select", placeholder: "Pick the <purpose> column", depends_on: "table_id"
+═══════════════════════════════════════════════════════════════════════════════
+C. CAMPAIGNS / BROADCASTS / SEGMENTS
+═══════════════════════════════════════════════════════════════════════════════
+Trigger phrases: "send a campaign", "trigger broadcast", "all hot leads",
+                 "premium customers segment"
 
-CRM Pipeline — when intent mentions deals, stages, kanban:
-- field: "pipeline_stage_id",    type: "select", placeholder: "Pick a CRM stage"
+- field: "campaign_id",           type: "select", placeholder: "Pick a campaign"
+- field: "broadcast_id",          type: "select", placeholder: "Pick a broadcast"
+- field: "segment_id",            type: "select", placeholder: "Pick a contact segment"
+- field: "template_name",         type: "template_picker", placeholder: "Pick an approved WA template"
+- field: "template_language",     type: "select", options: ["en","en_US","hi","hi_IN","mr","ta","te","bn","gu"]
 
-Contact Segments — when intent says "send to segment X", "all premium customers":
-- field: "segment_id",           type: "select", placeholder: "Pick a contact segment"
+═══════════════════════════════════════════════════════════════════════════════
+D. CRM PIPELINE (deals, stages)
+═══════════════════════════════════════════════════════════════════════════════
+Trigger phrases: "move to [stage] stage", "won deal", "close lost", "kanban"
 
-Integrations / Connectors — when a 3rd-party app is required but not connected:
-- field: "integration_<key>",    type: "integration_picker", placeholder: "Connect <App>"
+- field: "pipeline_stage_id",     type: "select", placeholder: "Pick a CRM stage"
+- field: "deal_id",               type: "text",   placeholder: "Deal ID or {{variable}}"
+- field: "operation_deal",        type: "select",
+                                  options: ["move_stage","assign_owner","add_tag","add_note","mark_won","mark_lost"]
 
-CASCADING RULE:
-When a picker depends on an upstream picker's value (sheet → tab → column → value),
-emit them ALL in the same node's missing_config[] AND set \`depends_on\` to the
-upstream field's name. The FE refreshes downstream pickers automatically when an
-upstream value changes. Without the depends_on chain the FE has to guess — be
-explicit.
+═══════════════════════════════════════════════════════════════════════════════
+E. GOOGLE WORKSPACE (Sheets, Calendar, Gmail)
+═══════════════════════════════════════════════════════════════════════════════
+Trigger phrases: "Google Sheet", "spreadsheet", "calendar booking", "Gmail filter"
+
+- field: "spreadsheet_id",        type: "select", placeholder: "Pick a Google Sheet"
+- field: "sheet_tab_name",        type: "select", placeholder: "Pick a tab",        depends_on: "spreadsheet_id"
+- field: "column_name_<purpose>", type: "select", placeholder: "Pick the <purpose> column", depends_on: "sheet_tab_name"
+- field: "column_value_<purpose>",type: "select", placeholder: "Pick the <purpose> value", depends_on: "column_name_<purpose>"
+- field: "operation_sheet",       type: "select",
+                                  options: ["append_row","update_row","read_range","find_row","upsert_row"]
+- field: "calendar_id",           type: "select", placeholder: "Pick a calendar"
+- field: "gmail_account_id",      type: "select", placeholder: "Pick a Gmail account"
+
+═══════════════════════════════════════════════════════════════════════════════
+F. PAYMENTS (Razorpay — extensible to Stripe/PayPal etc.)
+═══════════════════════════════════════════════════════════════════════════════
+Trigger phrases: "Razorpay", "payment link", "subscription", "refund",
+                 "check payment status"
+
+ALWAYS emit operation_razorpay FIRST. Then emit ONLY the additional fields
+the chosen operation needs (see conditional column).
+
+- field: "operation_razorpay",    type: "select", REQUIRED FIRST,
+                                  options: ["create_payment_link","check_payment_status","refund_payment",
+                                            "create_subscription","cancel_subscription","fetch_payment"]
+Then per-op:
+  create_payment_link → amount_paise (number), customer_email (email), description (text)
+  check_payment_status / refund_payment / fetch_payment → razorpay_payment_id (text)
+  create_subscription / cancel_subscription → razorpay_plan_id (select), razorpay_subscription_id (text)
+
+═══════════════════════════════════════════════════════════════════════════════
+G. EMAIL (Gmail / Outlook / Resend / SendGrid)
+═══════════════════════════════════════════════════════════════════════════════
+- field: "email_provider",        type: "select", options: ["gmail","outlook","resend","sendgrid","mailgun","ses","smtp"]
+- field: "from_email",            type: "email"
+- field: "to_email" / "to_list_segment_id"
+- field: "filter_subject" / "filter_from_email"
+
+═══════════════════════════════════════════════════════════════════════════════
+H. GENERIC CONNECTORS (Shopify, custom HTTP, webhooks)
+═══════════════════════════════════════════════════════════════════════════════
+- field: "integration_<key>",     type: "integration_picker", placeholder: "Connect <App>"
+- field: "api_endpoint",          type: "url"
+- field: "http_method",           type: "select", options: ["GET","POST","PUT","PATCH","DELETE"]
+- field: "webhook_url",           type: "url"
+- field: "webhook_secret",        type: "text"
+
+═══════════════════════════════════════════════════════════════════════════════
+OPERATION-PICKER PATTERN (universal rule)
+═══════════════════════════════════════════════════════════════════════════════
+For any resource that supports MULTIPLE operations (table, sheet, razorpay, deal):
+1. Emit the operation_<resource> picker first.
+2. Emit ONLY the additional pickers the chosen operation needs.
+3. The FE refreshes the dependent picker set when the operation changes.
+
+═══════════════════════════════════════════════════════════════════════════════
+CASCADING RULE (universal)
+═══════════════════════════════════════════════════════════════════════════════
+When a picker depends on an upstream picker's value, emit them ALL in the same
+node's missing_config[] AND set \`depends_on\` to the upstream field's name.
+The FE walks the chain automatically — without \`depends_on\` the FE has to
+guess.
+
+CHAIN EXAMPLES (memorize these patterns):
+- Sheets:  spreadsheet_id → sheet_tab_name → column_name_status → column_value_status
+- Tables:  table_id → column_name_status → column_value_status
+- Razorpay:operation_razorpay → (per-op fields)
+- Deal:    deal_id → operation_deal → (stage_id when op=move_stage)
 
 OUTPUT SCHEMA (omit keys with null / empty array values):
 {
@@ -1108,12 +1190,48 @@ OUTPUT SCHEMA (omit keys with null / empty array values):
   "blocking_issues": []
 }
 
-COMMON INTENT PATTERNS:
-- "forward email from X to Y" → trigger_email_received (filter_from_email=X) → forward_email (to=Y). Ask: email provider, whether to include attachments, any subject filters.
-- "when form submitted" → trigger_form_submit → send_template (outside 24 h). Ask: form provider (Typeform/Google Forms/custom), template body.
-- "payment received" → trigger_webhook (Razorpay) → send_template (payment confirmation). Ask: webhook secret, template content.
-- "every Monday" → trigger_scheduled (cron) → send_template. Ask: target audience/segment, template content.
-- "respond to inbound message" → trigger_inbound_keyword → send_text (within 24 h) or send_template. Ask: keywords, reply content.
+COMMON INTENT PATTERNS (with picker chains — emit these as missing_config[]):
+
+- "forward email from X to Y" → trigger_email_received (filter_from_email=X) → forward_email (to=Y).
+  Pickers: email_provider, gmail_account_id, filter_from_email (text), filter_subject (text).
+
+- "when form submitted" → trigger_form_submit → send_template (outside 24 h).
+  Pickers: form provider (select), template_name + template_language.
+
+- "payment received" → trigger_webhook (Razorpay) → send_template (payment confirmation).
+  Pickers: webhook_secret (text), template_name, template_language.
+
+- "every Monday at 10am send a campaign to hot leads" →
+  trigger_scheduled (cron) → send_template (broadcast-style).
+  Pickers: segment_id (live), template_name (live), template_language.
+
+- "respond to inbound 'pricing' message" → trigger_inbound_keyword → send_text or send_template.
+  Pickers: channel, quick_reply_id (live) OR template_name.
+
+- "when status in my Leads table changes to 'Qualified', notify the assigned agent on WhatsApp" →
+  trigger_sheet_row (table_id) → condition_variable (column_name_status, column_value_status='Qualified') → send_text.
+  Pickers: table_id, column_name_status (depends_on table_id), column_value_status (depends_on column_name_status),
+           assigned_agent_id, template_name (if outside 24h).
+
+- "send Razorpay payment link of ₹500 when customer says 'pay'" →
+  trigger_inbound_keyword → http_request (Razorpay create) → send_text.
+  Pickers: operation_razorpay='create_payment_link', amount_paise=50000, customer_email, description.
+
+- "when Razorpay payment is captured, mark customer row in my Customers table as Paid" →
+  trigger_webhook (razorpay.payment.captured) → update_sheet/update_table.
+  Pickers: table_id (live), column_name_status, column_value_status='Paid'.
+
+- "move deal to 'Closed Won' when customer says 'yes'" →
+  trigger_inbound_keyword → update_crm (operation_deal='move_stage').
+  Pickers: deal_id (from {{conversation.deal_id}}), pipeline_stage_id (live), operation_deal='move_stage'.
+
+- "broadcast offer to all VIP segment customers every Friday at 6pm" →
+  trigger_scheduled → send_template (broadcast to segment).
+  Pickers: segment_id (live), template_name (live), template_language.
+
+- "assign new inbound conversations from Instagram to Priya's team" →
+  trigger_inbound_keyword (channel=instagram) → assign_agent.
+  Pickers: channel='instagram', team_id (live) OR assigned_agent_id (live).
 
 Be concise. Descriptions ≤15 words, compliance_note ≤20 words. Only include keys with actual values.`
 
