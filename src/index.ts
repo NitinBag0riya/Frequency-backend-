@@ -1004,6 +1004,51 @@ EMAIL RULES (enforce for trigger_email_received / send_email / forward_email nod
 - Always flag missing OAuth / API credentials in missing_config
 - forward_email should preserve original sender in the forwarded body when possible
 
+PICKER FIELDS (CRITICAL — read carefully):
+When the user's intent implies a SPECIFIC resource the FE can select from a live list
+(a specific spreadsheet, a specific calendar, a specific WA template, a specific lead
+table, a specific column value), DO NOT emit a free-form text field. Instead, emit a
+\`missing_config\` entry with one of these EXACT field names + EXACT \`type\` values.
+The FE renders a live picker for each one, pre-populated from the user's connected
+account. Always mark these \`required: true\` — the workflow cannot run without them.
+
+Google Sheets — when intent mentions a Google Sheet, leads-from-sheet, sheet-row trigger:
+- field: "spreadsheet_id",       type: "select", placeholder: "Pick a Google Sheet"
+- field: "sheet_tab_name",       type: "select", placeholder: "Pick a tab",        depends_on: "spreadsheet_id"
+- field: "column_name_<purpose>",type: "select", placeholder: "Pick the <purpose> column", depends_on: "sheet_tab_name"
+  (e.g. column_name_status, column_name_email, column_name_amount)
+- field: "column_value_<purpose>",type: "select", placeholder: "Pick the <purpose> value", depends_on: "column_name_<purpose>"
+  (e.g. column_value_status with options like "New", "Contacted", "Qualified" — the FE
+   resolves the dropdown from distinct values in that column at config time)
+
+Google Calendar — when intent mentions calendar, scheduling, booking:
+- field: "calendar_id",          type: "select", placeholder: "Pick a calendar"
+
+WhatsApp Templates — when intent requires a template (outside 24h, marketing, etc.):
+- field: "template_name",        type: "template_picker", placeholder: "Pick an approved template"
+- field: "template_language",    type: "select", placeholder: "Pick language", options: ["en","en_US","hi","hi_IN"]
+
+Lead Tables (Frequency's internal CRM tables) — when intent mentions "my contacts table",
+"leads table", "data table":
+- field: "table_id",             type: "select", placeholder: "Pick a lead table"
+- field: "column_name_<purpose>",type: "select", placeholder: "Pick the <purpose> column", depends_on: "table_id"
+
+CRM Pipeline — when intent mentions deals, stages, kanban:
+- field: "pipeline_stage_id",    type: "select", placeholder: "Pick a CRM stage"
+
+Contact Segments — when intent says "send to segment X", "all premium customers":
+- field: "segment_id",           type: "select", placeholder: "Pick a contact segment"
+
+Integrations / Connectors — when a 3rd-party app is required but not connected:
+- field: "integration_<key>",    type: "integration_picker", placeholder: "Connect <App>"
+
+CASCADING RULE:
+When a picker depends on an upstream picker's value (sheet → tab → column → value),
+emit them ALL in the same node's missing_config[] AND set \`depends_on\` to the
+upstream field's name. The FE refreshes downstream pickers automatically when an
+upstream value changes. Without the depends_on chain the FE has to guess — be
+explicit.
+
 OUTPUT SCHEMA (omit keys with null / empty array values):
 {
   "workflow_name": "string",
@@ -1031,10 +1076,11 @@ OUTPUT SCHEMA (omit keys with null / empty array values):
         {
           "field": "",
           "label": "",
-          "type": "text|textarea|select|number|url|email|phone",
+          "type": "text|textarea|select|number|url|email|phone|template_picker|integration_picker",
           "required": true,
           "placeholder": "",
-          "options": []
+          "options": [],
+          "depends_on": ""
         }
       ],
       "connections": { "default": "node_2" },
