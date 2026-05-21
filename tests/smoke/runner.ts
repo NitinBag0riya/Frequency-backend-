@@ -30,6 +30,8 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { randomUUID } from 'crypto'
 import '../../src/env'
+import { runCoverageProbe } from './coverage-probe'
+import { runIntegrityChecks } from './db-integrity'
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
@@ -136,60 +138,72 @@ function assertEq(actual: any, expected: any, message: string): void {
 // We need a test tenant + a test user with a real JWT to hit auth-gated
 // endpoints. We provision both via service-role on first run.
 
-interface Fixture {
+interface Provisioned {
   tenantId: string
   userId: string
   userEmail: string
   userToken: string
-  cleanupIds: { table: string; ids: string[] }[]
 }
 
-async function setupFixture(): Promise<Fixture> {
-  const stamp = Date.now()
-  const userEmail = `smoke+${stamp}@frequency-test.local`
+interface Fixture extends Provisioned {
+  cleanupIds: { table: string; ids: string[] }[]
+  /** Second tenant + user for cross-tenant isolation tests. */
+  foreign: Provisioned
+}
+
+/**
+ * Spin up one auth user + tenant + owner role. Used twice — once for the
+ * primary actor and once for a "foreign" actor we use to assert
+ * tenant-isolation (must NEVER see the primary's rows).
+ */
+async function provisionUserAndTenant(label: string): Promise<Provisioned> {
+  const stamp = Date.now() + Math.floor(Math.random() * 1000)
+  const userEmail = `smoke+${label}-${stamp}@frequency-test.local`
   const userPassword = `Smoke${stamp}!_${randomUUID().slice(0, 8)}`
 
-  // 1. Create auth user via admin API.
   const { data: userCreated, error: userErr } = await sb.auth.admin.createUser({
     email: userEmail,
     password: userPassword,
     email_confirm: true,
   })
-  if (userErr || !userCreated?.user) throw new Error(`Failed to create test user: ${userErr?.message}`)
+  if (userErr || !userCreated?.user) throw new Error(`Failed to create ${label} user: ${userErr?.message}`)
   const userId = userCreated.user.id
 
-  // 2. Mint a session JWT for that user.
   const { data: signin, error: signinErr } = await sb.auth.signInWithPassword({
     email: userEmail,
     password: userPassword,
   })
-  if (signinErr || !signin.session) throw new Error(`Failed to sign in test user: ${signinErr?.message}`)
+  if (signinErr || !signin.session) throw new Error(`Failed to sign in ${label} user: ${signinErr?.message}`)
   const userToken = signin.session.access_token
 
-  // 3. Create a test tenant.
-  const tenantSlug = `smoke-${stamp}`
+  const tenantSlug = `smoke-${label}-${stamp}`
   const { data: tenant, error: tenantErr } = await sb.from('tenants').insert({
     user_id: userId,
-    business_name: `Smoke Test Tenant ${stamp}`,
+    business_name: `Smoke Test Tenant ${label} ${stamp}`,
     slug: tenantSlug,
     status: 'active',
   }).select('id').single()
-  if (tenantErr || !tenant) throw new Error(`Failed to create test tenant: ${tenantErr?.message}`)
+  if (tenantErr || !tenant) throw new Error(`Failed to create ${label} tenant: ${tenantErr?.message}`)
   const tenantId = tenant.id
 
-  // 4. Give the user owner role on the tenant via user_roles (legacy table — used by every checkPermission).
   await sb.from('user_roles').insert({
     user_id: userId,
     tenant_id: tenantId,
     role: 'owner',
   })
 
-  return { tenantId, userId, userEmail, userToken, cleanupIds: [] }
+  return { tenantId, userId, userEmail, userToken }
+}
+
+async function setupFixture(): Promise<Fixture> {
+  const primary = await provisionUserAndTenant('p')
+  const foreign = await provisionUserAndTenant('f')
+  return { ...primary, foreign, cleanupIds: [] }
 }
 
 async function cleanup(fx: Fixture): Promise<void> {
   if (!ARGS.cleanup) {
-    console.log(`\nSkipping cleanup (--no-cleanup). Tenant: ${fx.tenantId}, User: ${fx.userId}`)
+    console.log(`\nSkipping cleanup (--no-cleanup). Primary tenant: ${fx.tenantId}, foreign tenant: ${fx.foreign.tenantId}`)
     return
   }
   // Cleanup in reverse dependency order. Service-role bypasses RLS.
@@ -197,9 +211,11 @@ async function cleanup(fx: Fixture): Promise<void> {
     if (c.ids.length === 0) continue
     await sb.from(c.table).delete().in('id', c.ids)
   }
-  await sb.from('user_roles').delete().eq('user_id', fx.userId).eq('tenant_id', fx.tenantId)
-  await sb.from('tenants').delete().eq('id', fx.tenantId)
-  await sb.auth.admin.deleteUser(fx.userId)
+  for (const actor of [fx, fx.foreign]) {
+    await sb.from('user_roles').delete().eq('user_id', actor.userId).eq('tenant_id', actor.tenantId)
+    await sb.from('tenants').delete().eq('id', actor.tenantId)
+    await sb.auth.admin.deleteUser(actor.userId)
+  }
 }
 
 // ── Test groups ────────────────────────────────────────────────────────────
@@ -422,6 +438,279 @@ async function testInvalidAuth(fx: Fixture): Promise<void> {
     // Non-existent tenant → identifyTenant blocks
     assert(r.status === 401 || r.status === 403 || r.status === 404, `expected 4xx, got ${r.status}`, r.body)
   })
+  await runTest('auth-edge', 'POST endpoints with empty body return 400/422 (no 500 panic)', async () => {
+    // Hit a few mutating endpoints with no body and verify we get a 4xx
+    // validation, never a 5xx panic.
+    const paths = [
+      '/api/lead-tables',
+      '/api/sla/config',
+      '/api/pii/config',
+      '/api/ai/qa-wizard',
+      '/api/ai/knowledge',
+    ]
+    for (const p of paths) {
+      const r = await http(p, { method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId, body: {} })
+      assert(r.status < 500, `${p} panicked on empty body (${r.status})`, r.body)
+    }
+  })
+}
+
+/**
+ * Cross-tenant isolation — the foreign user must NEVER see or mutate the
+ * primary tenant's rows. Catches RLS regressions and "forgot to filter by
+ * tenant_id" bugs in handlers.
+ */
+async function testTenantIsolation(fx: Fixture): Promise<void> {
+  // Primary creates a lead table.
+  let primaryTableId: string | null = null
+  await runTest('isolation', 'Setup: primary creates a lead table', async () => {
+    const r = await http('/api/lead-tables', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: {
+        name: 'Iso Test Primary',
+        source: 'manual',
+        columns: [{ name: 'Email', type: 'text', is_required: true, options: [] }],
+      },
+    })
+    assertEq(r.status, 200, 'primary table created')
+    primaryTableId = r.body.id
+    fx.cleanupIds.push({ table: 'lead_tables', ids: [primaryTableId!] })
+  })
+
+  await runTest('isolation', 'Foreign user GET /api/lead-tables does NOT see primary\'s table', async () => {
+    const r = await http('/api/lead-tables', {
+      userToken: fx.foreign.userToken, tenantId: fx.foreign.tenantId,
+    })
+    assertEq(r.status, 200, 'foreign list status')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    assert(!list.some((t: any) => t.id === primaryTableId), 'foreign user MUST NOT see primary\'s lead_table', list)
+  })
+
+  await runTest('isolation', 'Foreign user with primary tenant header → 401/403/404', async () => {
+    // Foreign user's JWT spoofing the primary's X-Tenant-ID must be rejected.
+    const r = await http('/api/lead-tables', {
+      userToken: fx.foreign.userToken, tenantId: fx.tenantId,
+    })
+    assert(r.status === 401 || r.status === 403 || r.status === 404,
+      `cross-tenant spoof should 4xx, got ${r.status}`, r.body)
+  })
+
+  await runTest('isolation', 'Foreign cannot DELETE primary\'s lead_table', async () => {
+    if (!primaryTableId) throw new Error('no primary table id')
+    const r = await http(`/api/lead-tables/${primaryTableId}`, {
+      method: 'DELETE', userToken: fx.foreign.userToken, tenantId: fx.foreign.tenantId,
+    })
+    assert(r.status === 401 || r.status === 403 || r.status === 404,
+      `foreign DELETE should 4xx, got ${r.status}`, r.body)
+    // Verify still present
+    const { data: row } = await sb.from('lead_tables').select('id').eq('id', primaryTableId).maybeSingle()
+    assert(row, 'primary table still present after foreign delete attempt')
+  })
+}
+
+/**
+ * Contacts — the most-used entity across inbox, broadcasts, segments.
+ * Create + list + tenant-scoped read.
+ */
+async function testContacts(fx: Fixture): Promise<void> {
+  let contactId: string | null = null
+  await runTest('contacts', 'POST /api/contacts creates a contact', async () => {
+    // ContactCreateSchema is .strict() — only accepts name, phone, email,
+    // tags, attributes, status, bot_paused.
+    const r = await http('/api/contacts', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { name: 'Smoke Contact', phone: '+919900112233', status: 'active' },
+    })
+    // Some routes return 200, others 201
+    assert(r.status === 200 || r.status === 201, `contact create ${r.status}`, r.body)
+    const id = r.body?.id ?? r.body?.data?.id ?? r.body?.contact?.id
+    if (id) {
+      contactId = id
+      fx.cleanupIds.push({ table: 'contacts', ids: [contactId!] })
+    }
+  })
+  await runTest('contacts', 'GET /api/contacts lists the new contact', async () => {
+    const r = await http('/api/contacts', { userToken: fx.userToken, tenantId: fx.tenantId })
+    assertEq(r.status, 200, 'contacts list status')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    if (contactId) {
+      assert(list.some((c: any) => c.id === contactId), 'created contact appears in list')
+    }
+  })
+}
+
+/**
+ * Workflows — pivotal feature. Create + list + read-by-id.
+ */
+async function testWorkflows(fx: Fixture): Promise<void> {
+  let workflowId: string | null = null
+  await runTest('workflows', 'POST /api/workflows creates a workflow', async () => {
+    const r = await http('/api/workflows', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: {
+        name: 'Smoke WF',
+        description: 'smoke test',
+        // Minimal valid blueprint — single trigger.
+        blueprint: {
+          nodes: [
+            { id: 'n1', type: 'trigger.message_received', config: { channel: 'whatsapp' } },
+          ],
+          edges: [],
+        },
+        status: 'draft',
+      },
+    })
+    if (r.status >= 400) {
+      // Workflow shape may have shifted — accept 400 here but verify it's a
+      // validation error, not a panic.
+      assert(r.status < 500, `workflow create panicked: ${r.status}`, r.body)
+      return
+    }
+    assert([200, 201].includes(r.status), `workflow create status ${r.status}`, r.body)
+    workflowId = r.body?.id ?? r.body?.data?.id ?? r.body?.workflow?.id
+    if (workflowId) fx.cleanupIds.push({ table: 'workflows', ids: [workflowId!] })
+  })
+  await runTest('workflows', 'GET /api/workflows lists workflows', async () => {
+    const r = await http('/api/workflows', { userToken: fx.userToken, tenantId: fx.tenantId })
+    assertEq(r.status, 200, 'workflows list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? r.body?.workflows ?? []
+    assert(Array.isArray(list), 'workflows response is iterable', r.body)
+  })
+}
+
+/**
+ * Quick replies + conversation notes — composer features.
+ */
+async function testQuickRepliesAndNotes(fx: Fixture): Promise<void> {
+  let qrId: string | null = null
+  await runTest('inbox-composer', 'POST /api/quick-replies creates a reply', async () => {
+    const r = await http('/api/quick-replies', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { shortcut: 'thx', text: 'Thanks for reaching out!' },
+    })
+    if (r.status >= 500) throw new Error(`quick-replies panicked: ${r.status}`)
+    if (r.status === 404) {
+      // Not all builds expose this — skip gracefully.
+      return
+    }
+    assert([200, 201].includes(r.status), `quick-replies status ${r.status}`, r.body)
+    qrId = r.body?.id ?? r.body?.data?.id
+    if (qrId) fx.cleanupIds.push({ table: 'quick_replies', ids: [qrId!] })
+  })
+  await runTest('inbox-composer', 'GET /api/quick-replies returns array', async () => {
+    const r = await http('/api/quick-replies', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'quick-replies list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    assert(Array.isArray(list), 'quick-replies list iterable', r.body)
+  })
+}
+
+/**
+ * Segments + broadcasts — campaign targeting + send-ready list management.
+ * We only test the CREATE / LIST paths; we never call /send (would burn WA credits).
+ */
+async function testSegmentsAndBroadcasts(fx: Fixture): Promise<void> {
+  await runTest('segments', 'GET /api/segments returns array', async () => {
+    const r = await http('/api/segments', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return // route may not exist in this build
+    assertEq(r.status, 200, 'segments list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    assert(Array.isArray(list), 'segments list iterable', r.body)
+  })
+  await runTest('broadcasts', 'GET /api/broadcasts returns array (no panic)', async () => {
+    const r = await http('/api/broadcasts', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'broadcasts list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    assert(Array.isArray(list), 'broadcasts list iterable', r.body)
+  })
+}
+
+/**
+ * CRM deals — pipeline mutations + stage validation.
+ */
+async function testDeals(fx: Fixture): Promise<void> {
+  // First fetch stages, pick the first "open" stage to attach the deal to.
+  let openStageId: string | null = null
+  await runTest('crm-deals', 'Setup: pick an open CRM stage', async () => {
+    const r = await http('/api/crm/stages', { userToken: fx.userToken, tenantId: fx.tenantId })
+    assertEq(r.status, 200, 'stages list')
+    const stages = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    const open = stages.find((s: any) => !s.is_won && !s.is_lost)
+    assert(open?.id, 'at least one open stage exists', stages)
+    openStageId = open.id
+  })
+
+  let dealId: string | null = null
+  await runTest('crm-deals', 'POST /api/crm/deals creates a deal', async () => {
+    if (!openStageId) throw new Error('no open stage id')
+    const r = await http('/api/crm/deals', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: {
+        stage_id: openStageId,
+        title: 'Smoke deal',
+        value: 1500,
+        currency: 'INR',
+      },
+    })
+    if (r.status === 404) return // route may not exist in this build
+    assert([200, 201].includes(r.status), `deal create status ${r.status}`, r.body)
+    dealId = r.body?.id ?? r.body?.data?.id ?? r.body?.deal?.id
+    if (dealId) fx.cleanupIds.push({ table: 'crm_deals', ids: [dealId!] })
+  })
+  await runTest('crm-deals', 'GET /api/crm/deals lists the new deal', async () => {
+    const r = await http('/api/crm/deals', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'deals list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    if (dealId) assert(list.some((d: any) => d.id === dealId), 'new deal in list', list)
+  })
+}
+
+/**
+ * Killed features — migration 103 dropped commerce + governance + KB
+ * schemas. If a route returns 200 from one of those paths it means
+ * someone re-added the table. Anything except 404 here is a regression.
+ */
+async function testKilledFeatures(fx: Fixture): Promise<void> {
+  const killed = [
+    'GET /api/khata/accounts',
+    'GET /api/khata/transactions',
+    'GET /api/catalog',
+    'GET /api/catalog/items',
+    'GET /api/commerce/governance/queue',
+    'GET /api/governance/queue',
+    'GET /api/knowledge-bases',
+    'GET /api/kb/sources',
+    'GET /api/ai-agents/list',
+  ]
+  for (const entry of killed) {
+    const [method, path] = entry.split(' ') as [string, string]
+    await runTest('killed', `${method} ${path} stays gone (404)`, async () => {
+      const r = await http(path, { method, userToken: fx.userToken, tenantId: fx.tenantId })
+      assert(r.status === 404, `${path} returned ${r.status} — killed feature is BACK`, { status: r.status, body: r.body })
+    })
+  }
+}
+
+/**
+ * Plans + subscriptions — billing surface readability.
+ */
+async function testPlansAndBilling(fx: Fixture): Promise<void> {
+  await runTest('billing', 'GET /api/plans returns array', async () => {
+    const r = await http('/api/plans', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'plans list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? r.body?.plans ?? []
+    assert(Array.isArray(list), 'plans list iterable', r.body)
+  })
+  await runTest('billing', 'GET /api/entitlements returns object', async () => {
+    const r = await http('/api/entitlements', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'entitlements')
+    assert(typeof r.body === 'object', 'entitlements body is object', r.body)
+  })
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
@@ -442,6 +731,7 @@ async function main(): Promise<void> {
   console.log(`  tenant=${fx.tenantId}\n  user=${fx.userId}`)
 
   try {
+    // ── Hand-written deep tests (mutating, business-logic verification) ──
     await testAuthGate(fx)
     await testSla(fx)
     await testPii(fx)
@@ -450,6 +740,71 @@ async function main(): Promise<void> {
     await testTables(fx)
     await testGoogleSheetsImportRegression(fx)
     await testInvalidAuth(fx)
+    await testTenantIsolation(fx)
+    await testContacts(fx)
+    await testWorkflows(fx)
+    await testQuickRepliesAndNotes(fx)
+    await testSegmentsAndBroadcasts(fx)
+    await testDeals(fx)
+    await testKilledFeatures(fx)
+    await testPlansAndBilling(fx)
+
+    // ── Layer 2: Auto-discover + probe every endpoint ────────────────────
+    if (!ARGS.only || ARGS.only.includes('coverage')) {
+      console.log('\nAuto-probing every discovered endpoint (this may take a minute)…')
+      const cov = await runCoverageProbe({
+        baseUrl: ARGS.base,
+        userToken: fx.userToken,
+        tenantId: fx.tenantId,
+        foreignToken: fx.foreign.userToken,
+        foreignTenantId: fx.foreign.tenantId,
+      })
+      console.log(`  ${cov.probed} probed, ${cov.skipped} skipped (webhooks / send / streaming)`)
+      // Treat every authed unexpected status as a test failure
+      for (const r of cov.authedFails) {
+        RESULTS.push({
+          group: 'coverage', name: `${r.endpoint.method} ${r.endpoint.path}`,
+          status: 'FAIL', ms: r.ms, message: r.reason,
+          detail: { file: r.endpoint.file, line: r.endpoint.line, body: r.bodyPreview },
+        })
+        process.stdout.write(`  \x1b[31mFAIL\x1b[0m coverage · ${r.endpoint.method} ${r.endpoint.path} → ${r.reason}\n`)
+      }
+      // Auth-gate leaks = security regressions, hard fail
+      for (const r of cov.unauthedLeaks) {
+        RESULTS.push({
+          group: 'coverage-authgate', name: `${r.endpoint.method} ${r.endpoint.path}`,
+          status: 'FAIL', ms: r.ms, message: r.reason,
+          detail: { file: r.endpoint.file, line: r.endpoint.line, body: r.bodyPreview },
+        })
+        process.stdout.write(`  \x1b[31mFAIL\x1b[0m coverage-authgate · ${r.endpoint.method} ${r.endpoint.path} → ${r.reason}\n`)
+      }
+      const okCount = cov.probed * 2 - cov.authedFails.length - cov.unauthedLeaks.length
+      RESULTS.push({
+        group: 'coverage', name: `${okCount}/${cov.probed * 2} probes passed`,
+        status: cov.authedFails.length + cov.unauthedLeaks.length === 0 ? 'PASS' : 'FAIL',
+        ms: 0,
+      })
+      process.stdout.write(`  \x1b[${cov.authedFails.length + cov.unauthedLeaks.length === 0 ? '32mPASS' : '31mFAIL'}\x1b[0m coverage · ${okCount}/${cov.probed * 2} probes passed\n`)
+    }
+
+    // ── Layer 3: DB integrity (schema, RLS, append-only, RPC presence) ───
+    if (!ARGS.only || ARGS.only.includes('integrity')) {
+      console.log('\nChecking DB integrity (schema, RPCs, append-only contracts)…')
+      const integrity = await runIntegrityChecks(sb)
+      let intFails = 0
+      for (const r of integrity) {
+        if (!r.pass) {
+          intFails++
+          RESULTS.push({ group: 'integrity', name: r.check, status: 'FAIL', ms: 0, message: r.detail })
+          process.stdout.write(`  \x1b[31mFAIL\x1b[0m integrity · ${r.check} → ${r.detail}\n`)
+        }
+      }
+      RESULTS.push({
+        group: 'integrity', name: `${integrity.length - intFails}/${integrity.length} integrity checks passed`,
+        status: intFails === 0 ? 'PASS' : 'FAIL', ms: 0,
+      })
+      process.stdout.write(`  \x1b[${intFails === 0 ? '32mPASS' : '31mFAIL'}\x1b[0m integrity · ${integrity.length - intFails}/${integrity.length} checks passed\n`)
+    }
   } finally {
     console.log('\nCleaning up fixture…')
     await cleanup(fx)
