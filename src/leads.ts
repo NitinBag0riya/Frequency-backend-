@@ -441,12 +441,21 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
 
   router.delete('/lead-tables/:id', requireAuth, identifyTenant, checkPermission('leads', 'delete'), async (req, res) => {
     const tenantId = (req as any).tenantId
-    const { error } = await supabase
+    // Use .select() so we get the deleted rows back and can return 404 when
+    // nothing matched. The previous version returned 200 {success:true}
+    // regardless — meaning a cross-tenant DELETE attempt got a misleading
+    // success response. Caught by the behavioral smoke harness.
+    const { data: deleted, error } = await supabase
       .from('lead_tables')
       .delete()
       .eq('id', req.params.id)
       .eq('tenant_id', tenantId)
+      .select('id')
     if (error) { res.status(500).json({ error: error.message }); return }
+    if (!deleted || deleted.length === 0) {
+      res.status(404).json({ error: 'Table not found' })
+      return
+    }
     res.json({ success: true })
   })
 

@@ -61,7 +61,20 @@ if (!SUPABASE_SERVICE_ROLE) {
   console.error('FATAL: SUPABASE_SERVICE_ROLE_KEY not set in env')
   process.exit(2)
 }
+// Two clients:
+//   sbAdmin — pure service-role for direct DB ops (insert lead_rows etc).
+//             Stays service-role for the whole run; never carries a user
+//             session, so RLS is bypassed reliably.
+//   sb      — used for signInWithPassword to mint user JWTs. After sign-in,
+//             this client's session belongs to whichever user signed in
+//             most recently; using it for direct DB ops produces RLS
+//             failures masquerading as bugs (caught by the smoke run:
+//             lead_rows bulk insert flunked RLS because sb was foreign-user-
+//             scoped after the second provision). Keep it auth-only.
 const sb: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
+const sbAdmin: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+  auth: { persistSession: false, autoRefreshToken: false },
+})
 
 // ── Test results tracking ──────────────────────────────────────────────────
 
@@ -168,7 +181,7 @@ async function provisionUserAndTenant(label: string): Promise<Provisioned> {
   const userEmail = `smoke+${label}-${stamp}@frequency-test.local`
   const userPassword = `Smoke${stamp}!_${randomUUID().slice(0, 8)}`
 
-  const { data: userCreated, error: userErr } = await sb.auth.admin.createUser({
+  const { data: userCreated, error: userErr } = await sbAdmin.auth.admin.createUser({
     email: userEmail,
     password: userPassword,
     email_confirm: true,
@@ -190,7 +203,7 @@ async function provisionUserAndTenant(label: string): Promise<Provisioned> {
   // be confused for a real WhatsApp account. Columns with DB-side defaults
   // are omitted (csat_*, data_residency, etc).
   const fakeWabaId = `smoke-waba-${label}-${stamp}-${randomUUID().slice(0, 8)}`
-  const { data: tenant, error: tenantErr } = await sb.from('tenants').insert({
+  const { data: tenant, error: tenantErr } = await sbAdmin.from('tenants').insert({
     user_id: userId,
     business_name: `Smoke Test Tenant ${label} ${stamp}`,
     waba_id: fakeWabaId,
@@ -202,7 +215,7 @@ async function provisionUserAndTenant(label: string): Promise<Provisioned> {
   if (tenantErr || !tenant) throw new Error(`Failed to create ${label} tenant: ${tenantErr?.message}`)
   const tenantId = tenant.id
 
-  await sb.from('user_roles').insert({
+  await sbAdmin.from('user_roles').insert({
     user_id: userId,
     tenant_id: tenantId,
     role: 'owner',
@@ -225,12 +238,12 @@ async function cleanup(fx: Fixture): Promise<void> {
   // Cleanup in reverse dependency order. Service-role bypasses RLS.
   for (const c of fx.cleanupIds.slice().reverse()) {
     if (c.ids.length === 0) continue
-    await sb.from(c.table).delete().in('id', c.ids)
+    await sbAdmin.from(c.table).delete().in('id', c.ids)
   }
   for (const actor of [fx, fx.foreign]) {
-    await sb.from('user_roles').delete().eq('user_id', actor.userId).eq('tenant_id', actor.tenantId)
-    await sb.from('tenants').delete().eq('id', actor.tenantId)
-    await sb.auth.admin.deleteUser(actor.userId)
+    await sbAdmin.from('user_roles').delete().eq('user_id', actor.userId).eq('tenant_id', actor.tenantId)
+    await sbAdmin.from('tenants').delete().eq('id', actor.tenantId)
+    await sbAdmin.auth.admin.deleteUser(actor.userId)
   }
 }
 
@@ -296,7 +309,7 @@ async function testSla(fx: Fixture): Promise<void> {
     })
     assertEq(r.status, 200, 'sla upsert status')
     // Validate only ONE row exists with these scoping keys.
-    const { data: rows } = await sb.from('sla_configs')
+    const { data: rows } = await sbAdmin.from('sla_configs')
       .select('id').eq('tenant_id', fx.tenantId).is('team_id', null).eq('channel', 'any')
     assertEq(rows?.length, 1, 'upsert collapsed duplicates')
   })
@@ -384,7 +397,7 @@ async function testTables(fx: Fixture): Promise<void> {
     tableId = r.body.id
     fx.cleanupIds.push({ table: 'lead_tables', ids: [tableId!] })
     // Verify columns landed in DB.
-    const { data: cols } = await sb.from('lead_columns').select('name, key').eq('table_id', tableId)
+    const { data: cols } = await sbAdmin.from('lead_columns').select('name, key').eq('table_id', tableId)
     assert(cols && cols.length >= 2, `expected ≥2 columns in DB, got ${cols?.length}`)
   })
   await runTest('tables', 'GET /api/lead-tables shows the new table', async () => {
@@ -428,12 +441,12 @@ async function testGoogleSheetsImportRegression(fx: Fixture): Promise<void> {
       status:    'new',
       tags:      [],
     }))
-    const { error } = await sb.from('lead_rows').insert(rows)
+    const { error } = await sbAdmin.from('lead_rows').insert(rows)
     if (error) throw new Error(`bulk insert failed: ${error.message}`)
     const ms = Date.now() - start
     assert(ms < 10_000, `bulk-200 insert took ${ms}ms — expected <10s. N+1 regression suspected.`)
     // Verify count
-    const { count } = await sb.from('lead_rows').select('id', { count: 'exact', head: true }).eq('table_id', tableId)
+    const { count } = await sbAdmin.from('lead_rows').select('id', { count: 'exact', head: true }).eq('table_id', tableId)
     assertEq(count, 200, '200 rows landed in DB')
   })
 }
@@ -519,7 +532,7 @@ async function testTenantIsolation(fx: Fixture): Promise<void> {
     assert(r.status === 401 || r.status === 403 || r.status === 404,
       `foreign DELETE should 4xx, got ${r.status}`, r.body)
     // Verify still present
-    const { data: row } = await sb.from('lead_tables').select('id').eq('id', primaryTableId).maybeSingle()
+    const { data: row } = await sbAdmin.from('lead_tables').select('id').eq('id', primaryTableId).maybeSingle()
     assert(row, 'primary table still present after foreign delete attempt')
   })
 }

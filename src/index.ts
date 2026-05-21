@@ -747,7 +747,17 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
       next()
       return
     }
-    logger.debug(`[identifyTenant] header tenant ${headerTenantId} not accessible by user, falling through`)
+    // SECURITY: caller sent an X-Tenant-ID header they have NO access to.
+    // The previous behavior was to silently fall through and resolve to the
+    // caller's own tenant — which (a) lies to clients about which tenant
+    // they're operating on, (b) enables cross-tenant probing (caught by the
+    // behavioral smoke harness: a foreign user spoofing primary's tenant
+    // header got 200 with empty array, masking the rejection signal),
+    // and (c) widens the blast radius if any downstream handler trusts
+    // req.tenantId without re-validating. Hard-reject instead.
+    logger.warn(`[identifyTenant] SECURITY: user=${user.id} sent header tenant ${headerTenantId} they have no access to — rejecting`)
+    apiError(res, 403, 'tenant_access_denied', 'You do not have access to the requested tenant.')
+    return
   }
 
   // 2. Auto-detect: Check new RBAC user_role_assignments first
