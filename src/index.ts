@@ -1204,10 +1204,50 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
           ?.filter(b => b.type === 'text')
           .map(b => (b as any).text as string)
           .join('') ?? ''
-        const trimmed = assistantText.trim()
-        if (trimmed.startsWith('{')) {
-          const parsed = JSON.parse(trimmed)
-          const proposedNodes = Array.isArray(parsed?.nodes) ? parsed.nodes : []
+        // Robust extraction — mirrors FE lib/whatsapp-nlp.ts so the
+        // preview-validator behaviour matches what the FE will actually
+        // accept. Strips a single code fence if present, then walks
+        // balanced braces from the first '{'.
+        const extractFirstJsonObject = (text: string): string | null => {
+          if (!text) return null
+          const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/)
+          const candidate = fenceMatch ? fenceMatch[1] : text
+          const start = candidate.indexOf('{')
+          if (start === -1) return null
+          let depth = 0, inString = false, escape = false
+          for (let i = start; i < candidate.length; i++) {
+            const ch = candidate[i]
+            if (escape) { escape = false; continue }
+            if (ch === '\\' && inString) { escape = true; continue }
+            if (ch === '"') { inString = !inString; continue }
+            if (inString) continue
+            if (ch === '{') depth++
+            else if (ch === '}') {
+              depth--
+              if (depth === 0) return candidate.slice(start, i + 1)
+            }
+          }
+          return null
+        }
+        const jsonStr = extractFirstJsonObject(assistantText)
+        if (jsonStr) {
+          let parsed: any
+          try { parsed = JSON.parse(jsonStr) }
+          catch { parsed = JSON.parse(jsonStr.replace(/,(\s*[}\]])/g, '$1')) }
+          // Envelope unwrap — accept the blueprint nested under common
+          // wrapper keys so a wrapped response still produces a preview.
+          const ENVELOPE_KEYS = ['blueprint', 'workflow', 'result', 'data', 'output']
+          let workflowObj: any = parsed
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed.nodes) && typeof parsed.workflow_name !== 'string') {
+            for (const k of ENVELOPE_KEYS) {
+              const cand = parsed[k]
+              if (cand && typeof cand === 'object' && (Array.isArray(cand.nodes) || typeof cand.workflow_name === 'string' || typeof cand.name === 'string')) {
+                workflowObj = cand
+                break
+              }
+            }
+          }
+          const proposedNodes = Array.isArray(workflowObj?.nodes) ? workflowObj.nodes : []
           if (proposedNodes.length > 0) {
             const { validateWorkflow } = await import('./engine/workflow-validator')
             const report = await validateWorkflow(supabase, tenantId, proposedNodes)
@@ -1224,7 +1264,7 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
             writeEvent({
               type: 'preview',
               nodes_json: proposedNodes,
-              blueprint: parsed,
+              blueprint: workflowObj,
               validation: report,
               confidence,
             })
