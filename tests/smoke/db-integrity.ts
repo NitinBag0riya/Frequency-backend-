@@ -148,24 +148,26 @@ export async function runIntegrityChecks(sb: SupabaseClient): Promise<IntegrityR
     'knowledge_bases', 'kb_sources', 'kb_chunks',
     'kb_test_runs', 'kb_inference_log',
   ]) {
-    const { error } = await sb.from(tbl).select('*', { count: 'exact', head: true })
-    // We WANT this to error (table doesn't exist). If it succeeds, the
-    // table is back — which means migration 103 was reverted.
-    // PostgREST returns "Could not find the table" with code PGRST205
-    // when the table is dropped. The earlier regex only matched
-    // "does not exist" / "not found" / "42P01" and missed PostgREST's
-    // wording, producing false positives that flagged every dropped
-    // table as a regression.
-    const errMsg = error?.message ?? ''
-    const errCode = (error as any)?.code ?? ''
-    const tableAbsent =
-      /does not exist|not found|could not find|42P01/i.test(errMsg) ||
-      errCode === 'PGRST205' || errCode === '42P01'
-    const pass = !!error && tableAbsent
+    // supabase-js quirk verified against staging: a head-count query on a
+    // NON-EXISTENT table returns { data:null, count:null, error:null }
+    // — error is silently null, not the PGRST205 you'd get from raw REST.
+    // (PostgREST 12 swallows the 404 into a null count when count=exact +
+    // head=true.) So the only reliable "table absent" signal is count===null.
+    // An existing table returns count as a number, even if empty.
+    // Cast to `any` for the result — supabase-js types these dropped-table
+    // names as `never` (they're not in the generated schema types), which
+    // tsc rejects when we read .message off the (typed-as-never) error.
+    const res: any = await sb.from(tbl as any).select('*', { count: 'exact', head: true })
+    const count = res.count as number | null
+    const errMsg: string = res.error?.message ?? ''
+    const tableAbsent = count === null
+    const pass = tableAbsent || (!!res.error && /does not exist|not found|could not find|42P01/i.test(errMsg))
     out.push({
       check: `dropped table ${tbl} stays dropped`,
       pass,
-      detail: pass ? 'OK (table absent)' : `regression: table is back — ${errMsg || 'select succeeded'}`,
+      detail: pass
+        ? 'OK (table absent)'
+        : `regression: table is back — count=${count}${errMsg ? `, err=${errMsg}` : ''}`,
     })
   }
 

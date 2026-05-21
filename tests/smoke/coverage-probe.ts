@@ -65,6 +65,9 @@ const PUBLIC_PATHS = new Set<string>([
   '/api/agency-plans',
   '/api/connectors/registry',
   '/api/plans',
+  '/api/ping',
+  '/api/features',
+  '/api/workflow-templates',
 ])
 
 // Paths where the auto-probe should SKIP entirely (require special data
