@@ -18,6 +18,7 @@ import '../env'
 import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -27,6 +28,13 @@ const EXPIRY_MONTHS = 12
 const BATCH_SIZE = 500
 
 export async function startConsentExpirySweepWorker() {
+  const enabled = isPollerEnabled('CONSENT_EXPIRY_SWEEP')
+  logGate('CONSENT_EXPIRY_SWEEP', enabled)
+  if (!enabled) {
+    await cleanRepeatablesByName(cronQueue, 'consent-expiry-sweep')
+    return STUB_WORKER
+  }
+
   await cronQueue.add(
     'consent-expiry-sweep',
     {},

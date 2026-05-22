@@ -26,6 +26,7 @@ import { Q, connection, cronQueue } from '../queue'
 import { sheetsReadRange } from '../google'
 import { listAllRecords } from '../lib/airtable'
 import { loadMapping, applyMappingToPayload, type DecodedField } from '../lib/apply-mapping'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -34,6 +35,13 @@ const SYNC_INTERVAL_MS = Number(process.env.DATA_SOURCE_SYNC_INTERVAL_MS ?? 5 * 
 const BATCH_SIZE = 25
 
 export async function startDataSourceSyncWorker() {
+  const enabled = isPollerEnabled('DATA_SOURCE_SYNC')
+  logGate('DATA_SOURCE_SYNC', enabled)
+  if (!enabled) {
+    await cleanRepeatablesByName(cronQueue, 'data-source-sync')
+    return STUB_WORKER
+  }
+
   // Singleton repeatable — same dedupe pattern as template-sync.
   await cronQueue.add(
     'data-source-sync',

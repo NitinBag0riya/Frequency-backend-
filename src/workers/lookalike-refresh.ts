@@ -32,6 +32,7 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { decrypt } from '../crypto'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -45,6 +46,13 @@ const BATCH_SIZE = 25
 const META_OP_STATUS_FAILED = 300
 
 export async function startLookalikeRefreshWorker() {
+  const enabled = isPollerEnabled('LOOKALIKE_REFRESH')
+  logGate('LOOKALIKE_REFRESH', enabled)
+  if (!enabled) {
+    await cleanRepeatablesByName(cronQueue, 'lookalike-refresh')
+    return STUB_WORKER
+  }
+
   // Singleton repeatable — identical dedupe pattern to template-sync and
   // data-source-sync. BullMQ swallows duplicate adds with the same jobId,
   // so this is safe to call on every worker boot.

@@ -29,6 +29,7 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { fireShopifyTrigger } from '../engine/shopify-triggers'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -38,6 +39,13 @@ const NUDGE_DELAY_MIN  = Number(process.env.SHOPIFY_CART_NUDGE_DELAY_MIN ?? 10)
 const BATCH_SIZE       = 200
 
 export async function startShopifyAbandonedCartPollerWorker() {
+  const enabled = isPollerEnabled('SHOPIFY_CART_POLLER')
+  logGate('SHOPIFY_CART_POLLER', enabled)
+  if (!enabled) {
+    await cleanRepeatablesByName(cronQueue, 'shopify-abandoned-cart-poller')
+    return STUB_WORKER
+  }
+
   await cronQueue.add(
     'shopify-abandoned-cart-poller',
     {},

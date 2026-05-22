@@ -27,6 +27,7 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { decrypt } from '../crypto'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -37,6 +38,13 @@ const MAX_TENANTS_PER_TICK = Number(process.env.IG_COMMENT_POLL_MAX_TENANTS ?? 2
 const MAX_POSTS_PER_TENANT = Number(process.env.IG_COMMENT_POLL_MAX_POSTS  ?? 50)
 
 export async function startInstagramCommentPollerWorker() {
+  const enabled = isPollerEnabled('IG_COMMENT_POLLER')
+  logGate('IG_COMMENT_POLLER', enabled)
+  if (!enabled) {
+    await cleanRepeatablesByName(cronQueue, 'instagram-comment-poller-tick')
+    return STUB_WORKER
+  }
+
   await cronQueue.add(
     'instagram-comment-poller-tick',
     {},

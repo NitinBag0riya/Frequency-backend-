@@ -23,6 +23,7 @@ import '../env'
 import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -33,6 +34,13 @@ const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KE
 const TICK_INTERVAL_MS = Number(process.env.AGENCY_PAYOUT_AGG_INTERVAL_MS ?? 24 * 60 * 60 * 1000)
 
 export async function startAgencyPayoutAggregatorWorker() {
+  const enabled = isPollerEnabled('AGENCY_PAYOUT_AGGREGATOR')
+  logGate('AGENCY_PAYOUT_AGGREGATOR', enabled)
+  if (!enabled) {
+    await cleanRepeatablesByName(cronQueue, 'agency-payout-aggregator')
+    return STUB_WORKER
+  }
+
   await cronQueue.add(
     'agency-payout-aggregator',
     {},

@@ -24,6 +24,7 @@ import {
   enqueueWorkflowExecution, enqueueBroadcast,
 } from '../queue'
 import { executeCampaignStep } from '../engine/campaign'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -32,6 +33,14 @@ const POLL_INTERVAL_MS = Number(process.env.SCHEDULE_POLL_MS ?? 30_000)
 const BATCH_SIZE = 200
 
 export async function startSchedulePollerWorker() {
+  const enabled = isPollerEnabled('SCHEDULE_POLLER')
+  logGate('SCHEDULE_POLLER', enabled)
+  if (!enabled) {
+    // Scrub any prior repeat-schedule so it stops firing in Redis.
+    await cleanRepeatablesByName(cronQueue, 'poll-scheduled-jobs')
+    return STUB_WORKER
+  }
+
   // 1. Ensure the singleton repeatable job exists.
   //    BullMQ dedupes by jobId so repeated calls are safe.
   await cronQueue.add(

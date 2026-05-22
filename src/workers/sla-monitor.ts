@@ -53,6 +53,7 @@ import { Worker, type Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { logger } from '../lib/logger'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -172,6 +173,13 @@ interface ConvAgg {
 }
 
 export async function startSlaMonitorWorker() {
+  const enabled = isPollerEnabled('SLA_MONITOR')
+  logGate('SLA_MONITOR', enabled)
+  if (!enabled) {
+    await cleanRepeatablesByName(cronQueue, 'sla-monitor')
+    return STUB_WORKER
+  }
+
   await cronQueue.add(
     'sla-monitor',
     {},

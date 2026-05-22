@@ -20,6 +20,7 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { emitNotification } from '../routes/notifications'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -28,6 +29,13 @@ const TICK_INTERVAL_MS = Number(process.env.TRIAL_ENDING_INTERVAL_MS ?? 6 * 60 *
 const WARN_DAYS_AHEAD  = 7
 
 export async function startTrialEndingWorker() {
+  const enabled = isPollerEnabled('TRIAL_ENDING')
+  logGate('TRIAL_ENDING', enabled)
+  if (!enabled) {
+    await cleanRepeatablesByName(cronQueue, 'trial-ending-check')
+    return STUB_WORKER
+  }
+
   // Same singleton-repeatable pattern as the other cron workers — add once
   // with a stable jobId so concurrent server boots don't multiply ticks.
   await cronQueue.add(
