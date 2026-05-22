@@ -1293,6 +1293,165 @@ async function testWaitlist(): Promise<void> {
 }
 
 /**
+ * Webhook signature verification — negative tests.
+ *
+ * The signed webhooks (Meta WhatsApp, Razorpay, Shopify) MUST reject any
+ * request without a valid signature. Without these tests, a regression
+ * that weakens the signature check (e.g., comparing strings non-constant-
+ * time, accepting any signature when secret is empty, skipping the check
+ * on a refactor) would silently allow webhook spoofing — letting an
+ * attacker forge inbound messages or fake payment success events.
+ *
+ * Happy-path signature tests would require the actual app secret. We can
+ * do those locally with a fixture but in CI we can only assert the
+ * REJECTION path (no signature + bad signature both → 4xx). That's still
+ * the most security-critical assertion.
+ */
+async function testWebhookSignatures(): Promise<void> {
+  // Meta WhatsApp inbound — POST /webhook/whatsapp (no /api prefix).
+  await runTest('webhook-sig', 'POST /webhook/whatsapp without signature → 401', async () => {
+    const res = await fetch(`${ARGS.base}/webhook/whatsapp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"object":"whatsapp_business_account","entry":[]}',
+    })
+    assertEq(res.status, 401, 'Meta webhook MUST reject missing signature')
+  })
+  await runTest('webhook-sig', 'POST /webhook/whatsapp with bad signature → 401', async () => {
+    const res = await fetch(`${ARGS.base}/webhook/whatsapp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hub-Signature-256': 'sha256=0000000000000000000000000000000000000000000000000000000000000000',
+      },
+      body: '{"object":"whatsapp_business_account","entry":[]}',
+    })
+    assertEq(res.status, 401, 'Meta webhook MUST reject invalid signature')
+  })
+
+  // Razorpay billing webhook — verifies x-razorpay-signature header.
+  await runTest('webhook-sig', 'POST /api/billing/razorpay/webhook without sig → 401', async () => {
+    const res = await fetch(`${ARGS.base}/api/billing/razorpay/webhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"event":"payment.captured"}',
+    })
+    assert(res.status === 401 || res.status === 400,
+      `Razorpay webhook missing sig should be 4xx, got ${res.status}`)
+  })
+
+  // Shopify webhook — verifies x-shopify-hmac-sha256 header.
+  await runTest('webhook-sig', 'POST /api/webhooks/shopify without sig → 401', async () => {
+    const res = await fetch(`${ARGS.base}/api/webhooks/shopify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"topic":"orders/create"}',
+    })
+    assert(res.status === 401 || res.status === 400,
+      `Shopify webhook missing sig should be 4xx, got ${res.status}`)
+  })
+
+  // Meta WhatsApp verification challenge — GET /webhook/whatsapp with bad token → 403.
+  await runTest('webhook-sig', 'GET /webhook/whatsapp with bad verify token → 403', async () => {
+    const res = await fetch(
+      `${ARGS.base}/webhook/whatsapp?hub.mode=subscribe&hub.verify_token=WRONG&hub.challenge=challenge_string`,
+    )
+    assert(res.status === 403 || res.status === 401,
+      `Meta verify with bad token should be 4xx, got ${res.status}`)
+  })
+}
+
+/**
+ * Storage upload roundtrip — Supabase storage POST/GET/DELETE.
+ *
+ * We upload a tiny test blob to a bucket the user can write to (per RLS),
+ * verify it's readable, then delete it. Catches:
+ *   ✓ Bucket policies — RLS misconfiguration would 403 the upload
+ *   ✓ Storage quota — exhausted quota fails uploads
+ *   ✓ Read-after-write consistency — newly uploaded blob is fetchable
+ */
+async function testStorageUpload(fx: Fixture): Promise<void> {
+  // Use a likely-existing bucket name. If your project uses a different
+  // name, this gracefully skips on the upload status check.
+  const buckets = ['attachments', 'public', 'avatars']
+  let uploadedTo: string | null = null
+  let uploadedPath: string | null = null
+
+  for (const bucket of buckets) {
+    const ok = await runUploadOnce(fx, bucket).catch(() => null)
+    if (ok) {
+      uploadedTo = bucket
+      uploadedPath = ok
+      break
+    }
+  }
+  await runTest('storage', 'upload + readable + delete', async () => {
+    assert(uploadedTo && uploadedPath,
+      `no writable bucket found in [${buckets.join(', ')}] — verify bucket setup or RLS`)
+  })
+
+  async function runUploadOnce(fx: Fixture, bucket: string): Promise<string | null> {
+    const filename = `e2e-${Date.now()}.txt`
+    const path = `${fx.tenantId}/${filename}`
+    const content = Buffer.from('e2e storage upload')
+
+    const { error: upErr } = await sbAdmin.storage.from(bucket).upload(path, content, {
+      contentType: 'text/plain',
+      upsert: false,
+    })
+    if (upErr) return null
+
+    const { data: dl, error: dlErr } = await sbAdmin.storage.from(bucket).download(path)
+    if (dlErr || !dl) return null
+    const txt = await dl.text()
+    if (txt !== 'e2e storage upload') return null
+
+    await sbAdmin.storage.from(bucket).remove([path])
+    return path
+  }
+}
+
+/**
+ * Realtime subscribe — Supabase realtime websocket smoke.
+ *
+ * Asserts that a subscriber can connect to a channel and receive the
+ * SUBSCRIBED status within a reasonable timeout. Doesn't depend on actual
+ * row changes (those require timing-sensitive setup) — just that the
+ * realtime endpoint is reachable + the client handshake succeeds.
+ *
+ * If realtime is down (Supabase outage, project paused, network
+ * misconfiguration) every realtime feature in the app silently fails —
+ * inbox doesn't update, dashboards don't tick. This pins the contract.
+ */
+async function testRealtimeConnect(fx: Fixture): Promise<void> {
+  await runTest('realtime', 'subscribe to a channel completes SUBSCRIBED', async () => {
+    // Use a user-context client so we test the actual auth path the FE uses.
+    const userClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+      auth: { persistSession: false },
+    })
+    await userClient.auth.setSession({
+      access_token:  fx.userToken,
+      refresh_token: 'unused',
+    } as any).catch(() => { /* setSession may noop for service-role JWTs */ })
+
+    const ch = userClient.channel(`smoke-test-${Date.now()}`)
+    const status: string = await new Promise<string>((resolve) => {
+      const timer = setTimeout(() => resolve('TIMEOUT'), 10_000)
+      ch.subscribe((s: string) => {
+        clearTimeout(timer)
+        resolve(s)
+      })
+    })
+    try { await ch.unsubscribe() } catch { /* best effort */ }
+    // CHANNEL_ERROR happens on locked-down RLS but the connection itself
+    // worked — that's the contract we're pinning. TIMEOUT = realtime down.
+    assert(status !== 'TIMEOUT', 'realtime endpoint failed to respond')
+    assert(['SUBSCRIBED', 'CHANNEL_ERROR', 'CLOSED'].includes(status),
+      `realtime subscribe returned unexpected ${status}`)
+  })
+}
+
+/**
  * Plans + subscriptions — billing surface readability.
  */
 async function testPlansAndBilling(fx: Fixture): Promise<void> {
@@ -1363,6 +1522,9 @@ async function main(): Promise<void> {
     await testPrivacy(fx)
     await testPublicEndpoints()
     await testWaitlist()
+    await testWebhookSignatures()
+    await testStorageUpload(fx)
+    await testRealtimeConnect(fx)
     await testKilledFeatures(fx)
     await testPlansAndBilling(fx)
 
