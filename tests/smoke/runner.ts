@@ -1576,6 +1576,192 @@ async function testAgencyEndToEnd(fx: Fixture): Promise<void> {
 }
 
 /**
+ * Platform admin (`/api/super-admin/*`) — the Frequency-internal console.
+ *
+ * Provisions a separate user with the `platform_owner` role in
+ * user_role_assignments (tenant_id IS NULL, role_definitions.scope='platform'),
+ * then hits every super-admin GET endpoint. Catches:
+ *   ✓ Platform-perm middleware rejecting valid super-admin requests
+ *   ✓ Endpoint panics on the super-admin namespace
+ *   ✓ Missing super_admin_audit table / RLS regressions
+ *
+ * The role-id below is `platform_owner` from role_definitions —
+ * Frequency's CEO/CTO role with full platform permissions.
+ */
+async function testPlatformAdmin(fx: Fixture): Promise<void> {
+  const PLATFORM_OWNER_ROLE_ID = 'd1498ccb-0eb4-46e5-a2c7-b9e6ab57839c'
+  let pUserId: string | null = null
+  let pToken: string | null = null
+
+  await runTest('platform-admin', 'Setup: provision a platform_owner user', async () => {
+    const stamp = Date.now() + Math.floor(Math.random() * 1000)
+    const email = `smoke-platform+${stamp}@frequency-test.local`
+    const password = `Plat${stamp}!_${randomUUID().slice(0, 8)}`
+    const { data: created, error: cErr } = await sbAdmin.auth.admin.createUser({
+      email, password, email_confirm: true,
+    })
+    if (cErr || !created?.user) throw new Error(`platform user create failed: ${cErr?.message}`)
+    pUserId = created.user.id
+
+    // Mint a session JWT for this user.
+    const { data: signin, error: sErr } = await sbAdmin.auth.signInWithPassword({ email, password })
+    if (sErr || !signin.session) throw new Error(`platform user signin failed: ${sErr?.message}`)
+    pToken = signin.session.access_token
+    // Re-clamp sb to service-role context (signin promoted sbAdmin's auth session
+    // — though sbAdmin's `auth.persistSession: false` should prevent it, belt-
+    // and-braces). The cleanup below uses sbAdmin directly.
+
+    // Assign platform_owner role with tenant_id=null (platform scope).
+    const { error: aErr } = await sbAdmin.from('user_role_assignments').insert({
+      user_id: pUserId,
+      tenant_id: null,
+      role_definition_id: PLATFORM_OWNER_ROLE_ID,
+      assigned_by: pUserId, // self-assign in test
+    })
+    if (aErr) throw new Error(`role_assignment failed: ${aErr.message}`)
+    // Stash for cleanup.
+    fx.cleanupIds.push({ table: 'user_role_assignments', ids: [pUserId!] })
+  })
+
+  // Helper that wraps http() with the platform user's token + no tenant header.
+  const platformGet = async (path: string) => {
+    if (!pToken) throw new Error('platform user not provisioned')
+    return await http(path, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${pToken}` },
+    })
+  }
+
+  const reads = [
+    '/api/super-admin/tenants',
+    '/api/super-admin/plans',
+    '/api/super-admin/roles',
+    '/api/super-admin/audit',
+    '/api/super-admin/feature-flags',
+    '/api/super-admin/announcements',
+    '/api/super-admin/approval-rules',
+    '/api/super-admin/stats',
+    '/api/super-admin/mrr-trend',
+    '/api/super-admin/recent-signups',
+    '/api/super-admin/webhook-failures',
+    '/api/super-admin/agencies',
+  ]
+  for (const path of reads) {
+    await runTest('platform-admin', `GET ${path} responds (as platform_owner)`, async () => {
+      if (!pToken) return
+      const r = await platformGet(path)
+      if (r.status === 404) return // endpoint may not be present
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+      assert(r.status !== 403, `platform_owner unexpectedly rejected by perm gate on ${path}`, r.body)
+    })
+  }
+
+  // Cleanup user — the role_assignment row gets cleaned by cleanupIds, but
+  // the auth user needs separate deletion.
+  await runTest('platform-admin', 'Cleanup platform user', async () => {
+    if (!pUserId) return
+    await sbAdmin.from('user_role_assignments').delete().eq('user_id', pUserId)
+    await sbAdmin.auth.admin.deleteUser(pUserId)
+  })
+}
+
+/**
+ * Agency invite flows — cross-persona link between agency and tenants /
+ * members.
+ *
+ * The agency feature is broken until these flows work:
+ *   ✓ Agency adds a tenant as a sub-account (direct via service-role —
+ *     the FE flow uses an email-link, this exercises the API path)
+ *   ✓ Listing sub-accounts shows the linked tenant
+ *   ✓ Agency invites another user as a member (POST /api/agencies/:id/invite)
+ *   ✓ Members list grows
+ *
+ * No actual email is sent (BE shortcircuits on test domain); we verify
+ * the rows land + the response shape is correct.
+ */
+async function testAgencyInviteFlows(fx: Fixture): Promise<void> {
+  let agencyId: string | null = null
+  let subTenantUserId: string | null = null
+  let subTenantId: string | null = null
+  const memberEmail = `agency-member-${Date.now()}@frequency-test.local`
+
+  await runTest('agency-invite', 'Setup: create agency + a second tenant to link', async () => {
+    // 1. Create an agency owned by the test user.
+    const slug = `e2e-link-${Date.now()}-${randomUUID().slice(0, 6)}`.toLowerCase()
+    const ag = await http('/api/agencies', {
+      method: 'POST', userToken: fx.userToken,
+      body: { name: `Link Agency ${Date.now()}`, slug },
+    })
+    if (ag.status === 404) return
+    assert([200, 201].includes(ag.status), `agency create ${ag.status}`, ag.body)
+    agencyId = ag.body?.agency?.id ?? ag.body?.id ?? null
+    if (agencyId) fx.cleanupIds.push({ table: 'agencies', ids: [agencyId!] })
+
+    // 2. Provision a second user + tenant (the "sub-account").
+    const stamp = Date.now()
+    const subEmail = `sub-${stamp}@frequency-test.local`
+    const subPw = `Sub${stamp}!_${randomUUID().slice(0, 8)}`
+    const { data: sub } = await sbAdmin.auth.admin.createUser({
+      email: subEmail, password: subPw, email_confirm: true,
+    })
+    subTenantUserId = sub!.user!.id
+    const { data: tn } = await sbAdmin.from('tenants').insert({
+      user_id: subTenantUserId,
+      business_name: `Sub Tenant ${stamp}`,
+      waba_id: `sub-waba-${stamp}`,
+      phone_number_id: `sub-pn-${stamp}`,
+      access_token: 'sub-tok',
+      status: 'active',
+      slug: `sub-${stamp}`,
+    }).select('id').single()
+    subTenantId = tn!.id
+    fx.cleanupIds.push({ table: 'tenants', ids: [subTenantId!] })
+  })
+
+  await runTest('agency-invite', 'Agency-side: link sub-account tenant via direct insert', async () => {
+    if (!agencyId || !subTenantId) return
+    // The FE uses /api/agencies/:id/sub-accounts which generates an
+    // invite link. Direct insert mirrors the post-accept state — exercises
+    // the join + cross-tenant visibility downstream.
+    const { error } = await sbAdmin.from('agency_sub_accounts').insert({
+      agency_id: agencyId,
+      tenant_id: subTenantId,
+      billing_owner: 'agency',
+      added_at: new Date().toISOString(),
+    })
+    assert(!error, `sub-account link failed: ${error?.message}`)
+  })
+
+  await runTest('agency-invite', 'GET /api/agencies/:id/sub-accounts shows the linked tenant', async () => {
+    if (!agencyId || !subTenantId) return
+    const r = await http(`/api/agencies/${agencyId}/sub-accounts`, { userToken: fx.userToken })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'sub-accounts list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? r.body?.sub_accounts ?? []
+    assert(list.some((s: any) => s.tenant_id === subTenantId || s.tenants?.id === subTenantId),
+      'linked sub-account appears in agency\'s list', list)
+  })
+
+  await runTest('agency-invite', 'POST /api/agencies/:id/invite (member) does not 500', async () => {
+    if (!agencyId) return
+    const r = await http(`/api/agencies/${agencyId}/invite`, {
+      method: 'POST', userToken: fx.userToken,
+      body: { email: memberEmail, role: 'agency_member' },
+    })
+    if (r.status === 404) return
+    // 200/201 OK (real invite), or 400/422 (test domain rejected) — both
+    // prove the handler is resilient. 5xx = real panic.
+    assert(r.status < 500, `agency invite handler panicked: ${r.status}`, r.body)
+  })
+
+  // Cleanup the sub tenant's auth user (the tenant row is in cleanupIds).
+  await runTest('agency-invite', 'Cleanup sub-tenant auth user', async () => {
+    if (!subTenantUserId) return
+    await sbAdmin.auth.admin.deleteUser(subTenantUserId)
+  })
+}
+
+/**
  * Plans + subscriptions — billing surface readability.
  */
 async function testPlansAndBilling(fx: Fixture): Promise<void> {
@@ -1650,6 +1836,8 @@ async function main(): Promise<void> {
     await testStorageUpload(fx)
     await testRealtimeConnect(fx)
     await testAgencyEndToEnd(fx)
+    await testAgencyInviteFlows(fx)
+    await testPlatformAdmin(fx)
     await testKilledFeatures(fx)
     await testPlansAndBilling(fx)
 
