@@ -905,34 +905,45 @@ async function testKilledFeatures(fx: Fixture): Promise<void> {
  * Conversation notes — internal team-only annotations on a conversation.
  */
 async function testConversationNotes(fx: Fixture): Promise<void> {
-  // Need a phone to attach the note to. The conversation_phone column is
-  // free-form text in conversation_notes — no FK — so a synthetic value works.
-  const convoPhone = `91990${Math.floor(1000000 + Math.random() * 8999999)}`
+  // CreateNoteBody requires target_id as a UUID. Attach the note to a
+  // contact we create in this test (target_type='contact'). The earlier
+  // phone-string attempt failed the .uuid() validator with HTTP 400.
+  let contactId: string | null = null
   let noteId: string | null = null
+  await runTest('notes', 'Setup: create a contact to attach the note to', async () => {
+    const r = await http('/api/contacts', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { name: 'Note Target', phone: `+9199${Math.floor(10000000 + Math.random() * 89999999)}` },
+    })
+    assert([200, 201].includes(r.status), `contact for note ${r.status}`, r.body)
+    contactId = r.body?.id ?? r.body?.data?.id ?? null
+    if (contactId) fx.cleanupIds.push({ table: 'contacts', ids: [contactId!] })
+  })
   await runTest('notes', 'POST /api/notes creates an internal note', async () => {
+    if (!contactId) return
     const r = await http('/api/notes', {
       method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
       body: {
-        target_type: 'conversation',
-        target_id: convoPhone,
+        target_type: 'contact',
+        target_id: contactId,
         body: 'Smoke test note — auto-cleanup on suite end.',
         visibility: 'team',
       },
     })
-    if (r.status === 404) return // route may not be present in this build
+    if (r.status === 404) return
     assert([200, 201].includes(r.status), `note create ${r.status}`, r.body)
     noteId = r.body?.id ?? r.body?.data?.id ?? null
     if (noteId) fx.cleanupIds.push({ table: 'conversation_notes', ids: [noteId!] })
   })
-  await runTest('notes', 'GET /api/notes?target_type=conversation lists it', async () => {
-    if (!noteId) return
-    const r = await http(`/api/notes?target_type=conversation&target_id=${convoPhone}`, {
+  await runTest('notes', 'GET /api/notes lists it back', async () => {
+    if (!noteId || !contactId) return
+    const r = await http(`/api/notes?target_type=contact&target_id=${contactId}`, {
       userToken: fx.userToken, tenantId: fx.tenantId,
     })
     if (r.status === 404) return
     assertEq(r.status, 200, 'notes list')
     const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
-    if (noteId) assert(list.some((n: any) => n.id === noteId), 'created note appears', list)
+    assert(list.some((n: any) => n.id === noteId), 'created note appears', list)
   })
 }
 
@@ -1001,7 +1012,10 @@ async function testWorkflowsDeep(fx: Fixture): Promise<void> {
     assertEq(exec.status, 200, 'wf executions list')
   })
   await runTest('workflows-deep', 'workflow-recommendations list', async () => {
-    const r = await http('/api/workflow-recommendations', {
+    // Endpoint requires ?apps= query param (comma-separated). Without it
+    // the handler 400s with "apps query param required" — that's correct
+    // behavior, not a regression. Pass a realistic comma-separated set.
+    const r = await http('/api/workflow-recommendations?apps=whatsapp,google_sheets', {
       userToken: fx.userToken, tenantId: fx.tenantId,
     })
     if (r.status === 404) return
