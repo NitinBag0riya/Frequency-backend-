@@ -1114,6 +1114,155 @@ export function createConnectorsRouter(deps: Deps): express.Router {
       res.json(rows)
     })
 
+  // ── Connector HEALTH summary ─────────────────────────────────────────────
+  // Powers /settings/connections in the FE. Per connector, returns:
+  //   - everything from /api/connectors/connections (status, brand_label,
+  //     expires, capabilities)
+  //   - last inbound event (from messages, lead_rows ingest_source, or
+  //     webhook_inbound_log) — answers "is data actually flowing in?"
+  //   - alert level (none / warn / error) computed by combining:
+  //       expired token → error
+  //       no event in 7 days → warn (only for channels that should be live)
+  //       active without errors → none
+  //   - reasons (human-readable) tied to the alert level
+  // Distinct from /api/connectors/connections because the FE only wants the
+  // bigger payload on the settings page; the sidebar still uses the lighter
+  // /connections endpoint.
+  r.get('/api/connectors/health',
+    requireAuth, identifyTenant,
+    async (req, res) => {
+      const tenantId = (req as any).tenantId as string
+
+      // Reuse the existing connections roundup as the base shape.
+      const [{ data: tiRows }, { data: tenant }, { data: tgBot }] = await Promise.all([
+        supabase.from('tenant_integrations')
+          .select('key, status, brand_label, scope, token_expires_at, last_used_at, metadata, connected_at')
+          .eq('tenant_id', tenantId),
+        supabase.from('tenants')
+          .select('waba_id, display_phone, status, google_email, google_access_token, google_token_expiry')
+          .eq('id', tenantId).maybeSingle(),
+        supabase.from('tg_bots')
+          .select('bot_username, bot_id, created_at')
+          .eq('tenant_id', tenantId).maybeSingle(),
+      ])
+
+      const seen = new Set<string>()
+      const out: any[] = []
+
+      // Pull last-message-per-channel in a single grouped query. Used for
+      // both warn-when-stale alerts and the "Last activity" display.
+      const { data: lastEvents } = await supabase.rpc('connector_last_events', { p_tenant_id: tenantId })
+        .then(r => r, () => ({ data: null }))
+      // Fallback if the RPC isn't defined yet: best-effort, swallow any error.
+      const lastByChannel: Record<string, string | null> = {}
+      if (Array.isArray(lastEvents)) {
+        for (const row of lastEvents as any[]) lastByChannel[row.channel] = row.last_at
+      } else {
+        // Soft fallback — query messages directly per channel. Bounded to 3
+        // channels so this remains cheap.
+        for (const ch of ['whatsapp', 'instagram', 'telegram']) {
+          const { data } = await supabase.from('messages')
+            .select('created_at').eq('tenant_id', tenantId).eq('channel', ch)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle()
+          lastByChannel[ch] = (data as any)?.created_at ?? null
+        }
+      }
+
+      const STALE_DAYS = 7
+      const staleCutoff = Date.now() - STALE_DAYS * 86_400_000
+
+      const enrich = (base: any) => {
+        const def = getConnector(base.key)
+        const lastEventAt = lastByChannel[base.key] ?? base.last_used_at ?? null
+        const tokenExpiry = base.token_expires_at ? new Date(base.token_expires_at).getTime() : null
+        const isExpired = !!tokenExpiry && tokenExpiry < Date.now()
+        const isStale = def?.isChannel && lastEventAt && new Date(lastEventAt).getTime() < staleCutoff
+
+        const reasons: string[] = []
+        let alert: 'none' | 'warn' | 'error' = 'none'
+        if (isExpired) { alert = 'error'; reasons.push('Access token expired — reconnect required') }
+        if (isStale && alert === 'none') { alert = 'warn'; reasons.push(`No inbound activity in last ${STALE_DAYS} days`) }
+
+        return { ...base, last_event_at: lastEventAt, alert, reasons }
+      }
+
+      for (const row of tiRows ?? []) {
+        const expired = row.token_expires_at ? new Date(row.token_expires_at).getTime() < Date.now() : false
+        out.push(enrich(buildConnRow({
+          key: row.key,
+          status: expired ? 'expired' : (row.status ?? 'active'),
+          brand_label: row.brand_label,
+          scope: row.scope,
+          last_used_at: row.last_used_at,
+          token_expires_at: row.token_expires_at,
+          connected_at: row.connected_at,
+          metadata: row.metadata ?? {},
+        })))
+        seen.add(row.key)
+      }
+
+      if (tenant?.waba_id && tenant.status === 'active' && !seen.has('whatsapp')) {
+        out.push(enrich(buildConnRow({ key: 'whatsapp', brand_label: tenant.display_phone ?? tenant.waba_id })))
+        seen.add('whatsapp')
+      }
+      if (tenant?.google_access_token) {
+        const expired = tenant.google_token_expiry && new Date(tenant.google_token_expiry).getTime() < Date.now()
+        for (const k of ['google_drive', 'google_sheets', 'google_calendar', 'google_gmail']) {
+          if (seen.has(k)) continue
+          out.push(enrich(buildConnRow({
+            key: k,
+            status: expired ? 'expired' : 'active',
+            brand_label: tenant.google_email ?? '',
+            token_expires_at: tenant.google_token_expiry,
+          })))
+          seen.add(k)
+        }
+      }
+      if (tgBot?.bot_id && !seen.has('telegram')) {
+        out.push(enrich(buildConnRow({
+          key: 'telegram',
+          brand_label: tgBot.bot_username ? `@${tgBot.bot_username}` : `bot ${tgBot.bot_id}`,
+          connected_at: tgBot.created_at,
+        })))
+      }
+
+      // Also include UNCONNECTED connectors as inert "available" rows so the
+      // FE can render them as Connect-CTA cards without a separate request.
+      for (const def of publicRegistry()) {
+        if (seen.has(def.key)) continue
+        out.push({
+          key: def.key,
+          name: def.name,
+          category: def.category,
+          isChannel: !!def.isChannel,
+          channelFeatures: def.channelFeatures ?? [],
+          status: 'not_connected',
+          brand_label: null,
+          scope: null,
+          last_used_at: null,
+          last_event_at: null,
+          token_expires_at: null,
+          connected_at: null,
+          metadata: {},
+          capabilities: def.capabilities ?? [],
+          icon: def.iconName ?? 'Box',
+          color: def.brandColor ?? '#888',
+          alert: 'none',
+          reasons: [],
+        })
+      }
+
+      // Stable order: connected channels first, then connected non-channels,
+      // then available channels, then available non-channels.
+      const order = (r: any) => {
+        const connected = r.status !== 'not_connected'
+        return (connected ? 0 : 2) + (r.isChannel ? 0 : 1)
+      }
+      out.sort((a, b) => order(a) - order(b) || a.name.localeCompare(b.name))
+
+      res.json({ connectors: out })
+    })
+
   // ── Channel filter tabs (Inbox / Contacts / Campaigns) ───────────────────
   // Returns ONLY the connectors marked as `isChannel`. FE renders these as
   // [All] [WhatsApp ●] [Instagram ●] [Telegram ●] tabs above each unified view.
