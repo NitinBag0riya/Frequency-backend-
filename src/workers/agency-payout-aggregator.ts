@@ -1,12 +1,10 @@
 /**
- * Worker: agency-payout-aggregator (singleton repeatable, runs daily 02:00 IST)
+ * Worker: agency-payout-aggregator (in-process daily scheduler, ~24h cadence)
  *
  * Once per day, on the 1st of the month, sweep last month's accrued
  * revshare entries and emit one agency_payouts row per agency.
  *
  * On all other days the tick is a no-op (cheap idempotency check + return).
- * We picked 02:00 IST so it doesn't collide with the consent-expiry-sweep,
- * trial-ending notifier, or invoice generation peaks.
  *
  * Idempotency anchor: agency_payouts(agency_id, period_start, period_end)
  * has a unique index, so the upsert on rerun is a no-op. We deliberately
@@ -15,60 +13,27 @@
  * super-admin reconciliation). This worker only produces the aggregate;
  * the ledger stays append-only and the FE shows pending vs paid via JOIN.
  *
- * If you don't have Redis available locally, set DISABLE_WORKERS=1 and
- * the worker process exits without starting any workers.
+ * Migrated off BullMQ — see daily-scheduler.ts header for the rationale.
  */
 
 import '../env'
-import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
-import { Q, connection, cronQueue } from '../queue'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, logGate } from '../lib/poller-gate'
+import { scheduleDaily, SCHEDULE_STUB, type ScheduleHandle } from '../lib/daily-scheduler'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-// Default cadence = 24h. We could use a literal cron expression instead of
-// `every`, but the existing workers in this codebase use millisecond
-// intervals + a date-of-month guard inside the tick. Match that pattern.
+// Default cadence = 24h. The date-of-month guard inside runTick() makes
+// every other tick a no-op, so this interval is more "how often do we
+// check the date" than "how often do we do work".
 const TICK_INTERVAL_MS = Number(process.env.AGENCY_PAYOUT_AGG_INTERVAL_MS ?? 24 * 60 * 60 * 1000)
 
-export async function startAgencyPayoutAggregatorWorker() {
+export async function startAgencyPayoutAggregatorWorker(): Promise<ScheduleHandle> {
   const enabled = isPollerEnabled('AGENCY_PAYOUT_AGGREGATOR')
   logGate('AGENCY_PAYOUT_AGGREGATOR', enabled)
-  if (!enabled) {
-    await cleanRepeatablesByName(cronQueue, 'agency-payout-aggregator')
-    return STUB_WORKER
-  }
-
-  await cronQueue.add(
-    'agency-payout-aggregator',
-    {},
-    {
-      jobId: 'singleton-agency-payout-aggregator',
-      repeat: { every: TICK_INTERVAL_MS },
-      removeOnComplete: { count: 50 },
-      removeOnFail:     { count: 50 },
-    },
-  )
-
-  const worker = new Worker(
-    Q.cron,
-    async (job: Job) => {
-      if (job.name !== 'agency-payout-aggregator') return { skipped: 'not for me' }
-      return runTick()
-    },
-    { connection, concurrency: 1 },
-  )
-
-  worker.on('failed', (job, err) => {
-    if (job?.name === 'agency-payout-aggregator') {
-      console.warn(`[agency-payout-aggregator] tick failed: ${err.message}`)
-    }
-  })
-
-  console.log(`[worker:agency-payout-aggregator] started, interval=${TICK_INTERVAL_MS}ms`)
-  return worker
+  if (!enabled) return SCHEDULE_STUB
+  return scheduleDaily('agency-payout-aggregator', TICK_INTERVAL_MS, runTick)
 }
 
 /**

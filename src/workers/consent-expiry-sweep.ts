@@ -1,5 +1,5 @@
 /**
- * Worker: consent-expiry-sweep (singleton repeatable, every 24h)
+ * Worker: consent-expiry-sweep (in-process daily scheduler, ~24h cadence)
  *
  * DPDPA §6(8) requires consent to be "as may be necessary" and renewed
  * after a reasonable interval. The Indian SMB compliance convention is
@@ -9,16 +9,15 @@
  * trigger then flips the state to 'expired', which the message-sender
  * worker's consent gate reads as "do not send marketing".
  *
- * Singleton via cronQueue + jobId, same pattern as trial-ending and
- * schedule-poller. Idempotent because we only ever insert events for
- * rows still in 'opted_in' status — a second tick will find no rows.
+ * Migrated off BullMQ — see daily-scheduler.ts header for the rationale.
+ * Idempotent because we only ever insert events for rows still in
+ * 'opted_in' status — a duplicate tick finds no rows.
  */
 
 import '../env'
-import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
-import { Q, connection, cronQueue } from '../queue'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, logGate } from '../lib/poller-gate'
+import { scheduleDaily, SCHEDULE_STUB, type ScheduleHandle } from '../lib/daily-scheduler'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -27,42 +26,11 @@ const TICK_INTERVAL_MS = Number(process.env.CONSENT_EXPIRY_INTERVAL_MS ?? 24 * 6
 const EXPIRY_MONTHS = 12
 const BATCH_SIZE = 500
 
-export async function startConsentExpirySweepWorker() {
+export async function startConsentExpirySweepWorker(): Promise<ScheduleHandle> {
   const enabled = isPollerEnabled('CONSENT_EXPIRY_SWEEP')
   logGate('CONSENT_EXPIRY_SWEEP', enabled)
-  if (!enabled) {
-    await cleanRepeatablesByName(cronQueue, 'consent-expiry-sweep')
-    return STUB_WORKER
-  }
-
-  await cronQueue.add(
-    'consent-expiry-sweep',
-    {},
-    {
-      jobId: 'singleton-consent-expiry-sweep',
-      repeat: { every: TICK_INTERVAL_MS },
-      removeOnComplete: { count: 50 },
-      removeOnFail:     { count: 50 },
-    },
-  )
-
-  const worker = new Worker(
-    Q.cron,
-    async (job: Job) => {
-      if (job.name !== 'consent-expiry-sweep') return { skipped: 'not for me' }
-      return runTick()
-    },
-    { connection, concurrency: 1 },
-  )
-
-  worker.on('failed', (job, err) => {
-    if (job?.name === 'consent-expiry-sweep') {
-      console.warn(`[consent-expiry-sweep] tick failed: ${err.message}`)
-    }
-  })
-
-  console.log(`[worker:consent-expiry-sweep] started, interval=${TICK_INTERVAL_MS}ms, horizon=${EXPIRY_MONTHS}mo`)
-  return worker
+  if (!enabled) return SCHEDULE_STUB
+  return scheduleDaily('consent-expiry-sweep', TICK_INTERVAL_MS, runTick)
 }
 
 async function runTick(): Promise<{ expired: number; considered: number }> {

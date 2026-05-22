@@ -1,26 +1,28 @@
 /**
- * Worker: trial-ending (singleton repeatable, every 6 hours)
+ * Worker: trial-ending (in-process daily scheduler, ~6h cadence)
  *
  * Scans `tenant_subscriptions` for trials ending in the next 7 days and
  * fires `billing.trial_ending` notifications to all billing-eligible
  * recipients in each affected tenant.
  *
  * Dedup: queries `notifications` for an existing row with the same
- * `event_key + tenant_id + data.trial_ends_at`. Without this, every 6h
- * tick would re-send for the entire 7-day window — annoying at best,
+ * `event_key + tenant_id + data.trial_ends_at`. Without this, every tick
+ * would re-send for the entire 7-day window — annoying at best,
  * spam-grade at worst. Embedding the trial_ends_at in data lets re-runs
  * and DB restores stay idempotent — the same trial-end can't double-warn.
  *
- * Singleton via the same `cronQueue` + `jobId` pattern that template-sync
- * and data-source-sync use.
+ * Migrated off BullMQ (was a singleton repeatable on cronQueue) onto the
+ * in-process daily scheduler. The 6h cadence didn't benefit from BullMQ's
+ * retry/visibility machinery and the cost of the repeatable was 30+ Redis
+ * ops per tick plus a permanent Worker connection. Now: zero Redis ops
+ * for scheduling, one tiny Postgres RPC every ~5 min per replica.
  */
 
 import '../env'
-import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
-import { Q, connection, cronQueue } from '../queue'
 import { emitNotification } from '../routes/notifications'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, logGate } from '../lib/poller-gate'
+import { scheduleDaily, SCHEDULE_STUB, type ScheduleHandle } from '../lib/daily-scheduler'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -28,44 +30,11 @@ const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KE
 const TICK_INTERVAL_MS = Number(process.env.TRIAL_ENDING_INTERVAL_MS ?? 6 * 60 * 60 * 1000)
 const WARN_DAYS_AHEAD  = 7
 
-export async function startTrialEndingWorker() {
+export async function startTrialEndingWorker(): Promise<ScheduleHandle> {
   const enabled = isPollerEnabled('TRIAL_ENDING')
   logGate('TRIAL_ENDING', enabled)
-  if (!enabled) {
-    await cleanRepeatablesByName(cronQueue, 'trial-ending-check')
-    return STUB_WORKER
-  }
-
-  // Same singleton-repeatable pattern as the other cron workers — add once
-  // with a stable jobId so concurrent server boots don't multiply ticks.
-  await cronQueue.add(
-    'trial-ending-check',
-    {},
-    {
-      jobId: 'singleton-trial-ending',
-      repeat: { every: TICK_INTERVAL_MS },
-      removeOnComplete: { count: 50 },
-      removeOnFail:     { count: 50 },
-    }
-  )
-
-  const worker = new Worker(
-    Q.cron,
-    async (job: Job) => {
-      if (job.name !== 'trial-ending-check') return { skipped: 'not for me' }
-      return runTick()
-    },
-    { connection, concurrency: 1 },
-  )
-
-  worker.on('failed', (job, err) => {
-    if (job?.name === 'trial-ending-check') {
-      console.warn(`[trial-ending] tick failed: ${err.message}`)
-    }
-  })
-
-  console.log(`[worker:trial-ending] started, interval=${TICK_INTERVAL_MS}ms`)
-  return worker
+  if (!enabled) return SCHEDULE_STUB
+  return scheduleDaily('trial-ending', TICK_INTERVAL_MS, runTick)
 }
 
 async function runTick() {
@@ -98,7 +67,7 @@ async function runTick() {
     // CRITICAL: capture + bail on dedup query errors. If the jsonb filter
     // ever errors (PostgREST timeout, malformed `data` row, etc.) and we
     // silently treat that as "no existing notification", we'll re-fire
-    // every 6h for the entire 7-day window — spam-grade.
+    // every tick for the entire 7-day window — spam-grade.
     const dedupRes = await supabase.from('notifications')
       .select('id')
       .eq('tenant_id', sub.tenant_id)
