@@ -1263,6 +1263,105 @@ export function createConnectorsRouter(deps: Deps): express.Router {
       res.json({ connectors: out })
     })
 
+  // ── WhatsApp manual-paste setup ───────────────────────────────────────────
+  // Two endpoints for the guided wizard (FE: WhatsAppSetupWizard):
+  //
+  //   POST /api/connectors/whatsapp/test
+  //     Validate {waba_id, phone_number_id, access_token} against Meta Graph
+  //     WITHOUT writing to the DB. Returns business_name + phone display
+  //     so the wizard can confirm "is this the right number?" before commit.
+  //
+  //   POST /api/connectors/whatsapp/connect-manual
+  //     Same validation, then persists to tenants table + subscribes the
+  //     WABA to the webhook. This is the non-OAuth path — for devs who own
+  //     their own Meta app or solo founders who set up WABA directly via
+  //     Business Manager. The OAuth path stays at /api/auth/facebook/connect-waba.
+  const GRAPH_URL = 'https://graph.facebook.com/v18.0'
+
+  async function validateWaCreds(waba_id: string, phone_number_id: string, access_token: string) {
+    const headers = { Authorization: `Bearer ${access_token}` }
+    const wabaRes = await fetch(`${GRAPH_URL}/${waba_id}?fields=name,currency,timezone_id`, { headers })
+    const waba = await wabaRes.json() as any
+    if (!wabaRes.ok || waba.error) {
+      return { ok: false as const, error: waba.error?.message ?? `WABA lookup failed (HTTP ${wabaRes.status})` }
+    }
+    const phoneRes = await fetch(`${GRAPH_URL}/${phone_number_id}?fields=display_phone_number,verified_name,quality_rating,code_verification_status`, { headers })
+    const phone = await phoneRes.json() as any
+    if (!phoneRes.ok || phone.error) {
+      return { ok: false as const, error: phone.error?.message ?? `Phone Number ID lookup failed (HTTP ${phoneRes.status})` }
+    }
+    return {
+      ok: true as const,
+      business_name: waba.name as string,
+      display_phone: phone.display_phone_number as string,
+      verified_name: phone.verified_name as string,
+      quality: phone.quality_rating as string | undefined,
+      verification: phone.code_verification_status as string | undefined,
+    }
+  }
+
+  r.post('/api/connectors/whatsapp/test',
+    requireAuth, identifyTenant,
+    async (req, res) => {
+      const { waba_id, phone_number_id, access_token } = (req.body ?? {}) as Record<string, string>
+      if (!waba_id || !phone_number_id || !access_token) {
+        res.status(400).json({ ok: false, error: 'waba_id, phone_number_id, access_token required' }); return
+      }
+      const result = await validateWaCreds(waba_id, phone_number_id, access_token).catch(e => ({
+        ok: false as const,
+        error: e?.message ?? 'network error contacting Meta Graph API',
+      }))
+      // Always 200 — the WIZARD wants to render the error inline, not get
+      // bounced to a generic error page on 4xx/5xx.
+      res.json(result)
+    })
+
+  r.post('/api/connectors/whatsapp/connect-manual',
+    requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+    async (req, res) => {
+      const tenantId = (req as any).tenantId as string
+      const { waba_id, phone_number_id, access_token } = (req.body ?? {}) as Record<string, string>
+      if (!waba_id || !phone_number_id || !access_token) {
+        res.status(400).json({ ok: false, error: 'waba_id, phone_number_id, access_token required' }); return
+      }
+      // Validate first; refuse to persist garbage.
+      const v = await validateWaCreds(waba_id, phone_number_id, access_token).catch(e => ({
+        ok: false as const, error: e?.message ?? 'network error',
+      }))
+      if (!v.ok) { res.status(400).json(v); return }
+
+      // Subscribe the app to the WABA webhook so inbound messages start
+      // flowing. Failure here is non-fatal; the credentials are still
+      // useful (manual webhook setup remains an option).
+      const subRes = await fetch(`${GRAPH_URL}/${waba_id}/subscribed_apps`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${access_token}` },
+      }).then(r => r.json()).catch(e => ({ error: { message: e?.message ?? 'fetch failed' } }))
+      const webhookSubscribed = (subRes as any)?.success === true
+
+      // Persist on the tenant. The tenants schema (002) already has these
+      // columns since waba_id+phone_number_id+access_token are NOT NULL.
+      const { error: upErr } = await supabase.from('tenants').update({
+        waba_id,
+        phone_number_id,
+        access_token,
+        business_name: v.business_name,
+        display_phone: v.display_phone,
+        status: 'active',
+      }).eq('id', tenantId)
+      if (upErr) { res.status(500).json({ ok: false, error: upErr.message }); return }
+
+      res.json({
+        ok: true,
+        business_name: v.business_name,
+        display_phone: v.display_phone,
+        verified_name: v.verified_name,
+        webhook_subscribed: webhookSubscribed,
+        webhook_url: `${process.env.PUBLIC_API_URL ?? 'https://api.getfrequency.app'}/webhook/whatsapp`,
+        verify_token_hint: 'See your META_VERIFY_TOKEN env var or the webhook setup docs',
+      })
+    })
+
   // ── Channel filter tabs (Inbox / Contacts / Campaigns) ───────────────────
   // Returns ONLY the connectors marked as `isChannel`. FE renders these as
   // [All] [WhatsApp ●] [Instagram ●] [Telegram ●] tabs above each unified view.
