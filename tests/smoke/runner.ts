@@ -1494,8 +1494,13 @@ async function testAgencyEndToEnd(fx: Fixture): Promise<void> {
     const r = await http('/api/agencies/me', { userToken: fx.userToken })
     if (r.status === 404) return
     assertEq(r.status, 200, 'agencies/me')
-    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
-    assert(list.some((a: any) => (a.id ?? a.agency?.id) === agencyId),
+    // Handler returns { agencies: [{ role, accepted_at, invited_at, id,
+    // name, slug, status, default_revshare_pct }] } — the agency fields
+    // are spread into each row (see routes/agency.ts:223-228).
+    const list: any[] = Array.isArray(r.body)
+      ? r.body
+      : (r.body?.agencies ?? r.body?.data ?? [])
+    assert(list.some(a => (a.id ?? a.agency?.id) === agencyId),
       'newly-created agency appears in caller\'s agencies', list)
   })
 
