@@ -2154,7 +2154,7 @@ app.delete('/api/wa-templates/:name', requireAuth, identifyTenant, checkPermissi
   // truncated, rather than bubbling a 500 to the client.
   try {
     const r = await fetch(
-      `${GRAPH}/${tenant.waba_id}/message_templates?name=${encodeURIComponent(req.params.name)}`,
+      `${GRAPH}/${tenant.waba_id}/message_templates?name=${encodeURIComponent(String(req.params.name ?? ''))}`,
       { method: 'DELETE', headers: { Authorization: `Bearer ${tenant.access_token}` } }
     )
     const text = await r.text().catch(() => '')
