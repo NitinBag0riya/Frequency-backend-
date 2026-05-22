@@ -193,7 +193,12 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
       // 3. Resolve the lead_table — either reuse one or create new.
       let table: { id: string; name: string }
       if (lead_table_id) {
-        const { data: existing } = await supabase.from('lead_tables').select('id, name')
+        // Select the WHOLE row — the FE merges this into its lead_tables
+        // list and renders fields like row_count, source, created_at.
+        // Previously this returned only {id, name}; LeadsPage then crashed
+        // with "Cannot read properties of undefined (reading
+        // 'toLocaleString')" on the optimistic-merged row.
+        const { data: existing } = await supabase.from('lead_tables').select('*')
           .eq('id', lead_table_id).eq('tenant_id', tenantId).maybeSingle()
         if (!existing) { res.status(404).json({ error: 'lead_table not found' }); return }
         table = existing
@@ -206,7 +211,7 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
           description: `Mirrored from Google Sheet "${meta.properties?.title ?? ''}" · tab "${tabActual}"`,
           source:    'google_sheets',
           source_config: { spreadsheet_id, tab_name: tabActual },
-        }).select('id, name').single()
+        }).select('*').single()
         if (createErr || !created) {
           res.status(500).json({ error: createErr?.message ?? 'Failed to create lead_table' })
           return
@@ -322,10 +327,12 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
         res.status(400).json({ error: `Table "${schema.name}" has no fields.` }); return
       }
 
-      // 2. Resolve target lead_table — reuse or create.
-      let table: { id: string; name: string }
+      // 2. Resolve target lead_table — reuse or create. Select '*' so the
+      // FE gets row_count + source + created_at on the optimistic-merge
+      // path (same crash class as the Google Sheets mirror response).
+      let table: { id: string; name: string; [k: string]: any }
       if (lead_table_id) {
-        const { data: existing } = await supabase.from('lead_tables').select('id, name')
+        const { data: existing } = await supabase.from('lead_tables').select('*')
           .eq('id', lead_table_id).eq('tenant_id', tenantId).maybeSingle()
         if (!existing) { res.status(404).json({ error: 'lead_table not found' }); return }
         table = existing
@@ -338,7 +345,7 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
           description: `Mirrored from Airtable base ${base_id} · table "${schema.name}"`,
           source:    'airtable',
           source_config: { base_id, table_id: schema.id, table_name: schema.name, view },
-        }).select('id, name').single()
+        }).select('*').single()
         if (createErr || !created) {
           res.status(500).json({ error: createErr?.message ?? 'Failed to create lead_table' }); return
         }
