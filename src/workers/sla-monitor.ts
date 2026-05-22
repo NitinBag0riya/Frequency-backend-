@@ -53,12 +53,13 @@ import { Worker, type Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { logger } from '../lib/logger'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-const TICK_INTERVAL_MS = Number(process.env.SLA_MONITOR_INTERVAL_MS ?? 30_000)
+// 30s prod (SLA breaches need fast detection) · 5 min dev.
+const TICK_INTERVAL_MS = pollIntervalMs('SLA_MONITOR_INTERVAL_MS', { prod: 30_000, dev: 5 * 60_000 })
 // Lookback for the message scan. 7 days is enough for the common
 // "customer pinged Friday, agent ghost over the weekend" pattern.
 // Beyond that we treat the conversation as abandoned (janitor sweep

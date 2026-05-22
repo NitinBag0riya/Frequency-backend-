@@ -26,12 +26,13 @@ import { Q, connection, cronQueue } from '../queue'
 import { sheetsReadRange } from '../google'
 import { listAllRecords } from '../lib/airtable'
 import { loadMapping, applyMappingToPayload, type DecodedField } from '../lib/apply-mapping'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-const SYNC_INTERVAL_MS = Number(process.env.DATA_SOURCE_SYNC_INTERVAL_MS ?? 5 * 60 * 1000)
+// 5 min prod · 30 min dev.
+const SYNC_INTERVAL_MS = pollIntervalMs('DATA_SOURCE_SYNC_INTERVAL_MS', { prod: 5 * 60_000, dev: 30 * 60_000 })
 const BATCH_SIZE = 25
 
 export async function startDataSourceSyncWorker() {

@@ -32,13 +32,14 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { decrypt } from '../crypto'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
-const REFRESH_INTERVAL_MS = Number(process.env.LOOKALIKE_REFRESH_INTERVAL_MS ?? 30 * 60 * 1000)
+// 30 min prod · 6 h dev (Meta lookalikes recompute slowly anyway).
+const REFRESH_INTERVAL_MS = pollIntervalMs('LOOKALIKE_REFRESH_INTERVAL_MS', { prod: 30 * 60_000, dev: 6 * 60 * 60_000 })
 const BATCH_SIZE = 25
 // Meta operation_status.code values worth pinning as constants — matches
 // Meta Marketing API docs (CustomAudience.operation_status). 300 = failed

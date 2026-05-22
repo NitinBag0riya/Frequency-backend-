@@ -35,12 +35,14 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { gmailListNewThreads } from '../google'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-const TICK_INTERVAL_MS = Number(process.env.GMAIL_POLL_INTERVAL_MS ?? 2 * 60 * 1000)
+// 2 min prod · 15 min dev (each tick hits the Gmail API for every
+// connected tenant — slowing this down in dev is cheap + thoughtful).
+const TICK_INTERVAL_MS = pollIntervalMs('GMAIL_POLL_INTERVAL_MS', { prod: 2 * 60_000, dev: 15 * 60_000 })
 
 export async function startGmailPollerWorker() {
   const enabled = isPollerEnabled('GMAIL_POLLER')

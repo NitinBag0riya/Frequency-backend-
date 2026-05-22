@@ -23,6 +23,25 @@
 
 import type { Queue } from 'bullmq'
 
+/**
+ * Pick a poll-interval default based on NODE_ENV. Production gets the
+ * tight cadence the feature actually needs; dev/staging fall back to a
+ * relaxed cadence so a developer who explicitly enables a poller doesn't
+ * still hammer Redis every 30 seconds. The env var name (if set) always
+ * wins over both — so a CI/integration suite can pin a specific tick.
+ *
+ *   pollIntervalMs('SCHEDULE_POLL_MS', { prod: 30_000, dev: 300_000 })
+ *
+ * If the env var is set to a numeric string, that wins. Otherwise:
+ *   NODE_ENV === 'production' → prod
+ *   anything else             → dev
+ */
+export function pollIntervalMs(envName: string, opts: { prod: number; dev: number }): number {
+  const raw = process.env[envName]
+  if (raw && /^\d+$/.test(raw)) return Number(raw)
+  return process.env.NODE_ENV === 'production' ? opts.prod : opts.dev
+}
+
 export function isPollerEnabled(name: string): boolean {
   const perPoller = process.env[`${name.toUpperCase()}_ENABLED`]
   if (perPoller === '1' || perPoller === 'true')  return true

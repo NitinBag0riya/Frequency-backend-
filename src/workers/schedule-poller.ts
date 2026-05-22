@@ -24,12 +24,15 @@ import {
   enqueueWorkflowExecution, enqueueBroadcast,
 } from '../queue'
 import { executeCampaignStep } from '../engine/campaign'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-const POLL_INTERVAL_MS = Number(process.env.SCHEDULE_POLL_MS ?? 30_000)
+// 30s in prod (matches the existing scheduled_jobs SLA expectation) but
+// 5 min in dev — devs who flip POLLERS_ENABLED on still shouldn't burn
+// Redis ops every half-minute. SCHEDULE_POLL_MS env always wins.
+const POLL_INTERVAL_MS = pollIntervalMs('SCHEDULE_POLL_MS', { prod: 30_000, dev: 5 * 60_000 })
 const BATCH_SIZE = 200
 
 export async function startSchedulePollerWorker() {

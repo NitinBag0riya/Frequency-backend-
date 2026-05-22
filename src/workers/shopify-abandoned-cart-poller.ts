@@ -29,12 +29,13 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { fireShopifyTrigger } from '../engine/shopify-triggers'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-const TICK_INTERVAL_MS = Number(process.env.SHOPIFY_CART_POLLER_INTERVAL_MS ?? 5 * 60 * 1000)
+// 5 min prod · 30 min dev.
+const TICK_INTERVAL_MS = pollIntervalMs('SHOPIFY_CART_POLLER_INTERVAL_MS', { prod: 5 * 60_000, dev: 30 * 60_000 })
 const NUDGE_DELAY_MIN  = Number(process.env.SHOPIFY_CART_NUDGE_DELAY_MIN ?? 10)
 const BATCH_SIZE       = 200
 

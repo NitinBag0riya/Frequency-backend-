@@ -21,13 +21,14 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { emitNotification } from '../routes/notifications'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
-const SYNC_INTERVAL_MS = Number(process.env.TEMPLATE_SYNC_INTERVAL_MS ?? 15 * 60 * 1000)
+// 15 min prod · 60 min dev.
+const SYNC_INTERVAL_MS = pollIntervalMs('TEMPLATE_SYNC_INTERVAL_MS', { prod: 15 * 60_000, dev: 60 * 60_000 })
 
 export async function startTemplateSyncWorker() {
   const enabled = isPollerEnabled('TEMPLATE_SYNC')

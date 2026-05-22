@@ -27,13 +27,14 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { decrypt } from '../crypto'
-import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate } from '../lib/poller-gate'
+import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
-const TICK_INTERVAL_MS = Number(process.env.IG_COMMENT_POLL_INTERVAL_MS ?? 60 * 1000)
+// 60s prod (webhook safety net) · 5 min dev.
+const TICK_INTERVAL_MS = pollIntervalMs('IG_COMMENT_POLL_INTERVAL_MS', { prod: 60_000, dev: 5 * 60_000 })
 const MAX_TENANTS_PER_TICK = Number(process.env.IG_COMMENT_POLL_MAX_TENANTS ?? 200)
 const MAX_POSTS_PER_TENANT = Number(process.env.IG_COMMENT_POLL_MAX_POSTS  ?? 50)
 
