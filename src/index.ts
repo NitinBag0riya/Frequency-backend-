@@ -2143,17 +2143,33 @@ app.post('/api/wa-templates', requireAuth, identifyTenant, checkPermission('what
 app.delete('/api/wa-templates/:name', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'delete'), async (req, res) => {
   const tenantId = (req as any).tenantId
   const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
-  if (!tenant?.waba_id) { res.status(404).json({ error: 'No connected WhatsApp account' }); return }
+  if (!tenant?.waba_id || !tenant?.access_token) {
+    res.status(404).json({ error: 'No connected WhatsApp account' })
+    return
+  }
 
+  // Defense-in-depth: Meta Graph occasionally returns non-JSON (HTML error
+  // pages from upstream LB / Cloudflare) for bad creds or rate-limit
+  // pressure. Coerce any parse failure to a clean 400 with the raw body
+  // truncated, rather than bubbling a 500 to the client.
   try {
     const r = await fetch(
-      `${GRAPH}/${tenant.waba_id}/message_templates?name=${req.params.name}`,
+      `${GRAPH}/${tenant.waba_id}/message_templates?name=${encodeURIComponent(req.params.name)}`,
       { method: 'DELETE', headers: { Authorization: `Bearer ${tenant.access_token}` } }
     )
-    const data = await r.json() as any
-    if (data.error) { res.status(400).json({ error: data.error.message }); return }
+    const text = await r.text().catch(() => '')
+    let data: any = null
+    try { data = text ? JSON.parse(text) : null } catch { /* non-JSON below */ }
+    if (!r.ok || data?.error) {
+      const msg = data?.error?.message ?? text.slice(0, 200) ?? `Meta Graph returned ${r.status}`
+      res.status(400).json({ error: msg, upstream_status: r.status })
+      return
+    }
     res.json({ success: true })
-  } catch (err: any) { res.status(500).json({ error: err.message }) }
+  } catch (err: any) {
+    // Network/fetch error → 502 (bad gateway) is more accurate than 500.
+    res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? 'unknown'}` })
+  }
 })
 
 // ── Broadcasts API ────────────────────────────────────────────────────────────
