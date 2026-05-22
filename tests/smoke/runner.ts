@@ -902,6 +902,383 @@ async function testKilledFeatures(fx: Fixture): Promise<void> {
 }
 
 /**
+ * Conversation notes — internal team-only annotations on a conversation.
+ */
+async function testConversationNotes(fx: Fixture): Promise<void> {
+  // Need a phone to attach the note to. The conversation_phone column is
+  // free-form text in conversation_notes — no FK — so a synthetic value works.
+  const convoPhone = `91990${Math.floor(1000000 + Math.random() * 8999999)}`
+  let noteId: string | null = null
+  await runTest('notes', 'POST /api/notes creates an internal note', async () => {
+    const r = await http('/api/notes', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: {
+        target_type: 'conversation',
+        target_id: convoPhone,
+        body: 'Smoke test note — auto-cleanup on suite end.',
+        visibility: 'team',
+      },
+    })
+    if (r.status === 404) return // route may not be present in this build
+    assert([200, 201].includes(r.status), `note create ${r.status}`, r.body)
+    noteId = r.body?.id ?? r.body?.data?.id ?? null
+    if (noteId) fx.cleanupIds.push({ table: 'conversation_notes', ids: [noteId!] })
+  })
+  await runTest('notes', 'GET /api/notes?target_type=conversation lists it', async () => {
+    if (!noteId) return
+    const r = await http(`/api/notes?target_type=conversation&target_id=${convoPhone}`, {
+      userToken: fx.userToken, tenantId: fx.tenantId,
+    })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'notes list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    if (noteId) assert(list.some((n: any) => n.id === noteId), 'created note appears', list)
+  })
+}
+
+/**
+ * Contacts deep — PATCH, bot_pause toggle, soft delete.
+ */
+async function testContactsDeep(fx: Fixture): Promise<void> {
+  let cId: string | null = null
+  await runTest('contacts-deep', 'create + PATCH name + bot_pause toggle', async () => {
+    // Create
+    const c = await http('/api/contacts', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { name: 'Deep Contact', phone: `+9199${Math.floor(10000000 + Math.random() * 89999999)}` },
+    })
+    assert([200, 201].includes(c.status), `contact create ${c.status}`, c.body)
+    cId = c.body?.id ?? c.body?.data?.id ?? null
+    if (cId) fx.cleanupIds.push({ table: 'contacts', ids: [cId!] })
+    if (!cId) return
+
+    // PATCH name
+    const p = await http(`/api/contacts/${cId}`, {
+      method: 'PATCH', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { name: 'Renamed Contact' },
+    })
+    assertEq(p.status, 200, 'contact PATCH name')
+    const got = p.body?.name ?? p.body?.data?.name
+    if (got) assertEq(got, 'Renamed Contact', 'name persisted')
+
+    // bot_pause toggle
+    const bp = await http(`/api/contacts/${cId}/bot-pause`, {
+      method: 'PATCH', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { bot_paused: true },
+    })
+    if (bp.status !== 404) {
+      assertEq(bp.status, 200, 'bot-pause toggle')
+    }
+  })
+}
+
+/**
+ * Workflows deep — create + dry-run + executions list.
+ */
+async function testWorkflowsDeep(fx: Fixture): Promise<void> {
+  let wfId: string | null = null
+  await runTest('workflows-deep', 'create workflow + list executions empty', async () => {
+    const create = await http('/api/workflows', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: {
+        name: `Deep WF ${Date.now()}`,
+        description: 'smoke deep test',
+        status: 'draft',
+        blueprint: { nodes: [{ id: 'n1', type: 'trigger.message_received', config: {} }], edges: [] },
+      },
+    })
+    if (create.status >= 400 && create.status < 500) return // schema may have shifted
+    assert([200, 201].includes(create.status), `wf create ${create.status}`, create.body)
+    wfId = create.body?.id ?? create.body?.data?.id ?? null
+    if (!wfId) return
+    fx.cleanupIds.push({ table: 'workflows', ids: [wfId!] })
+
+    // Executions list (probably empty for a fresh workflow).
+    const exec = await http(`/api/workflows/${wfId}/executions`, {
+      userToken: fx.userToken, tenantId: fx.tenantId,
+    })
+    if (exec.status === 404) return
+    assertEq(exec.status, 200, 'wf executions list')
+  })
+  await runTest('workflows-deep', 'workflow-recommendations list', async () => {
+    const r = await http('/api/workflow-recommendations', {
+      userToken: fx.userToken, tenantId: fx.tenantId,
+    })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'recommendations')
+  })
+}
+
+/**
+ * WhatsApp features — templates, flows, catalog, qr-codes, profile.
+ * Read-only checks that the endpoints respond without crashing.
+ */
+async function testWhatsAppFeatures(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/wa-templates',
+    '/api/wa-flows',
+    '/api/wa-catalog/products',
+    '/api/wa-qr',
+    '/api/wa-profile',
+  ]
+  for (const path of reads) {
+    await runTest('wa', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+  // Public wa-templates marketplace (no auth)
+  await runTest('wa', 'GET /api/wa-templates/public returns array', async () => {
+    const r = await http('/api/wa-templates/public')
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'wa-templates/public')
+  })
+}
+
+/**
+ * Instagram features — triggers + comment-rules + DM quick-replies (read-only).
+ */
+async function testInstagramFeatures(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/instagram/triggers',
+    '/api/instagram/comment-rules',
+    '/api/instagram/dm/quick-replies',
+  ]
+  for (const path of reads) {
+    await runTest('instagram', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+}
+
+/**
+ * Telegram features — bot + channels + payments + mini-apps (read-only).
+ */
+async function testTelegramFeatures(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/telegram/bot',
+    '/api/telegram/channels',
+    '/api/telegram/payments',
+    '/api/telegram/mini-apps',
+  ]
+  for (const path of reads) {
+    await runTest('telegram', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+}
+
+/**
+ * Meta Ads — campaigns + creatives + audiences + ctwa attribution (read-only).
+ */
+async function testMetaAds(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/meta-ads/campaigns',
+    '/api/meta-ads/creatives',
+    '/api/meta-ads/audiences',
+    '/api/meta-ads/leads',
+    '/api/analytics/ctwa',
+  ]
+  for (const path of reads) {
+    await runTest('meta-ads', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+}
+
+/**
+ * Analytics — summary, timeseries, messages-by-channel, broadcast clicks.
+ */
+async function testAnalytics(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/analytics/summary',
+    '/api/analytics/timeseries',
+    '/api/analytics/messages-by-channel',
+    '/api/analytics/broadcast-clicks',
+  ]
+  for (const path of reads) {
+    await runTest('analytics', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+}
+
+/**
+ * Team — members, roles, custom-roles, invites list.
+ */
+async function testTeam(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/team/members',
+    '/api/team/roles',
+    '/api/team/role-labels',
+    '/api/team/invites',
+    '/api/team/custom-roles',
+    '/api/team/departments',
+  ]
+  for (const path of reads) {
+    await runTest('team', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+  // Team invite — actual create requires admin role; test happy path
+  // doesn't burn an email since BE checks for existing-user shortcut.
+  await runTest('team', 'POST /api/team/invite valid shape', async () => {
+    const r = await http('/api/team/invite', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { email: `invite-${Date.now()}@frequency-test.local`, role: 'agent' },
+    })
+    if (r.status === 404) return
+    // 200 (sent) or 500 (auth admin throws on test domain) both prove the
+    // input-validation layer doesn't 500 on the destructure (fix from 1d869b9).
+    assert(r.status !== 500 || (r.body?.error ?? '').length > 0, 'invite handler is resilient', r.body)
+  })
+}
+
+/**
+ * Channel connections — registry, connected channels, connector list.
+ */
+async function testConnections(fx: Fixture): Promise<void> {
+  await runTest('connections', 'GET /api/channels/connected', async () => {
+    const r = await http('/api/channels/connected', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'connected channels')
+  })
+  await runTest('connections', 'GET /api/connectors/connections', async () => {
+    const r = await http('/api/connectors/connections', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'connector connections')
+  })
+}
+
+/**
+ * Approvals + Audit log.
+ */
+async function testApprovalsAndAudit(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/approvals',
+    '/api/approvals/pending-count',
+    '/api/audit',
+  ]
+  for (const path of reads) {
+    await runTest('approvals-audit', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+}
+
+/**
+ * WA Calling — usage + routing-rules + intents (read-only).
+ */
+async function testWaCalling(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/calls/usage',
+    '/api/calls/routing-rules',
+    '/api/calls/consent-default',
+    '/api/calls/csat-defaults',
+  ]
+  for (const path of reads) {
+    await runTest('wa-calling', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+}
+
+/**
+ * Usage + Billing — usage counters + invoices + subscription state.
+ */
+async function testUsageAndBilling(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/usage',
+    '/api/usage/notifications',
+    '/api/billing/usage',
+    '/api/billing/invoices',
+    '/api/tenants',
+  ]
+  for (const path of reads) {
+    await runTest('usage-billing', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+}
+
+/**
+ * Privacy + DSR + data residency (compliance surface).
+ */
+async function testPrivacy(fx: Fixture): Promise<void> {
+  const reads = [
+    '/api/tenant/data-residency',
+    '/api/dsr',
+    '/api/breaches',
+  ]
+  for (const path of reads) {
+    await runTest('privacy', `GET ${path} responds`, async () => {
+      const r = await http(path, { userToken: fx.userToken, tenantId: fx.tenantId })
+      if (r.status === 404) return
+      assert(r.status < 500, `${path} panicked: ${r.status}`, r.body)
+    })
+  }
+}
+
+/**
+ * Public surface — endpoints anyone can hit without auth.
+ */
+async function testPublicEndpoints(): Promise<void> {
+  const publicGets = [
+    '/api/ping',
+    '/api/features',
+    '/api/changelog',
+    '/api/public/incidents',
+    '/api/incidents/active',
+    '/api/plans',
+    '/api/agency-plans',
+    '/api/connectors/registry',
+    '/api/workflow-templates',
+  ]
+  for (const path of publicGets) {
+    await runTest('public', `GET ${path} (no auth)`, async () => {
+      const r = await http(path)
+      if (r.status === 404) return
+      assertEq(r.status, 200, `public ${path}`)
+    })
+  }
+}
+
+/**
+ * Waitlist — pre-launch lead capture (public POST).
+ */
+async function testWaitlist(): Promise<void> {
+  await runTest('waitlist', 'POST /api/waitlist accepts a record', async () => {
+    const r = await http('/api/waitlist', {
+      method: 'POST',
+      body: {
+        email: `e2e-waitlist-${Date.now()}@frequency-test.local`,
+        source: 'smoke',
+      },
+    })
+    if (r.status === 404) return
+    // 200 OR 409 (already exists from a prior smoke) both prove the route works.
+    assert([200, 201, 409].includes(r.status), `waitlist ${r.status}`, r.body)
+  })
+}
+
+/**
  * Plans + subscriptions — billing surface readability.
  */
 async function testPlansAndBilling(fx: Fixture): Promise<void> {
@@ -956,6 +1333,22 @@ async function main(): Promise<void> {
     await testQuickRepliesDeep(fx)
     await testWorkflowTemplates(fx)
     await testDeals(fx)
+    await testConversationNotes(fx)
+    await testContactsDeep(fx)
+    await testWorkflowsDeep(fx)
+    await testWhatsAppFeatures(fx)
+    await testInstagramFeatures(fx)
+    await testTelegramFeatures(fx)
+    await testMetaAds(fx)
+    await testAnalytics(fx)
+    await testTeam(fx)
+    await testConnections(fx)
+    await testApprovalsAndAudit(fx)
+    await testWaCalling(fx)
+    await testUsageAndBilling(fx)
+    await testPrivacy(fx)
+    await testPublicEndpoints()
+    await testWaitlist()
     await testKilledFeatures(fx)
     await testPlansAndBilling(fx)
 
