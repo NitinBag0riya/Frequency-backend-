@@ -646,6 +646,8 @@ async function testQuickRepliesAndNotes(fx: Fixture): Promise<void> {
  * We only test the CREATE / LIST paths; we never call /send (would burn WA credits).
  */
 async function testSegmentsAndBroadcasts(fx: Fixture): Promise<void> {
+  // ── Segments — full CRUD ────────────────────────────────────────────────
+  let segmentId: string | null = null
   await runTest('segments', 'GET /api/segments returns array', async () => {
     const r = await http('/api/segments', { userToken: fx.userToken, tenantId: fx.tenantId })
     if (r.status === 404) return // route may not exist in this build
@@ -653,12 +655,161 @@ async function testSegmentsAndBroadcasts(fx: Fixture): Promise<void> {
     const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
     assert(Array.isArray(list), 'segments list iterable', r.body)
   })
+  await runTest('segments', 'POST /api/segments creates a segment', async () => {
+    const r = await http('/api/segments', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: {
+        name: `Smoke Segment ${Date.now()}`,
+        description: 'smoke-test segment',
+        filters: {},
+      },
+    })
+    if (r.status === 404) return
+    assert([200, 201].includes(r.status), `segment create status ${r.status}`, r.body)
+    segmentId = r.body?.id ?? r.body?.data?.id ?? null
+    if (segmentId) fx.cleanupIds.push({ table: 'contact_segments', ids: [segmentId!] })
+  })
+  await runTest('segments', 'GET /api/segments/:id reads it back', async () => {
+    if (!segmentId) return
+    const r = await http(`/api/segments/${segmentId}`, { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'segment read')
+    assert(r.body?.id === segmentId || r.body?.data?.id === segmentId, 'segment id roundtrip', r.body)
+  })
+
+  // ── Broadcasts — full CRUD ──────────────────────────────────────────────
+  let broadcastId: string | null = null
   await runTest('broadcasts', 'GET /api/broadcasts returns array (no panic)', async () => {
     const r = await http('/api/broadcasts', { userToken: fx.userToken, tenantId: fx.tenantId })
     if (r.status === 404) return
     assertEq(r.status, 200, 'broadcasts list')
     const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
     assert(Array.isArray(list), 'broadcasts list iterable', r.body)
+  })
+  await runTest('broadcasts', 'POST /api/broadcasts creates a draft broadcast', async () => {
+    // BroadcastCreateSchema is .strict(); only documented keys allowed.
+    const r = await http('/api/broadcasts', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: {
+        name: `Smoke Broadcast ${Date.now()}`,
+        channel: 'whatsapp',
+        status: 'draft',
+        audience: { tags: ['smoke'] },
+      },
+    })
+    if (r.status === 404) return
+    assert([200, 201].includes(r.status), `broadcast create status ${r.status}`, r.body)
+    broadcastId = r.body?.id ?? r.body?.data?.id ?? null
+    if (broadcastId) fx.cleanupIds.push({ table: 'broadcasts', ids: [broadcastId!] })
+  })
+  await runTest('broadcasts', 'GET /api/broadcasts shows the new one', async () => {
+    if (!broadcastId) return
+    const r = await http('/api/broadcasts', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    assert(list.some((b: any) => b.id === broadcastId), 'broadcast appears in list', list)
+  })
+}
+
+/**
+ * Campaigns — multi-step drip / one-time / triggered campaigns.
+ */
+async function testCampaigns(fx: Fixture): Promise<void> {
+  let campaignId: string | null = null
+  await runTest('campaigns', 'GET /api/campaigns returns array', async () => {
+    const r = await http('/api/campaigns', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'campaigns list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    assert(Array.isArray(list), 'campaigns list iterable', r.body)
+  })
+  await runTest('campaigns', 'POST /api/campaigns creates a drip campaign', async () => {
+    const r = await http('/api/campaigns', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: {
+        name: `Smoke Campaign ${Date.now()}`,
+        description: 'smoke-test campaign',
+        type: 'drip',
+        status: 'draft',
+      },
+    })
+    if (r.status === 404) return
+    assert([200, 201].includes(r.status), `campaign create status ${r.status}`, r.body)
+    campaignId = r.body?.id ?? r.body?.data?.id ?? null
+    if (campaignId) fx.cleanupIds.push({ table: 'campaigns', ids: [campaignId!] })
+  })
+  await runTest('campaigns', 'PATCH /api/campaigns/:id updates the name', async () => {
+    if (!campaignId) return
+    const newName = `Smoke Campaign Updated ${Date.now()}`
+    const r = await http(`/api/campaigns/${campaignId}`, {
+      method: 'PATCH', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { name: newName },
+    })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'campaign patch')
+    const got = r.body?.name ?? r.body?.data?.name
+    if (got) assertEq(got, newName, 'patched name persisted')
+  })
+}
+
+/**
+ * Quick replies — deeper test than the basic existence check in
+ * testQuickRepliesAndNotes. Exercises the use-counter via /api/quick-
+ * replies/:id/use, then verifies the FK-violation→404 fix from ea8696d.
+ */
+async function testQuickRepliesDeep(fx: Fixture): Promise<void> {
+  let qrId: string | null = null
+  await runTest('qr-deep', 'POST /api/quick-replies/:id/use with bad UUID → 404', async () => {
+    const r = await http('/api/quick-replies/00000000-0000-0000-0000-000000000000/use', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { edited: false },
+    })
+    // Asserts the FK-violation normalization (ea8696d) holds: 404, not 500.
+    assertEq(r.status, 404, 'FK-violation on synthetic quick_reply_id should 404')
+  })
+  await runTest('qr-deep', 'Create QR + use it logs to quick_reply_usage', async () => {
+    const create = await http('/api/quick-replies', {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { scope: 'personal', title: 'Smoke QR', body_template: 'Hello {{name}}' },
+    })
+    if (create.status === 404) return
+    assert([200, 201].includes(create.status), `qr create ${create.status}`, create.body)
+    qrId = create.body?.id ?? create.body?.data?.id ?? null
+    if (!qrId) return
+    fx.cleanupIds.push({ table: 'quick_replies', ids: [qrId!] })
+
+    const use = await http(`/api/quick-replies/${qrId}/use`, {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { edited: false },
+    })
+    assertEq(use.status, 200, 'qr use')
+    // Verify usage row landed via service-role.
+    const { data: rows, error } = await sbAdmin.from('quick_reply_usage')
+      .select('id').eq('quick_reply_id', qrId).limit(1)
+    assert(!error, `usage query: ${error?.message}`)
+    assert((rows ?? []).length >= 1, 'usage row inserted')
+  })
+}
+
+/**
+ * Workflow templates marketplace — public read + tenant clone.
+ */
+async function testWorkflowTemplates(fx: Fixture): Promise<void> {
+  let templateSlug: string | null = null
+  await runTest('templates', 'GET /api/workflow-templates returns array', async () => {
+    const r = await http('/api/workflow-templates')   // public, no auth
+    assertEq(r.status, 200, 'templates list')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? r.body?.templates ?? []
+    assert(Array.isArray(list), 'templates list iterable', r.body)
+    if (list.length > 0) {
+      templateSlug = list[0]?.slug ?? null
+    }
+  })
+  await runTest('templates', 'GET /api/workflow-templates/:slug returns detail', async () => {
+    if (!templateSlug) return
+    const r = await http(`/api/workflow-templates/${templateSlug}`)   // public
+    assertEq(r.status, 200, 'template detail')
+    assert((r.body?.slug ?? r.body?.data?.slug) === templateSlug, 'slug roundtrip', r.body)
   })
 }
 
@@ -801,6 +952,9 @@ async function main(): Promise<void> {
     await testWorkflows(fx)
     await testQuickRepliesAndNotes(fx)
     await testSegmentsAndBroadcasts(fx)
+    await testCampaigns(fx)
+    await testQuickRepliesDeep(fx)
+    await testWorkflowTemplates(fx)
     await testDeals(fx)
     await testKilledFeatures(fx)
     await testPlansAndBilling(fx)
