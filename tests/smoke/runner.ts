@@ -1603,13 +1603,18 @@ async function testPlatformAdmin(fx: Fixture): Promise<void> {
     if (cErr || !created?.user) throw new Error(`platform user create failed: ${cErr?.message}`)
     pUserId = created.user.id
 
-    // Mint a session JWT for this user.
-    const { data: signin, error: sErr } = await sbAdmin.auth.signInWithPassword({ email, password })
+    // Mint a session JWT via a SEPARATE client. Calling signInWithPassword
+    // on sbAdmin would swap its internal session into user-context — even
+    // with persistSession:false the in-memory headers shift. RLS on
+    // user_role_assignments then blocks the insert below because the
+    // caller is the new user, not service-role. Same root cause as the
+    // sb/sbAdmin split for the primary fixture.
+    const sbSignin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
+    const { data: signin, error: sErr } = await sbSignin.auth.signInWithPassword({ email, password })
     if (sErr || !signin.session) throw new Error(`platform user signin failed: ${sErr?.message}`)
     pToken = signin.session.access_token
-    // Re-clamp sb to service-role context (signin promoted sbAdmin's auth session
-    // — though sbAdmin's `auth.persistSession: false` should prevent it, belt-
-    // and-braces). The cleanup below uses sbAdmin directly.
 
     // Assign platform_owner role with tenant_id=null (platform scope).
     // Schema (verified via REST OpenAPI): user_role_assignments columns
