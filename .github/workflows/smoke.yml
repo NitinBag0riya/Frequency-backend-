@@ -21,7 +21,11 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Bumped 10 → 20min after the suite grew to ~160 assertions +
+    # broad endpoint probe + 3-persona deep tests. Each round-trip
+    # from GH runner → api.getfrequency.app is 5-7s on cold Fly
+    # machines; 160 × 5s ≈ 14 min worst case. 20min gives headroom.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
