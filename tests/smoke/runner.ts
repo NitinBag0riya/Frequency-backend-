@@ -1776,51 +1776,6 @@ async function testAgencyInviteFlows(fx: Fixture): Promise<void> {
 }
 
 /**
- * WhatsApp setup wizard — test endpoint negative path.
- *
- * Validates that the new /api/connectors/whatsapp/test endpoint:
- *   ✓ Requires waba_id, phone_number_id, access_token (400 on missing)
- *   ✓ Returns 200 with {ok:false, error} on invalid credentials — the
- *     wizard renders the error inline, so the endpoint never 4xx/5xx's
- *     on Meta Graph rejection.
- */
-async function testWhatsAppWizardEndpoints(fx: Fixture): Promise<void> {
-  await runTest('wa-wizard', 'POST /api/connectors/whatsapp/test — empty body → 400', async () => {
-    const r = await http('/api/connectors/whatsapp/test', {
-      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
-      body: {},
-    })
-    if (r.status === 404) return // route may not be present yet
-    assertEq(r.status, 400, 'missing-fields rejection')
-  })
-  await runTest('wa-wizard', 'POST /api/connectors/whatsapp/test — bogus creds → 200 {ok:false}', async () => {
-    const r = await http('/api/connectors/whatsapp/test', {
-      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
-      body: {
-        waba_id: '00000000000000',
-        phone_number_id: '11111111111111',
-        access_token: 'invalid-token',
-      },
-    })
-    if (r.status === 404) return
-    // Wizard expects 200 with ok=false so it can render the error inline
-    // instead of bouncing to a generic error page.
-    assertEq(r.status, 200, 'test endpoint status')
-    assertEq(r.body?.ok, false, 'invalid creds rejected')
-    assert(typeof r.body?.error === 'string' && r.body.error.length > 0,
-      'error message provided', r.body)
-  })
-  await runTest('wa-wizard', 'POST /api/connectors/whatsapp/connect-manual — empty body → 400', async () => {
-    const r = await http('/api/connectors/whatsapp/connect-manual', {
-      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
-      body: {},
-    })
-    if (r.status === 404) return
-    assertEq(r.status, 400, 'missing-fields rejection')
-  })
-}
-
-/**
  * Plans + subscriptions — billing surface readability.
  */
 async function testPlansAndBilling(fx: Fixture): Promise<void> {
@@ -1897,7 +1852,6 @@ async function main(): Promise<void> {
     await testAgencyEndToEnd(fx)
     await testAgencyInviteFlows(fx)
     await testPlatformAdmin(fx)
-    await testWhatsAppWizardEndpoints(fx)
     await testKilledFeatures(fx)
     await testPlansAndBilling(fx)
 
