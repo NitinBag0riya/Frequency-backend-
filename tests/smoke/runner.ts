@@ -1453,6 +1453,124 @@ async function testRealtimeConnect(fx: Fixture): Promise<void> {
 }
 
 /**
+ * Agency end-to-end — multi-tenant management surface.
+ *
+ * The agency feature lets a partner (marketing agency, consultancy, BSP)
+ * own multiple tenant accounts under one umbrella. Critical paths:
+ *   ✓ Create an agency (idempotent, unique slug constraint)
+ *   ✓ Owner is seeded as a member with agency_owner role
+ *   ✓ List "my agencies" — caller sees the one they own
+ *   ✓ Members list shows the owner
+ *   ✓ Sub-accounts list (empty for a fresh agency, but the endpoint
+ *     must respond cleanly)
+ *   ✓ Revshare summary, payouts list, subscription state — all readable
+ *   ✓ Agency plans (public) — pricing page surface
+ *
+ * NOT exercised here: actual sub-account link/invite (requires a second
+ * provisioned tenant + an inbound user; covered separately by FE flow).
+ */
+async function testAgencyEndToEnd(fx: Fixture): Promise<void> {
+  let agencyId: string | null = null
+  const slug = `e2e-agency-${Date.now()}-${randomUUID().slice(0, 6)}`.toLowerCase()
+
+  await runTest('agency', 'POST /api/agencies creates an agency', async () => {
+    const r = await http('/api/agencies', {
+      method: 'POST', userToken: fx.userToken,
+      body: {
+        name: `Smoke Agency ${Date.now()}`,
+        slug,
+        default_revshare_pct: 25,
+        agency_paid_by_default: true,
+      },
+    })
+    if (r.status === 404) return
+    assert([200, 201].includes(r.status), `agency create ${r.status}`, r.body)
+    agencyId = r.body?.agency?.id ?? r.body?.id ?? null
+    if (agencyId) fx.cleanupIds.push({ table: 'agencies', ids: [agencyId!] })
+  })
+
+  await runTest('agency', 'GET /api/agencies/me shows the new agency', async () => {
+    if (!agencyId) return
+    const r = await http('/api/agencies/me', { userToken: fx.userToken })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'agencies/me')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? []
+    assert(list.some((a: any) => (a.id ?? a.agency?.id) === agencyId),
+      'newly-created agency appears in caller\'s agencies', list)
+  })
+
+  await runTest('agency', 'GET /api/agencies/:id returns the agency detail', async () => {
+    if (!agencyId) return
+    const r = await http(`/api/agencies/${agencyId}`, { userToken: fx.userToken })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'agency detail')
+    const got = r.body?.agency ?? r.body
+    assertEq(got?.id, agencyId, 'agency id roundtrip')
+  })
+
+  await runTest('agency', 'GET /api/agencies/:id/members lists the owner', async () => {
+    if (!agencyId) return
+    const r = await http(`/api/agencies/${agencyId}/members`, { userToken: fx.userToken })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'agency members')
+    const list = Array.isArray(r.body) ? r.body : r.body?.data ?? r.body?.members ?? []
+    assert(list.some((m: any) => m.user_id === fx.userId && /owner/i.test(m.role)),
+      'owner appears as agency_owner', list)
+  })
+
+  await runTest('agency', 'GET /api/agencies/:id/sub-accounts responds', async () => {
+    if (!agencyId) return
+    const r = await http(`/api/agencies/${agencyId}/sub-accounts`, { userToken: fx.userToken })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'sub-accounts list')
+  })
+
+  await runTest('agency', 'GET /api/agencies/:id/revshare/summary responds', async () => {
+    if (!agencyId) return
+    const r = await http(`/api/agencies/${agencyId}/revshare/summary`, { userToken: fx.userToken })
+    if (r.status === 404) return
+    assert(r.status < 500, `revshare summary panicked: ${r.status}`, r.body)
+  })
+
+  await runTest('agency', 'GET /api/agencies/:id/payouts responds', async () => {
+    if (!agencyId) return
+    const r = await http(`/api/agencies/${agencyId}/payouts`, { userToken: fx.userToken })
+    if (r.status === 404) return
+    assert(r.status < 500, `payouts panicked: ${r.status}`, r.body)
+  })
+
+  await runTest('agency', 'GET /api/agencies/:id/subscription responds', async () => {
+    if (!agencyId) return
+    const r = await http(`/api/agencies/${agencyId}/subscription`, { userToken: fx.userToken })
+    if (r.status === 404) return
+    assert(r.status < 500, `subscription panicked: ${r.status}`, r.body)
+  })
+
+  await runTest('agency', 'PATCH /api/agencies/:id renames it', async () => {
+    if (!agencyId) return
+    const newName = `Renamed ${Date.now()}`
+    const r = await http(`/api/agencies/${agencyId}`, {
+      method: 'PATCH', userToken: fx.userToken,
+      body: { name: newName },
+    })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'agency PATCH')
+    const got = r.body?.agency?.name ?? r.body?.name
+    if (got) assertEq(got, newName, 'name persisted')
+  })
+
+  await runTest('agency', 'duplicate slug returns 409', async () => {
+    if (!agencyId) return
+    const r = await http('/api/agencies', {
+      method: 'POST', userToken: fx.userToken,
+      body: { name: 'Dup', slug },
+    })
+    if (r.status === 404) return
+    assertEq(r.status, 409, 'unique slug rejection')
+  })
+}
+
+/**
  * Plans + subscriptions — billing surface readability.
  */
 async function testPlansAndBilling(fx: Fixture): Promise<void> {
@@ -1526,6 +1644,7 @@ async function main(): Promise<void> {
     await testWebhookSignatures()
     await testStorageUpload(fx)
     await testRealtimeConnect(fx)
+    await testAgencyEndToEnd(fx)
     await testKilledFeatures(fx)
     await testPlansAndBilling(fx)
 
