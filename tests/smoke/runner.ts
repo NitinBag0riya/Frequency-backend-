@@ -1371,9 +1371,10 @@ async function testWebhookSignatures(): Promise<void> {
  *   ✓ Read-after-write consistency — newly uploaded blob is fetchable
  */
 async function testStorageUpload(fx: Fixture): Promise<void> {
-  // Use a likely-existing bucket name. If your project uses a different
-  // name, this gracefully skips on the upload status check.
-  const buckets = ['attachments', 'public', 'avatars']
+  // Actual buckets in the Frequency project (verified via storage/v1/bucket
+  // GET). Initial guess was generic names that didn't exist; bucket-list
+  // probe revealed inbox-media + dsr-exports as the only real ones.
+  const buckets = ['inbox-media', 'dsr-exports']
   let uploadedTo: string | null = null
   let uploadedPath: string | null = null
 
