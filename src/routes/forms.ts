@@ -28,7 +28,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import { validateBody } from '../validation'
 import { apiError } from '../lib/api-error'
-import { messageQueue, enqueueWebhookOutbound, enqueueWorkflowExecution } from '../queue'
+import { messageQueue, enqueueWebhookOutbound, enqueueWorkflowExecution, enqueueSignedFormPdf } from '../queue'
 
 // ── Validators ──────────────────────────────────────────────────────────
 
@@ -553,13 +553,46 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     const offset = Math.max(Number(req.query.offset ?? 0),  0)
     const { data, count, error } = await supabase
       .from('form_submissions')
-      .select('id, submitted_at, response_data, post_action_status, post_action_error, is_test, table_row_id', { count: 'exact' })
+      .select('id, submitted_at, response_data, post_action_status, post_action_error, is_test, table_row_id, pdf_path, pdf_status, pdf_error, signer_name, signed_at', { count: 'exact' })
       .eq('form_id', req.params.id)
       .eq('tenant_id', tenantId)
       .order('submitted_at', { ascending: false })
       .range(offset, offset + limit - 1)
     if (error) { apiError(res, 500, 'list_failed', error.message); return }
     res.json({ submissions: data ?? [], total: count ?? 0, limit, offset })
+  })
+
+  // Signed download URL for a single submission's rendered PDF (Block D).
+  // We don't ship the bytes; we return a short-lived signed URL so the FE
+  // can either window.open() or render an <a download> link.
+  r.get('/api/forms/:id/submissions/:subId/pdf-url', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: sub, error: subErr } = await supabase
+      .from('form_submissions')
+      .select('id, pdf_path, pdf_status, pdf_error')
+      .eq('id', req.params.subId)
+      .eq('form_id', req.params.id)
+      .eq('tenant_id', tenantId)
+      .maybeSingle()
+    if (subErr) { apiError(res, 500, 'load_failed', subErr.message); return }
+    if (!sub)                { apiError(res, 404, 'not_found',  'Submission not found.'); return }
+    if (!(sub as any).pdf_path) {
+      apiError(res, 409, 'pdf_not_ready', `PDF not ready (status: ${(sub as any).pdf_status ?? 'pending'}).`, {
+        pdf_status: (sub as any).pdf_status,
+        pdf_error:  (sub as any).pdf_error,
+      })
+      return
+    }
+    // 10 minute lifetime — long enough for the user to click + download,
+    // short enough that a leaked URL becomes useless quickly.
+    const { data, error } = await supabase.storage
+      .from('form-uploads')
+      .createSignedUrl((sub as any).pdf_path, 60 * 10)
+    if (error || !data?.signedUrl) {
+      apiError(res, 500, 'sign_failed', error?.message ?? 'Could not create signed URL.')
+      return
+    }
+    res.json({ signed_url: data.signedUrl, expires_in_seconds: 600, path: (sub as any).pdf_path })
   })
 
   // ── PUBLIC ENDPOINTS ──────────────────────────────────────────────────
@@ -1003,6 +1036,19 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
       await supabase.from('form_submissions')
         .update({ post_action_status: actionStatus, post_action_error: actionError })
         .eq('id', submission.id)
+    }
+
+    // ── 6a. Enqueue signed-form PDF render (Block D) ────────────────────
+    // Fire-and-forget — worker reads the row and uploads to the bucket.
+    // jobId keyed on submission_id so retries don't generate dupes.
+    if (hasSignature && submission?.id) {
+      try {
+        await enqueueSignedFormPdf({ submissionId: submission.id })
+      } catch (e: any) {
+        // Don't fail the submit on enqueue errors; the row's
+        // pdf_status='pending' will surface in monitoring.
+        console.warn('[forms] enqueue signed-form-pdf failed:', e?.message ?? e)
+      }
     }
 
     // ── 6b. Clear partial-submission for this anonymous token (Block B) ─

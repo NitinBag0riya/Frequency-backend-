@@ -88,6 +88,11 @@ export const Q = {
   // idempotency — BullMQ rejects duplicate adds for the same logical
   // breach, the enqueuer swallows the error.
   breachNotification:   'breach-notification',
+  // ── Signed-form PDF render (Block D, migration 109) ─────────────────────
+  // Enqueued from forms.ts submit handler when a form has a signature
+  // field. Worker renders a PDF receipt + uploads to the form-uploads
+  // bucket + flips form_submissions.pdf_status to 'rendered'.
+  signedFormPdf:        'signed-form.pdf',
 } as const
 
 // ── Job payload types ─────────────────────────────────────────────────────────
@@ -256,6 +261,14 @@ export interface BreachNotificationJob {
   breachId: string
 }
 
+// ── Signed-form PDF render payload (Block D) ──────────────────────────────
+// Tiny payload — worker re-reads the form_submissions row to render the
+// PDF, so a stale job (e.g. submit retried) just regenerates the same
+// content. jobId keys on submission_id for natural idempotency.
+export interface SignedFormPdfJob {
+  submissionId: string
+}
+
 // ── Queue instances ───────────────────────────────────────────────────────────
 const defaultJobOpts = {
   removeOnComplete: { count: 1000, age: 24 * 60 * 60 },  // keep last 1000 / 24h
@@ -381,6 +394,27 @@ export const breachNotificationQueue = new Queue<BreachNotificationJob>(Q.breach
   connection,
   defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 30_000 } },
 })
+
+// ── Signed-form PDF queue (Block D) ─────────────────────────────────────
+// 3 attempts with exponential backoff so a transient Supabase Storage
+// hiccup doesn't burn the receipt. Per-submission jobId keeps a retried
+// submit from generating duplicate PDFs.
+export const signedFormPdfQueue = new Queue<SignedFormPdfJob>(Q.signedFormPdf, {
+  connection,
+  defaultJobOptions: { ...defaultJobOpts, attempts: 3, backoff: { type: 'exponential', delay: 15_000 } },
+})
+
+export async function enqueueSignedFormPdf(payload: SignedFormPdfJob) {
+  try {
+    return await signedFormPdfQueue.add('render', payload, {
+      // BullMQ 5.x rejects `:` in custom jobIds — use `--` separator.
+      jobId: `signed-form-pdf--${payload.submissionId}`,
+    })
+  } catch (err: any) {
+    if (String(err?.message ?? err).toLowerCase().includes('already')) return null
+    throw err
+  }
+}
 
 /**
  * BullMQ custom backoff strategy used by webhook.inbound + webhook.outbound
@@ -546,6 +580,8 @@ export async function closeQueues() {
     webhookOutboundQueue.close(),
     webhookInboundDeadQueue.close(),
     webhookOutboundDeadQueue.close(),
+    // Signed-form PDF render queue (Block D)
+    signedFormPdfQueue.close(),
   ])
   await connection.quit().catch(() => {})
 }

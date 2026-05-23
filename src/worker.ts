@@ -46,6 +46,9 @@ import { startSlaMonitorWorker } from './workers/sla-monitor'
 import { startContactImportProcessorWorker } from './workers/contact-import-processor'
 // P2 #20 — Voice note transcription (migration 086)
 import { startVoiceNoteTranscribeWorker } from './workers/voice-note-transcribe'
+// Block D — Signed-form PDF render (migration 109). One job per signed
+// submission; renders a receipt PDF + uploads to form-uploads bucket.
+import { startSignedFormPdfWorker } from './workers/signed-form-pdf'
 import { createClient } from '@supabase/supabase-js'
 import { closeQueues, attachCallDispatchFailureListener } from './queue'
 
@@ -106,6 +109,11 @@ async function main() {
   // Best-effort — failures here never affect message persistence.
   const vnt = startVoiceNoteTranscribeWorker()
 
+  // Block D — Signed-form PDF render worker. One job per signed form
+  // submission; renders an A4 receipt with field values + signature image
+  // + audit footer, uploads to form-uploads/signed/<tenant>/<form>/<id>.pdf.
+  const sfp = startSignedFormPdfWorker()
+
   // Failure listener for call.dispatch — when BullMQ permanently fails a
   // dispatch job, flip call_sessions.status='failed' so the agent's UI
   // doesn't sit on "Connecting…" forever.
@@ -143,6 +151,8 @@ async function main() {
       cip.close(),
       // Voice note transcription (P2 #20)
       vnt.close(),
+      // Signed-form PDF render (Block D)
+      sfp.close(),
     ])
     await closeQueues()
     process.exit(0)
