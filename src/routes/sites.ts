@@ -37,6 +37,7 @@
  */
 
 import express from 'express'
+import crypto from 'crypto'
 import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { validateBody } from '../validation'
@@ -452,7 +453,15 @@ export function createSitesRouter({
       .eq('slug', siteSlug)
       .maybeSingle()
     if (sErr || !site) { apiError(res, 404, 'not_found', 'Site not found.'); return }
-    if ((site as any).status !== 'published') { apiError(res, 404, 'not_found', 'Site not published.'); return }
+    // Site-level publish gate: only ARCHIVED sites block public reads.
+    // Pages still need to be individually published (filtered below).
+    // The original `status !== 'published'` check meant a brand-new site
+    // returned 404 for every page until the tenant manually flipped the
+    // site row to published — but the UI only exposes per-page publish,
+    // not per-site. Net effect: every site rendered 404. Now we honour
+    // page-level publishing as the source of truth, and the only thing
+    // that hides a whole site publicly is explicit archival.
+    if ((site as any).status === 'archived') { apiError(res, 404, 'not_found', 'Site not available.'); return }
 
     // 3. Resolve the page. Explicit slug wins; otherwise home_page_id;
     //    otherwise the lowest sort_order published page.
@@ -495,6 +504,127 @@ export function createSitesRouter({
   // explicit split because path-to-regexp v8 dropped `?`-suffix syntax.
   r.get('/api/public/sites/:tenantSlug/:siteSlug',           publicSiteHandler)
   r.get('/api/public/sites/:tenantSlug/:siteSlug/:pageSlug', publicSiteHandler)
+
+  // ── Public submit endpoint for Site pages ────────────────────────────
+  // Mirrors the essential bits of POST /api/public/forms/.../submit but
+  // writes form_submissions with site_page_id populated (form_id null).
+  // MVP scope — skips advanced features the legacy form endpoint has:
+  //   • Razorpay payment verification (Site pages can't host a payment
+  //     widget yet from a publish-quota standpoint; revisit when we wire
+  //     plan gating to site_pages)
+  //   • Signed-form PDF render enqueue (no published_plan_tier on
+  //     site_pages yet to drive the signed_forms_allowed check)
+  //   • Per-page monthly submission quota (no snapshot yet)
+  // Honeypot + show_if pruning + table-row insert still happen — that's
+  // the minimum bar for a form widget on a Site page to "work".
+  r.post('/api/public/sites/:tenantSlug/:siteSlug/:pageSlug/submit', async (req, res) => {
+    const { tenantSlug, siteSlug, pageSlug } = req.params as { tenantSlug: string; siteSlug: string; pageSlug: string }
+
+    // 1. Resolve tenant → site → page.
+    const { data: tenant } = await supabase.from('tenants').select('id').eq('slug', tenantSlug).maybeSingle()
+    if (!tenant) { apiError(res, 404, 'not_found', 'Page not found.'); return }
+    const { data: site } = await supabase.from('sites')
+      .select('id, status, tenant_id').eq('tenant_id', (tenant as any).id).eq('slug', siteSlug).maybeSingle()
+    if (!site)               { apiError(res, 404, 'not_found',     'Page not found.'); return }
+    if ((site as any).status === 'archived') {
+      apiError(res, 404, 'not_found', 'Site not available.'); return
+    }
+    const { data: page } = await supabase.from('site_pages')
+      .select('id, status, schema_json, response_table_id, post_save_action_json, tenant_id')
+      .eq('site_id', (site as any).id).eq('slug', pageSlug).maybeSingle()
+    if (!page)                { apiError(res, 404, 'not_found',     'Page not found.'); return }
+    if ((page as any).status !== 'published') {
+      apiError(res, 404, 'not_found', 'Page not published.'); return
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>
+
+    // 2. Honeypot — same convention as /api/public/forms/.../submit.
+    if (body._hp && String(body._hp).length > 0) {
+      res.json({ ok: true, message: 'Thanks!' }); return
+    }
+
+    // 3. Strip control fields + filter by known field ids in the schema.
+    const fieldIds = new Set<string>()
+    const fieldById = new Map<string, any>()
+    for (const w of ((page as any).schema_json?.widgets ?? []) as any[]) {
+      if (w?.kind === 'form' && Array.isArray(w.fields)) {
+        for (const f of w.fields) if (f?.id) { fieldIds.add(f.id); fieldById.set(f.id, f) }
+      }
+    }
+    const responseData: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(body)) {
+      if (k === '_hp' || k === '_utm' || k === '_test' || k === '_partial_token') continue
+      if (fieldIds.size === 0 || fieldIds.has(k)) responseData[k] = v
+    }
+
+    // 4. show_if pruning — strip values for fields that should be hidden.
+    for (const f of fieldById.values()) {
+      if (!f?.show_if) continue
+      const rule = f.show_if
+      const left = String(responseData[rule.field_id] ?? '')
+      let shown = true
+      switch (rule.op) {
+        case 'equals':       shown = left === String(rule.value ?? ''); break
+        case 'not_equals':   shown = left !== String(rule.value ?? ''); break
+        case 'in':           shown = Array.isArray(rule.value) && rule.value.includes(left); break
+        case 'not_in':       shown = Array.isArray(rule.value) && !rule.value.includes(left); break
+        case 'is_empty':     shown = left === ''; break
+        case 'is_not_empty': shown = left !== ''; break
+      }
+      if (!shown) delete responseData[f.id]
+    }
+
+    // 5. Required + length / pattern checks (mirror of forms.ts §3a).
+    const errors: Array<{ field_id: string; field_label: string; reason: string }> = []
+    for (const f of fieldById.values()) {
+      if (f?.show_if && !(f.id in responseData)) continue
+      const val = responseData[f.id] == null ? '' : String(responseData[f.id])
+      if (f.required && val.trim() === '') {
+        errors.push({ field_id: f.id, field_label: f.label, reason: 'required' }); continue
+      }
+      if (val === '') continue
+      if (['short_text','long_text','email','phone'].includes(f.kind)) {
+        if (typeof f.min_length === 'number' && val.length < f.min_length) errors.push({ field_id: f.id, field_label: f.label, reason: `min_length:${f.min_length}` })
+        if (typeof f.max_length === 'number' && val.length > f.max_length) errors.push({ field_id: f.id, field_label: f.label, reason: `max_length:${f.max_length}` })
+        if (typeof f.pattern === 'string' && f.pattern.length > 0) {
+          try { if (!new RegExp(f.pattern).test(val)) errors.push({ field_id: f.id, field_label: f.label, reason: f.pattern_error || 'pattern_mismatch' }) }
+          catch { /* invalid regex in schema — skip */ }
+        }
+      }
+    }
+    if (errors.length > 0) {
+      apiError(res, 422, 'validation_failed', `${errors.length} field${errors.length === 1 ? '' : 's'} failed validation.`, { errors })
+      return
+    }
+
+    // 6. Insert submission row. site_page_id populated; form_id stays null.
+    const ipHash = req.ip ? crypto.createHash('sha256').update(String(req.ip)).digest('hex') : null
+    const { data: submission, error: subErr } = await supabase.from('form_submissions').insert({
+      site_page_id:  (page as any).id,
+      tenant_id:     (page as any).tenant_id,
+      response_data: responseData,
+      ip_hash:       ipHash,
+      user_agent:    req.headers['user-agent']?.toString().slice(0, 500) ?? null,
+      submitted_at:  new Date().toISOString(),
+    }).select('id').single()
+    if (subErr) { apiError(res, 500, 'submit_failed', subErr.message); return }
+
+    // 7. Mirror into the destination lead_table (Step 2) if set. Best-effort.
+    if ((page as any).response_table_id) {
+      try {
+        await supabase.from('lead_table_rows').insert({
+          table_id: (page as any).response_table_id,
+          tenant_id: (page as any).tenant_id,
+          data: responseData,
+        })
+      } catch (e: any) {
+        console.warn(`[sites] table mirror failed for submission ${submission?.id}: ${e?.message ?? e}`)
+      }
+    }
+
+    res.json({ ok: true, submission_id: submission?.id ?? null })
+  })
 
   return r
 }
