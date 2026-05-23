@@ -383,6 +383,94 @@ export function createSitesRouter({
     res.json({ ok: true })
   })
 
+  // ── Site page templates marketplace ──────────────────────────────────
+  // Curated (+ tenant-published, future) templates that fork into a
+  // Site as a new site_pages row.
+  //
+  //   GET  /api/site-page-templates                       — list / filter
+  //   POST /api/sites/:siteId/pages/from-template/:tplId  — fork into site
+  //
+  // Mirror of the form_templates pattern from migration 110.
+
+  r.get('/api/site-page-templates', requireAuth, async (req, res) => {
+    let q = supabase.from('site_page_templates')
+      .select('id, slug, title, description, category, is_curated, screenshot_url, fork_count, author_tenant_id, created_at')
+      .order('is_curated', { ascending: false })
+      .order('fork_count', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(200)
+    if (req.query.category && typeof req.query.category === 'string') {
+      q = q.eq('category', req.query.category)
+    }
+    const { data, error } = await q
+    if (error) { apiError(res, 500, 'list_failed', error.message); return }
+    res.json({ templates: data ?? [] })
+  })
+
+  // Fork a template into a Site as a new page. Accepts optional title +
+  // slug overrides so the user can name their fork at create time.
+  r.post('/api/sites/:siteId/pages/from-template/:templateId',
+    requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { siteId, templateId } = req.params as { siteId: string; templateId: string }
+
+    const [siteRes, tplRes] = await Promise.all([
+      supabase.from('sites').select('id, tenant_id').eq('id', siteId).eq('tenant_id', tenantId).maybeSingle(),
+      supabase.from('site_page_templates').select('*').eq('id', templateId).maybeSingle(),
+    ])
+    if (siteRes.error)  { apiError(res, 500, 'read_failed', siteRes.error.message); return }
+    if (!siteRes.data)  { apiError(res, 404, 'not_found',  'Site not found.'); return }
+    if (tplRes.error)   { apiError(res, 500, 'read_failed', tplRes.error.message); return }
+    if (!tplRes.data)   { apiError(res, 404, 'not_found',  'Template not found.'); return }
+
+    const tpl = tplRes.data as any
+    const overrides = (req.body ?? {}) as { title?: string; slug?: string }
+    const overrideTitle = typeof overrides.title === 'string' && overrides.title.trim()
+      ? overrides.title.trim().slice(0, 200)
+      : tpl.title
+    const overrideSlug  = typeof overrides.slug === 'string' && overrides.slug.trim()
+      ? overrides.slug.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 80)
+      : `${tpl.slug}-${Date.now().toString(36).slice(-5)}`
+
+    // First page in a fresh site auto-becomes home.
+    const { count } = await supabase
+      .from('site_pages').select('id', { count: 'exact', head: true })
+      .eq('site_id', siteId).neq('status', 'archived')
+    const isFirstPage = (count ?? 0) === 0
+
+    const { data: page, error: insErr } = await supabase.from('site_pages').insert({
+      site_id:     siteId,
+      tenant_id:   tenantId,
+      title:       overrideTitle,
+      slug:        overrideSlug,
+      schema_json: tpl.schema_json,
+      sort_order:  (count ?? 0),
+      is_home:     isFirstPage,
+    }).select('*').single()
+    if (insErr) {
+      if ((insErr as any).code === '23505') {
+        apiError(res, 409, 'slug_taken', `A page with slug "${overrideSlug}" already exists in this site.`)
+        return
+      }
+      apiError(res, 500, 'fork_failed', insErr.message); return
+    }
+
+    if (isFirstPage) {
+      await supabase.from('sites').update({ home_page_id: page.id }).eq('id', siteId)
+    }
+
+    // Bump fork_count for popularity ranking. Best-effort.
+    try {
+      await supabase.rpc('increment_site_page_template_fork_count', { p_template_id: templateId })
+    } catch {
+      await supabase.from('site_page_templates')
+        .update({ fork_count: (tpl.fork_count ?? 0) + 1 })
+        .eq('id', templateId)
+    }
+
+    res.status(201).json({ page })
+  })
+
   // ── Import a standalone form into this Site as a page ────────────────
   // Lets a tenant keep their existing /forms list working AND optionally
   // promote a form into a Site without losing the schema. Sets is_home
