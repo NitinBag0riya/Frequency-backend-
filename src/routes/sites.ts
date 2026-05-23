@@ -433,9 +433,10 @@ export function createSitesRouter({
 
   // ── Public renderer endpoint ─────────────────────────────────────────
   // pageSlug optional → resolves to sites.home_page_id, then falls back
-  // to the lowest sort_order published page. Returns 404 if neither
-  // exists (= the site is brand new + no published page yet).
-  r.get('/api/public/sites/:tenantSlug/:siteSlug/:pageSlug?', async (req, res) => {
+  // to the lowest sort_order published page. Two explicit routes instead
+  // of `:pageSlug?` because Express 5 / path-to-regexp v8 dropped the
+  // legacy optional-suffix syntax — `?` now throws "Unexpected ? at index".
+  const publicSiteHandler: express.RequestHandler = async (req, res) => {
     const { tenantSlug, siteSlug, pageSlug } = req.params as { tenantSlug: string; siteSlug: string; pageSlug?: string }
 
     // 1. Resolve tenant by slug.
@@ -489,7 +490,11 @@ export function createSitesRouter({
       page: pageRes.data,
       siblings: navPages ?? [],
     })
-  })
+  }
+  // Bind both URL shapes to the same handler — Express 5 requires the
+  // explicit split because path-to-regexp v8 dropped `?`-suffix syntax.
+  r.get('/api/public/sites/:tenantSlug/:siteSlug',           publicSiteHandler)
+  r.get('/api/public/sites/:tenantSlug/:siteSlug/:pageSlug', publicSiteHandler)
 
   return r
 }
