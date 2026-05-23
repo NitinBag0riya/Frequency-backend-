@@ -320,6 +320,74 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     })
   })
 
+  // Payment-form order create. Called from the FE BEFORE submit when the
+  // form contains a Payment widget. We:
+  //   1. Resolve the form's Payment widget config (amount mode + value)
+  //   2. Compute the amount in paise (resolves from response_data if mode='from_field')
+  //   3. Create a Razorpay order via the tenant's connected merchant
+  //   4. Return order_id + key_id + amount so the FE can open Razorpay Checkout
+  // The actual submission still flows through /submit AFTER payment succeeds —
+  // the FE attaches razorpay_payment_id + razorpay_order_id + razorpay_signature
+  // to the submit body; we verify the signature server-side.
+  r.post('/api/public/forms/:tenantSlug/:formSlug/payment-order', publicSubmitLimiter, async (req, res) => {
+    const form = await loadPublishedForm(supabase, String(req.params.tenantSlug ?? ''), String(req.params.formSlug ?? ''))
+    if (!form) { apiError(res, 404, 'not_found', 'Form not found or not published.'); return }
+    const widget = (form.schema_json?.widgets ?? []).find((w: any) => w?.kind === 'payment') as any
+    if (!widget) { apiError(res, 400, 'no_payment_widget', 'This form has no payment widget.'); return }
+
+    // Resolve amount from the configured mode
+    const responseData = (req.body?.response_data ?? {}) as Record<string, unknown>
+    let amountPaise: number = 0
+    if (widget.amount_mode === 'fixed') {
+      amountPaise = Number(widget.fixed_amount_paise ?? 0)
+    } else if (widget.amount_mode === 'from_field' && widget.amount_from_field_id) {
+      const raw = responseData[widget.amount_from_field_id]
+      const rupees = Number(String(raw ?? '').replace(/[^\d.]/g, ''))
+      amountPaise = Math.round(rupees * 100)
+    }
+    if (!amountPaise || amountPaise < 100) {
+      apiError(res, 400, 'invalid_amount', 'Payment amount must be ≥ ₹1.'); return
+    }
+
+    // Mint Razorpay order using the tenant's connected merchant.
+    try {
+      const { getRazorpayAuthHeader } = await import('../routes/connectors/razorpay')
+      const auth = await getRazorpayAuthHeader(supabase, form.tenant_id)
+      const r2 = await fetch('https://api.razorpay.com/v1/orders', {
+        method:  'POST',
+        headers: { Authorization: auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          amount:   amountPaise,
+          currency: widget.currency || 'INR',
+          notes: {
+            frequency_form_id: form.id,
+            frequency_tenant:  form.tenant_id,
+          },
+        }),
+      })
+      const order = await r2.json() as any
+      if (!r2.ok) {
+        apiError(res, 502, 'razorpay_order_failed', order?.error?.description ?? 'Razorpay order failed'); return
+      }
+      // Pull the merchant's key_id so the FE can pass it to Checkout JS.
+      // Stored on tenant_integrations.metadata.key_id.
+      const { data: integ } = await supabase.from('tenant_integrations')
+        .select('metadata').eq('tenant_id', form.tenant_id).eq('key', 'razorpay').maybeSingle()
+      const keyId = (integ as any)?.metadata?.key_id
+      if (!keyId) { apiError(res, 400, 'razorpay_misconfig', 'Razorpay key_id not stored on tenant.'); return }
+
+      res.json({
+        order_id:    order.id,
+        amount:      order.amount,
+        currency:    order.currency,
+        key_id:      keyId,
+        description: widget.description ?? form.title,
+      })
+    } catch (e: any) {
+      apiError(res, 502, 'razorpay_error', e?.message ?? 'Razorpay request failed')
+    }
+  })
+
   r.post('/api/public/forms/:tenantSlug/:formSlug/submit', publicSubmitLimiter, async (req, res) => {
     const form = await loadPublishedForm(supabase, String(req.params.tenantSlug ?? ''), String(req.params.formSlug ?? ''))
     if (!form) { apiError(res, 404, 'not_found', 'Form not found or not published.'); return }
@@ -333,6 +401,39 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     if (body._hp && String(body._hp).length > 0) {
       res.json({ ok: true, message: form.schema_json?.successMessage ?? 'Thanks!' })
       return
+    }
+
+    // ── 2a. Payment verification (when form has a payment widget) ──────
+    // If the form has a payment widget, the submit must carry valid
+    // Razorpay signature triple (payment_id + order_id + signature)
+    // that we verify against the tenant's Razorpay secret. Otherwise
+    // anyone could submit without paying.
+    const paymentWidget = (form.schema_json?.widgets ?? []).find((w: any) => w?.kind === 'payment') as any
+    if (paymentWidget) {
+      const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = body
+      if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+        apiError(res, 402, 'payment_required', 'Payment is required to submit this form.')
+        return
+      }
+      try {
+        const { data: integ } = await supabase.from('tenant_integrations')
+          .select('access_token').eq('tenant_id', form.tenant_id).eq('key', 'razorpay').maybeSingle()
+        const secret = (integ as any)?.access_token as string | undefined
+        if (!secret) { apiError(res, 400, 'razorpay_misconfig', 'Tenant Razorpay secret missing.'); return }
+        const expected = crypto.createHmac('sha256', secret)
+          .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+          .digest('hex')
+        if (expected !== razorpay_signature) {
+          apiError(res, 403, 'invalid_payment_signature', 'Payment signature did not match.')
+          return
+        }
+        // Persist payment ids onto response_data so the Submissions tab
+        // shows them and downstream workflows can reference them.
+        body.__razorpay = { payment_id: razorpay_payment_id, order_id: razorpay_order_id }
+      } catch (e: any) {
+        apiError(res, 500, 'payment_verify_failed', e?.message ?? 'Signature verification crashed')
+        return
+      }
     }
 
     // ── 2. Quota: per-form + per-tenant monthly caps ────────────────────
@@ -359,8 +460,20 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
       // Strip control fields the renderer prepends (honeypot, UTM bag,
       // test flag) before persisting / mapping. They aren't form data
       // even when fieldIds is empty (no schema).
-      if (k === '_hp' || k === '_utm' || k === '_test') continue
+      // Strip every control / payment field. Razorpay ids land in
+      // response_data.__razorpay so they're queryable downstream.
+      if (
+        k === '_hp' || k === '_utm' || k === '_test' ||
+        k === 'razorpay_payment_id' || k === 'razorpay_order_id' || k === 'razorpay_signature' ||
+        k === '__razorpay'
+      ) continue
       if (fieldIds.size === 0 || fieldIds.has(k)) responseData[k] = v
+    }
+    // Re-attach payment metadata so the submission audit + downstream
+    // workflows can find the Razorpay ids without exposing them to the
+    // field-id allowlist check above.
+    if (body.__razorpay) {
+      responseData.__razorpay = body.__razorpay
     }
 
     // ── 4. Insert audit row (always — survives Table INSERT failures) ──
