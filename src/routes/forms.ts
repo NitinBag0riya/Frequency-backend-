@@ -861,6 +861,70 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
         if (!shown) delete responseData[f.id]
       }
     }
+
+    // ── 3a. Server-side field validation ─────────────────────────────────
+    // The FE already enforces required / min_length / max_length / pattern
+    // via native HTML5 attributes — this is the defence-in-depth layer
+    // that catches a curl-armed adversary or a stale FE bundle that
+    // shipped before a validation rule was tightened. Validation runs
+    // ONLY against currently-visible fields (post show_if pruning).
+    const validationErrors: Array<{ field_id: string; field_label: string; reason: string }> = []
+    for (const w of (form.schema_json?.widgets ?? []) as any[]) {
+      if (w?.kind !== 'form' || !Array.isArray(w.fields)) continue
+      for (const f of w.fields as any[]) {
+        // Skip fields that were stripped by show_if above — their value is
+        // gone and they're considered hidden, so don't validate them.
+        if (f?.show_if && !(f.id in responseData)) continue
+        const raw = responseData[f.id]
+        const val = raw == null ? '' : String(raw)
+        // Required check — empty string OR missing key.
+        if (f.required && val.trim() === '') {
+          validationErrors.push({ field_id: f.id, field_label: f.label, reason: 'required' })
+          continue
+        }
+        if (val === '') continue   // optional + blank → skip the rest
+        // Text-shaped bounds. Applies to short_text, long_text, email,
+        // phone. Number / date / select have their own native bounds.
+        const textKinds = ['short_text', 'long_text', 'email', 'phone']
+        if (textKinds.includes(f.kind)) {
+          if (typeof f.min_length === 'number' && val.length < f.min_length) {
+            validationErrors.push({ field_id: f.id, field_label: f.label, reason: `min_length:${f.min_length}` })
+          }
+          if (typeof f.max_length === 'number' && val.length > f.max_length) {
+            validationErrors.push({ field_id: f.id, field_label: f.label, reason: `max_length:${f.max_length}` })
+          }
+          if (typeof f.pattern === 'string' && f.pattern.length > 0) {
+            try {
+              if (!new RegExp(f.pattern).test(val)) {
+                validationErrors.push({
+                  field_id: f.id, field_label: f.label,
+                  reason: f.pattern_error || 'pattern_mismatch',
+                })
+              }
+            } catch {
+              // Schema-supplied regex is malformed — log + skip rather than
+              // blocking the submission on a builder bug.
+              console.warn(`[forms] invalid regex pattern on field ${f.id}: ${f.pattern}`)
+            }
+          }
+        }
+        if (f.kind === 'number') {
+          const num = Number(val)
+          if (Number.isNaN(num)) {
+            validationErrors.push({ field_id: f.id, field_label: f.label, reason: 'not_a_number' })
+          } else {
+            if (typeof f.min === 'number' && num < f.min) validationErrors.push({ field_id: f.id, field_label: f.label, reason: `min:${f.min}` })
+            if (typeof f.max === 'number' && num > f.max) validationErrors.push({ field_id: f.id, field_label: f.label, reason: `max:${f.max}` })
+          }
+        }
+      }
+    }
+    if (validationErrors.length > 0) {
+      apiError(res, 422, 'validation_failed',
+        `${validationErrors.length} field${validationErrors.length === 1 ? '' : 's'} failed validation.`,
+        { errors: validationErrors })
+      return
+    }
     // Re-attach payment metadata so the submission audit + downstream
     // workflows can find the Razorpay ids without exposing them to the
     // field-id allowlist check above.
