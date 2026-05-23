@@ -175,6 +175,56 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     res.json({ form: data })
   })
 
+  // ── Helpers for the builder UI ──────────────────────────────────────
+  // Workflow picker on the form's post-save-action panel needs a list
+  // of selectable nodes for the tenant. Returns id + name + status so the
+  // FE can render a labeled dropdown.
+  r.get('/api/forms-helpers/workflows', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data, error } = await supabase
+      .from('workflows')
+      .select('id, name, status')
+      .eq('tenant_id', tenantId)
+      .order('updated_at', { ascending: false })
+      .limit(200)
+    if (error) { apiError(res, 500, 'list_failed', error.message); return }
+    res.json({ workflows: data ?? [] })
+  })
+
+  // Plan tier + quotas for the active tenant. Drives the
+  // builder's footer-removal toggle and the submission-cap banner.
+  r.get('/api/forms-helpers/plan', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const plan = await resolveTenantPlan(supabase, tenantId)
+    const { data: quotas } = await supabase.from('plan_quotas')
+      .select('*').eq('plan_tier', plan).maybeSingle()
+    // Submission counts this month (per-tenant) — used for the banner.
+    const istMonthStartUtc = computeIstMonthStartUtc()
+    const { count } = await supabase.from('form_submissions')
+      .select('*', { count: 'exact', head: true })
+      .eq('tenant_id', tenantId)
+      .gte('submitted_at', istMonthStartUtc)
+      .eq('is_test', false)
+    res.json({ plan, quotas, current_month_submissions: count ?? 0 })
+  })
+
+  // Per-form submissions list (paginated) — drives the Submissions tab
+  // on the builder. Most-recent first; capped at 500/page.
+  r.get('/api/forms/:id/submissions', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const limit  = Math.min(Number(req.query.limit  ?? 50), 500)
+    const offset = Math.max(Number(req.query.offset ?? 0),  0)
+    const { data, count, error } = await supabase
+      .from('form_submissions')
+      .select('id, submitted_at, response_data, post_action_status, post_action_error, is_test, table_row_id', { count: 'exact' })
+      .eq('form_id', req.params.id)
+      .eq('tenant_id', tenantId)
+      .order('submitted_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+    if (error) { apiError(res, 500, 'list_failed', error.message); return }
+    res.json({ submissions: data ?? [], total: count ?? 0, limit, offset })
+  })
+
   // ── PUBLIC ENDPOINTS ──────────────────────────────────────────────────
   // No auth — used by the public renderer at /f/:tenant/:slug. Reads only
   // published forms; rate-limited; honeypot + plan-gated on submit.
@@ -185,10 +235,26 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     // Public payload: schema + title + post-save success message only.
     // Never expose response_table_id / mapping / settings — those are
     // tenant-private even though the form itself is public.
+    //
+    // Plan-gate the "Powered by Frequency" footer: if the form's
+    // published_plan_tier doesn't allow footer removal, force every
+    // footer widget's show_powered_by back to true so a downgrade
+    // can't strip the brand mark on already-published forms.
+    const planTier = form.published_plan_tier || 'free'
+    const { data: quotas } = await supabase.from('plan_quotas')
+      .select('footer_removable').eq('plan_tier', planTier).maybeSingle()
+    const canRemoveFooter = !!(quotas as any)?.footer_removable
+    const schema = form.schema_json as any
+    if (schema?.widgets && !canRemoveFooter) {
+      for (const w of schema.widgets) {
+        if (w?.kind === 'footer') w.show_powered_by = true
+      }
+    }
+
     res.json({
       slug:    form.slug,
       title:   form.title,
-      schema:  form.schema_json,
+      schema,
       // The branding the renderer needs to paint header/footer correctly.
       brand_kit: await loadBrandKit(supabase, form.tenant_id),
     })
@@ -248,12 +314,20 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     }
     const responseData: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(body)) {
-      if (k === '_hp') continue
+      // Strip control fields the renderer prepends (honeypot, UTM bag,
+      // test flag) before persisting / mapping. They aren't form data
+      // even when fieldIds is empty (no schema).
+      if (k === '_hp' || k === '_utm' || k === '_test') continue
       if (fieldIds.size === 0 || fieldIds.has(k)) responseData[k] = v
     }
 
     // ── 4. Insert audit row (always — survives Table INSERT failures) ──
+    // UTM params arrive in body._utm as { utm_source, utm_medium, ... }
+    // from the FE renderer which collects them on mount. Persisted to
+    // form_submissions.utm_json so the Phase 3 funnel analytics has the
+    // attribution data ready when those queries land.
     const ipHash = sha256(`${req.ip ?? 'unknown'}:${form.tenant_id}`)
+    const utmJson = sanitizeUtm(body._utm)
     const { data: submission, error: subErr } = await supabase.from('form_submissions')
       .insert({
         form_id:       form.id,
@@ -261,6 +335,7 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
         ip_hash:       ipHash,
         user_agent:    req.get('user-agent') ?? null,
         referrer:      req.get('referer') ?? null,
+        utm_json:      utmJson,
         response_data: responseData,
         is_test:       body._test === true,
       })
@@ -401,6 +476,27 @@ function sha256(s: string): string {
  * stripped). Doesn't try to parse complex expressions — that's by design;
  * post-save action templates should stay shallow.
  */
+/**
+ * Sanitize the `_utm` bag the FE renderer sends on submit. We allow
+ * only the conventional utm_* keys + `gclid` / `fbclid` (paid-ad click
+ * identifiers); everything else is dropped. Each value is capped at
+ * 200 chars to prevent oversized analytics rows.
+ */
+const ALLOWED_UTM_KEYS = new Set([
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+  'gclid', 'fbclid', 'msclkid', 'ttclid',
+])
+function sanitizeUtm(raw: unknown): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!ALLOWED_UTM_KEYS.has(k)) continue
+    if (typeof v !== 'string') continue
+    out[k] = v.slice(0, 200)
+  }
+  return out
+}
+
 function renderTemplate(tpl: string, data: Record<string, unknown>): string {
   return tpl.replace(/\{\{([^}]+)\}\}/g, (_, key) => {
     const trimmed = String(key).trim()
