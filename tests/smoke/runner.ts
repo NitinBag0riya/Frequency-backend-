@@ -1851,6 +1851,106 @@ async function testFormsPhase1(fx: Fixture): Promise<void> {
     assertEq((r.body as any)?.form?.status, 'published', 'status now published')
   })
 
+  await runTest('forms', 'GET /api/forms-helpers/plan returns plan + quotas', async () => {
+    const r = await http('/api/forms-helpers/plan', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'plan status')
+    const body = r.body as any
+    assert(typeof body?.plan === 'string', 'plan field present', body)
+    assert(typeof body?.quotas === 'object', 'quotas object present', body)
+    // Migration 112 lifted feature flags — assert they're now on for free.
+    if (body?.plan === 'free') {
+      assert(body?.quotas?.signed_forms_allowed === true,  'free should now allow signed forms', body?.quotas)
+      assert(body?.quotas?.ab_variants_allowed === true,   'free should now allow A/B variants',  body?.quotas)
+      assert(body?.quotas?.gated_content_allowed === true, 'free should now allow gated content', body?.quotas)
+    }
+  })
+
+  await runTest('forms', 'GET /api/form-templates returns curated library', async () => {
+    const r = await http('/api/form-templates', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'templates status')
+    const tpls = (r.body as any)?.templates
+    assert(Array.isArray(tpls), 'templates is array', r.body)
+    // Migrations 110+111 seed 16 curated templates — expect at least one.
+    assert(tpls.length > 0, 'at least one curated template present', { count: tpls.length })
+  })
+
+  await runTest('forms', 'GET /api/form-templates?category=booking filters', async () => {
+    const r = await http('/api/form-templates?category=booking', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'templates filter status')
+    const tpls = (r.body as any)?.templates ?? []
+    for (const t of tpls) {
+      assertEq(t.category, 'booking', `every row is booking (got ${t.category})`)
+    }
+  })
+
+  await runTest('forms', 'GET /api/forms/:id/embed returns iframe + js snippets', async () => {
+    if (!formId) return
+    const r = await http(`/api/forms/${formId}/embed`, { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'embed status')
+    const body = r.body as any
+    assert(typeof body?.public_url  === 'string', 'public_url present',  body)
+    assert(typeof body?.iframe_html === 'string', 'iframe_html present', body)
+    assert(typeof body?.js_snippet  === 'string', 'js_snippet present',  body)
+  })
+
+  await runTest('forms', 'GET /api/forms/:id/analytics/funnel responds', async () => {
+    if (!formId) return
+    const r = await http(`/api/forms/${formId}/analytics/funnel`, { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'funnel status')
+    const body = r.body as any
+    assert(typeof body?.total_visitors    === 'number', 'visitors numeric',    body)
+    assert(typeof body?.total_submissions === 'number', 'submissions numeric', body)
+    assert(typeof body?.conversion_rate   === 'number', 'rate numeric',        body)
+  })
+
+  await runTest('forms', 'GET /api/forms/:id/variants returns array', async () => {
+    if (!formId) return
+    const r = await http(`/api/forms/${formId}/variants`, { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (r.status === 404) return
+    assertEq(r.status, 200, 'variants status')
+    assert(Array.isArray((r.body as any)?.variants), 'variants array', r.body)
+  })
+
+  await runTest('forms', 'GET /pdf-url 404s cleanly for nonexistent submission', async () => {
+    if (!formId) return
+    const r = await http(`/api/forms/${formId}/submissions/00000000-0000-0000-0000-000000000000/pdf-url`, {
+      userToken: fx.userToken, tenantId: fx.tenantId,
+    })
+    // 404 = expected (no such submission). 200 means we somehow returned
+    // a URL for a phantom row — that would be a bug.
+    assert(r.status === 404 || r.status === 422, `expected 404/422, got ${r.status}`, r.body)
+  })
+
+  await runTest('forms', 'POST /api/form-templates/:id/fork creates a new form', async () => {
+    // Find a curated template to fork.
+    const list = await http('/api/form-templates', { userToken: fx.userToken, tenantId: fx.tenantId })
+    if (list.status !== 200) return
+    const tpls = (list.body as any)?.templates ?? []
+    if (tpls.length === 0) return
+    const tplId = tpls[0].id
+    const forkSlug = `smoke-fork-${Date.now()}`
+    const r = await http(`/api/form-templates/${tplId}/fork`, {
+      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId,
+      body: { title: 'Smoke fork', slug: forkSlug },
+    })
+    // 402 = forms quota reached — accept it as valid since the smoke
+    // tenant might already be at cap from earlier tests.
+    if (r.status === 402) return
+    if (r.status === 404) return
+    assertEq(r.status, 201, 'fork status')
+    const forkedId = (r.body as any)?.form?.id
+    assert(typeof forkedId === 'string', 'forked form id returned', r.body)
+    // Clean up so we don't leak forms across smoke runs.
+    if (forkedId) {
+      await http(`/api/forms/${forkedId}`, { method: 'DELETE', userToken: fx.userToken, tenantId: fx.tenantId })
+    }
+  })
+
   await runTest('forms', 'DELETE /api/forms/:id archives the form', async () => {
     if (!formId) return
     const r = await http(`/api/forms/${formId}`, {
