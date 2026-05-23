@@ -469,6 +469,28 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
       ) continue
       if (fieldIds.size === 0 || fieldIds.has(k)) responseData[k] = v
     }
+    // Defense-in-depth — drop values for fields whose show_if rule
+    // evaluates to false against the current responses. The FE already
+    // strips before submit; this guarantees a hostile client can't sneak
+    // a value into a field that should have been hidden.
+    for (const w of (form.schema_json?.widgets ?? []) as any[]) {
+      if (w?.kind !== 'form' || !Array.isArray(w.fields)) continue
+      for (const f of w.fields as any[]) {
+        if (!f?.show_if) continue
+        const rule = f.show_if
+        const left = String(responseData[rule.field_id] ?? '')
+        let shown = true
+        switch (rule.op) {
+          case 'equals':       shown = left === String(rule.value ?? ''); break
+          case 'not_equals':   shown = left !== String(rule.value ?? ''); break
+          case 'in':           shown = Array.isArray(rule.value) && rule.value.includes(left); break
+          case 'not_in':       shown = Array.isArray(rule.value) && !rule.value.includes(left); break
+          case 'is_empty':     shown = left === ''; break
+          case 'is_not_empty': shown = left !== ''; break
+        }
+        if (!shown) delete responseData[f.id]
+      }
+    }
     // Re-attach payment metadata so the submission audit + downstream
     // workflows can find the Razorpay ids without exposing them to the
     // field-id allowlist check above.
