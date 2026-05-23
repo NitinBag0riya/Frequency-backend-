@@ -290,6 +290,154 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     res.json({ found: true, response_data: (data as any).response_data, current_step_index: (data as any).current_step_index })
   })
 
+  // ── A/B variants (Block C) ────────────────────────────────────────────
+  // Create a new form_pages row that copies the schema + branding of the
+  // parent form. The new row's variant_of points back at the parent. The
+  // traffic split is read from variant_weight on each row (sum across
+  // parent + all variants = 100; renderer hashes visitor_id → bucket).
+  r.post('/api/forms/:id/variants', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: parent, error } = await supabase.from('form_pages')
+      .select('*').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (error) { apiError(res, 500, 'read_failed', error.message); return }
+    if (!parent) { apiError(res, 404, 'not_found', 'Parent form not found.'); return }
+    if ((parent as any).variant_of) {
+      apiError(res, 400, 'nested_variant', 'Cannot variant a variant. Variant the original.'); return
+    }
+    const { label } = (req.body ?? {}) as { label?: string }
+    const variantSlug = `${parent.slug}-v${Date.now().toString(36).slice(-4)}`
+    const { data: variant, error: insErr } = await supabase.from('form_pages')
+      .insert({
+        tenant_id:               parent.tenant_id,
+        slug:                    variantSlug,
+        title:                   parent.title,
+        schema_json:             parent.schema_json,
+        response_table_id:       parent.response_table_id,
+        response_mapping_id:     parent.response_mapping_id,
+        post_save_action_json:   parent.post_save_action_json,
+        branding_overrides_json: parent.branding_overrides_json,
+        settings_json:           parent.settings_json,
+        status:                  'draft',
+        variant_of:              parent.id,
+        variant_label:           label || `Variant ${Date.now().toString(36)}`,
+        variant_weight:          50,
+      })
+      .select('*').single()
+    if (insErr) { apiError(res, 500, 'variant_create_failed', insErr.message); return }
+    res.status(201).json({ variant })
+  })
+
+  // Promote a winning variant — copies its content into the parent +
+  // archives the losing variants.
+  r.post('/api/forms/:id/variants/:variantId/promote', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: variant } = await supabase.from('form_pages')
+      .select('*').eq('id', req.params.variantId).eq('tenant_id', tenantId).maybeSingle()
+    if (!variant || !(variant as any).variant_of) {
+      apiError(res, 404, 'not_found', 'Variant not found or has no parent.'); return
+    }
+    const parentId = (variant as any).variant_of
+    // Copy variant's content into the parent.
+    await supabase.from('form_pages').update({
+      schema_json:             variant.schema_json,
+      post_save_action_json:   variant.post_save_action_json,
+      branding_overrides_json: variant.branding_overrides_json,
+      settings_json:           variant.settings_json,
+    }).eq('id', parentId).eq('tenant_id', tenantId)
+    // Archive every other variant of the same parent.
+    await supabase.from('form_pages').update({ status: 'archived' })
+      .eq('variant_of', parentId).eq('tenant_id', tenantId)
+    res.json({ ok: true })
+  })
+
+  // List variants of a form (parent's variants).
+  r.get('/api/forms/:id/variants', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data, error } = await supabase.from('form_pages')
+      .select('id, slug, status, variant_label, variant_weight, created_at')
+      .eq('variant_of', req.params.id)
+      .eq('tenant_id', tenantId)
+      .order('created_at', { ascending: true })
+    if (error) { apiError(res, 500, 'list_failed', error.message); return }
+    res.json({ variants: data ?? [] })
+  })
+
+  // ── Funnel analytics (Block C) ────────────────────────────────────────
+  // Public event ingest. Lightweight — single insert, no validation
+  // beyond shape. Per-IP rate limit absorbs spam without affecting
+  // legitimate engagement bursts.
+  const eventIngestLimiter = rateLimit({
+    windowMs: 60_000, max: 300,    // 5 events/sec/IP
+    standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? 'unknown')}:fevent`,
+    handler: (_req, res) => apiError(res, 429, 'rate_limited', 'Too many events.'),
+  })
+  r.post('/api/public/forms/:tenantSlug/:formSlug/events', eventIngestLimiter, async (req, res) => {
+    const form = await loadPublishedForm(supabase, String(req.params.tenantSlug ?? ''), String(req.params.formSlug ?? ''))
+    if (!form) { apiError(res, 404, 'not_found', 'Form not found.'); return }
+    const events = Array.isArray(req.body?.events) ? req.body.events : []
+    if (events.length === 0) { res.json({ ok: true, accepted: 0 }); return }
+    if (events.length > 100) { apiError(res, 413, 'batch_too_large', 'Max 100 events/batch.'); return }
+    const allowedTypes = new Set(['view','focus','change','blur','step_advance','submit_attempt','submit_success'])
+    const rows = events
+      .filter((e: any) => e && allowedTypes.has(e.event_type))
+      .map((e: any) => ({
+        tenant_id:            form.tenant_id,
+        form_id:              form.id,
+        variant_id:           (form as any).variant_of || form.id,
+        anonymous_visitor_id: String(e.anonymous_visitor_id ?? '').slice(0, 128),
+        field_id:             e.field_id ? String(e.field_id).slice(0, 128) : null,
+        event_type:           e.event_type,
+        step_index:           Number(e.step_index ?? 0) || 0,
+        utm_json:             sanitizeUtm(e.utm),
+      }))
+      .filter((r: any) => r.anonymous_visitor_id.length >= 8)
+    if (rows.length === 0) { res.json({ ok: true, accepted: 0 }); return }
+    const { error } = await supabase.from('form_field_events').insert(rows)
+    if (error) { apiError(res, 500, 'ingest_failed', error.message); return }
+    res.json({ ok: true, accepted: rows.length })
+  })
+
+  // Funnel summary — per-step + per-field drop-off counts. Driven from
+  // the analytics page; not paginated since result set is small.
+  r.get('/api/forms/:id/analytics/funnel', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const days = Math.max(1, Math.min(Number(req.query.days ?? 30), 365))
+    const since = new Date(Date.now() - days * 86_400_000).toISOString()
+    // Three rollups — visitors, focus per field, submissions.
+    const [{ count: visitors }, { data: focused, error: focErr }, { count: submits }] = await Promise.all([
+      supabase.from('form_field_events').select('anonymous_visitor_id', { count: 'exact', head: true })
+        .eq('form_id', req.params.id).eq('tenant_id', tenantId)
+        .gte('event_ts', since).eq('event_type', 'view'),
+      supabase.from('form_field_events').select('field_id, anonymous_visitor_id')
+        .eq('form_id', req.params.id).eq('tenant_id', tenantId)
+        .gte('event_ts', since).eq('event_type', 'focus')
+        .limit(50_000),
+      supabase.from('form_submissions').select('id', { count: 'exact', head: true })
+        .eq('form_id', req.params.id).eq('tenant_id', tenantId)
+        .gte('submitted_at', since).eq('is_test', false),
+    ])
+    if (focErr) { apiError(res, 500, 'funnel_failed', focErr.message); return }
+    // Aggregate focus counts per field (unique visitors per field).
+    const perField = new Map<string, Set<string>>()
+    for (const row of (focused ?? []) as any[]) {
+      if (!row.field_id) continue
+      const s = perField.get(row.field_id) ?? new Set<string>()
+      s.add(row.anonymous_visitor_id)
+      perField.set(row.field_id, s)
+    }
+    const fields = Array.from(perField.entries())
+      .map(([field_id, set]) => ({ field_id, unique_visitors: set.size }))
+      .sort((a, b) => b.unique_visitors - a.unique_visitors)
+    res.json({
+      window_days:        days,
+      total_visitors:     visitors ?? 0,
+      total_submissions:  submits ?? 0,
+      conversion_rate:    (visitors ?? 0) > 0 ? ((submits ?? 0) / (visitors ?? 0)) : 0,
+      fields,
+    })
+  })
+
   // Per-form submissions list (paginated) — drives the Submissions tab
   // on the builder. Most-recent first; capped at 500/page.
   r.get('/api/forms/:id/submissions', requireAuth, identifyTenant, async (req, res) => {
@@ -597,6 +745,9 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
         utm_json:      utmJson,
         response_data: responseData,
         is_test:       body._test === true,
+        // Stamp variant_id when this form is itself a variant. Lets the
+        // analytics page attribute conversions per variant cleanly.
+        variant_id:    (form as any).variant_of ? form.id : null,
       })
       .select('id').single()
     if (subErr) { apiError(res, 500, 'submit_failed', subErr.message); return }
