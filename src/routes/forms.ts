@@ -735,6 +735,33 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     // attribution data ready when those queries land.
     const ipHash = sha256(`${req.ip ?? 'unknown'}:${form.tenant_id}`)
     const utmJson = sanitizeUtm(body._utm)
+    // Signed-form audit (Block D). If the form's schema has any field
+    // of kind='signature', stamp signer_* columns + compute the
+    // document_hash so we can later prove what was signed. PDF render
+    // is non-blocking — enqueued below via worker (TBD).
+    const hasSignature = (form.schema_json?.widgets ?? []).some((w: any) =>
+      w?.kind === 'form' && (w.fields ?? []).some((f: any) => f?.kind === 'signature')
+    )
+    const signedAt: string | null = hasSignature ? new Date().toISOString() : null
+    const documentHash: string | null = hasSignature
+      ? crypto.createHash('sha256').update(JSON.stringify(form.schema_json)).digest('hex')
+      : null
+    // signer_name pulled from a field labeled 'Name'/'Full name' if any;
+    // otherwise leave null.
+    let signerName: string | null = null
+    if (hasSignature) {
+      for (const w of (form.schema_json?.widgets ?? []) as any[]) {
+        if (w?.kind !== 'form') continue
+        for (const f of (w.fields ?? []) as any[]) {
+          if (/^(full[\s_-]?)?name$/i.test(String(f?.label ?? ''))) {
+            signerName = String(responseData[f.id] ?? '') || null
+            break
+          }
+        }
+        if (signerName) break
+      }
+    }
+
     const { data: submission, error: subErr } = await supabase.from('form_submissions')
       .insert({
         form_id:       form.id,
@@ -748,6 +775,11 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
         // Stamp variant_id when this form is itself a variant. Lets the
         // analytics page attribute conversions per variant cleanly.
         variant_id:    (form as any).variant_of ? form.id : null,
+        // Signed-form audit columns — null on non-signed forms.
+        signer_name:    signerName,
+        signed_at:      signedAt,
+        document_hash:  documentHash,
+        pdf_status:     hasSignature ? 'pending' : null,
       })
       .select('id').single()
     if (subErr) { apiError(res, 500, 'submit_failed', subErr.message); return }
