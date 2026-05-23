@@ -1015,6 +1015,16 @@ Parse the user's plain-language automation intent and return ONLY a compact JSON
 CRITICAL RULE — CLARIFYING QUESTIONS:
 When key information is missing to build a complete, executable workflow, populate "clarifying_questions" with 2–5 targeted questions. Each targets exactly one unknown. Still build the best-guess workflow skeleton; set config_completion_percent to 20–45 when questions are present. Do NOT invent credentials, emails, or phone numbers.
 
+CRITICAL RULE — LARGE / MULTI-WORKFLOW INPUT:
+If the user pastes a large existing workflow (n8n JSON, Zapier zap, Make scenario, or a multi-page spec) AND/OR asks for "multiple workflows" or "linked workflows", DO NOT try to translate the entire thing into one giant blueprint. Output budget is ~16K tokens — overruns get truncated mid-JSON and the parser rejects them. Instead:
+  1. Identify the SINGLE most important workflow (usually the first trigger → first conversion path) and emit a complete blueprint for THAT one.
+  2. List the remaining workflows as "blocking_issues" entries with severity:"info" and clear messages like "Step 2: Visit reminder cron — ask separately for a Frequency blueprint of this."
+  3. Use clarifying_questions to confirm scope: "I see this spans 5 separate flows. I built the first (Lead intake → BHK qualification). Want me to do (a) Visit booking, (b) Drip nurture, (c) Stale recovery next — pick one?"
+  4. NEVER copy n8n-specific node types (n8n-nodes-base.*) — translate to Frequency node types from the list below.
+  5. NEVER preserve hardcoded webhook URLs, phone-number IDs, or template names from the source — emit them as missing_config[] picker fields so the user wires them via our existing connectors.
+
+Output a single, complete, balanced JSON object. Better to ship one tight workflow that parses than half of a giant one that gets cut off.
+
 NODE TYPES (use exact strings):
 Triggers:  trigger_form_submit, trigger_webhook, trigger_sheet_row, trigger_inbound_keyword,
            trigger_scheduled, trigger_api, trigger_broadcast_reply, trigger_email_received
@@ -1233,7 +1243,13 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
 
     const stream = anthropic.messages.stream({
       model: 'claude-sonnet-4-6',
-      max_tokens: 6000,
+      // Bumped from 6000 → 16000 after users hit truncation pasting large
+      // existing workflow JSON (e.g. an n8n export). Sonnet 4.6 supports
+      // up to 64K output tokens; 16K is ~12K words of JSON which covers
+      // every realistic Frequency blueprint while keeping latency
+      // bounded. Truncation is also explicitly detected below via
+      // stop_reason='max_tokens' so we can surface a clean error.
+      max_tokens: 16000,
       // Prompt-cache the (long, stable) system prompt for ~70% cost / latency win.
       // First call seeds the cache; subsequent calls in the next 5 min hit it.
       system: [
@@ -1256,9 +1272,26 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
     const final = await stream.finalMessage().catch(() => null)
     const usage = final?.usage
     if (usage) {
-      console.log(`[parse-workflow] done chars=${charCount} input=${usage.input_tokens} output=${usage.output_tokens} cache_read=${(usage as any).cache_read_input_tokens ?? 0} cache_create=${(usage as any).cache_creation_input_tokens ?? 0}`)
+      console.log(`[parse-workflow] done chars=${charCount} input=${usage.input_tokens} output=${usage.output_tokens} cache_read=${(usage as any).cache_read_input_tokens ?? 0} cache_create=${(usage as any).cache_creation_input_tokens ?? 0} stop=${final?.stop_reason}`)
       void import('./lib/ai-usage').then(({ recordAiUsage }) =>
         recordAiUsage(supabase, tenantId, usage as any, 'parse_workflow', 'claude-sonnet-4-6'))
+    }
+
+    // Truncation detection — the LLM hit our max_tokens budget mid-response.
+    // The streamed text will end mid-JSON (unbalanced braces) so the FE's
+    // extractFirstJsonObject() returns null and shows "replied with prose
+    // instead of a workflow blueprint" — confusing because the AI WAS
+    // returning a blueprint, just not the whole thing. Surface a specific
+    // error before the FE attempts to parse so the user sees actionable copy.
+    if (!clientGone && final?.stop_reason === 'max_tokens') {
+      writeEvent({
+        error: 'truncated',
+        message: 'Your workflow was too large to generate in one go. Break the ask into smaller pieces — e.g. split a multi-stage automation into separate workflows that trigger each other via webhook, or describe one stage at a time and add the rest as follow-up.',
+      })
+      writeEvent({ done: true })
+      res.write('data: [DONE]\n\n')
+      res.end()
+      return
     }
 
     // ── P1 #14: emit a `preview` event before [DONE] ───────────────────────
