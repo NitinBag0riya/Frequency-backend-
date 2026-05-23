@@ -383,6 +383,109 @@ export function createSitesRouter({
     res.json({ ok: true })
   })
 
+  // ── Builder asset library ────────────────────────────────────────────
+  // Used by the in-builder image picker. Lists tenant assets under
+  // form-uploads/assets/<tenant_id>/ and mints signed upload URLs into
+  // the same prefix. This is separate from the form-submission file
+  // upload path (which scopes per-form + per-submission); these are
+  // long-lived workspace assets reusable across pages.
+  r.get('/api/builder/assets', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const prefix = `assets/${tenantId}`
+    // Storage.list returns the immediate children of the prefix. We sort
+    // by created_at desc so the newest uploads land first in the picker.
+    const { data, error } = await supabase.storage
+      .from('form-uploads')
+      .list(prefix, { limit: 200, sortBy: { column: 'created_at', order: 'desc' } })
+    if (error) { apiError(res, 500, 'list_failed', error.message); return }
+    const assets = (data ?? [])
+      .filter(it => it.name && !it.name.startsWith('.'))
+      .map(it => {
+        const path = `${prefix}/${it.name}`
+        const { data: pub } = supabase.storage.from('form-uploads').getPublicUrl(path)
+        return {
+          path,
+          name:         it.name,
+          public_url:   pub?.publicUrl ?? '',
+          created_at:   (it as any).created_at ?? null,
+          size:         (it.metadata as any)?.size ?? null,
+          content_type: (it.metadata as any)?.mimetype ?? null,
+        }
+      })
+    res.json({ assets })
+  })
+
+  // Mint a signed upload URL for a workspace-level image asset. The FE
+  // generates a uuid client-side and PUTs the file bytes to the signed
+  // URL; the resulting public URL is reusable across pages.
+  r.post('/api/builder/asset-upload-url', requireAuth, identifyTenant,
+    checkPermission('settings', 'edit'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { filename, content_type } = (req.body ?? {}) as { filename?: string; content_type?: string }
+    if (!filename || filename.length > 200) {
+      apiError(res, 400, 'invalid_filename', 'Filename required (≤200 chars).'); return
+    }
+    // Sanitize + prefix with a uuid so two uploads with the same filename
+    // don't collide. Lives under assets/<tenant>/<uuid>-<name>.
+    const safe = filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120)
+    const uid  = crypto.randomUUID()
+    const path = `assets/${tenantId}/${uid}-${safe}`
+    const { data, error } = await supabase.storage
+      .from('form-uploads')
+      .createSignedUploadUrl(path)
+    if (error || !data) {
+      apiError(res, 500, 'upload_url_failed', error?.message ?? 'Could not mint upload URL'); return
+    }
+    const { data: pub } = supabase.storage.from('form-uploads').getPublicUrl(path)
+    res.json({
+      signed_url:   data.signedUrl,
+      token:        data.token,
+      path,
+      public_url:   pub?.publicUrl ?? '',
+      content_type,
+    })
+  })
+
+  // ── Reorder pages within a site ──────────────────────────────────────
+  // Accepts the full ordered list of page IDs and writes contiguous
+  // sort_order values 0..N-1. The FE optimistically updates its local
+  // state before calling so the drag handle feels instantaneous; this
+  // endpoint just durably persists the order so a refresh restores it.
+  // Idempotent — calling with the same order is a no-op.
+  r.post('/api/sites/:siteId/pages/reorder', requireAuth, identifyTenant,
+    checkPermission('settings', 'edit'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { siteId } = req.params as { siteId: string }
+    const ids = Array.isArray((req.body ?? {}).page_ids) ? ((req.body as any).page_ids as unknown[]) : null
+    if (!ids || ids.some(x => typeof x !== 'string')) {
+      apiError(res, 400, 'invalid_body', 'Expected { page_ids: string[] }'); return
+    }
+    // Guard: every supplied id must belong to this site + tenant.
+    const { data: rows, error: readErr } = await supabase
+      .from('site_pages')
+      .select('id')
+      .eq('site_id', siteId)
+      .eq('tenant_id', tenantId)
+      .neq('status', 'archived')
+    if (readErr) { apiError(res, 500, 'read_failed', readErr.message); return }
+    const validIds = new Set((rows ?? []).map(r => (r as any).id as string))
+    for (const id of ids as string[]) {
+      if (!validIds.has(id)) { apiError(res, 400, 'unknown_page', `Page "${id}" not in site.`); return }
+    }
+    // Write sort_order in one pass. Postgres doesn't have a batched
+    // update API in Supabase JS so we issue parallel single-row updates.
+    const results = await Promise.all((ids as string[]).map((id, idx) =>
+      supabase.from('site_pages')
+        .update({ sort_order: idx })
+        .eq('id', id)
+        .eq('site_id', siteId)
+        .eq('tenant_id', tenantId)
+    ))
+    const firstErr = results.find(r => r.error)
+    if (firstErr?.error) { apiError(res, 500, 'reorder_failed', firstErr.error.message); return }
+    res.json({ ok: true, count: ids.length })
+  })
+
   // ── Site page templates marketplace ──────────────────────────────────
   // Curated (+ tenant-published, future) templates that fork into a
   // Site as a new site_pages row.
