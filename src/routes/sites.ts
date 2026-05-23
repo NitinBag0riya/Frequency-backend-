@@ -88,6 +88,24 @@ interface RouterDeps {
   checkPermission: (resource: string, action: 'view' | 'edit' | 'delete') => express.RequestHandler
 }
 
+// Guard handlers from receiving non-UUID URL params. Coverage probes and
+// curl typos used to hit `.eq('id', ':siteId')` directly which Postgres
+// rejects with "invalid input syntax for type uuid" — the BE then
+// returned 500. With this middleware we 400 cleanly instead.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+function requireUuid(...keys: string[]): express.RequestHandler {
+  return (req, res, next) => {
+    for (const k of keys) {
+      const v = (req.params as Record<string, string | undefined>)[k]
+      if (!v || !UUID_RE.test(v)) {
+        apiError(res, 400, 'invalid_id', `${k} must be a UUID.`)
+        return
+      }
+    }
+    next()
+  }
+}
+
 export function createSitesRouter({
   supabase, requireAuth, identifyTenant, checkPermission,
 }: RouterDeps): express.Router {
@@ -125,7 +143,7 @@ export function createSitesRouter({
     res.status(201).json({ site: data })
   })
 
-  r.get('/api/sites/:siteId', requireAuth, identifyTenant, async (req, res) => {
+  r.get('/api/sites/:siteId', requireAuth, identifyTenant, requireUuid('siteId'), async (req, res) => {
     const tenantId = (req as any).tenantId
     const [{ data: site, error: siteErr }, { data: pages, error: pagesErr }] = await Promise.all([
       supabase.from('sites').select('*').eq('id', req.params.siteId).eq('tenant_id', tenantId).maybeSingle(),
@@ -142,10 +160,20 @@ export function createSitesRouter({
     res.json({ site, pages: pages ?? [] })
   })
 
-  r.patch('/api/sites/:siteId', requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+  r.patch('/api/sites/:siteId', requireAuth, identifyTenant, requireUuid('siteId'), checkPermission('settings', 'edit'),
     validateBody(UpdateSiteSchema), async (req, res) => {
     const tenantId = (req as any).tenantId
     const patch = req.body as z.infer<typeof UpdateSiteSchema>
+    // Empty patch = no-op. Supabase rejects .update({}) with "no columns
+    // to update" which our handler used to bubble as 500. Treat as a
+    // successful no-change instead — return the current row.
+    if (Object.keys(patch).length === 0) {
+      const { data: current, error: readErr } = await supabase
+        .from('sites').select('*').eq('id', req.params.siteId).eq('tenant_id', tenantId).maybeSingle()
+      if (readErr) { apiError(res, 500, 'read_failed', readErr.message); return }
+      if (!current) { apiError(res, 404, 'not_found', 'Site not found.'); return }
+      res.json({ site: current }); return
+    }
     const { data, error } = await supabase
       .from('sites')
       .update(patch)
@@ -156,12 +184,15 @@ export function createSitesRouter({
       if ((error as any).code === '23505') {
         apiError(res, 409, 'slug_taken', 'Slug already in use in this workspace.'); return
       }
+      if ((error as any).code === 'PGRST116') {
+        apiError(res, 404, 'not_found', 'Site not found.'); return
+      }
       apiError(res, 500, 'update_failed', error.message); return
     }
     res.json({ site: data })
   })
 
-  r.delete('/api/sites/:siteId', requireAuth, identifyTenant, checkPermission('settings', 'delete'), async (req, res) => {
+  r.delete('/api/sites/:siteId', requireAuth, identifyTenant, requireUuid('siteId'), checkPermission('settings', 'delete'), async (req, res) => {
     const tenantId = (req as any).tenantId
     const { error } = await supabase
       .from('sites')
@@ -174,7 +205,7 @@ export function createSitesRouter({
 
   // ── Pages CRUD ───────────────────────────────────────────────────────
 
-  r.get('/api/sites/:siteId/pages', requireAuth, identifyTenant, async (req, res) => {
+  r.get('/api/sites/:siteId/pages', requireAuth, identifyTenant, requireUuid('siteId'), async (req, res) => {
     const tenantId = (req as any).tenantId
     const { data, error } = await supabase
       .from('site_pages')
@@ -187,7 +218,7 @@ export function createSitesRouter({
     res.json({ pages: data ?? [] })
   })
 
-  r.post('/api/sites/:siteId/pages', requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+  r.post('/api/sites/:siteId/pages', requireAuth, identifyTenant, requireUuid('siteId'), checkPermission('settings', 'edit'),
     validateBody(CreatePageSchema), async (req, res) => {
     const tenantId = (req as any).tenantId
     const { title, slug, is_home } = req.body as z.infer<typeof CreatePageSchema>
@@ -239,7 +270,7 @@ export function createSitesRouter({
     res.status(201).json({ page })
   })
 
-  r.get('/api/sites/:siteId/pages/:pageId', requireAuth, identifyTenant, async (req, res) => {
+  r.get('/api/sites/:siteId/pages/:pageId', requireAuth, identifyTenant, requireUuid('siteId', 'pageId'), async (req, res) => {
     const tenantId = (req as any).tenantId
     const { data, error } = await supabase
       .from('site_pages')
@@ -253,7 +284,7 @@ export function createSitesRouter({
     res.json({ page: data })
   })
 
-  r.patch('/api/sites/:siteId/pages/:pageId', requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+  r.patch('/api/sites/:siteId/pages/:pageId', requireAuth, identifyTenant, requireUuid('siteId', 'pageId'), checkPermission('settings', 'edit'),
     validateBody(UpdatePageSchema), async (req, res) => {
     const tenantId = (req as any).tenantId
     const patch = { ...(req.body as z.infer<typeof UpdatePageSchema>) }
@@ -261,6 +292,18 @@ export function createSitesRouter({
     // so we can demote the previous home in the same transaction.
     const newIsHome = patch.is_home
     delete patch.is_home
+
+    // Empty patch (after is_home strip) = no-op. Avoid the Supabase
+    // "no columns to update" 500 — return the current row instead.
+    if (Object.keys(patch).length === 0 && newIsHome === undefined) {
+      const { data: current, error: readErr } = await supabase
+        .from('site_pages').select('*')
+        .eq('id', req.params.pageId).eq('site_id', req.params.siteId).eq('tenant_id', tenantId)
+        .maybeSingle()
+      if (readErr)   { apiError(res, 500, 'read_failed', readErr.message); return }
+      if (!current)  { apiError(res, 404, 'not_found', 'Page not found.'); return }
+      res.json({ page: current }); return
+    }
 
     const { data: page, error } = await supabase
       .from('site_pages')
@@ -272,6 +315,9 @@ export function createSitesRouter({
     if (error) {
       if ((error as any).code === '23505') {
         apiError(res, 409, 'slug_taken', 'Slug already in use in this site.'); return
+      }
+      if ((error as any).code === 'PGRST116') {
+        apiError(res, 404, 'not_found', 'Page not found.'); return
       }
       apiError(res, 500, 'update_failed', error.message); return
     }
@@ -293,7 +339,7 @@ export function createSitesRouter({
     res.json({ page })
   })
 
-  r.post('/api/sites/:siteId/pages/:pageId/publish', requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+  r.post('/api/sites/:siteId/pages/:pageId/publish', requireAuth, identifyTenant, requireUuid('siteId', 'pageId'), checkPermission('settings', 'edit'),
     async (req, res) => {
     const tenantId = (req as any).tenantId
     const { data, error } = await supabase
@@ -303,11 +349,17 @@ export function createSitesRouter({
       .eq('site_id', req.params.siteId)
       .eq('tenant_id', tenantId)
       .select('*').single()
-    if (error) { apiError(res, 500, 'publish_failed', error.message); return }
+    if (error) {
+      // PGRST116 = no rows returned for .single(). Map to 404 instead of 500
+      // — without this, hitting publish on a phantom page id used to crash
+      // the coverage probe with "publish_failed: query returned 0 rows".
+      if ((error as any).code === 'PGRST116') { apiError(res, 404, 'not_found', 'Page not found.'); return }
+      apiError(res, 500, 'publish_failed', error.message); return
+    }
     res.json({ page: data })
   })
 
-  r.post('/api/sites/:siteId/pages/:pageId/unpublish', requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+  r.post('/api/sites/:siteId/pages/:pageId/unpublish', requireAuth, identifyTenant, requireUuid('siteId', 'pageId'), checkPermission('settings', 'edit'),
     async (req, res) => {
     const tenantId = (req as any).tenantId
     const { data, error } = await supabase
@@ -317,11 +369,14 @@ export function createSitesRouter({
       .eq('site_id', req.params.siteId)
       .eq('tenant_id', tenantId)
       .select('*').single()
-    if (error) { apiError(res, 500, 'unpublish_failed', error.message); return }
+    if (error) {
+      if ((error as any).code === 'PGRST116') { apiError(res, 404, 'not_found', 'Page not found.'); return }
+      apiError(res, 500, 'unpublish_failed', error.message); return
+    }
     res.json({ page: data })
   })
 
-  r.post('/api/sites/:siteId/pages/:pageId/duplicate', requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+  r.post('/api/sites/:siteId/pages/:pageId/duplicate', requireAuth, identifyTenant, requireUuid('siteId', 'pageId'), checkPermission('settings', 'edit'),
     async (req, res) => {
     const tenantId = (req as any).tenantId
     const { data: src, error: srcErr } = await supabase
@@ -370,7 +425,7 @@ export function createSitesRouter({
     res.status(201).json({ page: dup })
   })
 
-  r.delete('/api/sites/:siteId/pages/:pageId', requireAuth, identifyTenant, checkPermission('settings', 'delete'),
+  r.delete('/api/sites/:siteId/pages/:pageId', requireAuth, identifyTenant, requireUuid('siteId', 'pageId'), checkPermission('settings', 'delete'),
     async (req, res) => {
     const tenantId = (req as any).tenantId
     const { error } = await supabase
@@ -452,7 +507,7 @@ export function createSitesRouter({
   // state before calling so the drag handle feels instantaneous; this
   // endpoint just durably persists the order so a refresh restores it.
   // Idempotent — calling with the same order is a no-op.
-  r.post('/api/sites/:siteId/pages/reorder', requireAuth, identifyTenant,
+  r.post('/api/sites/:siteId/pages/reorder', requireAuth, identifyTenant, requireUuid('siteId'),
     checkPermission('settings', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId
     const { siteId } = req.params as { siteId: string }
@@ -513,7 +568,7 @@ export function createSitesRouter({
   // Fork a template into a Site as a new page. Accepts optional title +
   // slug overrides so the user can name their fork at create time.
   r.post('/api/sites/:siteId/pages/from-template/:templateId',
-    requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
+    requireAuth, identifyTenant, requireUuid('siteId', 'templateId'), checkPermission('settings', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId
     const { siteId, templateId } = req.params as { siteId: string; templateId: string }
 
@@ -578,7 +633,7 @@ export function createSitesRouter({
   // Lets a tenant keep their existing /forms list working AND optionally
   // promote a form into a Site without losing the schema. Sets is_home
   // false unless this is the first page in the site.
-  r.post('/api/sites/:siteId/import-form/:formId', requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+  r.post('/api/sites/:siteId/import-form/:formId', requireAuth, identifyTenant, requireUuid('siteId', 'formId'), checkPermission('settings', 'edit'),
     async (req, res) => {
     const tenantId = (req as any).tenantId
 
