@@ -278,6 +278,48 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     },
   })
 
+  // Mint a one-shot signed upload URL for a file field on a published
+  // form. Rate-limited per-IP/tenant/form to defeat upload-spamming. We
+  // never accept the file bytes directly — the FE uploads to Supabase
+  // Storage with the returned token; the resulting object key gets
+  // submitted alongside the form values.
+  const publicUploadLimiter = rateLimit({
+    windowMs: 60_000, max: 20,
+    standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? 'unknown')}:${req.params.tenantSlug}:${req.params.formSlug}:upload`,
+    handler: (_req, res) => apiError(res, 429, 'rate_limited', 'Too many upload requests.'),
+  })
+  r.post('/api/public/forms/:tenantSlug/:formSlug/upload-url', publicUploadLimiter, async (req, res) => {
+    const form = await loadPublishedForm(supabase, String(req.params.tenantSlug ?? ''), String(req.params.formSlug ?? ''))
+    if (!form) { apiError(res, 404, 'not_found', 'Form not found or not published.'); return }
+    const { filename, content_type } = (req.body ?? {}) as { filename?: string; content_type?: string }
+    if (!filename || filename.length > 200) {
+      apiError(res, 400, 'invalid_filename', 'Filename required (≤200 chars).'); return
+    }
+    // Compose the storage path. submission_id is regenerated each upload
+    // so two file fields on the same submission get separate prefixes —
+    // safer than reusing one prefix where a second file could overwrite
+    // the first by accidentally sharing a filename.
+    const submissionId = crypto.randomUUID()
+    const safe = filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120)
+    const objectPath = `${form.tenant_id}/${form.id}/${submissionId}/${safe}`
+    // Service role can mint a 5-minute signed upload URL — Supabase JS
+    // exposes this via storage.from(bucket).createSignedUploadUrl(path).
+    const { data, error } = await supabase.storage
+      .from('form-uploads')
+      .createSignedUploadUrl(objectPath)
+    if (error || !data) {
+      apiError(res, 500, 'upload_url_failed', error?.message ?? 'Could not mint upload URL'); return
+    }
+    res.json({
+      signed_url:    data.signedUrl,
+      token:         data.token,
+      path:          objectPath,
+      submission_id: submissionId,
+      content_type,
+    })
+  })
+
   r.post('/api/public/forms/:tenantSlug/:formSlug/submit', publicSubmitLimiter, async (req, res) => {
     const form = await loadPublishedForm(supabase, String(req.params.tenantSlug ?? ''), String(req.params.formSlug ?? ''))
     if (!form) { apiError(res, 404, 'not_found', 'Form not found or not published.'); return }
