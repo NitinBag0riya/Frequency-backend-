@@ -28,7 +28,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import { validateBody } from '../validation'
 import { apiError } from '../lib/api-error'
-import { messageQueue } from '../queue'
+import { messageQueue, enqueueWebhookOutbound, enqueueWorkflowExecution } from '../queue'
 
 // ── Validators ──────────────────────────────────────────────────────────
 
@@ -290,17 +290,21 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     }
 
     // ── 6. Dispatch post-save action (best-effort, queued) ──────────────
+    // Each action kind enqueues onto the existing per-channel queue. Errors
+    // are caught + recorded on form_submissions.post_action_error so we
+    // can debug without blocking the visitor's success response.
     const action = form.post_save_action_json as any
-    if (action?.kind === 'whatsapp_template') {
-      // Resolve the `to` field (phone number) from response_data using
-      // the configured to_field_id. Variables map form_field_id → '1' / '2' / ...
-      const to = String(responseData[action.to_field_id] ?? '').replace(/^\+/, '')
-      if (to) {
-        const ordered: string[] = []
-        for (const [fieldId, varIndex] of Object.entries(action.variable_map ?? {}) as [string, string][]) {
-          ordered[Number(varIndex) - 1] = String(responseData[fieldId] ?? '')
-        }
-        try {
+    let actionStatus: 'pending' | 'dispatched' | 'failed' | 'none' = 'none'
+    let actionError: string | null = null
+
+    try {
+      if (action?.kind === 'whatsapp_template') {
+        const to = String(responseData[action.to_field_id] ?? '').replace(/^\+/, '')
+        if (to) {
+          const ordered: string[] = []
+          for (const [fieldId, varIndex] of Object.entries(action.variable_map ?? {}) as [string, string][]) {
+            ordered[Number(varIndex) - 1] = String(responseData[fieldId] ?? '')
+          }
           await messageQueue.add('send', {
             tenantId: form.tenant_id,
             to,
@@ -312,14 +316,69 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
               parameters: ordered.filter(v => v !== undefined),
             },
           })
-          await supabase.from('form_submissions')
-            .update({ post_action_status: 'dispatched' }).eq('id', submission.id)
-        } catch (e: any) {
-          await supabase.from('form_submissions')
-            .update({ post_action_status: 'failed', post_action_error: `wa_dispatch: ${e?.message ?? e}` })
-            .eq('id', submission.id)
+          actionStatus = 'dispatched'
         }
+      } else if (action?.kind === 'email') {
+        // Subject + body templates may reference {{field_id}} placeholders
+        // resolved against the submission's response_data. The destination
+        // email is read from to_field_id.
+        const to = String(responseData[action.to_field_id] ?? '').trim()
+        if (to) {
+          const subject = renderTemplate(action.subject_template ?? '', responseData)
+          const body    = renderTemplate(action.body_template ?? '',    responseData)
+          await messageQueue.add('send', {
+            tenantId: form.tenant_id,
+            to,
+            channel: 'email',
+            email: { to, subject, body, provider: 'auto' },
+          })
+          actionStatus = 'dispatched'
+        }
+      } else if (action?.kind === 'webhook') {
+        // POST the submission to the configured URL. Body is the raw
+        // response_data plus form context. HMAC-SHA256 signature header
+        // when signing_secret is set so the receiver can verify origin.
+        const payloadObj = {
+          form_id:      form.id,
+          tenant_id:    form.tenant_id,
+          submitted_at: new Date().toISOString(),
+          data:         responseData,
+        }
+        const body = JSON.stringify(payloadObj)
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+        if (action.signing_secret) {
+          const sig = crypto.createHmac('sha256', action.signing_secret).update(body).digest('hex')
+          headers['x-frequency-signature'] = `sha256=${sig}`
+        }
+        await enqueueWebhookOutbound({
+          tenantId:  form.tenant_id,
+          source:    'form_submit',
+          url:       action.url,
+          method:    'POST',
+          headers,
+          body,
+        })
+        actionStatus = 'dispatched'
+      } else if (action?.kind === 'workflow') {
+        // Phase 1 wiring: we fire the workflow but pass form values as
+        // the reply.raw object. A future workflow primitive ("form input
+        // trigger") will read directly from this payload.
+        await enqueueWorkflowExecution({
+          sessionId: form.tenant_id,  // tenant-scoped session, not user-bound
+          nodeId:    action.workflow_id,
+          reply: { text: '', raw: { source: 'form_submit', form_id: form.id, data: responseData } },
+        })
+        actionStatus = 'dispatched'
       }
+    } catch (e: any) {
+      actionStatus = 'failed'
+      actionError  = `${action?.kind ?? 'unknown'}_dispatch: ${e?.message ?? e}`
+    }
+
+    if (actionStatus !== 'none') {
+      await supabase.from('form_submissions')
+        .update({ post_action_status: actionStatus, post_action_error: actionError })
+        .eq('id', submission.id)
     }
 
     // ── 7. Return success ──────────────────────────────────────────────
@@ -334,6 +393,20 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
 
 function sha256(s: string): string {
   return crypto.createHash('sha256').update(s).digest('hex')
+}
+
+/**
+ * Render a {{field_id}} template against a flat data dict. Missing keys
+ * leave the placeholder in place (visible — easier to debug than silently
+ * stripped). Doesn't try to parse complex expressions — that's by design;
+ * post-save action templates should stay shallow.
+ */
+function renderTemplate(tpl: string, data: Record<string, unknown>): string {
+  return tpl.replace(/\{\{([^}]+)\}\}/g, (_, key) => {
+    const trimmed = String(key).trim()
+    const value = data[trimmed]
+    return value === undefined ? `{{${trimmed}}}` : String(value)
+  })
 }
 
 function extractSuccessMessage(schema: any): string | null {
