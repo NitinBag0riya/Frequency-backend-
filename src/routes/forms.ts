@@ -325,17 +325,37 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
       return
     }
 
-    const slug = `${(tpl as any).slug}-${Date.now().toString(36).slice(-5)}`
+    // Accept optional title + slug overrides from the caller so the
+    // user can name their fork at create time. Falls back to the
+    // template's title and an auto-suffixed slug for backward compat
+    // (the older client just POSTed an empty body).
+    const overrides = (req.body ?? {}) as { title?: string; slug?: string }
+    const overrideTitle = typeof overrides.title === 'string' && overrides.title.trim()
+      ? overrides.title.trim().slice(0, 200)
+      : (tpl as any).title
+    const overrideSlug = typeof overrides.slug === 'string' && overrides.slug.trim()
+      ? overrides.slug.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 80)
+      : `${(tpl as any).slug}-${Date.now().toString(36).slice(-5)}`
+
     const { data: form, error: insErr } = await supabase.from('form_pages')
       .insert({
         tenant_id:             tenantId,
-        slug,
-        title:                 (tpl as any).title,
+        slug:                  overrideSlug,
+        title:                 overrideTitle,
         schema_json:           (tpl as any).schema_json,
         post_save_action_json: (tpl as any).default_action_json ?? { kind: 'none' },
       })
       .select('*').single()
-    if (insErr) { apiError(res, 500, 'fork_failed', insErr.message); return }
+    if (insErr) {
+      // Slug-collision is the likely failure mode when the user picks
+      // a name that already exists. Surface a specific code so the FE
+      // can keep the dialog open with an inline error.
+      if ((insErr as any).code === '23505') {
+        apiError(res, 409, 'slug_taken', `A form with slug "${overrideSlug}" already exists in this workspace.`)
+        return
+      }
+      apiError(res, 500, 'fork_failed', insErr.message); return
+    }
 
     // Bump fork_count — best-effort (don't block the fork on this).
     try {
