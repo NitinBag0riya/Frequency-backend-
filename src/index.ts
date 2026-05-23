@@ -33,6 +33,7 @@ import { createTeamsRouter }       from './routes/teams'
 import { createTenantAuditRouter } from './routes/tenant-audit'
 import { createNotificationsRouter } from './routes/notifications'
 import { createFormsRouter } from './routes/forms'
+import { createSitesRouter } from './routes/sites'
 import { createDevicesRouter }       from './routes/devices'
 import { createUsageRouter }         from './routes/usage'
 import { createWedgeSurfaceRouter }  from './routes/wedge-surface'
@@ -4166,6 +4167,7 @@ app.use(createTenantAuditRouter({ supabase, requireAuth, identifyTenant, checkPe
 // ── Notifications (in-app bell + preferences) ────────────────────────────────
 app.use(createNotificationsRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createFormsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+app.use(createSitesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Inbox agent-collision presence audit (P1 #16) ───────────────────────────
 // Live "Agent X is already replying" toast is driven by Supabase Realtime
