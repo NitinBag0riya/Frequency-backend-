@@ -488,6 +488,32 @@ export function createSitesRouter({
       .eq('status', 'published')
       .order('sort_order', { ascending: true })
 
+    // 5. Resolve any `form:<id>` cross-link tokens embedded in this page's
+    //    schema so the public renderer can emit /f/:tenant/:formSlug
+    //    hrefs without a second round-trip. Only forms that actually
+    //    appear in the schema are returned; nothing else leaks.
+    const formTokenIds = new Set<string>()
+    const walk = (node: any): void => {
+      if (!node) return
+      if (typeof node === 'string' && node.startsWith('form:')) {
+        formTokenIds.add(node.slice(5))
+      } else if (Array.isArray(node)) {
+        for (const v of node) walk(v)
+      } else if (typeof node === 'object') {
+        for (const v of Object.values(node)) walk(v)
+      }
+    }
+    walk((pageRes.data as any)?.schema_json)
+    let linkedForms: Array<{ id: string; slug: string; title: string }> = []
+    if (formTokenIds.size > 0) {
+      const { data: formRows } = await supabase.from('form_pages')
+        .select('id, slug, title, status')
+        .in('id', Array.from(formTokenIds))
+        .eq('tenant_id', (tenant as any).id)
+        .eq('status', 'published')
+      linkedForms = (formRows ?? []).map((f: any) => ({ id: f.id, slug: f.slug, title: f.title }))
+    }
+
     res.json({
       site: {
         name:          (site as any).name,
@@ -496,8 +522,9 @@ export function createSitesRouter({
         theme_json:    (site as any).theme_json,
         custom_domain: (site as any).custom_domain,
       },
-      page: pageRes.data,
-      siblings: navPages ?? [],
+      page:         pageRes.data,
+      siblings:     navPages ?? [],
+      linked_forms: linkedForms,
     })
   }
   // Bind both URL shapes to the same handler — Express 5 requires the
