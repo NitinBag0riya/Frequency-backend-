@@ -612,8 +612,26 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     }
 
     // ── 7. Return success ──────────────────────────────────────────────
+    // Form-level settings can redirect to a custom thank-you page or a
+    // gated-content unlock URL. Gated-content unlocks are plan-gated
+    // (Growth+) per the locked-in matrix — enforce by checking the
+    // form's published_plan_tier against plan_quotas.gated_content_allowed.
     const successMessage = extractSuccessMessage(form.schema_json) ?? 'Thanks! Your submission was received.'
-    res.json({ ok: true, message: successMessage })
+    const settings = (form.settings_json ?? {}) as Record<string, unknown>
+    const respPayload: Record<string, unknown> = { ok: true, message: successMessage }
+
+    if (typeof settings.redirect_url === 'string' && settings.redirect_url) {
+      respPayload.redirect_url = settings.redirect_url
+    }
+    if (typeof settings.gated_unlock_url === 'string' && settings.gated_unlock_url) {
+      const tier = form.published_plan_tier || 'free'
+      const { data: q } = await supabase.from('plan_quotas')
+        .select('gated_content_allowed').eq('plan_tier', tier).maybeSingle()
+      if ((q as any)?.gated_content_allowed) {
+        respPayload.gated_unlock_url = settings.gated_unlock_url
+      }
+    }
+    res.json(respPayload)
   })
 
   return r
