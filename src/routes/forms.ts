@@ -208,6 +208,88 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     res.json({ plan, quotas, current_month_submissions: count ?? 0 })
   })
 
+  // Embed snippet (Block B) — return iframe + JS-snippet markup the
+  // tenant can paste into an external site. Authed because tenant needs
+  // to be logged in to see the snippet for their own forms.
+  r.get('/api/forms/:id/embed', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: form, error } = await supabase.from('form_pages')
+      .select('id, slug, title, tenant_id')
+      .eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (error) { apiError(res, 500, 'read_failed', error.message); return }
+    if (!form)  { apiError(res, 404, 'not_found', 'Form not found.'); return }
+    const { data: tenant } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+    const tenantSlug = (tenant as any)?.slug
+    if (!tenantSlug) { apiError(res, 400, 'tenant_no_slug', 'Tenant has no slug.'); return }
+
+    const base = process.env.PUBLIC_FE_URL ?? 'https://beta.getfrequency.app'
+    const publicUrl = `${base}/f/${tenantSlug}/${form.slug}?embed=1`
+    const iframeHtml = `<iframe src="${publicUrl}" style="width:100%; min-height:600px; border:0;" loading="lazy" title="${escapeHtml(form.title)}"></iframe>`
+    const jsSnippet = [
+      `<div id="frequency-form-${form.id}"></div>`,
+      `<script>(function(){`,
+      `  var c = document.getElementById("frequency-form-${form.id}");`,
+      `  var i = document.createElement("iframe");`,
+      `  i.src = "${publicUrl}";`,
+      `  i.style = "width:100%; min-height:600px; border:0;";`,
+      `  i.loading = "lazy";`,
+      `  i.title = ${JSON.stringify(form.title)};`,
+      `  c.appendChild(i);`,
+      `  // Auto-resize on postMessage from the form (sent by the FE on load + step change)`,
+      `  window.addEventListener("message", function(e){`,
+      `    if (!e.data || e.data.type !== "frequency:resize") return;`,
+      `    if (e.data.formId !== "${form.id}") return;`,
+      `    i.style.height = (e.data.height + 16) + "px";`,
+      `  });`,
+      `})();</script>`,
+    ].join('\n')
+
+    res.json({ public_url: publicUrl, iframe_html: iframeHtml, js_snippet: jsSnippet })
+  })
+
+  // Save-and-resume — public endpoint, no auth.
+  // POST /api/public/forms/:tenant/:slug/save-progress
+  //   body: { anonymous_token, response_data, current_step_index? }
+  // Upserts the partial; expires_at refreshed to now + 30 days.
+  r.post('/api/public/forms/:tenantSlug/:formSlug/save-progress', async (req, res) => {
+    const form = await loadPublishedForm(supabase, String(req.params.tenantSlug ?? ''), String(req.params.formSlug ?? ''))
+    if (!form) { apiError(res, 404, 'not_found', 'Form not found.'); return }
+    const { anonymous_token, response_data, current_step_index } = req.body ?? {}
+    if (!anonymous_token || typeof anonymous_token !== 'string' || anonymous_token.length < 16 || anonymous_token.length > 128) {
+      apiError(res, 400, 'invalid_token', 'anonymous_token must be 16-128 chars.'); return
+    }
+    if (!response_data || typeof response_data !== 'object') {
+      apiError(res, 400, 'invalid_data', 'response_data required.'); return
+    }
+    const { error } = await supabase.from('form_partial_submissions').upsert({
+      tenant_id:          form.tenant_id,
+      form_id:            form.id,
+      anonymous_token,
+      response_data,
+      current_step_index: Number(current_step_index) || 0,
+      expires_at:         new Date(Date.now() + 30 * 86_400_000).toISOString(),
+    }, { onConflict: 'form_id,anonymous_token' })
+    if (error) { apiError(res, 500, 'save_failed', error.message); return }
+    res.json({ ok: true })
+  })
+
+  // GET /api/public/forms/:tenant/:slug/resume?token=...
+  r.get('/api/public/forms/:tenantSlug/:formSlug/resume', async (req, res) => {
+    const form = await loadPublishedForm(supabase, String(req.params.tenantSlug ?? ''), String(req.params.formSlug ?? ''))
+    if (!form) { apiError(res, 404, 'not_found', 'Form not found.'); return }
+    const token = String(req.query.token ?? '')
+    if (!token) { apiError(res, 400, 'no_token', 'token required.'); return }
+    const { data, error } = await supabase.from('form_partial_submissions')
+      .select('response_data, current_step_index, expires_at')
+      .eq('form_id', form.id)
+      .eq('anonymous_token', token)
+      .gt('expires_at', new Date().toISOString())
+      .maybeSingle()
+    if (error) { apiError(res, 500, 'read_failed', error.message); return }
+    if (!data)  { res.json({ found: false }); return }
+    res.json({ found: true, response_data: (data as any).response_data, current_step_index: (data as any).current_step_index })
+  })
+
   // Per-form submissions list (paginated) — drives the Submissions tab
   // on the builder. Most-recent first; capped at 500/page.
   r.get('/api/forms/:id/submissions', requireAuth, identifyTenant, async (req, res) => {
@@ -463,7 +545,7 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
       // Strip every control / payment field. Razorpay ids land in
       // response_data.__razorpay so they're queryable downstream.
       if (
-        k === '_hp' || k === '_utm' || k === '_test' ||
+        k === '_hp' || k === '_utm' || k === '_test' || k === '_partial_token' ||
         k === 'razorpay_payment_id' || k === 'razorpay_order_id' || k === 'razorpay_signature' ||
         k === '__razorpay'
       ) continue
@@ -633,6 +715,19 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
         .eq('id', submission.id)
     }
 
+    // ── 6b. Clear partial-submission for this anonymous token (Block B) ─
+    // If the visitor was using save-and-resume, the partial row for this
+    // token should be deleted now that the submit succeeded. Best-effort
+    // — failure here doesn't affect the visitor's success response.
+    if (body._partial_token && typeof body._partial_token === 'string') {
+      try {
+        await supabase.from('form_partial_submissions')
+          .delete()
+          .eq('form_id', form.id)
+          .eq('anonymous_token', body._partial_token)
+      } catch { /* best-effort cleanup */ }
+    }
+
     // ── 7. Return success ──────────────────────────────────────────────
     // Form-level settings can redirect to a custom thank-you page or a
     // gated-content unlock URL. Gated-content unlocks are plan-gated
@@ -690,6 +785,16 @@ function sanitizeUtm(raw: unknown): Record<string, string> {
     out[k] = v.slice(0, 200)
   }
   return out
+}
+
+/** HTML-escape utility for embed snippet safety. */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
 }
 
 function renderTemplate(tpl: string, data: Record<string, unknown>): string {
