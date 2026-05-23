@@ -290,6 +290,93 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
     res.json({ found: true, response_data: (data as any).response_data, current_step_index: (data as any).current_step_index })
   })
 
+  // ── Templates marketplace (Block E) ──────────────────────────────────
+  // Templates list — anyone authenticated can browse the library
+  // (curated + tenant-published). Filter by category via ?category=…
+  r.get('/api/form-templates', requireAuth, async (req, res) => {
+    let q = supabase.from('form_templates')
+      .select('id, slug, title, description, category, is_curated, screenshot_url, fork_count, author_tenant_id, created_at')
+      .order('is_curated', { ascending: false })
+      .order('fork_count', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(200)
+    if (req.query.category && typeof req.query.category === 'string') {
+      q = q.eq('category', req.query.category)
+    }
+    const { data, error } = await q
+    if (error) { apiError(res, 500, 'list_failed', error.message); return }
+    res.json({ templates: data ?? [] })
+  })
+
+  // Fork a template — creates a new form_pages row in the caller's
+  // tenant with the template's schema. Slug auto-suffixed to avoid
+  // collisions. Bumps the template's fork_count for popularity ranking.
+  r.post('/api/form-templates/:templateId/fork', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: tpl, error: tplErr } = await supabase.from('form_templates')
+      .select('*').eq('id', req.params.templateId).maybeSingle()
+    if (tplErr) { apiError(res, 500, 'read_failed', tplErr.message); return }
+    if (!tpl)   { apiError(res, 404, 'not_found', 'Template not found.'); return }
+
+    // Quota check — same as POST /api/forms.
+    const quotaCheck = await checkFormsQuota(supabase, tenantId)
+    if (!quotaCheck.ok) {
+      apiError(res, 402, 'forms_quota_exceeded', quotaCheck.reason, { plan: quotaCheck.plan, max: quotaCheck.max })
+      return
+    }
+
+    const slug = `${(tpl as any).slug}-${Date.now().toString(36).slice(-5)}`
+    const { data: form, error: insErr } = await supabase.from('form_pages')
+      .insert({
+        tenant_id:             tenantId,
+        slug,
+        title:                 (tpl as any).title,
+        schema_json:           (tpl as any).schema_json,
+        post_save_action_json: (tpl as any).default_action_json ?? { kind: 'none' },
+      })
+      .select('*').single()
+    if (insErr) { apiError(res, 500, 'fork_failed', insErr.message); return }
+
+    // Bump fork_count — best-effort (don't block the fork on this).
+    try {
+      await supabase.rpc('increment_template_fork_count', { p_template_id: req.params.templateId })
+    } catch {
+      // RPC may not exist; manual update fallback
+      await supabase.from('form_templates')
+        .update({ fork_count: ((tpl as any).fork_count ?? 0) + 1 })
+        .eq('id', req.params.templateId)
+    }
+
+    res.status(201).json({ form })
+  })
+
+  // Publish a tenant-owned form as a template (paid tier — Growth+
+  // suggested per plan-gate matrix; enforcement TBD).
+  r.post('/api/forms/:id/publish-as-template', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: form, error: fErr } = await supabase.from('form_pages')
+      .select('*').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (fErr) { apiError(res, 500, 'read_failed', fErr.message); return }
+    if (!form) { apiError(res, 404, 'not_found', 'Form not found.'); return }
+    const { description, category } = (req.body ?? {}) as { description?: string; category?: string }
+    const allowedCategories = new Set(['lead_capture','event_rsvp','booking','payment','signed','survey','other'])
+    const cat = allowedCategories.has(String(category)) ? category as string : 'other'
+    const slug = `${form.slug}-by-${tenantId.slice(0, 6)}-${Date.now().toString(36).slice(-4)}`
+
+    const { data, error } = await supabase.from('form_templates').insert({
+      slug,
+      title:               form.title,
+      description:         description ?? null,
+      category:            cat,
+      schema_json:         form.schema_json,
+      default_action_json: form.post_save_action_json,
+      is_curated:          false,
+      author_tenant_id:    tenantId,
+    }).select('*').single()
+    if (error) { apiError(res, 500, 'publish_failed', error.message); return }
+    res.status(201).json({ template: data })
+  })
+
   // ── A/B variants (Block C) ────────────────────────────────────────────
   // Create a new form_pages row that copies the schema + branding of the
   // parent form. The new row's variant_of points back at the parent. The
