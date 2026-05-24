@@ -34,8 +34,6 @@ import { createTenantAuditRouter } from './routes/tenant-audit'
 import { createNotificationsRouter } from './routes/notifications'
 import { createFormsRouter } from './routes/forms'
 import { createSitesRouter } from './routes/sites'
-import { createPipelinesRouter } from './routes/pipelines'
-import { seedPipelinePacks } from './lib/seed-packs'
 import { createDevicesRouter }       from './routes/devices'
 import { createUsageRouter }         from './routes/usage'
 import { createWedgeSurfaceRouter }  from './routes/wedge-surface'
@@ -4203,11 +4201,6 @@ app.use(createTenantAuditRouter({ supabase, requireAuth, identifyTenant, checkPe
 app.use(createNotificationsRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createFormsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createSitesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
-// Pipelines + Vertical Packs (migration 116). Mounted after sites so the
-// /api/pipeline-packs gallery + /api/pipelines installed-pipelines list
-// land next to the other tenant-scoped product surfaces. The pack seed
-// fires once on boot below — see seedPipelinePacks() call near app.listen.
-app.use(createPipelinesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Inbox agent-collision presence audit (P1 #16) ───────────────────────────
 // Live "Agent X is already replying" toast is driven by Supabase Realtime
@@ -4374,12 +4367,6 @@ if (process.env.NODE_ENV !== 'production') attachDebugListeners()
 const server = app.listen(PORT, () => {
   console.log(`Frequency server running on http://localhost:${PORT}`)
   console.log(`  → Bull Board: http://localhost:${PORT}/admin/queues`)
-  // Seed pipeline packs once the server is up. Fire-and-forget — a slow
-  // upsert shouldn't delay readiness, and the seed is idempotent so a
-  // failed boot run just retries on the next deploy.
-  seedPipelinePacks(supabase).catch((e) => {
-    console.warn('[seed-packs] boot seed failed:', e?.message ?? e)
-  })
 })
 
 // Graceful shutdown — finish in-flight requests + close queue connections.

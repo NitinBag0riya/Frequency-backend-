@@ -2089,97 +2089,6 @@ async function testSites(fx: Fixture): Promise<void> {
 }
 
 /**
- * Pipelines + Vertical Packs (migration 116).
- *
- * Covers: list packs → install Real Estate → list pipelines → idempotent
- * re-install (returns same pipeline, no duplicates) → archive cleanly.
- * Skips gracefully if the routes aren't mounted (404).
- */
-async function testPipelines(fx: Fixture): Promise<void> {
-  let packId: string | null = null
-  let pipelineId: string | null = null
-  let leadTableId: string | null = null
-
-  await runTest('pipelines', 'GET /api/pipeline-packs lists curated packs', async () => {
-    const r = await http('/api/pipeline-packs', { userToken: fx.userToken, tenantId: fx.tenantId })
-    if (r.status === 404) return
-    assertEq(r.status, 200, 'list status')
-    const packs = (r.body as any)?.packs
-    assert(Array.isArray(packs), 'packs is array', r.body)
-    // Real-estate pack is upserted on every boot — expect at least one row.
-    const re = (packs ?? []).find((p: any) => p?.vertical === 'real_estate')
-    assert(!!re, 'real_estate pack present', packs)
-    packId = re?.id
-  })
-
-  await runTest('pipelines', 'GET /api/pipeline-packs/:id returns manifest + preview', async () => {
-    if (!packId) return
-    const r = await http(`/api/pipeline-packs/${packId}`, { userToken: fx.userToken, tenantId: fx.tenantId })
-    assertEq(r.status, 200, 'detail status')
-    const preview = (r.body as any)?.preview
-    assert(preview?.workflows > 0, 'preview.workflows positive', preview)
-    assert(preview?.templates > 0, 'preview.templates positive', preview)
-  })
-
-  await runTest('pipelines', 'POST install creates pipeline + table + workflows + templates', async () => {
-    if (!packId) return
-    const r = await http(`/api/pipeline-packs/${packId}/install`, {
-      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId, body: {},
-    })
-    if (r.status === 404) return
-    assertEq(r.status, 201, 'install status')
-    pipelineId  = (r.body as any)?.pipeline?.id
-    leadTableId = (r.body as any)?.lead_table_id
-    assert(typeof pipelineId === 'string', 'pipeline id returned')
-    assert(typeof leadTableId === 'string', 'lead table id returned')
-    const wfs = (r.body as any)?.workflows
-    const tpls = (r.body as any)?.templates
-    assert(Array.isArray(wfs) && wfs.length > 0, 'workflows installed', wfs)
-    assert(Array.isArray(tpls) && tpls.length > 0, 'templates installed', tpls)
-  })
-
-  await runTest('pipelines', 'GET /api/pipelines reflects the new pipeline', async () => {
-    if (!pipelineId) return
-    const r = await http('/api/pipelines', { userToken: fx.userToken, tenantId: fx.tenantId })
-    assertEq(r.status, 200, 'list status')
-    const list = (r.body as any)?.pipelines ?? []
-    const found = list.find((p: any) => p.id === pipelineId)
-    assert(!!found, 'pipeline appears in tenant list', list)
-  })
-
-  await runTest('pipelines', 'GET /api/pipelines/:id returns detail + bindings + stats', async () => {
-    if (!pipelineId) return
-    const r = await http(`/api/pipelines/${pipelineId}`, { userToken: fx.userToken, tenantId: fx.tenantId })
-    assertEq(r.status, 200, 'detail status')
-    assert((r.body as any)?.pipeline?.id === pipelineId, 'pipeline echoed')
-    assert(Array.isArray((r.body as any)?.bindings), 'bindings array')
-    assert(typeof (r.body as any)?.stats?.row_count === 'number', 'row_count number')
-  })
-
-  await runTest('pipelines', 'Re-install returns same pipeline (idempotent)', async () => {
-    if (!packId || !pipelineId) return
-    const r = await http(`/api/pipeline-packs/${packId}/install`, {
-      method: 'POST', userToken: fx.userToken, tenantId: fx.tenantId, body: {},
-    })
-    assertEq(r.status, 200, 're-install status')
-    assert((r.body as any)?.already_installed === true, 'flagged as already_installed')
-    assertEq((r.body as any)?.pipeline?.id, pipelineId, 'same pipeline id')
-  })
-
-  await runTest('pipelines', 'DELETE archives the pipeline cleanly', async () => {
-    if (!pipelineId) return
-    const r = await http(`/api/pipelines/${pipelineId}`, {
-      method: 'DELETE', userToken: fx.userToken, tenantId: fx.tenantId,
-    })
-    assertEq(r.status, 200, 'archive status')
-    // Verify it dropped out of the active list.
-    const verify = await http('/api/pipelines', { userToken: fx.userToken, tenantId: fx.tenantId })
-    const stillThere = ((verify.body as any)?.pipelines ?? []).some((p: any) => p.id === pipelineId)
-    assert(!stillThere, 'archived pipeline removed from active list')
-  })
-}
-
-/**
  * Plans + subscriptions — billing surface readability.
  */
 async function testPlansAndBilling(fx: Fixture): Promise<void> {
@@ -2259,7 +2168,6 @@ async function main(): Promise<void> {
     await testKilledFeatures(fx)
     await testFormsPhase1(fx)
     await testSites(fx)
-    await testPipelines(fx)
     await testPlansAndBilling(fx)
 
     // ── Layer 2: Auto-discover + probe every endpoint ────────────────────
