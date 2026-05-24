@@ -273,6 +273,100 @@ test('credentials / API keys / phone-number IDs stripped from config', () => {
   assert.equal(cfg.url, 'https://example.com')
 })
 
+// ── 14. Google Calendar → create_calendar_event (live connector) ───────────
+test('googleCalendar node → create_calendar_event, NOT in missing_apps', () => {
+  const json = JSON.stringify({
+    name: 'Demo booking',
+    nodes: [
+      { name: 'Hook', type: 'n8n-nodes-base.webhook', parameters: {} },
+      {
+        name: 'Book', type: 'n8n-nodes-base.googleCalendar',
+        parameters: {
+          operation: 'create',
+          calendar: 'primary',
+          summary: 'Demo call',
+          start: '2026-10-12T15:00:00+05:30',
+          end:   '2026-10-12T15:30:00+05:30',
+        },
+      },
+    ],
+    connections: { 'Hook': { main: [[{ node: 'Book', type: 'main', index: 0 }]] } },
+  })
+  const out = parseN8nJson(json)
+  const book = out.proposed_workflows[0].nodes_json[1]
+  assert.equal(book.type, 'create_calendar_event')
+  assert.equal(out.missing_apps.length, 0, 'Google Calendar must NOT be flagged as missing — it is live in Frequency')
+})
+
+// ── 15. Google Calendar availability op → check_calendar_availability ──────
+test('googleCalendar availability op → check_calendar_availability', () => {
+  const json = JSON.stringify({
+    name: 'Check free',
+    nodes: [
+      { name: 'Hook',  type: 'n8n-nodes-base.webhook',        parameters: {} },
+      { name: 'Check', type: 'n8n-nodes-base.googleCalendar', parameters: { operation: 'availability' } },
+    ],
+    connections: { 'Hook': { main: [[{ node: 'Check', type: 'main', index: 0 }]] } },
+  })
+  const out = parseN8nJson(json)
+  assert.equal(out.proposed_workflows[0].nodes_json[1].type, 'check_calendar_availability')
+})
+
+// ── 16. Airtable → airtable_create_record / update_record ──────────────────
+test('airtable create op → airtable_create_record; update op → airtable_update_record', () => {
+  const json = JSON.stringify({
+    name: 'AT',
+    nodes: [
+      { name: 'Hook', type: 'n8n-nodes-base.webhook', parameters: {} },
+      { name: 'Add', type: 'n8n-nodes-base.airtable', parameters: { operation: 'append' } },
+      { name: 'Upd', type: 'n8n-nodes-base.airtable', parameters: { operation: 'update' } },
+    ],
+    connections: {
+      'Hook': { main: [[{ node: 'Add', type: 'main', index: 0 }]] },
+      'Add':  { main: [[{ node: 'Upd', type: 'main', index: 0 }]] },
+    },
+  })
+  const out = parseN8nJson(json)
+  assert.equal(out.missing_apps.length, 0)
+  assert.equal(out.proposed_workflows[0].nodes_json[1].type, 'airtable_create_record')
+  assert.equal(out.proposed_workflows[0].nodes_json[2].type, 'airtable_update_record')
+})
+
+// ── 17. Shopify → shopify_create_draft_order ───────────────────────────────
+test('shopify node → shopify_create_draft_order, NOT in missing_apps', () => {
+  const json = JSON.stringify({
+    name: 'SH',
+    nodes: [
+      { name: 'Hook', type: 'n8n-nodes-base.webhook', parameters: {} },
+      { name: 'Order', type: 'n8n-nodes-base.shopify', parameters: { resource: 'order', operation: 'create' } },
+    ],
+    connections: { 'Hook': { main: [[{ node: 'Order', type: 'main', index: 0 }]] } },
+  })
+  const out = parseN8nJson(json)
+  assert.equal(out.proposed_workflows[0].nodes_json[1].type, 'shopify_create_draft_order')
+  assert.equal(out.missing_apps.length, 0)
+})
+
+// ── 18. Telegram → telegram_send_message ───────────────────────────────────
+test('telegram node → telegram_send_message; invoice op → telegram_create_invoice', () => {
+  const json = JSON.stringify({
+    name: 'TG',
+    nodes: [
+      { name: 'Hook', type: 'n8n-nodes-base.webhook',  parameters: {} },
+      { name: 'Send', type: 'n8n-nodes-base.telegram', parameters: { operation: 'sendMessage' } },
+      { name: 'Inv',  type: 'n8n-nodes-base.telegram', parameters: { resource: 'invoice', operation: 'sendInvoice' } },
+    ],
+    connections: {
+      'Hook': { main: [[{ node: 'Send', type: 'main', index: 0 }]] },
+      'Send': { main: [[{ node: 'Inv',  type: 'main', index: 0 }]] },
+    },
+  })
+  const out = parseN8nJson(json)
+  assert.equal(out.missing_apps.length, 0)
+  assert.equal(out.proposed_workflows[0].nodes_json[1].type, 'telegram_send_message')
+  assert.equal(out.proposed_workflows[0].nodes_json[2].type, 'telegram_create_invoice')
+})
+
 // ── Summary ─────────────────────────────────────────────────────────────────
 console.log(`\n${pass} passed, ${fail} failed`)
 if (fail > 0) {

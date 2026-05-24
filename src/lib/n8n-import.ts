@@ -108,6 +108,11 @@ interface MissingConfigField {
 // Extend this map as new n8n nodes are encountered. Anything not listed in
 // either group is auto-classified as "unknown app" and added to missing_apps.
 
+// Keep this in lockstep with src/connectors/registry.ts — anything with
+// status:'live' AND a workflowNodeType lives here, not in REQUEST_ONBOARDING.
+// Otherwise the import UI tells users to "request onboarding" for apps
+// Frequency already supports natively (this exact bug happened with
+// Google Calendar — see Arihant import case, 2026-05).
 const SUPPORTED_MAP: Record<string, string> = {
   'n8n-nodes-base.webhook':         'trigger_webhook',
   'n8n-nodes-base.scheduleTrigger': 'trigger_scheduled',
@@ -125,23 +130,32 @@ const SUPPORTED_MAP: Record<string, string> = {
   'n8n-nodes-base.set':             'http_request',       // no-op data shaper + warning
   'n8n-nodes-base.merge':           'http_request',       // flag warning
   'n8n-nodes-base.function':        'http_request',       // legacy alias for .code
+  // Live Frequency connectors with workflow nodes — translate inline so the
+  // import doesn't ask the user to "request onboarding" for apps we already
+  // ship. Per-app translation lives in translateNode below.
+  'n8n-nodes-base.googleCalendar': 'create_calendar_event',
+  'n8n-nodes-base.airtable':       'airtable_create_record',
+  'n8n-nodes-base.shopify':        'shopify_create_draft_order',
+  'n8n-nodes-base.telegram':       'telegram_send_message',
 }
 
 const REQUEST_ONBOARDING_MAP: Record<string, string> = {
-  'n8n-nodes-base.slack':          'Slack',
-  'n8n-nodes-base.zoom':           'Zoom',
+  // Tier 1 — visible in /apps as "planned"
   'n8n-nodes-base.notion':         'Notion',
-  'n8n-nodes-base.airtable':       'Airtable',
   'n8n-nodes-base.hubspot':        'HubSpot',
+  'n8n-nodes-base.stripe':         'Stripe',
+  'n8n-nodes-base.mailchimp':      'Mailchimp',
+  // Slack is technically "live" via incoming webhook URL but has no workflow
+  // node yet, so importing a Slack node maps to http_request — surface it as
+  // onboarding ask so the user gets a real Slack node, not an http stub.
+  'n8n-nodes-base.slack':          'Slack',
+  // Tier 2 — backlog
+  'n8n-nodes-base.zoom':           'Zoom',
   'n8n-nodes-base.salesforce':     'Salesforce',
-  'n8n-nodes-base.googleCalendar': 'Google Calendar',
   'n8n-nodes-base.discord':        'Discord',
-  'n8n-nodes-base.telegram':       'Telegram',
   'n8n-nodes-base.twilio':         'Twilio',
   'n8n-nodes-base.openAi':         'OpenAI',
-  'n8n-nodes-base.stripe':         'Stripe',
   'n8n-nodes-base.zendesk':        'Zendesk',
-  'n8n-nodes-base.shopify':        'Shopify',
   'n8n-nodes-base.dropbox':        'Dropbox',
   'n8n-nodes-base.googleDrive':    'Google Drive',
   'n8n-nodes-base.microsoftTeams': 'Microsoft Teams',
@@ -154,7 +168,6 @@ const REQUEST_ONBOARDING_MAP: Record<string, string> = {
   'n8n-nodes-base.intercom':       'Intercom',
   'n8n-nodes-base.freshdesk':      'Freshdesk',
   'n8n-nodes-base.activeCampaign': 'ActiveCampaign',
-  'n8n-nodes-base.mailchimp':      'Mailchimp',
   'n8n-nodes-base.sendgrid':       'SendGrid',
 }
 
@@ -405,7 +418,12 @@ function translateNode(
 
   // ── Generic supported mapping ────────────────────────────────────────────
   if (SUPPORTED_MAP[rawType]) {
-    const fxType = SUPPORTED_MAP[rawType]
+    // Some n8n apps fan out into multiple operations (Airtable: create/update,
+    // Google Calendar: create/get/availability, Telegram: sendMessage/sendPhoto,
+    // Shopify: order/customer/product). The base map picks the most common
+    // "create" variant; routeByOperation upgrades it when n8n's `operation`
+    // param tells us a more specific Frequency node fits.
+    const fxType = routeByOperation(rawType, params) ?? SUPPORTED_MAP[rawType]
     const out: FrequencyNode = {
       id: fxId, type: fxType, label, position,
       description: notes || defaultDescription(fxType, label),
@@ -503,7 +521,79 @@ function enrichMissingConfig(
             options: ['equals', 'not_equals', 'contains', 'gt', 'lt'] })
       add({ field: 'value', label: 'Expected value', required: true, type: 'text' })
       break
+    // ── Live Frequency connector nodes ───────────────────────────────────
+    case 'create_calendar_event':
+      add({ field: 'calendar_id', label: 'Calendar', required: false, type: 'text',
+            placeholder: 'primary' })
+      add({ field: 'summary',     label: 'Event title', required: true, type: 'text' })
+      add({ field: 'start',       label: 'Start (ISO 8601)', required: true, type: 'text',
+            placeholder: '2026-10-12T15:00:00+05:30' })
+      add({ field: 'end',         label: 'End (ISO 8601)',   required: true, type: 'text',
+            placeholder: '2026-10-12T15:30:00+05:30' })
+      add({ field: 'attendees',   label: 'Attendee emails',  required: false, type: 'textarea',
+            placeholder: 'asha@example.com, ravi@example.com' })
+      break
+    case 'check_calendar_availability':
+      add({ field: 'calendar_id', label: 'Calendar', required: false, type: 'text', placeholder: 'primary' })
+      add({ field: 'time_min',    label: 'Window start (ISO 8601)', required: true, type: 'text' })
+      add({ field: 'time_max',    label: 'Window end (ISO 8601)',   required: true, type: 'text' })
+      break
+    case 'airtable_create_record':
+    case 'airtable_update_record':
+      add({ field: 'base_id',  label: 'Airtable base',  required: true, type: 'integration_picker' })
+      add({ field: 'table_id', label: 'Airtable table', required: true, type: 'integration_picker', depends_on: 'base_id' })
+      add({ field: 'fields',   label: 'Field values (JSON)', required: true, type: 'textarea',
+            placeholder: '{"Name": "{{trigger.name}}", "Phone": "{{trigger.phone}}"}' })
+      break
+    case 'shopify_create_draft_order':
+    case 'shopify_fulfill_order':
+      add({ field: 'store_id',     label: 'Shopify store', required: true, type: 'integration_picker' })
+      add({ field: 'line_items',   label: 'Line items (JSON)', required: true, type: 'textarea',
+            placeholder: '[{"variant_id": 12345, "quantity": 1}]' })
+      add({ field: 'customer_phone', label: 'Customer phone', required: false, type: 'phone' })
+      break
+    case 'telegram_send_message':
+      add({ field: 'chat_id', label: 'Chat ID', required: true, type: 'text',
+            placeholder: '{{trigger.chat_id}}' })
+      add({ field: 'text',    label: 'Message', required: true, type: 'textarea' })
+      break
+    case 'telegram_create_invoice':
+      add({ field: 'title',       label: 'Invoice title', required: true, type: 'text' })
+      add({ field: 'amount',      label: 'Amount (Stars / XTR)', required: true, type: 'number' })
+      add({ field: 'payload',     label: 'Internal reference', required: true, type: 'text' })
+      break
   }
+}
+
+/**
+ * Some n8n apps (Airtable, Google Calendar, Telegram, Shopify) cover multiple
+ * Frequency node types via their `operation` param. Pick the better match
+ * when n8n tells us what the node is actually doing — otherwise SUPPORTED_MAP's
+ * default ("create" variant) is fine.
+ *
+ * Returns null when no upgrade is warranted; caller falls back to SUPPORTED_MAP.
+ */
+function routeByOperation(rawType: string, params: Record<string, unknown>): string | null {
+  const op = typeof params.operation === 'string' ? params.operation.toLowerCase() : ''
+  const resource = typeof params.resource === 'string' ? params.resource.toLowerCase() : ''
+  switch (rawType) {
+    case 'n8n-nodes-base.googleCalendar':
+      if (op === 'getall' || op === 'get' || op === 'list')       return 'http_request'  // read ops not in workflow nodes yet
+      if (op === 'availability' || op === 'getavailability')      return 'check_calendar_availability'
+      if (op === 'delete' || op === 'update')                     return 'http_request'
+      return 'create_calendar_event'
+    case 'n8n-nodes-base.airtable':
+      if (op === 'update' || op === 'upsert')                     return 'airtable_update_record'
+      if (op === 'append' || op === 'create')                     return 'airtable_create_record'
+      return 'airtable_create_record'
+    case 'n8n-nodes-base.shopify':
+      if (resource === 'order' && (op === 'fulfill' || op === 'fulfilment')) return 'shopify_fulfill_order'
+      return 'shopify_create_draft_order'
+    case 'n8n-nodes-base.telegram':
+      if (op === 'sendinvoice' || op === 'invoice' || resource === 'invoice') return 'telegram_create_invoice'
+      return 'telegram_send_message'
+  }
+  return null
 }
 
 /**
@@ -651,18 +741,26 @@ function prettyName(raw: string): string {
 function defaultDescription(fxType: string, label: string): string {
   // Short, deterministic fallback used when the n8n node has no `notes`.
   const map: Record<string, string> = {
-    trigger_webhook:       'Fires when the webhook is called',
-    trigger_scheduled:     'Runs on the configured schedule',
-    trigger_form_submit:   'Fires when a Frequency form is submitted',
-    trigger_email_received:'Fires when a matching email arrives',
-    wait_delay:            'Wait before the next step',
-    condition_variable:    'Branch based on a variable',
-    split_ab:              'Split into multiple branches',
-    http_request:          'Call an external API',
-    update_sheet:          'Write to a Frequency Lead Table',
-    send_email:            'Send a transactional email',
-    send_template:         'Send an approved WhatsApp template',
-    send_payment_link:     'Send a Razorpay payment link',
+    trigger_webhook:             'Fires when the webhook is called',
+    trigger_scheduled:           'Runs on the configured schedule',
+    trigger_form_submit:         'Fires when a Frequency form is submitted',
+    trigger_email_received:      'Fires when a matching email arrives',
+    wait_delay:                  'Wait before the next step',
+    condition_variable:          'Branch based on a variable',
+    split_ab:                    'Split into multiple branches',
+    http_request:                'Call an external API',
+    update_sheet:                'Write to a Frequency Lead Table',
+    send_email:                  'Send a transactional email',
+    send_template:               'Send an approved WhatsApp template',
+    send_payment_link:           'Send a Razorpay payment link',
+    create_calendar_event:       'Create a Google Calendar event',
+    check_calendar_availability: 'Check Google Calendar free/busy',
+    airtable_create_record:      'Append a record to an Airtable table',
+    airtable_update_record:      'Update an Airtable record',
+    shopify_create_draft_order:  'Create a Shopify draft order',
+    shopify_fulfill_order:       'Fulfil a Shopify order',
+    telegram_send_message:       'Send a Telegram message',
+    telegram_create_invoice:     'Issue a Telegram Stars invoice',
   }
   return map[fxType] ?? label
 }
