@@ -1855,6 +1855,18 @@ app.delete('/api/tenants/:id', requireAuth, async (req, res) => {
   res.json({ success: true })
 })
 
+// Redirect-mode fallback. Embedded Signup is registered with redirect_uri
+// /api/auth/meta/callback in the Meta dashboard, but the FE uses popup mode
+// (override_default_response_type=true) so this is never hit in normal flow.
+// Kept as defense-in-depth: if someone ever drops the override flag, Meta
+// would redirect here instead of 404ing. We bounce to /onboarding so the
+// SPA picks the code out of the query string and finishes the connect.
+app.get('/api/auth/meta/callback', (req, res) => {
+  const code = String(req.query.code ?? '')
+  const frontend = process.env.FRONTEND_URL ?? 'https://getfrequency.app'
+  res.redirect(`${frontend}/onboarding?code=${encodeURIComponent(code)}`)
+})
+
 // ── Facebook Embedded Signup callback ─────────────────────────────────────────
 // Frontend calls this after user completes Embedded Signup and gets a short-lived token + WABA ID
 app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
