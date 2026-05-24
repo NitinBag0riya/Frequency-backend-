@@ -2894,6 +2894,9 @@ app.post('/webhook/whatsapp', async (req, res) => {
         // payload mentioning a foreign platform_message_id could otherwise
         // mutate another tenant's message status.
         for (const status of value.statuses ?? []) {
+          if (status.status === 'failed') {
+            console.error(`[webhook] STATUS FAILED platform_message_id=${status.id} errors=${JSON.stringify(status.errors)}`)
+          }
           const { error: statusErr } = await supabase.from('messages')
             .update({ status: status.status })
             .eq('platform_message_id', status.id)

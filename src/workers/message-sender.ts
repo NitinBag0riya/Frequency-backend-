@@ -256,7 +256,6 @@ async function logRateLimitRejection(data: MessageSendJob, err: RateLimitExceede
     direction: 'outbound',
     contact_phone: recipient,
     channel: data.channel,
-    wa_message_id: null,
     platform_message_id: null,
     content: {
       error: err.message,
@@ -374,9 +373,7 @@ async function logOutbound(
     direction: 'outbound',
     contact_phone: to,
     channel,
-    // wa_message_id kept for back-compat with WhatsApp-only readers; new
     // platform_message_id mirrors it across all channels.
-    wa_message_id: channel === 'whatsapp' ? platformMessageId : null,
     platform_message_id: platformMessageId,
     content: error ? { ...payload, error } : payload,
     status,

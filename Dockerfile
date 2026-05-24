@@ -6,12 +6,8 @@ FROM node:22-slim AS build
 
 WORKDIR /app
 
-# Install build deps — package files first so npm cache is reusable across
-# rebuilds when source changes but deps don't.
 COPY package.json package-lock.json* ./
-# `npm ci` is faster + stricter than `npm install`. It refuses to start if
-# package-lock.json is out of sync with package.json — exactly the failure
-# mode the audit caught (recharts not pinned).
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 RUN npm ci --omit=optional
 
 # Copy source + tsconfig + supabase migrations (workers may reference them

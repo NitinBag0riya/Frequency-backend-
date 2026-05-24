@@ -180,7 +180,7 @@ async function checkKeywordTriggers(
 
     const keywords: string[] = trigger.config?.keywords ?? []
     if (keywords.some((kw: string) => text.toLowerCase().includes(kw.toLowerCase()))) {
-      await startWorkflow(supabase, tenant, wf, contactId, channel)
+      await startWorkflow(supabase, tenant, wf, contactId, channel, { text })
       break  // first match wins; matches mental model of priority by workflow order
     }
   }
@@ -258,15 +258,35 @@ async function startWorkflow(
   const firstAction = nodes.find((n: any) => !n.type?.startsWith('trigger_'))
   if (!firstAction) return
 
+  // Load contact properties to seed session variables (P0.5 / P0.7)
+  const phoneVal = `+${contactId}`.replace(/^\+\++/, '+')
+  const { data: contact } = await supabase.from('contacts')
+    .select('name, phone, tags, attributes')
+    .eq('tenant_id', tenant.id)
+    .or(`phone.eq.${phoneVal},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
+    .limit(1)
+    .maybeSingle()
+
+  const seedVars: Record<string, any> = {}
+  if (contact) {
+    seedVars.contact = {
+      name: contact.name ?? '',
+      phone: contact.phone ?? '',
+      tags: contact.tags ?? [],
+      ...(contact.attributes ?? {}),
+    }
+  }
+  if (triggerPayload) {
+    seedVars.trigger = triggerPayload
+  }
+
   const { data: session } = await supabase.from('workflow_sessions').insert({
     tenant_id:       tenant.id,
     workflow_id:     workflow.id,
     contact_phone:   contactId,
     channel,                          // migration 031 added this column
     current_node_id: firstAction.id,
-    // Seed variables with the trigger payload so workflow steps can
-    // reference {{trigger.story_id}}, {{trigger.comment_id}}, etc.
-    variables:       triggerPayload ? { trigger: triggerPayload } : {},
+    variables:       seedVars,
     status:          'active',
   }).select('id').single()
 
