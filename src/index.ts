@@ -41,6 +41,8 @@ import { createApprovalsRouter, requireApproval } from './routes/approvals'
 import { createWorkflowRecosRouter } from './routes/workflow-recos'
 import { createWorkflowTemplatesRouter } from './routes/workflow-templates'
 import { createWorkflowVersionsRouter } from './routes/workflow-versions'
+import { createN8nImportRouter }        from './routes/n8n-import'
+import { createIntegrationRequestsRouter } from './routes/integration-requests'
 import { createWaCallingRouter }     from './routes/wa-calling'
 import { createAiResponderRouter }   from './routes/ai-responder'
 import { createDsrRouter }           from './routes/dsr'
@@ -4268,6 +4270,20 @@ app.use(createWorkflowTemplatesRouter({ supabase, requireAuth, identifyTenant })
 // Diffs are rendered plain-English-first on the FE with a collapsible JSON
 // fallback. Versions table is append-only (migration 081).
 app.use(createWorkflowVersionsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── n8n import — deterministic parse + draft create ─────────────────────────
+// POST /api/workflows/import-n8n (preview) + /import-n8n/commit (persist).
+// Split into one Frequency draft per n8n trigger. Pairs with the FE
+// "Import from n8n" modal on /workflows. See src/lib/n8n-import.ts for the
+// parser; this router only owns request validation + persistence.
+app.use(createN8nImportRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Integration onboarding requests ─────────────────────────────────────────
+// POST /api/integration-requests — captures user asks for apps we don't
+// natively support yet. Persists a row in integration_requests + fires a
+// transactional email to developers@frequency.app via Resend. Reused beyond
+// n8n import: any "request this app" CTA can hit this endpoint.
+app.use(createIntegrationRequestsRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── AI Responder — opt-in auto-reply with per-tenant knowledge (RAG) ─────────
 // Settings + QA wizard + knowledge browser + test endpoint. The
