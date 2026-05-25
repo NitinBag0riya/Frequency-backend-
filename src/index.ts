@@ -3185,6 +3185,23 @@ async function sendTemplateMessage(tenant: any, to: string, templateName: string
     body: JSON.stringify(payload)
   })
   const data = await r.json() as any
+  // Critical: surface Meta errors so /api/inbox/send returns 5xx and the
+  // FE shows a useful error chip. Previously we only inserted on success
+  // and silently swallowed `data.error` — the FE got 200, closed the
+  // composer modal, and the user saw "nothing happening on screen" while
+  // the message never actually sent.
+  if (!r.ok || data.error) {
+    const detail = data?.error?.message
+      ? `${data.error.message}${data.error.error_subcode ? ` (subcode ${data.error.error_subcode})` : ''}`
+      : `WA template send failed (${r.status})`
+    // Also log a failed-send row so the operator's audit / message history
+    // has a footprint of the attempt instead of silent nothing.
+    await supabase.from('messages').insert({
+      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
+      content: { ...payload, error: detail }, status: 'failed',
+    }).then(() => {}, () => {})
+    throw new Error(detail)
+  }
   if (data.messages?.[0]?.id) {
     await supabase.from('messages').insert({
       tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
@@ -3212,7 +3229,22 @@ async function sendInteractiveMessage(tenant: any, to: string, config: any) {
     headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
-  return r.json()
+  const data = await r.json() as any
+  if (!r.ok || data.error) {
+    const detail = data?.error?.message ?? `WA interactive send failed (${r.status})`
+    await supabase.from('messages').insert({
+      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
+      content: { ...payload, error: detail }, status: 'failed',
+    }).then(() => {}, () => {})
+    throw new Error(detail)
+  }
+  if (data.messages?.[0]?.id) {
+    await supabase.from('messages').insert({
+      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
+      platform_message_id: data.messages[0].id, content: payload, status: 'sent',
+    })
+  }
+  return data
 }
 
 // ── RBAC / Team API ───────────────────────────────────────────────────────────
