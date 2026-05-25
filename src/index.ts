@@ -1996,10 +1996,27 @@ app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
       .eq('waba_id', waba_id)
       .maybeSingle()
 
-    const targetId = existingForWaba?.id ?? existingNullWaba?.id
+    // 3. Fall back to ANY active tenant owned by this user. Important when
+    // the user is reconnecting to a DIFFERENT WABA than their existing
+    // tenant has — without this lookup the upsert would create a parallel
+    // tenant, orphaning the original's flows/templates/contacts. We update
+    // the existing tenant with the new waba_id instead.
+    let existingForUser: { id: string; slug: string; business_name: string | null } | null = null
+    if (!existingForWaba && !existingNullWaba) {
+      const { data } = await supabase.from('tenants')
+        .select('id, slug, business_name')
+        .eq('user_id', user.id)
+        .eq('status', 'active')
+        .order('created_at', { ascending: true })  // oldest = original
+        .limit(1)
+        .maybeSingle()
+      existingForUser = data
+    }
+
+    const targetId = existingForWaba?.id ?? existingNullWaba?.id ?? existingForUser?.id
     const businessName = wabaData.name ?? phoneData.verified_name ?? 'My Business'
-    
-    let slugToWrite = existingForWaba?.slug ?? existingNullWaba?.slug ?? undefined
+
+    let slugToWrite = existingForWaba?.slug ?? existingNullWaba?.slug ?? existingForUser?.slug ?? undefined
     if (!slugToWrite) {
       const { ensureUniqueSlug } = await import('./lib/slug')
       slugToWrite = await ensureUniqueSlug(supabase, businessName, user.id)
