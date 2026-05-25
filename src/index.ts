@@ -2917,6 +2917,23 @@ function mapMetaError(data: any, fallback: string): string {
   if (code === 131049) {
     return `Marketing template throttled by Meta: ${raw}. Send a UTILITY template (or wait for the recipient's marketing-engagement window to reset).`
   }
+  // 131005 — "Access denied" on a successful template flow.
+  //   Meta returns this when the token has whatsapp_business_messaging
+  //   granted but WITHOUT a target_ids binding to the specific WABA, so
+  //   templates (which travel through whatsapp_business_management — the
+  //   scope WITH target_ids) succeed, but free-form text fails. Common
+  //   on manually-issued 24h temp tokens. Embedded Signup tokens get the
+  //   binding automatically; System User tokens get it via the assigned-
+  //   asset list. Surface this clearly so the operator doesn't chase a
+  //   "session window expired" rabbit hole.
+  if (code === 131005) {
+    return `Meta rejected the text send: token lacks whatsapp_business_messaging binding to this WABA. ` +
+           `Templates may still work (they route through whatsapp_business_management). ` +
+           `To enable free-form text replies, either (a) reconnect WhatsApp via Embedded Signup so the new ` +
+           `token gets WABA-bound messaging permission, or (b) generate a System User access token from ` +
+           `business.facebook.com → Business Settings → Users → System Users with the WABA assigned. ` +
+           `(Meta: ${raw})`
+  }
   // 132001 — "Template name does not exist in the translation".
   // This fires when the template name+language combo isn't registered on
   // the WABA we're sending FROM. Two common causes:
