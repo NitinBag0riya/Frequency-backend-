@@ -88,7 +88,17 @@ For the user's connected apps, return up to 4 high-leverage workflow templates t
   - blueprint: an array of nodes, each with { type, label, config }
     - First node should be a trigger (e.g. type: 'inbox_message', 'lead_added', 'webhook')
     - Subsequent nodes use one of the connected apps' actions
-    - Use {{var}} interpolation for dynamic values
+
+TOKEN GRAMMAR — the workflow executor resolves {{...}} placeholders against this exact namespace:
+  • {{trigger.text}}          — inbound message text (keyword / IG comment / IG mention text)
+  • {{trigger.<payload_key>}} — any field on the trigger payload (e.g. {{trigger.story_id}}, {{trigger.comment_id}}, {{trigger.order_id}} for shopify webhooks, {{trigger.email_from}} for gmail-triggered)
+  • {{contact.name}}          — contact's display name (empty string if unknown)
+  • {{contact.phone}}         — E.164 phone with leading +
+  • {{contact.tags}}          — array of tag strings
+  • {{contact.<attribute>}}   — any tenant-set custom attribute on contacts.attributes (e.g. {{contact.budget}}, {{contact.city}})
+  • {{<step_output_var>}}     — variables set by previous nodes via response_variable (e.g. {{ai_reply}}, {{collected_email}}, {{http_response}})
+
+DO NOT use {{conversation.*}}, {{user.*}}, {{tenant.*}} — those namespaces don't exist. Missing tokens render as the literal {{x.y}} string in the sent message (a visible bug), so only reference fields you've explicitly seeded.
 
 Output STRICT JSON: { "recommendations": [...] }. No markdown, no commentary.`
 
