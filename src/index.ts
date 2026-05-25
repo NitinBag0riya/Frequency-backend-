@@ -1879,27 +1879,38 @@ app.get('/api/auth/meta/callback', (req, res) => {
 //     picker UX can come later.
 app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
   const user = (req as any).user
-  let { code, waba_id, phone_number_id } = req.body as { code?: string; waba_id?: string; phone_number_id?: string }
-  if (!code) {
-    res.status(400).json({ error: 'code required' }); return
+  let { code, access_token: tokenFromBody, waba_id, phone_number_id } = req.body as {
+    code?: string;
+    access_token?: string;
+    waba_id?: string;
+    phone_number_id?: string;
+  }
+  if (!code && !tokenFromBody) {
+    res.status(400).json({ error: 'code or access_token required' }); return
   }
 
   try {
-    // Exchange short-lived code for a long-lived user access token.
-    // For codes minted by FB.login with override_default_response_type=true
-    // (the Embedded Signup JS SDK flow), Meta requires redirect_uri to be
-    // the EMPTY string at exchange time — anything else (including omitting
-    // the param entirely, which we used to do) returns "Error validating
-    // verification code. Please make sure your redirect_uri is identical
-    // to the one you used in the OAuth dialog request".
-    // ref: https://developers.facebook.com/docs/facebook-login/guides/access-tokens/get-long-lived/
-    const tokenRes = await fetch(
-      `${GRAPH}/oauth/access_token?client_id=${META_APP_ID}&client_secret=${META_APP_SECRET}&redirect_uri=&code=${code}`
-    )
-    const tokenData = await tokenRes.json() as any
-    if (tokenData.error) throw new Error(tokenData.error.message)
-
-    const shortToken: string = tokenData.access_token
+    // Two paths to a short-lived user token:
+    //   1) FE sent access_token directly (token-flow / FB.login default
+    //      response_type=token). Skip code exchange entirely — the
+    //      redirect_uri-mismatch error is impossible if we never exchange.
+    //   2) FE sent code (legacy code-flow). We exchange with redirect_uri=
+    //      empty per Meta docs, but Meta rejects this under Strict Mode
+    //      for SDK-minted codes because the OAuth dialog used the SDK's
+    //      session-specific staticxx.facebook.com URI which we can't
+    //      reconstruct server-side. Token flow above is the fix; we keep
+    //      this branch for backward-compat with any legacy callers.
+    let shortToken: string
+    if (tokenFromBody) {
+      shortToken = tokenFromBody
+    } else {
+      const tokenRes = await fetch(
+        `${GRAPH}/oauth/access_token?client_id=${META_APP_ID}&client_secret=${META_APP_SECRET}&redirect_uri=&code=${code}`
+      )
+      const tokenData = await tokenRes.json() as any
+      if (tokenData.error) throw new Error(tokenData.error.message)
+      shortToken = tokenData.access_token
+    }
 
     // Exchange for long-lived token (60 days)
     const longRes = await fetch(
