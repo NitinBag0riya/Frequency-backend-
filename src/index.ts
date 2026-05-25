@@ -89,6 +89,7 @@ import {
   PICKER_CATALOG, composePickerPromptSection, flattenPickers,
 } from './connectors/picker-catalog'
 import { enqueueContactImport }       from './workers/contact-import-processor'
+import { syncTenant as syncTenantTemplates } from './workers/template-sync'
 import {
   enqueueWorkflowExecution,
   workflowQueue, messageQueue, broadcastQueue, cronQueue,
@@ -2069,6 +2070,25 @@ app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
     }
 
     console.log(`[connect-waba] tenant=${data.id} created/updated for user=${user.id}`)
+
+    // Auto-trigger a destructive template sync so the picker reflects what's
+    // actually on the newly-connected WABA. Without this, a tenant that
+    // switches WABAs (or reconnects with different credentials) keeps the
+    // OLD WABA's templates in their picker — clicking them then fails with
+    // Meta's #132001 "Template name does not exist in the translation"
+    // because they're not registered on the new WABA. Self-healing here
+    // beats relying on the 15-min cron tick + operator-initiated refresh.
+    //
+    // Errors are non-fatal — connect-waba already succeeded; sync failure
+    // is just an "out-of-date templates" problem the cron will eventually
+    // pick up. Logged so we have a trail when it does fail.
+    try {
+      const sync = await syncTenantTemplates(data as any)
+      console.log(`[connect-waba] auto-sync tenant=${data.id} fetched=${sync.fetched} updated=${sync.updated} deleted=${sync.deleted}`)
+    } catch (syncErr: any) {
+      console.warn(`[connect-waba] auto-sync failed tenant=${data.id}: ${syncErr?.message ?? syncErr}`)
+    }
+
     res.json({ success: true, tenant: data })
   } catch (err: any) {
     res.status(500).json({ error: err.message })
@@ -2379,6 +2399,41 @@ app.delete('/api/wa-templates/:name', requireAuth, identifyTenant, checkPermissi
   } catch (err: any) {
     // Network/fetch error → 502 (bad gateway) is more accurate than 500.
     res.status(502).json({ error: `Meta Graph unreachable: ${err?.message ?? 'unknown'}` })
+  }
+})
+
+// ── Force-resync templates against the currently connected WABA ──────────────
+// Triggers an immediate, destructive template sync for the calling tenant.
+// "Destructive" = templates we have locally that Meta no longer returns get
+// DELETED. This is what makes the picker self-heal after a WABA switch:
+// without this, the 103 templates the tenant synced on WABA A stay in the
+// table forever, even after switching to WABA B which has none of them →
+// every send fails with #132001.
+//
+// Called by:
+//   - FE "Refresh templates" button on /apps WhatsApp
+//   - The connect-waba flow itself (auto-trigger after a successful
+//     reconnect) so the picker reflects the new WABA without operator
+//     action.
+app.post('/api/wa-templates/sync', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  const { data: tenant, error: tErr } = await supabase
+    .from('tenants')
+    .select('id, waba_id, access_token, user_id')
+    .eq('id', tenantId)
+    .maybeSingle()
+  if (tErr) { res.status(500).json({ error: tErr.message }); return }
+  if (!tenant?.waba_id || !tenant?.access_token) {
+    res.status(404).json({ error: 'No connected WhatsApp account' })
+    return
+  }
+  try {
+    const result = await syncTenantTemplates(tenant as any)
+    res.json({ success: true, ...result })
+  } catch (err: any) {
+    // Meta API errors here are usually token/permission issues, not network
+    // — surface them so the operator can react (e.g. re-connect WABA).
+    res.status(502).json({ error: `Template sync failed: ${err?.message ?? 'unknown'}` })
   }
 })
 

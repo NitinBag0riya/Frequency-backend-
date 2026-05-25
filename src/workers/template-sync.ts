@@ -88,27 +88,67 @@ async function runSync() {
 
   let totalTemplates = 0
   let updated = 0
+  let deleted = 0
   let failedTenants = 0
 
   for (const tenant of tenants) {
     if (!tenant.waba_id || !tenant.access_token) continue
     try {
-      const templates = await fetchTemplates(tenant.waba_id, tenant.access_token)
-      totalTemplates += templates.length
+      const r = await syncTenant(tenant as any)
+      totalTemplates += r.fetched
+      updated += r.updated
+      deleted += r.deleted
+    } catch (err: any) {
+      failedTenants++
+      console.warn(`[template-sync] tenant=${tenant.id} failed: ${err.message}`)
+    }
+  }
 
-      // Pre-fetch existing rows for this tenant so we can DIFF status &
-      // category in one pass instead of N round-trips. One row per
-      // (tenant_id, name, language) is the natural key.
-      const { data: priorRows } = await supabase
-        .from('wa_templates')
-        .select('id, name, language, category, status')
-        .eq('tenant_id', tenant.id)
-      const priorByKey = new Map<string, { id: string; category: string | null; status: string | null }>()
-      for (const p of (priorRows ?? []) as any[]) {
-        priorByKey.set(`${p.name}|${p.language}`, { id: p.id, category: p.category, status: p.status })
-      }
+  const duration = Date.now() - startedAt
+  console.log(`[template-sync] tenants=${tenants.length} fetched=${totalTemplates} updated=${updated} deleted=${deleted} failed=${failedTenants} ${duration}ms`)
+  return { tenants: tenants.length, fetched: totalTemplates, updated, deleted, failedTenants, durationMs: duration }
+}
 
-      for (const t of templates) {
+/**
+ * Sync templates for a single tenant. Exported so the /api/wa-templates/sync
+ * endpoint can trigger an on-demand resync (e.g. immediately after a WABA
+ * reconnect, when the tenant's stored access_token/waba_id pair has just
+ * changed and the cron's 15-minute tick is too slow).
+ *
+ * Destructive: any locally-stored template whose (name, language) key is
+ * NOT in Meta's response gets deleted. This is the only way to clean up
+ * stale templates when the tenant switches WABAs (templates were synced
+ * from the old WABA; the new WABA doesn't have them → they'd otherwise
+ * sit in the picker forever and fail with #132001 on send).
+ *
+ * Safety: if Meta returns ZERO templates for this WABA, we SKIP the
+ * delete. Easy mistake: a transient Meta outage could otherwise wipe
+ * every template the tenant has. Real WABAs always have at least
+ * `hello_world`, so an empty response is almost always wrong.
+ */
+export async function syncTenant(tenant: { id: string; waba_id: string; access_token: string; user_id: string | null }): Promise<{ fetched: number; updated: number; deleted: number }> {
+  if (!tenant.waba_id || !tenant.access_token) {
+    return { fetched: 0, updated: 0, deleted: 0 }
+  }
+  const templates = await fetchTemplates(tenant.waba_id, tenant.access_token)
+
+  // Pre-fetch existing rows for this tenant so we can DIFF status &
+  // category in one pass instead of N round-trips. One row per
+  // (tenant_id, name, language) is the natural key.
+  const { data: priorRows } = await supabase
+    .from('wa_templates')
+    .select('id, name, language, category, status')
+    .eq('tenant_id', tenant.id)
+  const priorByKey = new Map<string, { id: string; category: string | null; status: string | null }>()
+  for (const p of (priorRows ?? []) as any[]) {
+    priorByKey.set(`${p.name}|${p.language}`, { id: p.id, category: p.category, status: p.status })
+  }
+
+  // Track which keys Meta returned so we can purge stale ones below.
+  const seenKeys = new Set<string>()
+  let updated = 0
+
+  for (const t of templates) {
         const status = mapStatus(t.status)
         const metaCategory = String(t.category ?? '').toLowerCase() || null
         const key = `${t.name}|${t.language}`
@@ -145,16 +185,21 @@ async function runSync() {
           buttons: parsed.buttons,
           last_synced_at: new Date().toISOString(),
         }
-        // Category: only overwrite local on first-seen OR when the diff
-        // is real (i.e. categoryChanged). Otherwise keep the local
-        // category to avoid resetting the previous_category trail on
-        // every sync.
+        // Category: ALWAYS include in patch — wa_templates.category is
+        // NOT NULL, and PostgREST upserts go through INSERT...ON CONFLICT
+        // even when the conflict resolves to UPDATE, so a missing
+        // `category` key fails the NOT NULL constraint on the INSERT
+        // attempt and the row never updates. Carry forward the prior
+        // value when category hasn't changed; stamp the new value (and
+        // the change-trail) when it has.
         if (categoryChanged) {
           patch.category            = metaCategory
           patch.previous_category   = prior!.category
           patch.category_changed_at = new Date().toISOString()
-        } else if (!prior) {
-          patch.category = metaCategory
+        } else if (prior) {
+          patch.category = prior.category ?? metaCategory ?? 'utility'
+        } else {
+          patch.category = metaCategory ?? 'utility'
         }
 
         // UPSERT (was UPDATE-only) so templates created OUT-OF-BAND
@@ -163,7 +208,18 @@ async function runSync() {
         // and become selectable in the inbox composer.
         const { error: upErr } = await supabase.from('wa_templates')
           .upsert(patch, { onConflict: 'tenant_id,name,language' })
-        if (!upErr) updated++
+        if (upErr) {
+          console.warn(`[template-sync] upsert FAILED tenant=${tenant.id} name=${t.name} lang=${t.language}: ${upErr.message}`)
+        } else {
+          updated++
+        }
+        // Always mark the key as "seen by Meta" regardless of whether the
+        // upsert into our DB succeeded. The destructive purge below should
+        // be driven by what Meta returned, not what our DB write managed
+        // to persist — otherwise a transient DB error (constraint hiccup,
+        // schema drift, etc.) on row N causes us to DELETE row N's
+        // existing data, which is the opposite of self-healing.
+        seenKeys.add(key)
 
         // If category changed, pause every active campaign that
         // references this template + notify the tenant's admins.
@@ -177,15 +233,42 @@ async function runSync() {
           })
         }
       }
-    } catch (err: any) {
-      failedTenants++
-      console.warn(`[template-sync] tenant=${tenant.id} failed: ${err.message}`)
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Destructive purge: delete any local template whose (name, language)
+  // key wasn't returned by Meta this run. Catches the WABA-switch case
+  // where the tenant was previously on WABA A (synced 103 templates) and
+  // is now on WABA B (which has none of them) — without this purge, the
+  // 103 stale rows sit in the picker forever and every send fails with
+  // #132001.
+  //
+  // Safety: skip purge if Meta returned ZERO templates — almost always a
+  // transient error (a real WABA at minimum has `hello_world`). Without
+  // this guard, a single bad Meta response could wipe every template a
+  // tenant has, which would be catastrophic.
+  // ──────────────────────────────────────────────────────────────────────
+  let deleted = 0
+  if (templates.length > 0) {
+    const staleIds: string[] = []
+    for (const [k, v] of priorByKey.entries()) {
+      if (!seenKeys.has(k)) staleIds.push(v.id)
+    }
+    if (staleIds.length > 0) {
+      const { error: delErr, count } = await supabase
+        .from('wa_templates')
+        .delete({ count: 'exact' })
+        .eq('tenant_id', tenant.id)
+        .in('id', staleIds)
+      if (delErr) {
+        console.warn(`[template-sync] purge failed tenant=${tenant.id}: ${delErr.message}`)
+      } else {
+        deleted = count ?? staleIds.length
+        console.log(`[template-sync] purged ${deleted} stale templates for tenant=${tenant.id}`)
+      }
     }
   }
 
-  const duration = Date.now() - startedAt
-  console.log(`[template-sync] tenants=${tenants.length} fetched=${totalTemplates} updated=${updated} failed=${failedTenants} ${duration}ms`)
-  return { tenants: tenants.length, fetched: totalTemplates, updated, failedTenants, durationMs: duration }
+  return { fetched: templates.length, updated, deleted }
 }
 
 async function fetchTemplates(wabaId: string, accessToken: string) {
