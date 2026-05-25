@@ -1885,9 +1885,16 @@ app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
   }
 
   try {
-    // Exchange short-lived code for a long-lived user access token
+    // Exchange short-lived code for a long-lived user access token.
+    // For codes minted by FB.login with override_default_response_type=true
+    // (the Embedded Signup JS SDK flow), Meta requires redirect_uri to be
+    // the EMPTY string at exchange time — anything else (including omitting
+    // the param entirely, which we used to do) returns "Error validating
+    // verification code. Please make sure your redirect_uri is identical
+    // to the one you used in the OAuth dialog request".
+    // ref: https://developers.facebook.com/docs/facebook-login/guides/access-tokens/get-long-lived/
     const tokenRes = await fetch(
-      `${GRAPH}/oauth/access_token?client_id=${META_APP_ID}&client_secret=${META_APP_SECRET}&code=${code}`
+      `${GRAPH}/oauth/access_token?client_id=${META_APP_ID}&client_secret=${META_APP_SECRET}&redirect_uri=&code=${code}`
     )
     const tokenData = await tokenRes.json() as any
     if (tokenData.error) throw new Error(tokenData.error.message)
