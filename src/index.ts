@@ -2248,6 +2248,15 @@ app.get('/api/wa-templates', requireAuth, identifyTenant, checkPermission('whats
       category: t.category?.toUpperCase() ?? 'MARKETING',
       language: t.language ?? 'en',
       components,
+      // Also expose the flat columns so the inbox / composer preview can
+      // render a WhatsApp-style template card without re-parsing the
+      // components array client-side. components[] stays for any caller
+      // that needs Meta's canonical shape; both views are kept in sync
+      // by the template-sync worker.
+      body:    t.body ?? null,
+      header:  t.header ?? null,
+      footer:  t.footer ?? null,
+      buttons: t.buttons ?? [],
       // Surfaced on the WATemplatesPage rejection-state banner — when Meta
       // rejects a template, the rejected_reason field is what the user
       // needs to understand what to change. Null when status != rejected

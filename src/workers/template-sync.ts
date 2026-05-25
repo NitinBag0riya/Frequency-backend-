@@ -123,10 +123,21 @@ async function runSync() {
           && metaCategory
           && prior.category.toLowerCase() !== metaCategory)
 
+        // Parse Meta's components array → our flat columns. This is the
+        // source of truth for what the recipient actually sees on their
+        // phone, so we ALWAYS overwrite (no diff guard) — if a tenant
+        // edited the template on business.facebook.com, we want our DB
+        // to reflect that on next sync.
+        const parsed = parseComponents(t.components)
+
         const patch: Record<string, any> = {
           status,
           meta_template_id: t.id,
           rejection_reason: t.rejected_reason ?? null,
+          body:    parsed.body,
+          header:  parsed.header,
+          footer:  parsed.footer,
+          buttons: parsed.buttons,
           last_synced_at: new Date().toISOString(),
         }
         if (categoryChanged) {
@@ -166,7 +177,11 @@ async function runSync() {
 
 async function fetchTemplates(wabaId: string, accessToken: string) {
   // Meta returns 25 by default; bump to 100 to cover most tenants in 1 page.
-  const url = `${GRAPH}/${wabaId}/message_templates?limit=100&fields=id,name,language,status,category,rejected_reason`
+  // `components` is the source of truth for header/body/footer/buttons —
+  // without it, every newly-synced template lands with those columns NULL
+  // and the inbox/composer renders an empty preview. Cost: a few KB per
+  // template per page, negligible vs. the per-tenant page-of-100 baseline.
+  const url = `${GRAPH}/${wabaId}/message_templates?limit=100&fields=id,name,language,status,category,rejected_reason,components`
   const out: any[] = []
   let next: string | null = url
   let pages = 0
@@ -182,6 +197,45 @@ async function fetchTemplates(wabaId: string, accessToken: string) {
     pages++
   }
   return out
+}
+
+/**
+ * Translate Meta's `components` array into the flat column layout our
+ * wa_templates table uses. Meta groups by component type:
+ *   [
+ *     {type:'HEADER', format:'TEXT',   text:'...'},
+ *     {type:'BODY',                    text:'Hi {{1}}, ...'},
+ *     {type:'FOOTER',                  text:'...'},
+ *     {type:'BUTTONS',                 buttons:[{type:'QUICK_REPLY', text:'...'}, ...]},
+ *   ]
+ * Missing components → null/empty so the inbox preview can detect "no
+ * footer" / "no buttons" cleanly.
+ */
+function parseComponents(components: any[] | undefined | null): {
+  body:    string | null
+  header:  { text: string; type: string } | null
+  footer:  string | null
+  buttons: Array<{ text: string; type: string }>
+} {
+  const empty = { body: null, header: null, footer: null, buttons: [] as Array<{ text: string; type: string }> }
+  if (!Array.isArray(components)) return empty
+  const find = (type: string) => components.find(c => String(c?.type ?? '').toUpperCase() === type)
+  const headerComp = find('HEADER')
+  const bodyComp   = find('BODY')
+  const footerComp = find('FOOTER')
+  const buttonsComp = find('BUTTONS')
+  return {
+    body:   bodyComp?.text ?? null,
+    header: headerComp?.text
+      ? { text: String(headerComp.text), type: String(headerComp.format ?? 'text').toLowerCase() }
+      : null,
+    footer: footerComp?.text ?? null,
+    buttons: Array.isArray(buttonsComp?.buttons)
+      ? buttonsComp.buttons
+          .filter((b: any) => b?.text)
+          .map((b: any) => ({ text: String(b.text), type: String(b.type ?? 'QUICK_REPLY') }))
+      : [],
+  }
 }
 
 function mapStatus(metaStatus: string): string {
