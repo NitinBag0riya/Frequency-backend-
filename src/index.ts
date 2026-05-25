@@ -1868,12 +1868,20 @@ app.get('/api/auth/meta/callback', (req, res) => {
 })
 
 // ── Facebook Embedded Signup callback ─────────────────────────────────────────
-// Frontend calls this after user completes Embedded Signup and gets a short-lived token + WABA ID
+// Frontend calls this after user completes Embedded Signup. Two modes:
+//   • Picker mode: FE got waba_id + phone_number_id from the popup's
+//     WA_EMBEDDED_SIGNUP postMessage → pass them through.
+//   • Discovery mode: FE only has `code` (postMessage didn't fire because
+//     Meta skipped the picker — happens on reconnects where the WABA is
+//     already authorized to our app). We use /debug_token's granular_scopes
+//     to find the WABA(s) the user just authorized, then fetch the first
+//     phone number on it. Takes the first WABA when multiple — multi-WABA
+//     picker UX can come later.
 app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
   const user = (req as any).user
-  const { code, waba_id, phone_number_id } = req.body
-  if (!code || !waba_id || !phone_number_id) {
-    res.status(400).json({ error: 'code, waba_id, phone_number_id required' }); return
+  let { code, waba_id, phone_number_id } = req.body as { code?: string; waba_id?: string; phone_number_id?: string }
+  if (!code) {
+    res.status(400).json({ error: 'code required' }); return
   }
 
   try {
@@ -1893,6 +1901,40 @@ app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
     const longData = await longRes.json() as any
     if (longData.error) throw new Error(longData.error.message)
     const longToken: string = longData.access_token
+
+    // Discovery mode: no waba_id/phone_number_id from FE → look them up.
+    // /debug_token returns the granular_scopes block, which lists the
+    // exact WABA IDs the user just consented to. Way more reliable than
+    // walking /me/businesses → /{biz}/owned_whatsapp_business_accounts
+    // (which also surfaces WABAs the user might NOT have included in
+    // this consent). App access token is the standard auth for /debug_token.
+    if (!waba_id || !phone_number_id) {
+      const appAccessToken = `${META_APP_ID}|${META_APP_SECRET}`
+      const debugRes = await fetch(
+        `${GRAPH}/debug_token?input_token=${longToken}&access_token=${appAccessToken}`
+      )
+      const debugData = await debugRes.json() as any
+      const scopes: Array<{ scope: string; target_ids?: string[] }> = debugData?.data?.granular_scopes ?? []
+      const wabaScope = scopes.find(s => s.scope === 'whatsapp_business_management') ?? scopes.find(s => s.scope === 'whatsapp_business_messaging')
+      const discoveredWaba = wabaScope?.target_ids?.[0]
+      if (!discoveredWaba) {
+        throw new Error('No WhatsApp Business Account was authorized in the Meta popup. Please retry and complete every picker step, or use the manual setup form.')
+      }
+      waba_id = discoveredWaba
+
+      // Fetch the first phone number on this WABA
+      const phonesRes = await fetch(
+        `${GRAPH}/${waba_id}/phone_numbers?fields=id,display_phone_number,verified_name`,
+        { headers: { Authorization: `Bearer ${longToken}` } }
+      )
+      const phonesData = await phonesRes.json() as any
+      const firstPhone = phonesData?.data?.[0]
+      if (!firstPhone?.id) {
+        throw new Error('No phone number is registered on this WABA yet. Add one in Meta Business Manager → WhatsApp Accounts → Phone Numbers.')
+      }
+      phone_number_id = firstPhone.id
+      console.log(`[connect-waba] discovery mode: WABA=${waba_id} phone=${phone_number_id}`)
+    }
 
     // Fetch WABA info (business_name, etc.)
     const wabaRes = await fetch(
