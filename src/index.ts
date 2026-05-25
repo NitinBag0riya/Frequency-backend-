@@ -2824,6 +2824,47 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
   })
 })
 
+/**
+ * Map a Meta Cloud API error response to an operator-actionable string.
+ *
+ * Meta's raw error messages frequently obscure the actual fix the tenant
+ * needs to take. The biggest offender is `(#200) You do not have the
+ * necessary permissions to send messages on behalf of this WhatsApp
+ * Business Account` — this is what Meta returns when the access_token
+ * is a USER token (issued via Embedded Signup) rather than a System
+ * User token. User tokens carry `whatsapp_business_messaging` scope at
+ * the user level but NOT bound to a specific WABA, so messaging API
+ * calls are rejected. The only fix is for the tenant to generate a
+ * System User permanent token in business.facebook.com → Business
+ * Settings → System Users, assign the WABA to the system user, and
+ * paste the new token via the manual /apps WhatsApp connect form.
+ */
+function mapMetaError(data: any, fallback: string): string {
+  const code = data?.error?.code
+  const sub = data?.error?.error_subcode
+  const raw = data?.error?.message ?? ''
+  // #200 + "necessary permissions" → user-token-vs-system-token issue.
+  if (code === 200 && /necessary permissions/i.test(raw)) {
+    return 'Meta rejected the send: this connection is using a personal user token, not a System User token. ' +
+           'Go to business.facebook.com → Business Settings → Users → System Users → create one + assign the WABA + ' +
+           'generate a permanent access_token with whatsapp_business_messaging, then re-connect via /apps WhatsApp → ' +
+           '"Use a token instead". (Meta: ' + raw + ')'
+  }
+  // 131009 — parameter invalid (often phone number not in test-recipient list while app in Dev mode)
+  if (code === 131009 || sub === 2494010) {
+    return `Recipient not allowed: ${raw}. While the Meta app is in Development mode, only phone numbers added under App Roles → Testers can receive messages.`
+  }
+  // 131047 — outside 24h customer service window (need an approved template)
+  if (code === 131047) {
+    return `Outside 24h session window: ${raw}. Free-form text can only be sent within 24h of the customer's last inbound. Send an approved template instead.`
+  }
+  // 131049 — marketing template frequency capping (real ecosystem signal)
+  if (code === 131049) {
+    return `Marketing template throttled by Meta: ${raw}. Send a UTILITY template (or wait for the recipient's marketing-engagement window to reset).`
+  }
+  return raw ? `${raw}${sub ? ` (subcode ${sub})` : ''}` : fallback
+}
+
 // WhatsApp Cloud API media send — image / video / audio / document.
 async function sendWAMedia(tenant: any, to: string, kind: 'image'|'video'|'audio'|'document', url: string, caption?: string | null, filename?: string) {
   const payload: any = { messaging_product: 'whatsapp', to, type: kind }
@@ -2843,9 +2884,7 @@ async function sendWAMedia(tenant: any, to: string, kind: 'image'|'video'|'audio
   })
   const data = await r.json() as any
   if (!r.ok || data.error) {
-    const detail = data?.error?.message
-      ? `${data.error.message}${data.error.error_subcode ? ` (subcode ${data.error.error_subcode})` : ''}`
-      : `WA media send failed (${r.status})`
+    const detail = mapMetaError(data, `WA media send failed (${r.status})`)
     if (row?.id) {
       await supabase.from('messages').update({
         status: 'failed', content: { ...payload, error: detail },
@@ -3293,9 +3332,7 @@ async function sendTextMessage(tenant: any, to: string, text: string) {
   })
   const data = await r.json() as any
   if (!r.ok || data.error) {
-    const detail = data?.error?.message
-      ? `${data.error.message}${data.error.error_subcode ? ` (subcode ${data.error.error_subcode})` : ''}`
-      : `WA text send failed (${r.status})`
+    const detail = mapMetaError(data, `WA text send failed (${r.status})`)
     if (row?.id) {
       await supabase.from('messages').update({
         status: 'failed', content: { ...payload, error: detail },
@@ -3333,9 +3370,7 @@ async function sendTemplateMessage(tenant: any, to: string, templateName: string
   })
   const data = await r.json() as any
   if (!r.ok || data.error) {
-    const detail = data?.error?.message
-      ? `${data.error.message}${data.error.error_subcode ? ` (subcode ${data.error.error_subcode})` : ''}`
-      : `WA template send failed (${r.status})`
+    const detail = mapMetaError(data, `WA template send failed (${r.status})`)
     if (row?.id) {
       await supabase.from('messages').update({
         status: 'failed', content: { ...payload, error: detail },
@@ -3381,7 +3416,7 @@ async function sendInteractiveMessage(tenant: any, to: string, config: any) {
   })
   const data = await r.json() as any
   if (!r.ok || data.error) {
-    const detail = data?.error?.message ?? `WA interactive send failed (${r.status})`
+    const detail = mapMetaError(data, `WA interactive send failed (${r.status})`)
     if (row?.id) {
       await supabase.from('messages').update({
         status: 'failed', content: { ...payload, error: detail },
