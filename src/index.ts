@@ -1969,33 +1969,52 @@ app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
       console.error(`[connect-waba] ⚠️ Webhook subscription FAILED for WABA ${waba_id}:`, subData)
     }
 
-    // Resolve slug. On a WABA reconnect (existing tenant by waba_id) we keep
-    // the existing slug — renaming a workspace's URL via reconnect would
-    // break every team-member's bookmark. Only generate a fresh slug for
-    // truly new tenants. The `select('slug').eq('waba_id', waba_id)` look-
-    // ahead is the cheapest way to detect new-vs-existing without first
-    // doing a SELECT+INSERT round trip.
+    // Resolve slug and link to existing tenant row.
+    // 1. Look for an existing tenant row for this user where waba_id is null (Step 1 profile setup)
+    const { data: existingNullWaba } = await supabase.from('tenants')
+      .select('id, slug, business_name')
+      .eq('user_id', user.id)
+      .is('waba_id', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    // 2. Look for an existing tenant with this waba_id (reconnect flow)
     const { data: existingForWaba } = await supabase.from('tenants')
-      .select('slug').eq('waba_id', waba_id).maybeSingle()
+      .select('id, slug, business_name')
+      .eq('waba_id', waba_id)
+      .maybeSingle()
+
+    const targetId = existingForWaba?.id ?? existingNullWaba?.id
     const businessName = wabaData.name ?? phoneData.verified_name ?? 'My Business'
-    let slugToWrite: string | undefined = existingForWaba?.slug ?? undefined
+    
+    let slugToWrite = existingForWaba?.slug ?? existingNullWaba?.slug ?? undefined
     if (!slugToWrite) {
       const { ensureUniqueSlug } = await import('./lib/slug')
       slugToWrite = await ensureUniqueSlug(supabase, businessName, user.id)
     }
 
-    // Upsert tenant row
-    const { data, error } = await supabase.from('tenants').upsert({
+    // Upsert tenant row using primary key 'id' if resolved to keep Step 1 and Step 2 linked.
+    // Otherwise upsert by waba_id.
+    const upsertPayload: any = {
       user_id: user.id,
       waba_id,
       phone_number_id,
       access_token: longToken,
-      business_name: businessName,
+      business_name: existingNullWaba?.business_name ?? businessName,
       slug: slugToWrite,
       display_phone: phoneData.display_phone_number,
       status: 'active',
       updated_at: new Date().toISOString(),
-    }, { onConflict: 'waba_id' }).select().single()
+    }
+    if (targetId) {
+      upsertPayload.id = targetId
+    }
+
+    const { data, error } = await supabase.from('tenants').upsert(
+      upsertPayload,
+      targetId ? {} : { onConflict: 'waba_id' }
+    ).select().single()
 
     if (error) throw new Error(error.message)
 
