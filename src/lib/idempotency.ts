@@ -29,8 +29,30 @@
  * twice than fail the legitimate request, given the typical send is
  * idempotent at the WhatsApp layer (Meta de-dupes by message_id).
  */
+import { createHash } from 'crypto'
 import type { Request, Response } from 'express'
 import type { SupabaseClient } from '@supabase/supabase-js'
+
+/**
+ * Canonicalize + sha256 hash a request body. Without this, a buggy
+ * client that reuses the same Idempotency-Key across DIFFERENT payloads
+ * gets the first call's cached response replayed for every subsequent
+ * send — second-Nth real messages never reach Meta. (Stripe documents
+ * the same gotcha; their fix is a 409 when key+endpoint matches but
+ * body differs.) Returns null on failure so caller can fall back to
+ * legacy unhashed behaviour.
+ */
+function hashBody(body: unknown): string | null {
+  try {
+    // JSON.stringify is non-deterministic for object key order, but for
+    // this purpose (comparing replays of the SAME request) the caller
+    // sends the same shape every time, so stable ordering isn't required.
+    // If a future caller mixes shapes, we'd swap in canonical-json.
+    return createHash('sha256').update(JSON.stringify(body ?? null)).digest('hex')
+  } catch {
+    return null
+  }
+}
 
 export interface HandlerResult {
   status: number
@@ -74,11 +96,15 @@ export async function withIdempotency(
     return res.status(result.status).json(result.body)
   }
 
+  // Hash the request body so we can detect key-reuse-with-different-payload
+  // and reject it explicitly (409) rather than silently replaying the
+  // first call's cached response for an unrelated send.
+  const bodyHash = hashBody((req as any).body)
+
   // Look up an existing cached response for this (tenant, key, endpoint).
-  // `.maybeSingle()` returns null when no row — no error on miss.
   const { data: existing, error: lookupErr } = await supabase
     .from('idempotency_keys')
-    .select('status_code, response_body')
+    .select('status_code, response_body, body_hash')
     .eq('tenant_id', tenantId)
     .eq('key', key)
     .eq('endpoint', endpoint)
@@ -89,6 +115,15 @@ export async function withIdempotency(
     // than to fail the user's request because the cache table is hot.
     console.warn(`[idempotency] lookup failed for ${endpoint}: ${lookupErr.message}`)
   } else if (existing) {
+    const prevHash = (existing as any).body_hash as string | null
+    if (prevHash && bodyHash && prevHash !== bodyHash) {
+      // Same key, different payload → real bug in the client. Refuse
+      // to replay a stale response that doesn't match the new request.
+      return res.status(409).json({
+        error: 'idempotency_key_reuse',
+        message: 'This Idempotency-Key was already used with a different payload. Use a new key for distinct requests.',
+      })
+    }
     res.setHeader('X-Idempotent-Replay', 'true')
     return res.status((existing as any).status_code).json((existing as any).response_body)
   }
@@ -105,6 +140,7 @@ export async function withIdempotency(
       tenant_id: tenantId,
       key,
       endpoint,
+      body_hash: bodyHash,
       status_code: result.status,
       response_body: result.body as any,
     })

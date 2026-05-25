@@ -214,6 +214,24 @@ async function checkEmailKeywordTriggers(tenant: any, msg: any, fullText: string
     const { enqueueWorkflowExecution } = await import('../queue')
     const firstAction = (wf.nodes as any[])?.find((n: any) => !n.type?.startsWith('trigger_'))
     if (!firstAction) continue
+    // Seed with the canonical {trigger, contact} bag via shared helper.
+    // Email-flat fields (email_from / email_subject / email_body) are
+    // preserved at top level for backward-compat with legacy workflows
+    // that reference {{email_from}} flat — new workflows can use
+    // {{trigger.email_from}} via the standard namespace.
+    const { seedSessionVars } = await import('../engine/seed-vars')
+    const triggerPayload = {
+      email_from:    msg.from,
+      email_subject: msg.subject,
+      email_body:    msg.snippet,
+    }
+    const seedVars = await seedSessionVars(
+      supabase,
+      tenant.id,
+      `email:${msg.from}`,
+      triggerPayload,
+      triggerPayload, // also spread at top level for legacy {{email_from}}
+    )
     const { data: session } = await supabase.from('workflow_sessions').insert({
       tenant_id:       tenant.id,
       workflow_id:     wf.id,
@@ -227,11 +245,7 @@ async function checkEmailKeywordTriggers(tenant: any, msg: any, fullText: string
       // bypasses session.channel.
       channel:         'whatsapp',
       current_node_id: firstAction.id,
-      variables:       {
-        email_from:    msg.from,
-        email_subject: msg.subject,
-        email_body:    msg.snippet,
-      },
+      variables:       seedVars,
       status:          'active',
     }).select('id').single()
     if (session) {

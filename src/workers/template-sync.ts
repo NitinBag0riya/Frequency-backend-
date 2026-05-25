@@ -22,6 +22,7 @@ import { createClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { emitNotification } from '../routes/notifications'
 import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
+import { parseComponents } from '../lib/wa-components'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -131,6 +132,10 @@ async function runSync() {
         const parsed = parseComponents(t.components)
 
         const patch: Record<string, any> = {
+          tenant_id: tenant.id,
+          user_id:   tenant.user_id ?? null,
+          name:      t.name,
+          language:  t.language,
           status,
           meta_template_id: t.id,
           rejection_reason: t.rejected_reason ?? null,
@@ -140,16 +145,24 @@ async function runSync() {
           buttons: parsed.buttons,
           last_synced_at: new Date().toISOString(),
         }
+        // Category: only overwrite local on first-seen OR when the diff
+        // is real (i.e. categoryChanged). Otherwise keep the local
+        // category to avoid resetting the previous_category trail on
+        // every sync.
         if (categoryChanged) {
           patch.category            = metaCategory
           patch.previous_category   = prior!.category
           patch.category_changed_at = new Date().toISOString()
+        } else if (!prior) {
+          patch.category = metaCategory
         }
 
-        const { error: upErr } = await supabase.from('wa_templates').update(patch)
-          .eq('tenant_id', tenant.id)
-          .eq('name', t.name)
-          .eq('language', t.language)
+        // UPSERT (was UPDATE-only) so templates created OUT-OF-BAND
+        // (business.facebook.com directly, or POST /api/wa-templates
+        // before this row landed locally) actually appear in our DB
+        // and become selectable in the inbox composer.
+        const { error: upErr } = await supabase.from('wa_templates')
+          .upsert(patch, { onConflict: 'tenant_id,name,language' })
         if (!upErr) updated++
 
         // If category changed, pause every active campaign that
@@ -199,44 +212,10 @@ async function fetchTemplates(wabaId: string, accessToken: string) {
   return out
 }
 
-/**
- * Translate Meta's `components` array into the flat column layout our
- * wa_templates table uses. Meta groups by component type:
- *   [
- *     {type:'HEADER', format:'TEXT',   text:'...'},
- *     {type:'BODY',                    text:'Hi {{1}}, ...'},
- *     {type:'FOOTER',                  text:'...'},
- *     {type:'BUTTONS',                 buttons:[{type:'QUICK_REPLY', text:'...'}, ...]},
- *   ]
- * Missing components → null/empty so the inbox preview can detect "no
- * footer" / "no buttons" cleanly.
- */
-function parseComponents(components: any[] | undefined | null): {
-  body:    string | null
-  header:  { text: string; type: string } | null
-  footer:  string | null
-  buttons: Array<{ text: string; type: string }>
-} {
-  const empty = { body: null, header: null, footer: null, buttons: [] as Array<{ text: string; type: string }> }
-  if (!Array.isArray(components)) return empty
-  const find = (type: string) => components.find(c => String(c?.type ?? '').toUpperCase() === type)
-  const headerComp = find('HEADER')
-  const bodyComp   = find('BODY')
-  const footerComp = find('FOOTER')
-  const buttonsComp = find('BUTTONS')
-  return {
-    body:   bodyComp?.text ?? null,
-    header: headerComp?.text
-      ? { text: String(headerComp.text), type: String(headerComp.format ?? 'text').toLowerCase() }
-      : null,
-    footer: footerComp?.text ?? null,
-    buttons: Array.isArray(buttonsComp?.buttons)
-      ? buttonsComp.buttons
-          .filter((b: any) => b?.text)
-          .map((b: any) => ({ text: String(b.text), type: String(b.type ?? 'QUICK_REPLY') }))
-      : [],
-  }
-}
+// `parseComponents` previously lived inline here. Moved to
+// src/lib/wa-components.ts so the create endpoint can use the same
+// parser (and the same media-header / URL-button preservation logic).
+// See the import at the top of the file.
 
 function mapStatus(metaStatus: string): string {
   const s = (metaStatus ?? '').toLowerCase()

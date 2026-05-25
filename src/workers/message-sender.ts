@@ -221,15 +221,18 @@ async function sendWhatsApp(data: MessageSendJob) {
   const body = await r.json() as any
 
   if (!r.ok || body.error) {
-    // Permanent vs transient — Meta uses 4xx for permanent (template not approved,
-    // outside 24h window). Don't retry those — throw a non-retryable error.
-    if (r.status >= 400 && r.status < 500 && body.error?.code !== 130472 /* rate limit */) {
-      // Mark as failed in our log and signal BullMQ not to retry by throwing
-      // an UnrecoverableError-shaped message. BullMQ has UnrecoverableError but
-      // to avoid extra import, we just let the retry happen — they'll all fail
-      // identically and end up in the DLQ within seconds.
-    }
     await logOutbound(tenant, to, payload, null, 'failed', body.error?.message, data.sessionId ?? null, data.broadcastId ?? null, 'whatsapp')
+    // Permanent vs transient: 4xx means Meta rejected for a reason that
+    // a retry won't fix (template not approved, outside 24h window,
+    // invalid recipient). Throw UnrecoverableError so BullMQ marks the
+    // job failed immediately instead of burning all 5 retries on the
+    // same guaranteed-to-fail call. Code 130472 is the one 4xx that
+    // IS transient (rate limit) — let it retry through normal backoff.
+    if (r.status >= 400 && r.status < 500 && body.error?.code !== 130472) {
+      throw new UnrecoverableError(
+        `Meta send failed (${r.status}, no retry): ${body.error?.message ?? JSON.stringify(body)}`
+      )
+    }
     throw new Error(`Meta send failed (${r.status}): ${body.error?.message ?? JSON.stringify(body)}`)
   }
 

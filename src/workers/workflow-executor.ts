@@ -62,6 +62,27 @@ export function startWorkflowExecutorWorker() {
         attempt: job.attemptsMade + 1,
       }).select('id').single()
 
+      // RESUME-time refresh: when a workflow advances after a
+      // collect_input / wait_input step, the new inbound reply is in
+      // `reply`. The session's `variables.trigger.text` is still the
+      // FIRST inbound text from when the workflow started — so any
+      // downstream {{trigger.text}} reference would render the stale
+      // first-inbound rather than the latest reply. Merge fresh reply
+      // into trigger.* before executing the node.
+      if (reply) {
+        const refreshed = {
+          ...(session.variables ?? {}),
+          trigger: {
+            ...(session.variables?.trigger ?? {}),
+            text: reply.text ?? (session.variables?.trigger?.text ?? ''),
+            ...(reply as any).raw ? { raw: (reply as any).raw } : {},
+          },
+        }
+        session.variables = refreshed
+        await supabase.from('workflow_sessions')
+          .update({ variables: refreshed }).eq('id', session.id)
+      }
+
       const ctx = { tenant, session, workflow, reply: reply ?? null }
       const result = await executeNode(ctx, node)
 

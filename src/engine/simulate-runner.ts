@@ -114,13 +114,27 @@ export async function runSimulation(opts: RunSimulationOpts): Promise<Simulation
   // can interpolate {{name}}, {{phone}}, etc. The phone is sourced from
   // triggerInput.phone with a clearly-fake fallback so the trace's "to"
   // lines are non-empty and the user can see the recipient.
+  // Mirror production seeding shape — prod wraps trigger under
+  // `vars.trigger.*`. Simulator previously flat-spread triggerInput, so
+  // authors saw {{text}} resolve in the simulator but ship raw
+  // {{trigger.text}} to Meta. Now mirrors prod's {trigger, contact}
+  // bag. Legacy flat keys preserved at top level for back-compat.
+  const contactPhone = String(triggerInput.phone ?? triggerInput.contact_phone ?? '+91SIMULATED')
   const session: any = {
     id: 'simulated-session',
     tenant_id: tenant.id,
     workflow_id: workflow.id,
-    contact_phone: String(triggerInput.phone ?? triggerInput.contact_phone ?? '+91SIMULATED'),
+    contact_phone: contactPhone,
     current_node_id: currentNodeId,
-    variables: { ...triggerInput },
+    variables: {
+      ...triggerInput,                                  // legacy flat
+      trigger: { ...triggerInput },                     // prod canonical
+      contact: {
+        name:  String(triggerInput.contact_name ?? 'Simulated Contact'),
+        phone: contactPhone,
+        tags:  Array.isArray(triggerInput.tags) ? triggerInput.tags : [],
+      },
+    },
     status: 'active',
     channel: triggerInput.channel ?? 'whatsapp',
   }

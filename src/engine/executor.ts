@@ -134,20 +134,29 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
       }
 
       case 'send_template': {
+        // Interpolate every author-visible field. Previously
+        // `cfg.template_name` and `cfg.language` were used raw, so a
+        // workflow like `send_template name="welcome_{{plan}}"` would
+        // ship the literal `welcome_{{plan}}` to Meta and Meta would
+        // 404 — workflow author couldn't dynamically pick a template
+        // per session. Parameters are interpolated against the same
+        // vars bag so `{{contact.name}}` etc resolve consistently.
+        const templateName = interpolate(cfg.template_name, vars)
+        const language     = interpolate(cfg.language ?? 'en_US', vars) || 'en_US'
         const params: string[] = (cfg.parameters ?? []).map((p: string) => interpolate(p, vars))
         if (isSim(ctx)) {
           return simAdvance(ctx, node, {
-            template_name: cfg.template_name,
+            template_name: templateName,
             parameters: params,
-            language: cfg.language ?? 'en_US',
+            language,
             to: ctx.session.contact_phone,
           })
         }
         await enqueueMessageSend(buildSendJob(ctx, {
           kind: 'template',
           template: {
-            name: cfg.template_name,
-            language: cfg.language ?? 'en_US',
+            name: templateName,
+            language,
             parameters: params,
           },
         }))
@@ -966,13 +975,26 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         const firstAction = (target.nodes as any[])?.find((n: any) => !n.type?.startsWith('trigger_'))
         if (!firstAction) return { kind: 'error', error: 'start_workflow: target has no actionable nodes' }
 
+        // Child workflow seeds against the SAME contact_phone but must
+        // re-seed `contact` (parent might have stale contact data if the
+        // row was updated mid-execution) and re-seed `trigger` so chained
+        // workflows don't inherit the parent's first inbound. Merge any
+        // pass_variables on top so explicit author-configured values win.
         const passVars = interpolateDeep(cfg.pass_variables ?? {}, vars)
+        const { seedSessionVars } = await import('./seed-vars')
+        const childSeed = await seedSessionVars(
+          supabase,
+          ctx.tenant.id,
+          ctx.session.contact_phone,
+          vars.trigger,        // forward parent's trigger payload
+          { ...vars, ...passVars },
+        )
         const { data: newSession } = await supabase.from('workflow_sessions').insert({
           tenant_id: ctx.tenant.id,
           workflow_id: target.id,
           contact_phone: ctx.session.contact_phone,
           current_node_id: firstAction.id,
-          variables: { ...passVars, ...vars },
+          variables: childSeed,
           status: 'active',
           parent_session_id: ctx.session.id,
         }).select().single()

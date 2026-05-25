@@ -70,13 +70,15 @@ export async function fireShopifyTrigger(
     const firstAction = nodes.find((n: any) => !String(n?.type ?? '').startsWith('shopify_') && !String(n?.type ?? '').startsWith('trigger_'))
     if (!firstAction) continue
 
+    const { seedSessionVars } = await import('./seed-vars')
+    const seedVars = await seedSessionVars(supabase, tenantId, payload.contactId, payload)
     const { data: session, error } = await supabase.from('workflow_sessions').insert({
       tenant_id:       tenantId,
       workflow_id:     wf.id,
       contact_phone:   payload.contactId,
       channel:         'whatsapp',
       current_node_id: firstAction.id,
-      variables:       { trigger: payload },
+      variables:       seedVars,
       status:          'active',
     }).select('id').single()
     if (error || !session) {

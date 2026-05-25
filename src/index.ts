@@ -1143,7 +1143,18 @@ COMMON INTENT PATTERNS (with picker chains — emit these as missing_config[]):
 
 - "move deal to 'Closed Won' when customer says 'yes'" →
   trigger_inbound_keyword → update_crm (operation_deal='move_stage').
-  Pickers: deal_id (from {{conversation.deal_id}}), pipeline_stage_id (live), operation_deal='move_stage'.
+  Pickers: deal_id (from {{contact.deal_id}} — assumes attribute was set earlier), pipeline_stage_id (live), operation_deal='move_stage'.
+
+TOKEN GRAMMAR — supported namespaces in {{...}} placeholders (anything else renders as a literal '{{x.y}}' string in the sent message, which is a visible bug):
+  • {{trigger.text}}        — inbound message text (keyword / IG comment text)
+  • {{trigger.<key>}}       — any field on the trigger payload (story_id, comment_id, order_id from shopify, email_from from gmail, etc.)
+  • {{contact.name}}        — contact's display name (empty string if unknown)
+  • {{contact.phone}}       — E.164 phone with leading +
+  • {{contact.tags}}        — array of tag strings
+  • {{contact.<attribute>}} — any custom attribute the tenant set (e.g. {{contact.budget}}, {{contact.city}})
+  • {{<output_var>}}        — variables set by previous nodes via response_variable (e.g. {{ai_reply}}, {{collected_email}}, {{http_response}})
+
+NEVER use {{conversation.*}}, {{user.*}}, {{tenant.*}}, {{message.*}} — those namespaces don't exist in the executor. Only reference fields you've explicitly seeded or set as a step output.
 
 - "broadcast offer to all VIP segment customers every Friday at 6pm" →
   trigger_scheduled → send_template (broadcast to segment).
@@ -2277,11 +2288,31 @@ app.post('/api/wa-templates', requireAuth, identifyTenant, checkPermission('what
   const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).maybeSingle()
   if (!tenant?.waba_id) { res.status(404).json({ error: 'No connected WhatsApp account' }); return }
 
-  const { name, category = 'MARKETING', language = 'en_US', body, buttons = [] } = req.body
-  const components: any[] = [{ type: 'BODY', text: body }]
-  if (buttons.length > 0) {
-    components.push({ type: 'BUTTONS', buttons: buttons.map((btn: string) => ({ type: 'QUICK_REPLY', text: btn })) })
+  // Accept TWO payload shapes:
+  //   1. Full Meta shape:  { name, category, language, components: [...] }
+  //   2. Legacy short:     { name, category, language, body, buttons: string[] }
+  // (1) is what the new FE composer sends — preserves header/footer/
+  // media headers/URL+phone+copy_code buttons. (2) is the original
+  // body-only shape; kept for back-compat with older callers.
+  const { name, category = 'MARKETING', language = 'en_US', body, buttons = [], components: providedComponents } = req.body
+  if (!name) { res.status(400).json({ error: 'name required' }); return }
+
+  let components: any[]
+  if (Array.isArray(providedComponents) && providedComponents.length > 0) {
+    components = providedComponents
+  } else {
+    if (!body) { res.status(400).json({ error: 'body or components required' }); return }
+    components = [{ type: 'BODY', text: String(body) }]
+    if (Array.isArray(buttons) && buttons.length > 0) {
+      components.push({
+        type: 'BUTTONS',
+        buttons: buttons.map((btn: any) => typeof btn === 'string'
+          ? { type: 'QUICK_REPLY', text: btn }
+          : btn),
+      })
+    }
   }
+
   try {
     const r = await fetch(`${GRAPH}/${tenant.waba_id}/message_templates`, {
       method: 'POST',
@@ -2289,8 +2320,33 @@ app.post('/api/wa-templates', requireAuth, identifyTenant, checkPermission('what
       body: JSON.stringify({ name, language, category, components })
     })
     const data = await r.json() as any
-    if (data.error) { res.status(400).json({ error: data.error.message }); return }
-    res.json(data)
+    if (!r.ok || data.error) {
+      res.status(400).json({ error: data.error?.message ?? `Meta create failed (${r.status})` })
+      return
+    }
+    // Insert into wa_templates immediately so the new row is visible in
+    // the inbox composer picker without waiting up to 15min for the next
+    // template-sync run. Status comes from Meta's response if present,
+    // otherwise 'pending' (most CREATE responses don't include status —
+    // Meta sets it asynchronously after their internal review).
+    const { parseComponents } = await import('./lib/wa-components')
+    const parsed = parseComponents(components)
+    await supabase.from('wa_templates').upsert({
+      tenant_id:  tenantId,
+      user_id:    tenant.user_id ?? null,
+      name,
+      language,
+      category:   String(category).toLowerCase(),
+      status:     String(data.status ?? 'pending').toLowerCase(),
+      meta_template_id: data.id ?? null,
+      body:    parsed.body,
+      header:  parsed.header,
+      footer:  parsed.footer,
+      buttons: parsed.buttons,
+      last_synced_at: new Date().toISOString(),
+    }, { onConflict: 'tenant_id,name,language' }).then(() => {}, e => console.warn('[wa-templates create] DB upsert non-fatal:', e?.message))
+
+    res.json({ id: data.id, status: data.status ?? 'pending', name, language, category })
   } catch (err: any) { res.status(500).json({ error: err.message }) }
 })
 
@@ -2774,19 +2830,33 @@ async function sendWAMedia(tenant: any, to: string, kind: 'image'|'video'|'audio
   payload[kind] = { link: url }
   if (caption && (kind === 'image' || kind === 'video' || kind === 'document')) payload[kind].caption = caption
   if (filename && kind === 'document') payload[kind].filename = filename
+  // Pre-insert (see sendTextMessage for race-fix rationale).
+  const { data: row } = await supabase.from('messages').insert({
+    tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound',
+    contact_phone: to, content: payload, status: 'queued',
+  }).select('id').single()
+
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
   const data = await r.json() as any
-  if (!r.ok || data.error) throw new Error(data.error?.message ?? `WA media send failed (${r.status})`)
-  if (data.messages?.[0]?.id) {
-    await supabase.from('messages').insert({
-      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound',
-      contact_phone: to, platform_message_id: data.messages[0].id,
-      content: payload, status: 'sent',
-    })
+  if (!r.ok || data.error) {
+    const detail = data?.error?.message
+      ? `${data.error.message}${data.error.error_subcode ? ` (subcode ${data.error.error_subcode})` : ''}`
+      : `WA media send failed (${r.status})`
+    if (row?.id) {
+      await supabase.from('messages').update({
+        status: 'failed', content: { ...payload, error: detail },
+      }).eq('id', row.id)
+    }
+    throw new Error(detail)
+  }
+  if (row?.id && data.messages?.[0]?.id) {
+    await supabase.from('messages').update({
+      platform_message_id: data.messages[0].id, status: 'sent',
+    }).eq('id', row.id)
   }
   return data
 }
@@ -3010,16 +3080,62 @@ app.post('/webhook/whatsapp', async (req, res) => {
         // for our own WABAs, defense-in-depth: a malicious or replayed
         // payload mentioning a foreign platform_message_id could otherwise
         // mutate another tenant's message status.
+        // Monotonic status precedence — higher wins. Webhook order isn't
+        // guaranteed (delivered can arrive after read in rare cases), so
+        // we read the current status and only overwrite when the new
+        // value is strictly forward. `failed` is terminal — once set,
+        // never revert. Also persists Meta error payload onto content
+        // so the operator can see WHY delivery failed (P2-16).
+        const RANK: Record<string, number> = {
+          queued: 0, sent: 1, delivered: 2, read: 3, failed: 4,
+        }
         for (const status of value.statuses ?? []) {
           if (status.status === 'failed') {
             console.error(`[webhook] STATUS FAILED platform_message_id=${status.id} errors=${JSON.stringify(status.errors)}`)
           }
-          const { error: statusErr } = await supabase.from('messages')
-            .update({ status: status.status })
-            .eq('platform_message_id', status.id)
-            .eq('tenant_id', tenant.id)
-          if (statusErr) {
-            console.error(`[webhook] status update failed tenant=${tenant.id} msg=${status.id}:`, statusErr.message)
+          // Race fix: Meta's webhook can arrive in the brief window between
+          // the outbound send-call returning and our post-fetch PATCH
+          // landing. Retry once after 500ms before declaring orphan.
+          const tryApply = async () => {
+            const { data: rows } = await supabase
+              .from('messages')
+              .select('id, status, content')
+              .eq('platform_message_id', status.id)
+              .eq('tenant_id', tenant.id)
+              .limit(1)
+            if (!rows || rows.length === 0) return { matched: 0 }
+            const row = rows[0] as any
+            const currentRank = RANK[row.status ?? 'queued'] ?? 0
+            const incoming    = RANK[status.status]         ?? 0
+            // Monotonic forward — never downgrade. `failed` is sticky.
+            if (incoming <= currentRank && row.status !== 'failed') {
+              return { matched: 1, skipped: true }
+            }
+            const update: any = { status: status.status }
+            if (status.status === 'failed' && status.errors?.length) {
+              // Merge Meta error metadata into existing content (don't
+              // wipe payload). content.errors is what the inbox tooltip
+              // reads to render the Meta reason next to the red icon.
+              update.content = {
+                ...(row.content ?? {}),
+                errors: status.errors,
+                error: status.errors?.[0]?.message ?? status.errors?.[0]?.title ?? 'Delivery failed',
+              }
+            }
+            const { error: upErr } = await supabase.from('messages')
+              .update(update)
+              .eq('id', row.id)
+            return { matched: 1, skipped: false, error: upErr }
+          }
+          let result = await tryApply()
+          if (result.matched === 0) {
+            await new Promise(r => setTimeout(r, 500))
+            result = await tryApply()
+          }
+          if (result.matched === 0) {
+            console.warn(`[webhook] status update orphan tenant=${tenant.id} msg=${status.id} status=${status.status} — outbound row not found after retry`)
+          } else if ((result as any).error) {
+            console.error(`[webhook] status update failed tenant=${tenant.id} msg=${status.id}:`, (result as any).error?.message)
           }
         }
       }
@@ -3033,15 +3149,24 @@ async function handleInboundMessage(tenant: any, msg: any, contact: any) {
   const phone = msg.from // e.g. "919876543210"
   const text  = msg.text?.body ?? msg.button?.text ?? msg.interactive?.button_reply?.title ?? ''
 
-  // Log the message (tenant-scoped)
-  await supabase.from('messages').insert({
+  // UPSERT (was INSERT) so Meta's aggressive retry policy can't produce
+  // duplicate inbound rows. Meta retries any webhook that returns >5s
+  // OR that they can't reach — under any handler stall, the same
+  // platform_message_id is delivered N times. Without ON CONFLICT,
+  // those N inserts ALL succeed → duplicate inbox rows → duplicate
+  // workflow triggers → duplicate auto-replies. The unique partial
+  // index `messages_tenant_platform_id` (migration 122) backs this.
+  const { error: insertErr } = await supabase.from('messages').upsert({
     tenant_id: tenant.id,
     channel: 'whatsapp',
     direction: 'inbound',
     contact_phone: phone,
     platform_message_id: msg.id,
     content: msg,
-  })
+  }, { onConflict: 'tenant_id,platform_message_id', ignoreDuplicates: true })
+  if (insertErr) {
+    console.warn(`[webhook] inbound upsert failed tenant=${tenant.id} msg=${msg.id}: ${insertErr.message}`)
+  }
 
   // Upsert contact (tenant-scoped — fixes the user_id vs tenant_id leak from 008)
   // Capture whether this was a new insert so we can write the implicit
@@ -3150,22 +3275,38 @@ function interpolate(text: string, vars: Record<string, string> = {}) {
 
 async function sendTextMessage(tenant: any, to: string, text: string) {
   const payload = { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }
+  // Pre-insert pattern: INSERT row BEFORE the Meta call (status='queued')
+  // so the webhook's status update can find it by id when Meta sends
+  // 'sent'/'delivered'/'read' microseconds later. Without this, Meta's
+  // status webhook arrives, queries by platform_message_id, finds 0
+  // rows (because our INSERT hadn't happened yet) — status stays at
+  // 'sent' forever and delivery telemetry is lost.
+  const { data: row } = await supabase.from('messages').insert({
+    tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound',
+    contact_phone: to, content: payload, status: 'queued',
+  }).select('id').single()
+
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
   const data = await r.json() as any
-  if (data.messages?.[0]?.id) {
-    await supabase.from('messages').insert({
-      tenant_id: tenant.id,
-      channel: 'whatsapp',
-      direction: 'outbound',
-      contact_phone: to,
-      platform_message_id: data.messages[0].id,
-      content: payload,
-      status: 'sent',
-    })
+  if (!r.ok || data.error) {
+    const detail = data?.error?.message
+      ? `${data.error.message}${data.error.error_subcode ? ` (subcode ${data.error.error_subcode})` : ''}`
+      : `WA text send failed (${r.status})`
+    if (row?.id) {
+      await supabase.from('messages').update({
+        status: 'failed', content: { ...payload, error: detail },
+      }).eq('id', row.id)
+    }
+    throw new Error(detail)
+  }
+  if (row?.id && data.messages?.[0]?.id) {
+    await supabase.from('messages').update({
+      platform_message_id: data.messages[0].id, status: 'sent',
+    }).eq('id', row.id)
   }
   return data
 }
@@ -3179,34 +3320,33 @@ async function sendTemplateMessage(tenant: any, to: string, templateName: string
     messaging_product: 'whatsapp', to, type: 'template',
     template: { name: templateName, language: { code: language }, components }
   }
+  // Pre-insert (see sendTextMessage for race-fix rationale).
+  const { data: row } = await supabase.from('messages').insert({
+    tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound',
+    contact_phone: to, content: payload, status: 'queued',
+  }).select('id').single()
+
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
   const data = await r.json() as any
-  // Critical: surface Meta errors so /api/inbox/send returns 5xx and the
-  // FE shows a useful error chip. Previously we only inserted on success
-  // and silently swallowed `data.error` — the FE got 200, closed the
-  // composer modal, and the user saw "nothing happening on screen" while
-  // the message never actually sent.
   if (!r.ok || data.error) {
     const detail = data?.error?.message
       ? `${data.error.message}${data.error.error_subcode ? ` (subcode ${data.error.error_subcode})` : ''}`
       : `WA template send failed (${r.status})`
-    // Also log a failed-send row so the operator's audit / message history
-    // has a footprint of the attempt instead of silent nothing.
-    await supabase.from('messages').insert({
-      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
-      content: { ...payload, error: detail }, status: 'failed',
-    }).then(() => {}, () => {})
+    if (row?.id) {
+      await supabase.from('messages').update({
+        status: 'failed', content: { ...payload, error: detail },
+      }).eq('id', row.id)
+    }
     throw new Error(detail)
   }
-  if (data.messages?.[0]?.id) {
-    await supabase.from('messages').insert({
-      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
-      platform_message_id: data.messages[0].id, content: payload, status: 'sent',
-    })
+  if (row?.id && data.messages?.[0]?.id) {
+    await supabase.from('messages').update({
+      platform_message_id: data.messages[0].id, status: 'sent',
+    }).eq('id', row.id)
   }
   return data
 }
@@ -3218,12 +3358,22 @@ async function sendInteractiveMessage(tenant: any, to: string, config: any) {
       type: 'button',
       body: { text: config.body ?? '' },
       action: {
+        // Preserve user-supplied button.id when present — earlier code
+        // unconditionally rewrote to `btn_${i}` which broke routing of
+        // button reply payloads back to the trigger that issued them.
         buttons: (config.buttons ?? []).slice(0, 3).map((b: any, i: number) => ({
-          type: 'reply', reply: { id: `btn_${i}`, title: b.text ?? b }
+          type: 'reply',
+          reply: { id: String(b.id ?? `btn_${i}`), title: String(b.text ?? b ?? '') },
         }))
       }
     }
   }
+  // Pre-insert (see sendTextMessage for race-fix rationale).
+  const { data: row } = await supabase.from('messages').insert({
+    tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound',
+    contact_phone: to, content: payload, status: 'queued',
+  }).select('id').single()
+
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
@@ -3232,17 +3382,17 @@ async function sendInteractiveMessage(tenant: any, to: string, config: any) {
   const data = await r.json() as any
   if (!r.ok || data.error) {
     const detail = data?.error?.message ?? `WA interactive send failed (${r.status})`
-    await supabase.from('messages').insert({
-      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
-      content: { ...payload, error: detail }, status: 'failed',
-    }).then(() => {}, () => {})
+    if (row?.id) {
+      await supabase.from('messages').update({
+        status: 'failed', content: { ...payload, error: detail },
+      }).eq('id', row.id)
+    }
     throw new Error(detail)
   }
-  if (data.messages?.[0]?.id) {
-    await supabase.from('messages').insert({
-      tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound', contact_phone: to,
-      platform_message_id: data.messages[0].id, content: payload, status: 'sent',
-    })
+  if (row?.id && data.messages?.[0]?.id) {
+    await supabase.from('messages').update({
+      platform_message_id: data.messages[0].id, status: 'sent',
+    }).eq('id', row.id)
   }
   return data
 }

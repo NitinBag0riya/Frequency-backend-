@@ -258,27 +258,11 @@ async function startWorkflow(
   const firstAction = nodes.find((n: any) => !n.type?.startsWith('trigger_'))
   if (!firstAction) return
 
-  // Load contact properties to seed session variables (P0.5 / P0.7)
-  const phoneVal = `+${contactId}`.replace(/^\+\++/, '+')
-  const { data: contact } = await supabase.from('contacts')
-    .select('name, phone, tags, attributes')
-    .eq('tenant_id', tenant.id)
-    .or(`phone.eq.${phoneVal},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
-    .limit(1)
-    .maybeSingle()
-
-  const seedVars: Record<string, any> = {}
-  if (contact) {
-    seedVars.contact = {
-      name: contact.name ?? '',
-      phone: contact.phone ?? '',
-      tags: contact.tags ?? [],
-      ...(contact.attributes ?? {}),
-    }
-  }
-  if (triggerPayload) {
-    seedVars.trigger = triggerPayload
-  }
+  // Build the canonical {trigger, contact} bag via the shared seeder.
+  // See engine/seed-vars.ts — guarantees contact is always populated
+  // (so {{contact.name}} doesn't leak to recipients as a literal token).
+  const { seedSessionVars } = await import('./seed-vars')
+  const seedVars = await seedSessionVars(supabase, tenant.id, contactId, triggerPayload)
 
   const { data: session } = await supabase.from('workflow_sessions').insert({
     tenant_id:       tenant.id,
