@@ -2862,6 +2862,25 @@ function mapMetaError(data: any, fallback: string): string {
   if (code === 131049) {
     return `Marketing template throttled by Meta: ${raw}. Send a UTILITY template (or wait for the recipient's marketing-engagement window to reset).`
   }
+  // 132001 — "Template name does not exist in the translation".
+  // This fires when the template name+language combo isn't registered on
+  // the WABA we're sending FROM. Two common causes:
+  //   1. The tenant's connected WABA differs from the one the template was
+  //      created on (e.g. tenant switched between Meta's test WABA and the
+  //      real one — our wa_templates rows are from the OTHER WABA).
+  //   2. The language code on the template row doesn't match what's
+  //      registered on Meta (`en` vs `en_US` mismatch — Meta treats them
+  //      as separate translations).
+  // Both are operator-config issues, not retryable; surface them clearly
+  // so the operator knows to either re-create the template on this WABA
+  // or pick the right language.
+  if (code === 132001) {
+    return `Template not on this WhatsApp Business Account: ${raw}. ` +
+           `The template name + language must be registered on the WABA you're sending from. ` +
+           `Check: (a) the connected WABA matches the one the template was created on, ` +
+           `and (b) the language code matches Meta's registration ('en' vs 'en_US' are different translations). ` +
+           `Sync templates from /apps WhatsApp → Refresh.`
+  }
   return raw ? `${raw}${sub ? ` (subcode ${sub})` : ''}` : fallback
 }
 
