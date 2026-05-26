@@ -41,6 +41,7 @@ import { createApprovalsRouter, requireApproval } from './routes/approvals'
 import { createWorkflowRecosRouter } from './routes/workflow-recos'
 import { createWorkflowTemplatesRouter } from './routes/workflow-templates'
 import { createWorkflowVersionsRouter } from './routes/workflow-versions'
+import { createWorkflowInsightsRouter } from './routes/workflow-insights'
 import { createN8nImportRouter }        from './routes/n8n-import'
 import { createIntegrationRequestsRouter } from './routes/integration-requests'
 import { createWaCallingRouter }     from './routes/wa-calling'
@@ -581,6 +582,10 @@ const aiLimiter = makeLimiter({ windowMs: 60_000, max: 10, perUser: true })
 app.use('/api/parse-workflow', aiLimiter)
 app.use('/api/workflow-recos', aiLimiter)
 app.use('/api/skills/match',   aiLimiter)
+// /api/workflows/:id/analyze — protect the AI call (GET insights is cheap;
+// only the POST that re-runs Claude needs rate-limiting). The path has a
+// dynamic :id segment, so we match by regex tail.
+app.use(/^\/api\/workflows\/[^/]+\/analyze$/, aiLimiter)
 
 // WhatsApp / Telegram / Instagram send — every call costs Meta credit.
 // 30/min covers manual inbox replies + a moderate broadcast trigger rate.
@@ -1416,6 +1421,242 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
       res.write('data: [DONE]\n\n')
       res.end()
     }
+  } finally {
+    cleanup()
+  }
+})
+
+// ── In-app Copilot (AI assistant for both visitors and signed-in users) ───────
+//
+// Streams Anthropic responses with tool_use so the assistant can navigate
+// the user, open dialogs, or open external links as part of its reply. The
+// FE sends the current intent registry as `intents` (route + title +
+// optional event + optional answer hint) so the model can speak about real
+// pages the app actually exposes — no hallucinated routes.
+//
+// Auth-optional: signed-in users get the AUTHED persona (in-app helper);
+// visitors hit the PUBLIC persona (marketing / pricing / sales).
+//
+// Cost guard: 512-token cap + Haiku-class model (cheap, fast, plenty good
+// for short Q&A). Hard 45s timeout + heartbeat. No per-tenant usage
+// accounting yet — separate from /api/parse-workflow billing because this
+// is a discoverability tool, not a paid feature.
+type CopilotIntentMeta = {
+  id: string
+  title: string
+  route: string
+  event?: string
+  hint?: string  // short product fact the model can quote (`answer` from FE)
+}
+
+function buildCopilotSystemPrompt(opts: {
+  persona: 'authed' | 'public'
+  pagePath: string
+  intents: CopilotIntentMeta[]
+}): string {
+  const { persona, pagePath, intents } = opts
+  const intentList = intents
+    .map(i => {
+      const parts = [`- "${i.title}" → ${i.route}`]
+      if (i.event) parts.push(`(also fires dialog event: ${i.event})`)
+      if (i.hint) parts.push(`\n    fact: ${i.hint}`)
+      return parts.join(' ')
+    })
+    .join('\n')
+
+  const personaBlock = persona === 'authed'
+    ? `You are talking to a logged-in user inside the Frequency app. They're currently on the page: ${pagePath}.
+Your job is to help them find features fast: answer in 1-3 short sentences, then use the navigate tool to take them where they want to go. Open dialogs (open_dialog tool) when the destination is a modal on the current page. Never recommend signing up — they're already in.`
+    : `You are talking to a visitor on the Frequency marketing site. They're currently on the page: ${pagePath}. You haven't talked to them before.
+Your job is sales-grade Q&A: answer their question in 2-4 short sentences with real product facts (use the facts under "fact:" below — don't invent), then use the navigate tool to send them to /auth to start a free trial when it's a natural next step. Use external_link for "talk to sales" / mailto: requests.`
+
+  return `You are the Frequency in-app assistant. Frequency is a conversation OS for Indian SMBs — one tool that bundles WhatsApp Business API + Instagram DMs + Telegram, AI-built workflow automation, Razorpay payments, broadcasts, and a unified CRM. Pricing is INR-only with GST invoices; pricing starts at ₹999/month with a 7-day free trial (no card needed).
+
+${personaBlock}
+
+Rules:
+1. Answer first (1-4 sentences). Only then call a tool.
+2. NEVER call a tool without first writing a short text reply explaining what you're doing.
+3. Use ONLY the routes in the catalogue below. Do not invent paths.
+4. If the user asks something you don't have a fact for, say "I'm not sure — email hello@getfrequency.app and we'll get back to you" instead of guessing.
+5. Tone: warm, direct, no marketing fluff. Indian SMB audience — talk in clear short sentences, no jargon.
+
+Formatting (the UI renders a small subset of markdown):
+- Use **bold** for key facts: prices, numbers, product names. Use it sparingly — 1-3 bolds per reply max.
+- Use \`backticks\` for routes, event names, or technical terms.
+- Use a blank line (\\n\\n) between paragraphs when the reply is more than 2 sentences.
+- Use "- " bullets ONLY for genuine lists of 2-4 items. Don't bullet single facts.
+- DO NOT use headings (#, ##), tables, or links — they won't render.
+
+Catalogue of places you can navigate them to (use the navigate tool):
+${intentList}
+
+Tools you can call:
+- navigate(path) — go to a route inside the app (must come from the catalogue above)
+- open_dialog(event) — fire a CustomEvent that opens an in-app dialog (only when the catalogue entry lists an event)
+- external_link(url) — for mailto: / tel: / https:// destinations (e.g. mailto:hello@getfrequency.app)
+
+IMPORTANT — pair navigate + open_dialog when the catalogue requires it:
+If a catalogue entry includes "(also fires dialog event: X)", you MUST call BOTH navigate(path) AND open_dialog(X) — in that order — to complete the action. The route alone lands the user on the right page but they still need the dialog to actually do the thing (connect a channel, import a sheet, etc.). Calling navigate without the matching open_dialog leaves them stuck.`
+}
+
+const COPILOT_TOOLS = [
+  {
+    name: 'navigate',
+    description: 'Navigate the user to a route inside the Frequency app. Use this whenever the user wants to do something specific (create workflow, see pricing, etc.) and the route is listed in the catalogue.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: { type: 'string', description: 'Path to navigate to, must be from the catalogue. e.g. "/workflows", "/auth", "/home#pricing".' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'open_dialog',
+    description: 'Fire a CustomEvent that opens an in-app dialog. ONLY use when the catalogue explicitly lists a dialog event for the destination.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        event: { type: 'string', description: 'Event name, e.g. "open-apps-modal".' },
+      },
+      required: ['event'],
+    },
+  },
+  {
+    name: 'external_link',
+    description: 'Open an external URL via the browser (mailto:, tel:, https://). Use for "talk to sales" / "book a demo" / external links.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        url: { type: 'string', description: 'Full external URL, e.g. "mailto:hello@getfrequency.app".' },
+      },
+      required: ['url'],
+    },
+  },
+]
+
+// Tight rate limit — copilot is conversational so callers fire often.
+app.use('/api/copilot/', makeLimiter({ windowMs: 60_000, max: 20, perUser: true }))
+
+app.post('/api/copilot/stream', async (req, res) => {
+  const { message, history = [], persona = 'public', page_path = '/', intents = [] } = req.body ?? {}
+  if (!message || typeof message !== 'string' || message.length > 1000) {
+    res.status(400).json({ error: 'message (string, 1-1000 chars) required' }); return
+  }
+  if (!Array.isArray(intents) || intents.length === 0) {
+    res.status(400).json({ error: 'intents (non-empty array) required' }); return
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    res.status(503).json({ error: 'Assistant is offline right now. Please try again.' }); return
+  }
+
+  // ── SSE setup ─────────────────────────────────────────────────────────────
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
+  res.flushHeaders()
+
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) { try { res.write(': keepalive\n\n') } catch { /* socket gone */ } }
+  }, 15_000)
+
+  const TIMEOUT_MS = 45_000
+  const abortCtl = new AbortController()
+  const timeoutId = setTimeout(() => abortCtl.abort(), TIMEOUT_MS)
+
+  let clientGone = false
+  res.on('close', () => {
+    if (res.writableEnded) return
+    clientGone = true
+    abortCtl.abort()
+  })
+
+  const cleanup = () => { clearInterval(heartbeat); clearTimeout(timeoutId) }
+  const writeEvent = (obj: unknown) => {
+    if (res.writableEnded) return
+    try { res.write(`data: ${JSON.stringify(obj)}\n\n`) } catch { /* socket gone */ }
+  }
+
+  try {
+    // Clamp history to last 8 turns and shape — server is source of truth.
+    const safeHistory = (Array.isArray(history) ? history : [])
+      .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length < 4000)
+      .slice(-8)
+      .map((m: any) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+
+    // Clamp intents — strip anything we don't recognise.
+    const safeIntents: CopilotIntentMeta[] = (intents as any[])
+      .filter(i => i && typeof i.id === 'string' && typeof i.title === 'string' && typeof i.route === 'string')
+      .slice(0, 50)
+      .map(i => ({
+        id: String(i.id).slice(0, 60),
+        title: String(i.title).slice(0, 120),
+        route: String(i.route).slice(0, 200),
+        event: typeof i.event === 'string' ? String(i.event).slice(0, 60) : undefined,
+        hint: typeof i.hint === 'string' ? String(i.hint).slice(0, 600) : undefined,
+      }))
+
+    const system = buildCopilotSystemPrompt({
+      persona: persona === 'authed' ? 'authed' : 'public',
+      pagePath: typeof page_path === 'string' ? page_path.slice(0, 200) : '/',
+      intents: safeIntents,
+    })
+
+    const stream = anthropic.messages.stream({
+      model: 'claude-haiku-4-5',   // fast + cheap for short conversational Q&A
+      max_tokens: 512,
+      system: [
+        { type: 'text', text: system, cache_control: { type: 'ephemeral' } },
+      ] as any,
+      tools: COPILOT_TOOLS as any,
+      messages: [...safeHistory, { role: 'user' as const, content: message }],
+    }, { signal: abortCtl.signal as any })
+
+    // Track the current content block so we can buffer tool_use input until
+    // the block finishes (Anthropic streams JSON input as `partial_json`
+    // deltas, and we need the full payload before dispatching).
+    let currentTool: { name: string; inputJson: string } | null = null
+
+    for await (const chunk of stream) {
+      if (clientGone) break
+
+      if (chunk.type === 'content_block_start') {
+        if (chunk.content_block.type === 'tool_use') {
+          currentTool = { name: chunk.content_block.name, inputJson: '' }
+        }
+      } else if (chunk.type === 'content_block_delta') {
+        if (chunk.delta.type === 'text_delta') {
+          writeEvent({ text: chunk.delta.text })
+        } else if (chunk.delta.type === 'input_json_delta' && currentTool) {
+          currentTool.inputJson += chunk.delta.partial_json
+        }
+      } else if (chunk.type === 'content_block_stop') {
+        if (currentTool) {
+          // Parse the buffered JSON and emit a single tool event. Bad JSON
+          // is silently dropped — better to deliver text-only than crash.
+          try {
+            const args = currentTool.inputJson ? JSON.parse(currentTool.inputJson) : {}
+            writeEvent({ tool: { name: currentTool.name, args } })
+          } catch (e: any) {
+            console.warn('[copilot] tool args parse failed', currentTool.name, e?.message)
+          }
+          currentTool = null
+        }
+      }
+    }
+
+    writeEvent({ done: true })
+    if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end() }
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      writeEvent({ error: 'Assistant timed out — please try a shorter question.' })
+    } else {
+      console.warn('[copilot] stream error', err?.message)
+      writeEvent({ error: 'Assistant ran into a problem. Try again in a moment.' })
+    }
+    if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end() }
   } finally {
     cleanup()
   }
@@ -4685,6 +4926,12 @@ app.use(createApprovalsRouter({ supabase, requireAuth, identifyTenant, checkPerm
 
 // ── Workflow recommendations (AI-generated once, cached forever) ─────────────
 app.use(createWorkflowRecosRouter({ supabase, requireAuth, identifyTenant }))
+
+// ── Workflow insights (per-workflow optimization analysis) ───────────────────
+// POST /api/workflows/:id/analyze + GET /api/workflows/:id/insights — feeds
+// execution stats from workflow_sessions+messages+workflow_executions to
+// Claude, returns ranked actionable insights. Cached in workflow_insights.
+app.use(createWorkflowInsightsRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Workflow template library (P1 #13) ───────────────────────────────────────
 // Public catalog of pre-authored playbooks (D2C abandoned cart, EdTech course

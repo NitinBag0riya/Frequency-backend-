@@ -44,6 +44,9 @@ export type AiUsageSource =
   // P1 #14 — plain-English flow explainer (one call per (workflow, version),
   // cached on workflow_versions.explainer_text afterward).
   | 'explain_workflow'
+  // Per-workflow optimization insights — see src/routes/workflow-insights.ts.
+  // One call per analyze() invocation; result cached in workflow_insights row.
+  | 'workflow_insights'
 
 /**
  * Anthropic SDK's usage shape. Cache fields are optional and only present
