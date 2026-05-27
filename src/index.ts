@@ -107,7 +107,7 @@ import {
   WorkflowCreateSchema, WorkflowPatchSchema,
   BroadcastCreateSchema,
   ContactCreateSchema, ContactPatchSchema,
-  RazorpayConnectSchema, InboxSendSchema,
+  RazorpayConnectSchema, InboxSendSchema, InboxReactSchema,
   CampaignCreateSchema, CampaignPatchSchema,
 } from './validation'
 // B6: per-route filter+sort column allowlist. Replaces the prior
@@ -2994,6 +2994,7 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
       text, template_name, template_language, template_params,
       media_kind, media_url, caption, filename,
       interactive,
+      reply_to_platform_message_id,
     } = req.body
     const cleanPhone = String(phone).replace(/^\+/, '')
 
@@ -3062,7 +3063,7 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
       if (channel === 'whatsapp') {
         const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).single()
         if (!tenant?.access_token) return { status: 404, body: { error: 'WhatsApp not connected for this tenant' } }
-        if (type === 'text')              await sendTextMessage(tenant, cleanPhone, text)
+        if (type === 'text')              await sendTextMessage(tenant, cleanPhone, text, reply_to_platform_message_id ?? null)
         else if (type === 'template')     await sendTemplateMessage(tenant, cleanPhone, template_name, template_language ?? 'en_US', template_params ?? [])
         else if (type === 'media')        await sendWAMedia(tenant, cleanPhone, media_kind, media_url, caption, filename)
         else if (type === 'interactive')  await sendInteractiveMessage(tenant, cleanPhone, interactive)
@@ -3118,6 +3119,91 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
       return { status: 500, body: { error: err.message } }
     }
   })
+})
+
+// ──────────────────────────────────────────────────────────────────────────
+// POST /api/inbox/react — emoji-react to a specific message (migration 127)
+//
+// FE passes the LOCAL messages.id (uuid). We resolve the parent's
+// platform_message_id under RLS, then send Meta a `type: 'reaction'`
+// payload. Empty emoji means un-react (Meta's contract).
+//
+// WhatsApp-only today. Instagram has a similar reaction API but with
+// different shape — wiring that in is left to a follow-up so we don't
+// silently send the wrong payload shape on the wrong channel.
+// ──────────────────────────────────────────────────────────────────────────
+app.post('/api/inbox/react', requireAuth, identifyTenant, checkPermission('inbox', 'edit'), validateBody(InboxReactSchema), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  const { message_id, emoji } = req.body as { message_id: string; emoji: string }
+
+  // Lookup parent message under tenant scope. anon-key client wouldn't
+  // pass RLS, but we use the service-role `supabase` here — so we
+  // enforce the tenant boundary explicitly in the WHERE clause.
+  const { data: parent } = await supabase
+    .from('messages')
+    .select('id, tenant_id, channel, contact_phone, platform_message_id')
+    .eq('id', message_id)
+    .eq('tenant_id', tenantId)
+    .maybeSingle()
+  if (!parent) {
+    res.status(404).json({ error: 'message not found' }); return
+  }
+  if (parent.channel !== 'whatsapp') {
+    res.status(400).json({ error: `reactions not supported on channel: ${parent.channel}` }); return
+  }
+  if (!parent.platform_message_id) {
+    res.status(400).json({ error: 'parent message has no platform_message_id (was it sent?)' }); return
+  }
+
+  const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).single()
+  if (!tenant?.access_token) {
+    res.status(404).json({ error: 'WhatsApp not connected for this tenant' }); return
+  }
+
+  // Call Meta. Empty emoji = un-react. Both shapes use the same endpoint.
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: String(parent.contact_phone).replace(/^\+/, ''),
+    type: 'reaction',
+    reaction: { message_id: parent.platform_message_id, emoji },
+  }
+  try {
+    const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const data = await r.json() as any
+    if (!r.ok || data.error) {
+      const detail = mapMetaError(data, `WA reaction failed (${r.status})`)
+      res.status(502).json({ error: detail }); return
+    }
+    const platformReactionId: string | undefined = data.messages?.[0]?.id
+
+    // Persist locally. Outbound reaction always carries the AGENT's
+    // tenant identity; contact_phone is whose conversation we're
+    // reacting in (the customer). emoji='' deletes the row to mirror
+    // Meta's un-react semantics.
+    if (emoji === '') {
+      await supabase.from('message_reactions')
+        .delete()
+        .eq('message_id', parent.id)
+        .eq('contact_phone', parent.contact_phone)
+        .eq('direction', 'outbound')
+    } else {
+      await supabase.from('message_reactions').upsert({
+        tenant_id:            tenantId,
+        message_id:           parent.id,
+        contact_phone:        parent.contact_phone,
+        direction:            'outbound',
+        emoji,
+        platform_reaction_id: platformReactionId ?? null,
+      }, { onConflict: 'message_id,contact_phone,direction' })
+    }
+    res.json({ success: true })
+  } catch (err: any) {
+    res.status(500).json({ error: err.message })
+  }
 })
 
 /**
@@ -3520,6 +3606,53 @@ async function handleInboundMessage(tenant: any, msg: any, contact: any) {
   const phone = msg.from // e.g. "919876543210"
   const text  = msg.text?.body ?? msg.button?.text ?? msg.interactive?.button_reply?.title ?? ''
 
+  // ── Reactions (migration 127) ──────────────────────────────────────────
+  // A reaction is NOT a message. Persisting it as a row in `messages`
+  // would distort unread counts, workflow triggers, analytics, and
+  // conversation "latest text" rendering — exactly the bug wacrm 0.1.1
+  // fixed in their codebase. Branch early: write to message_reactions,
+  // skip the rest of the inbound pipeline (no workflow re-trigger, no
+  // CTWA attribution — those already fired on the parent message).
+  if (msg.type === 'reaction' && msg.reaction?.message_id) {
+    const parentWamid = msg.reaction.message_id as string
+    const emoji       = String(msg.reaction.emoji ?? '')
+    const { data: parent } = await supabase
+      .from('messages')
+      .select('id')
+      .eq('tenant_id', tenant.id)
+      .eq('platform_message_id', parentWamid)
+      .limit(1)
+      .maybeSingle()
+    if (!parent) {
+      console.warn(`[wa-webhook] reaction parent not found tenant=${tenant.id} parent_wamid=${parentWamid}`)
+      return
+    }
+    if (emoji === '') {
+      // Meta sends emoji='' to un-react. Mirror by deleting our row.
+      await supabase.from('message_reactions')
+        .delete()
+        .eq('message_id', parent.id)
+        .eq('contact_phone', phone)
+        .eq('direction', 'inbound')
+    } else {
+      await supabase.from('message_reactions').upsert({
+        tenant_id:            tenant.id,
+        message_id:           parent.id,
+        contact_phone:        phone,
+        direction:            'inbound',
+        emoji,
+        platform_reaction_id: msg.id ?? null,
+      }, { onConflict: 'message_id,contact_phone,direction' })
+    }
+    return
+  }
+
+  // Reply-to context (migration 127). When the customer taps "Reply" on
+  // a previous message, Meta attaches `context.id` = the parent wamid.
+  // We store it as text — the UI joins client-side against the loaded
+  // message set, falling back to "(message)" if the parent isn't loaded.
+  const replyToPlatformMessageId: string | null = msg.context?.id ?? null
+
   // UPSERT (was INSERT) so Meta's aggressive retry policy can't produce
   // duplicate inbound rows. Meta retries any webhook that returns >5s
   // OR that they can't reach — under any handler stall, the same
@@ -3534,6 +3667,7 @@ async function handleInboundMessage(tenant: any, msg: any, contact: any) {
     contact_phone: phone,
     platform_message_id: msg.id,
     content: msg,
+    reply_to_platform_message_id: replyToPlatformMessageId,
   }, { onConflict: 'tenant_id,platform_message_id', ignoreDuplicates: true })
   if (insertErr) {
     console.warn(`[webhook] inbound upsert failed tenant=${tenant.id} msg=${msg.id}: ${insertErr.message}`)
@@ -3644,8 +3778,15 @@ function interpolate(text: string, vars: Record<string, string> = {}) {
   return (text ?? '').replace(/\{\{(\w+)\}\}/g, (_, k) => vars[k] ?? `{{${k}}}`)
 }
 
-async function sendTextMessage(tenant: any, to: string, text: string) {
-  const payload = { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }
+async function sendTextMessage(tenant: any, to: string, text: string, replyToPlatformMessageId?: string | null) {
+  const payload: any = { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }
+  // Reply-to (migration 127). Meta's WA Cloud API takes `context.message_id`
+  // on the send payload and renders a quoted bubble on the customer's
+  // side. We also persist the parent wamid locally so our own inbox
+  // bubble shows the quote on the agent side.
+  if (replyToPlatformMessageId) {
+    payload.context = { message_id: replyToPlatformMessageId }
+  }
   // Pre-insert pattern: INSERT row BEFORE the Meta call (status='queued')
   // so the webhook's status update can find it by id when Meta sends
   // 'sent'/'delivered'/'read' microseconds later. Without this, Meta's
@@ -3655,6 +3796,7 @@ async function sendTextMessage(tenant: any, to: string, text: string) {
   const { data: row } = await supabase.from('messages').insert({
     tenant_id: tenant.id, channel: 'whatsapp', direction: 'outbound',
     contact_phone: to, content: payload, status: 'queued',
+    reply_to_platform_message_id: replyToPlatformMessageId ?? null,
   }).select('id').single()
 
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {

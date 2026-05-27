@@ -163,6 +163,10 @@ export const InboxSendSchema = z.object({
   filename:          z.string().max(255).optional(),
   // interactive
   interactive:       z.object({}).passthrough().optional(),
+  // reply-to (any send type) — captured into messages.reply_to_platform_message_id
+  // and forwarded to Meta as `context.message_id` so the customer's WhatsApp
+  // renders the quoted bubble.
+  reply_to_platform_message_id: z.string().max(255).optional(),
 }).refine(
   (v) => {
     if (v.type === 'text')        return !!v.text
@@ -176,6 +180,15 @@ export const InboxSendSchema = z.object({
   (v) => v.type !== 'template' || v.channel === 'whatsapp',
   { message: 'Templates are only supported on WhatsApp' }
 )
+
+// React to a specific message. emoji='' means un-react (Meta's contract).
+// message_id is the LOCAL messages.id (uuid) — the route resolves the
+// platform_message_id via RLS-checked lookup, so the FE doesn't have to
+// know about wamids.
+export const InboxReactSchema = z.object({
+  message_id: z.string().uuid(),
+  emoji:      z.string().max(16),
+})
 
 export const TeamInviteSchema = z.object({
   email: z.string().email(),

@@ -103,6 +103,41 @@ async function processMetaWhatsAppInbound(payload: WebhookInboundJob): Promise<P
         const text  = msg.text?.body ?? msg.button?.text ?? msg.interactive?.button_reply?.title ?? ''
         const contactProfile = value.contacts?.[0]
 
+        // ── Reactions (migration 127) ───────────────────────────────────
+        // Reactions don't go through the messages pipeline — they live
+        // in message_reactions and don't re-trigger workflows. Mirrors
+        // the inline path in src/index.ts handleInboundMessage.
+        if (msg.type === 'reaction' && msg.reaction?.message_id) {
+          const parentWamid = msg.reaction.message_id as string
+          const emoji       = String(msg.reaction.emoji ?? '')
+          const { data: parent } = await supabase
+            .from('messages')
+            .select('id')
+            .eq('tenant_id', tenant.id)
+            .eq('platform_message_id', parentWamid)
+            .limit(1)
+            .maybeSingle()
+          if (parent) {
+            if (emoji === '') {
+              await supabase.from('message_reactions')
+                .delete()
+                .eq('message_id', parent.id)
+                .eq('contact_phone', phone)
+                .eq('direction', 'inbound')
+            } else {
+              await supabase.from('message_reactions').upsert({
+                tenant_id:            tenant.id,
+                message_id:           parent.id,
+                contact_phone:        phone,
+                direction:            'inbound',
+                emoji,
+                platform_reaction_id: msg.id ?? null,
+              }, { onConflict: 'message_id,contact_phone,direction' })
+            }
+          }
+          continue
+        }
+
         const { data: insertedMsg, error: msgErr } = await supabase.from('messages').insert({
           tenant_id:           tenant.id,
           channel:             'whatsapp',
@@ -110,6 +145,7 @@ async function processMetaWhatsAppInbound(payload: WebhookInboundJob): Promise<P
           contact_phone:       phone,
           platform_message_id: msg.id,
           content:             msg,
+          reply_to_platform_message_id: msg.context?.id ?? null,
         }).select('id').maybeSingle()
         // Unique constraint on platform_message_id means a retry that ran
         // after a partial success will conflict — treat as already-processed.

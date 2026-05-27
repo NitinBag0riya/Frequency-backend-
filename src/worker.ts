@@ -49,6 +49,10 @@ import { startVoiceNoteTranscribeWorker } from './workers/voice-note-transcribe'
 // Block D — Signed-form PDF render (migration 109). One job per signed
 // submission; renders a receipt PDF + uploads to form-uploads bucket.
 import { startSignedFormPdfWorker } from './workers/signed-form-pdf'
+// Stale-session sweep — flips ghosted workflow_sessions to 'abandoned'
+// so the keyword-router can start a fresh flow for the same contact.
+// Inspired by wacrm's /api/flows/cron pattern, BullMQ-driven here.
+import { startSessionSweepWorker } from './workers/session-sweep'
 import { createClient } from '@supabase/supabase-js'
 import { closeQueues, attachCallDispatchFailureListener } from './queue'
 
@@ -113,6 +117,11 @@ async function main() {
   // submission; renders an A4 receipt with field values + signature image
   // + audit footer, uploads to form-uploads/signed/<tenant>/<form>/<id>.pdf.
   const sfp = startSignedFormPdfWorker()
+
+  // Stale-session sweep. Per-tenant timeout (defaults 24h, overridable
+  // via tenants.metadata.session_timeout_hours). Excludes sessions
+  // with pending scheduled_jobs (long-wait nodes are legitimate).
+  const sws = await startSessionSweepWorker()
 
   // Failure listener for call.dispatch — when BullMQ permanently fails a
   // dispatch job, flip call_sessions.status='failed' so the agent's UI

@@ -20,6 +20,7 @@ import {
 } from '../queue'
 import { executeNode, findNode } from '../engine/executor'
 import { dispatchDownstreamForCompletedSession } from '../engine/chaining'
+import { redactOutputForLogging } from '../lib/redact-output'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -163,6 +164,9 @@ export function startWorkflowExecutorWorker() {
 
         case 'error':
           // Log the failure and let BullMQ handle retries by throwing.
+          // result.error is a human message — redact in case the upstream
+          // formatter ever embeds raw customer text (e.g. an HTTP error
+          // body echoed back into the error string).
           await supabase.from('workflow_executions').insert({
             tenant_id: tenant.id,
             session_id: session.id,
@@ -172,12 +176,18 @@ export function startWorkflowExecutorWorker() {
             status: 'failed',
             attempt: job.attemptsMade + 1,
             duration_ms: Date.now() - startedAt,
-            error: result.error,
+            error: result.error ? redactOutputForLogging(result.error) : null,
           })
           throw new Error(result.error ?? 'node execution failed')
       }
 
-      // Log success row
+      // Log success row. Output is redacted before persistence — see
+      // lib/redact-output.ts for the threat model (aadhaar/pan/bank/otp
+      // can show up in collect_input outputs, HTTP response bodies, AI
+      // responder reply_text). Phone/email/dob are NOT masked here
+      // because legitimate workflow data (collect_email node) embeds
+      // them. In-memory return value is left untouched so downstream
+      // engine code keeps seeing the raw output.
       await supabase.from('workflow_executions').insert({
         tenant_id: tenant.id,
         session_id: session.id,
@@ -187,7 +197,7 @@ export function startWorkflowExecutorWorker() {
         status: 'succeeded',
         attempt: job.attemptsMade + 1,
         duration_ms: Date.now() - startedAt,
-        output: result.output ?? null,
+        output: result.output != null ? redactOutputForLogging(result.output) : null,
       })
 
       return { kind: result.kind, nextNodeId: result.nextNodeId ?? null, execId: execStart.data?.id }
