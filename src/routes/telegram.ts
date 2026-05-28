@@ -452,12 +452,23 @@ export function createTelegramRouter(deps: Deps): express.Router {
         const username = msg.from?.username ?? null
         const name = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || username || `Telegram ${fromId}`
         const text = msg.text ?? msg.caption ?? ''
-        // Upsert contact by telegram_id
+        // Upsert contact by telegram_id. We MUST stamp user_id on insert —
+        // the FE inbox query is `.eq('user_id', user.id)` (tenant-scoped
+        // contacts table still carries a per-row user_id for legacy RLS),
+        // so a NULL user_id makes the contact invisible to the inbox even
+        // though the row exists. The WhatsApp webhook path already does
+        // this (see handleInboundMessage in src/index.ts); Telegram was
+        // missing the same write, which left every Telegram-only contact
+        // hidden in the conversation list.
         const { data: existing } = await supabase.from('contacts')
           .select('id').eq('tenant_id', tenantId).eq('telegram_id', fromId).maybeSingle()
         if (!existing) {
+          const { data: tenantOwner } = await supabase.from('tenants')
+            .select('user_id').eq('id', tenantId).maybeSingle()
           await supabase.from('contacts').insert({
-            tenant_id: tenantId, name, phone: `tg:${fromId}`, telegram_id: fromId,
+            tenant_id: tenantId,
+            user_id:   tenantOwner?.user_id ?? null,
+            name, phone: `tg:${fromId}`, telegram_id: fromId,
             channel_primary: 'telegram',
           })
         }

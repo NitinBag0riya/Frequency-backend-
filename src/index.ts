@@ -2996,7 +2996,17 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
       interactive,
       reply_to_platform_message_id,
     } = req.body
-    const cleanPhone = String(phone).replace(/^\+/, '')
+    // Normalise phone for the channel:
+    //   - WhatsApp / SMS: strip leading "+" → digits only ("919876543210").
+    //   - Telegram     : the FE composer passes `contact.phone` which is
+    //                    prefixed with "tg:" (e.g. "tg:7797429783"). The
+    //                    Telegram Bot API expects a NUMERIC chat_id —
+    //                    "tg:" makes the sendMessage call fail with a
+    //                    400. Strip both the "+" and any "tg:" prefix
+    //                    so the same outbound path works regardless of
+    //                    which identifier shape the FE handed us.
+    //   - Instagram    : raw PSID, no prefix.
+    const cleanPhone = String(phone).replace(/^\+/, '').replace(/^tg:/i, '')
 
     // v1.1 audit fix — outbound PII gate.
     //
