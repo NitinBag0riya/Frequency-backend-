@@ -89,7 +89,57 @@ export function createTelegramRouter(deps: Deps): express.Router {
         console.error(`[telegram connect] tenant_integrations mirror upsert failed: ${tiErr.message}`)
         res.status(500).json({ error: 'Failed to persist connection mirror: ' + tiErr.message }); return
       }
-      res.json({ success: true, bot: { id: me.id, username: me.username, name: me.first_name } })
+
+      // Auto-set the Telegram webhook when PUBLIC_API_URL is configured.
+      //
+      // Without this, the user pastes a bot token, sees "connected", sends a
+      // message — and nothing arrives. Telegram has no idea where to deliver
+      // updates because /api/telegram/bot/webhook was never invoked. The FE
+      // used to require a separate "Set webhook" click that wasn't always
+      // discoverable.
+      //
+      // Local dev (no PUBLIC_API_URL): we skip the setWebhook call and
+      // surface `webhook: 'unset'` in the response. The TGBotSettings page
+      // shows a tunnel-URL input the user can fill once they have ngrok /
+      // cloudflared running. Production always has PUBLIC_API_URL set, so
+      // bot connects there "just work" end-to-end.
+      let webhookStatus: 'set' | 'unset' | 'failed' = 'unset'
+      let webhookError: string | undefined
+      const baseUrl = (process.env.PUBLIC_API_URL ?? '').replace(/\/$/, '')
+      if (baseUrl) {
+        try {
+          const webhook = `${baseUrl}/webhook/telegram?tenant_id=${tenantId}`
+          const secretToken = crypto.randomBytes(32).toString('hex')
+          await tgCall(bot_token, 'setWebhook', {
+            url: webhook,
+            allowed_updates: ['message', 'callback_query', 'pre_checkout_query'],
+            secret_token: secretToken,
+          })
+          await supabase.from('tg_bots').update({
+            webhook_url:    webhook,
+            webhook_secret: secretToken,
+            updated_at:     new Date().toISOString(),
+          }).eq('tenant_id', tenantId)
+          webhookStatus = 'set'
+          console.log(`[telegram connect] webhook auto-set tenant=${tenantId} bot=@${me.username ?? me.id}`)
+        } catch (whErr: any) {
+          // Don't fail the whole connect — the bot row is saved and the user
+          // can retry from TGBotSettings. Telegram errors are usually
+          // recoverable (rate limit, transient network).
+          webhookStatus = 'failed'
+          webhookError = whErr?.message ?? String(whErr)
+          console.warn(`[telegram connect] auto-setWebhook failed (non-fatal): ${webhookError}`)
+        }
+      } else {
+        console.log(`[telegram connect] PUBLIC_API_URL not set — webhook unset. User must call /api/telegram/bot/webhook with a tunnel URL.`)
+      }
+
+      res.json({
+        success: true,
+        bot: { id: me.id, username: me.username, name: me.first_name },
+        webhook: webhookStatus,
+        webhook_error: webhookError,
+      })
     } catch (err: any) {
       res.status(400).json({ error: err.message || 'Could not validate bot token' })
     }
