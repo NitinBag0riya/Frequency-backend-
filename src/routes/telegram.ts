@@ -112,7 +112,10 @@ export function createTelegramRouter(deps: Deps): express.Router {
           const secretToken = crypto.randomBytes(32).toString('hex')
           await tgCall(bot_token, 'setWebhook', {
             url: webhook,
-            allowed_updates: ['message', 'callback_query', 'pre_checkout_query'],
+            // Subscribe to message_reaction so the inbox can render emoji
+        // reactions in real time. Telegram does NOT deliver these by
+        // default — they're an opt-in update type, separate from `message`.
+        allowed_updates: ['message', 'callback_query', 'pre_checkout_query', 'message_reaction'],
             secret_token: secretToken,
           })
           await supabase.from('tg_bots').update({
@@ -198,7 +201,10 @@ export function createTelegramRouter(deps: Deps): express.Router {
       const secretToken = crypto.randomBytes(32).toString('hex')
       await tgCall(bot.token, 'setWebhook', {
         url: webhook,
-        allowed_updates: ['message', 'callback_query', 'pre_checkout_query'],
+        // Subscribe to message_reaction so the inbox can render emoji
+        // reactions in real time. Telegram does NOT deliver these by
+        // default — they're an opt-in update type, separate from `message`.
+        allowed_updates: ['message', 'callback_query', 'pre_checkout_query', 'message_reaction'],
         secret_token: secretToken,
       })
       // Persist the secret on the bot row. tg_bots.webhook_secret landed in
@@ -490,6 +496,56 @@ export function createTelegramRouter(deps: Deps): express.Router {
             const { routeInboundToWorkflow } = await import('../engine/inbound-router')
             await routeInboundToWorkflow(supabase, tenantRow, 'telegram', fromId, text, msg)
           }
+        }
+      }
+
+      // ── Inbound reactions (migration 127, Telegram parity with WhatsApp) ──
+      // Telegram delivers reactions as a separate `message_reaction` update
+      // type — NOT inside `message`. We must subscribe to it via
+      // setWebhook(allowed_updates) for these to arrive (handled below).
+      //
+      // Shape per https://core.telegram.org/bots/api#messagereactionupdated :
+      //   { chat: {id}, message_id, user/actor_chat, date,
+      //     old_reaction: [{type:'emoji', emoji:'👍'}, ...],
+      //     new_reaction: [{type:'emoji', emoji:'❤️'}, ...] }
+      //
+      // We treat new_reaction as the canonical CURRENT state for that
+      // (message, user) pair. Empty = un-reacted (mirror Meta's "" semantic).
+      // Multiple emojis on Telegram Premium users → we take the first as
+      // primary (the inbox chip model is single-emoji-per-direction).
+      const mr = update.message_reaction
+      if (mr?.chat?.id && mr?.message_id) {
+        const chatId   = String(mr.chat.id)
+        const wamid    = String(mr.message_id)
+        const reactor  = String(mr.user?.id ?? mr.actor_chat?.id ?? chatId)
+        const newList: any[] = Array.isArray(mr.new_reaction) ? mr.new_reaction : []
+        const emoji    = newList.find(r => r?.type === 'emoji')?.emoji ?? ''
+
+        const { data: parent } = await supabase
+          .from('messages')
+          .select('id')
+          .eq('tenant_id', tenantId)
+          .eq('channel', 'telegram')
+          .eq('platform_message_id', wamid)
+          .limit(1).maybeSingle()
+        if (parent) {
+          if (emoji === '') {
+            await supabase.from('message_reactions')
+              .delete()
+              .eq('message_id', parent.id)
+              .eq('contact_phone', reactor)
+              .eq('direction', 'inbound')
+          } else {
+            await supabase.from('message_reactions').upsert({
+              tenant_id:     tenantId,
+              message_id:    parent.id,
+              contact_phone: reactor,
+              direction:     'inbound',
+              emoji,
+            }, { onConflict: 'message_id,contact_phone,direction' })
+          }
+        } else {
+          console.warn(`[tg-webhook] reaction parent not found tenant=${tenantId} msg_id=${wamid}`)
         }
       }
       // Pre-checkout for Stars invoices — must respond OK or Telegram cancels.

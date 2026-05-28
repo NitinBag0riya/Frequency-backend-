@@ -3083,13 +3083,28 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
         const { decrypt } = await import('./crypto')
         const token = decrypt(bot.bot_token)
         if (type === 'text') {
-          await tgSend(token, 'sendMessage', { chat_id: cleanPhone, text })
-          await supabase.from('messages').insert({ tenant_id: tenantId, channel: 'telegram', direction: 'outbound', contact_phone: cleanPhone, content: { type: 'text', text }, status: 'sent' })
+          // Capture Telegram's message_id so inbound reactions can resolve
+          // the parent row. Without this, a user tapping ❤️ on the bot's
+          // message hits our webhook, we lookup by platform_message_id —
+          // but the row was inserted with NULL because we discarded the
+          // tgSend response. Reaction silently dropped, inbox never updates.
+          const sendRes = await tgSend(token, 'sendMessage', { chat_id: cleanPhone, text })
+          const pmid = sendRes?.result?.message_id ? String(sendRes.result.message_id) : null
+          await supabase.from('messages').insert({
+            tenant_id: tenantId, channel: 'telegram', direction: 'outbound',
+            contact_phone: cleanPhone, content: { type: 'text', text },
+            platform_message_id: pmid, status: 'sent',
+          })
         } else if (type === 'media') {
           const method = ({ image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio', document: 'sendDocument' } as any)[media_kind!]
           const fieldKey = ({ image: 'photo', video: 'video', audio: 'audio', document: 'document' } as any)[media_kind!]
-          await tgSend(token, method, { chat_id: cleanPhone, [fieldKey]: media_url, caption: caption ?? undefined })
-          await supabase.from('messages').insert({ tenant_id: tenantId, channel: 'telegram', direction: 'outbound', contact_phone: cleanPhone, content: { type: media_kind, url: media_url, caption, filename }, status: 'sent' })
+          const sendRes = await tgSend(token, method, { chat_id: cleanPhone, [fieldKey]: media_url, caption: caption ?? undefined })
+          const pmid = sendRes?.result?.message_id ? String(sendRes.result.message_id) : null
+          await supabase.from('messages').insert({
+            tenant_id: tenantId, channel: 'telegram', direction: 'outbound',
+            contact_phone: cleanPhone, content: { type: media_kind, url: media_url, caption, filename },
+            platform_message_id: pmid, status: 'sent',
+          })
         } else {
           return { status: 400, body: { error: `Telegram does not support type=${type}` } }
         }
@@ -3158,13 +3173,65 @@ app.post('/api/inbox/react', requireAuth, identifyTenant, checkPermission('inbox
   if (!parent) {
     res.status(404).json({ error: 'message not found' }); return
   }
-  if (parent.channel !== 'whatsapp') {
+  if (parent.channel !== 'whatsapp' && parent.channel !== 'telegram') {
     res.status(400).json({ error: `reactions not supported on channel: ${parent.channel}` }); return
   }
   if (!parent.platform_message_id) {
     res.status(400).json({ error: 'parent message has no platform_message_id (was it sent?)' }); return
   }
 
+  // Telegram branch — bot reacts to the user's message via setMessageReaction.
+  // Empty emoji = un-react (Telegram contract: send empty `reaction` array).
+  // chat_id is the contact_phone we stored on the parent row (raw chat id,
+  // no "tg:" prefix). Telegram supports only a fixed list of emoji for
+  // free accounts; our 6-pack (👍 ❤️ 😂 😮 😢 🙏) is in the standard set
+  // so all toolbar taps are valid.
+  if (parent.channel === 'telegram') {
+    const { data: bot } = await supabase.from('tg_bots').select('bot_token').eq('tenant_id', tenantId).maybeSingle()
+    if (!bot?.bot_token) {
+      res.status(404).json({ error: 'Telegram bot not connected for this tenant' }); return
+    }
+    const { decrypt } = await import('./crypto')
+    const token = decrypt(bot.bot_token)
+    const chatId = String(parent.contact_phone).replace(/^tg:/i, '')
+    const reaction = emoji === '' ? [] : [{ type: 'emoji', emoji }]
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${token}/setMessageReaction`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: Number(parent.platform_message_id),
+          reaction,
+        }),
+      })
+      const data = await r.json() as any
+      if (!r.ok || !data.ok) {
+        res.status(502).json({ error: data?.description ?? `TG reaction failed (${r.status})` }); return
+      }
+      if (emoji === '') {
+        await supabase.from('message_reactions')
+          .delete()
+          .eq('message_id', parent.id)
+          .eq('contact_phone', parent.contact_phone)
+          .eq('direction', 'outbound')
+      } else {
+        await supabase.from('message_reactions').upsert({
+          tenant_id:     tenantId,
+          message_id:    parent.id,
+          contact_phone: parent.contact_phone,
+          direction:     'outbound',
+          emoji,
+        }, { onConflict: 'message_id,contact_phone,direction' })
+      }
+      res.json({ success: true })
+      return
+    } catch (err: any) {
+      res.status(500).json({ error: err.message }); return
+    }
+  }
+
+  // WhatsApp branch (unchanged)
   const { data: tenant } = await supabase.from('tenants').select('*').eq('id', tenantId).single()
   if (!tenant?.access_token) {
     res.status(404).json({ error: 'WhatsApp not connected for this tenant' }); return

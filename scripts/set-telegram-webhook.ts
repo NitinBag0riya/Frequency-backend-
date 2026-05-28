@@ -67,7 +67,7 @@ async function main() {
 
   const setRes = await tgCall(decryptedToken, 'setWebhook', {
     url: webhook,
-    allowed_updates: ['message', 'callback_query', 'pre_checkout_query'],
+    allowed_updates: ['message', 'callback_query', 'pre_checkout_query', 'message_reaction'],
     secret_token: secretToken,
     drop_pending_updates: false,
   })
