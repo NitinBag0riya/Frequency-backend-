@@ -146,11 +146,67 @@ async function syncGoogleSheet(sub: any): Promise<{ imported: number; updated: n
   // Read the entire tab in one go (capped to 5000 rows for safety).
   const range = `${tab_name ?? 'Sheet1'}!1:5000`
   const values = await sheetsReadRange(tenant, spreadsheet_id, range)
-  const [headerRow = [], ...dataRows] = values
+  if (values.length === 0) return { imported: 0, updated: 0 }
+
+  // Detect the header row instead of blindly assuming row 0. Real-world
+  // sheets routinely carry title/legend rows above the actual column
+  // headers (the bug that collapsed a 9-column "UAT" sheet to a single
+  // "Done >>" column: A1 was a legend cell, the real header sat several
+  // rows down). Scan the first 15 rows and take the DENSEST (most non-empty
+  // cells) as the header; ties resolve to the earliest row. For a clean
+  // sheet whose header IS row 0, row 0 is the densest → behaviour is
+  // unchanged (no re-keying of healthy mirrors).
+  const SCAN = Math.min(values.length, 15)
+  let headerIdx = 0, bestCount = -1
+  for (let i = 0; i < SCAN; i++) {
+    const nonEmpty = (values[i] ?? []).filter(c => String(c ?? '').trim() !== '').length
+    if (nonEmpty > bestCount) { bestCount = nonEmpty; headerIdx = i }
+  }
+  const headerRow = values[headerIdx] ?? []
+  const dataRows = values.slice(headerIdx + 1)
   if (headerRow.length === 0) return { imported: 0, updated: 0 }
 
-  const keys = headerRow.map(keyify)
+  // Build column keys from EVERY header cell. Empty header cells get a
+  // positional fallback so their data column isn't silently dropped, and
+  // duplicate header labels are de-duped (Sheets allows repeats like two
+  // "Comments" columns) so each maps to a distinct key.
+  const seenKey = new Map<string, number>()
+  const keys = headerRow.map((cell, i) => {
+    const base = String(cell ?? '').trim() ? keyify(cell) : `col_${i + 1}`
+    const n = seenKey.get(base) ?? 0
+    seenKey.set(base, n + 1)
+    return n === 0 ? base : `${base}_${n + 1}`
+  })
   const primaryKey = keys[0]
+
+  // Register any detected columns that aren't in lead_columns yet so the
+  // table's "Structure" reflects ALL fields, not just whatever was created
+  // at mirror-setup time. ADDITIVE ONLY — never deletes/renames existing
+  // columns (a stale column from a previous mis-detection is left in place
+  // rather than dropping user data).
+  const { data: existingCols } = await supabase.from('lead_columns')
+    .select('key, position').eq('table_id', sub.lead_table_id)
+  const existingKeys = new Set((existingCols ?? []).map((c: any) => c.key))
+  const maxPos = (existingCols ?? []).reduce((m: number, c: any) => Math.max(m, c.position ?? 0), -1)
+  const missingCols = keys
+    .map((k, i) => ({ key: k, name: String(headerRow[i] ?? '').trim() || k }))
+    .filter(c => !existingKeys.has(c.key))
+    .map((c, j) => ({
+      table_id:    sub.lead_table_id,
+      tenant_id:   sub.tenant_id,
+      user_id:     tenant.user_id,
+      name:        c.name,
+      key:         c.key,
+      type:        'text',
+      options:     [],
+      is_required: false,
+      is_primary:  existingKeys.size === 0 && j === 0,
+      position:    maxPos + 1 + j,
+    }))
+  if (missingCols.length > 0) {
+    const { error: colErr } = await supabase.from('lead_columns').insert(missingCols)
+    if (colErr) console.warn(`[sheets-sync] lead_columns insert failed (table=${sub.lead_table_id}): ${colErr.message}`)
+  }
 
   // Pull existing rows once to dedupe by primary value (cheaper than per-row queries).
   // When a mapping is pinned, the visible `data` no longer carries the raw

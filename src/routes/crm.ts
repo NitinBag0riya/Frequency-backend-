@@ -564,16 +564,36 @@ export function createCrmRouter(deps: Deps): express.Router {
 
     // Lead half — only when we have an authenticated user. Lead rows are
     // user-scoped via assigned_to (text column matching the user uuid).
+    //
+    // Owner filter parity with deals: the deal half above honours the
+    // `?owner=<uuid>` query param (line ~509). The lead half MUST do the
+    // same or the board lies — previously this query hard-coded
+    // `assigned_to = userId` (the JWT caller) and ignored `owner` entirely,
+    // so a manager who selected another rep's owner chip (or just landed on
+    // the default "All owners" view) saw deals for everyone but lead cards
+    // for ONLY themselves. The assignment→pipeline chain (a rule routes a
+    // lead to rep B → rep B's lead should appear when the manager filters to
+    // rep B, and on the unfiltered board) was broken by that mismatch.
+    //
+    //   • owner = <uuid>  → that user's assigned lead rows (covers ?show=mine,
+    //                       which resolves to the caller's id, AND any owner
+    //                       chip).
+    //   • owner = null    → "All owners": every assigned lead row in the
+    //                       tenant, matching how the deal half shows all
+    //                       owners when the param is absent. Tenant-scoped, so
+    //                       no cross-tenant leakage.
     let leadCards: any[] = []
     if (userId) {
       const resolver = await buildStageResolver(tenantId)
-      const { data: leadRows } = await supabase
+      let leadQuery = supabase
         .from('lead_rows')
-        .select('id, table_id, data, status, tags, assigned_to_name, created_at, updated_at, lead_tables!inner(id, name)')
+        .select('id, table_id, data, status, tags, assigned_to, assigned_to_name, created_at, updated_at, lead_tables!inner(id, name)')
         .eq('tenant_id', tenantId)
-        .eq('assigned_to', userId)
+        .not('assigned_to', 'is', null)
         .order('updated_at', { ascending: false })
         .limit(MAX_LEAD_CARDS)
+      if (owner) leadQuery = leadQuery.eq('assigned_to', owner)
+      const { data: leadRows } = await leadQuery
 
       for (const row of (leadRows ?? []) as any[]) {
         const statusLower = (row.status ?? 'new').toString().toLowerCase()
@@ -589,7 +609,12 @@ export function createCrmRouter(deps: Deps): express.Router {
           subtitle:            tags.length > 0 ? `${tableName} · ${tags.slice(0, 3).join(', ')}` : tableName,
           stage_id:            resolvedStageId,
           value_inr_paise:     null,
-          owner_user_id:       userId, // lead rows are scoped by assigned_to
+          // The card's owner is the row's real assignee — NOT the JWT caller.
+          // With the owner-filter parity above this query can now return
+          // other users' assigned rows (the "All owners" + owner-chip views),
+          // so stamping `userId` here would mislabel every card as the
+          // viewer's own and break the FE owner chips + "Mine" toggle.
+          owner_user_id:       (row.assigned_to as string | null) ?? userId,
           closed_at:           statusLower === 'won' || statusLower === 'lost' ? row.updated_at : null,
           created_at:          row.created_at,
           updated_at:          row.updated_at,
