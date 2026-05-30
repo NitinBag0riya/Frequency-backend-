@@ -671,6 +671,60 @@ export function createInstagramRouter(deps: Deps): express.Router {
           const senderId = String(m.sender?.id ?? '')
           if (!senderId) continue
 
+          // ── Reactions (parity with WhatsApp handleInboundMessage) ────
+          // Instagram's Messenger Platform delivers a DM reaction as
+          //   m.reaction = { mid, action: 'react'|'unreact', reaction, emoji }
+          // where `mid` is the platform_message_id of OUR outbound message
+          // the user reacted to. A reaction is NOT a message — without this
+          // branch the event falls through to the insert below and writes a
+          // blank inbound row (empty pmid + empty text), distorting unread
+          // counts and the conversation's "latest text". Branch early:
+          // resolve the parent via platform_message_id and upsert/delete in
+          // message_reactions with direction='inbound', then skip the rest
+          // of the inbound pipeline (no workflow re-trigger). This mirrors
+          // the WhatsApp reaction handler in src/index.ts.
+          if (m.reaction?.mid) {
+            const parentMid = String(m.reaction.mid)
+            const emoji     = String(m.reaction.emoji ?? '')
+            const action    = String(m.reaction.action ?? (emoji ? 'react' : 'unreact'))
+            const { data: parent } = await supabase
+              .from('messages')
+              .select('id')
+              .eq('tenant_id', tenant.id)
+              .eq('platform_message_id', parentMid)
+              .limit(1)
+              .maybeSingle()
+            if (!parent) {
+              console.warn(`[ig-webhook] reaction parent not found tenant=${tenant.id} parent_mid=${parentMid}`)
+              continue
+            }
+            if (action === 'unreact' || emoji === '') {
+              await supabase.from('message_reactions')
+                .delete()
+                .eq('message_id', parent.id)
+                .eq('contact_phone', senderId)
+                .eq('direction', 'inbound')
+            } else {
+              await supabase.from('message_reactions').upsert({
+                tenant_id:            tenant.id,
+                message_id:           parent.id,
+                contact_phone:        senderId,
+                direction:            'inbound',
+                emoji,
+                platform_reaction_id: String(m.reaction.mid),
+              }, { onConflict: 'message_id,contact_phone,direction' })
+            }
+            continue
+          }
+
+          // Skip non-message events (read receipts, delivery, postbacks,
+          // and any future event without a `message`). Without this guard
+          // such events fall through to the insert below and write a blank
+          // inbound row (empty pmid + empty text) — the same class of
+          // bug the reaction branch above fixes. We only persist rows that
+          // actually carry a DM payload.
+          if (!m.message) continue
+
           // ── Story-reply / shared-post / replied-message branches ────
           // Meta surfaces these as additional fields on `message`:
           //   reply_to.story.id + .url → user replied to OUR story
@@ -706,7 +760,7 @@ export function createInstagramRouter(deps: Deps): express.Router {
             channel:             'instagram',
             direction:           'inbound',
             contact_phone:       senderId,
-            platform_message_id: String(m.message?.mid ?? ''),
+            platform_message_id: m.message?.mid ? String(m.message.mid) : null,
             content:             { type: 'text', text, kind, raw: m },
             metadata:            metadata,
           })
