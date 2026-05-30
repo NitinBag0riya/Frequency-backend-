@@ -1016,6 +1016,17 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
       case 'shopify_list_orders':     case 'shopify_get_order':         case 'shopify_list_products':   case 'shopify_create_draft_order':
       case 'razorpay_list_payments':  case 'razorpay_get_payment':      case 'razorpay_refund_payment': case 'razorpay_list_subscriptions':
       case 'razorpay_create_payment_link':
+      case 'woocommerce_list_orders': case 'woocommerce_get_order':      case 'woocommerce_list_products': case 'woocommerce_create_order':
+      case 'brevo_create_contact':    case 'brevo_send_email':           case 'brevo_send_sms':
+      case 'msg91_send_sms':          case 'msg91_send_otp':             case 'msg91_verify_otp':
+      case 'shiprocket_list_orders':  case 'shiprocket_create_order':    case 'shiprocket_track_awb': case 'shiprocket_check_serviceability':
+      case 'cashfree_create_order':   case 'cashfree_create_payment_link': case 'cashfree_get_order': case 'cashfree_create_refund':
+      case 'gupshup_send_message':    case 'gupshup_send_template':      case 'gupshup_opt_in_user':
+      case 'exotel_make_call':        case 'exotel_send_sms':            case 'exotel_get_call_details':
+      case 'payu_generate_payment_hash': case 'payu_verify_payment':      case 'payu_refund_payment':
+      case 'leadsquared_create_or_update_lead': case 'leadsquared_get_lead_by_email': case 'leadsquared_post_activity':
+      case 'kylas_create_lead':       case 'kylas_create_contact':       case 'kylas_create_deal': case 'kylas_search_leads':
+      case 'indiamart_fetch_leads':   case 'tradeindia_fetch_leads':
       case 'slack_send_message':
       case 'gmail_send_email': {
         // Resolve op: explicit cfg.op for generic 'connector_call', else

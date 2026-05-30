@@ -27,6 +27,19 @@ import { createAirtableConnector } from './airtable'
 import { createRazorpayConnector } from './razorpay'
 import { createShopifyConnector } from './shopify'
 import { createSlackConnector } from './slack'
+import { createWoocommerceConnector } from './woocommerce'
+import { createBrevoConnector } from './brevo'
+import { createMsg91Connector } from './msg91'
+import { createShiprocketConnector } from './shiprocket'
+import { createCashfreeConnector } from './cashfree'
+import { createGupshupConnector } from './gupshup'
+import { createExotelConnector } from './exotel'
+import { createPayuConnector } from './payu'
+import { createLeadsquaredConnector } from './leadsquared'
+import { createKylasConnector } from './kylas'
+import { createIndiamartConnector } from './indiamart'
+import { createTradeindiaConnector } from './tradeindia'
+import { createLeadWebhookConnectors } from './lead-webhooks'
 import { signOauthState } from '../../lib/oauth-state'
 
 // Meta Graph API base — kept inline to avoid pulling in unrelated config modules.
@@ -1478,6 +1491,19 @@ export function createConnectorsRouter(deps: Deps): express.Router {
   r.use(createRazorpayConnector(deps))
   r.use(createShopifyConnector(deps))
   r.use(createSlackConnector(deps))
+  r.use(createWoocommerceConnector(deps))
+  r.use(createBrevoConnector(deps))
+  r.use(createMsg91Connector(deps))
+  r.use(createShiprocketConnector(deps))
+  r.use(createCashfreeConnector(deps))
+  r.use(createGupshupConnector(deps))
+  r.use(createExotelConnector(deps))
+  r.use(createPayuConnector(deps))
+  r.use(createLeadsquaredConnector(deps))
+  r.use(createKylasConnector(deps))
+  r.use(createIndiamartConnector(deps))
+  r.use(createTradeindiaConnector(deps))
+  r.use(createLeadWebhookConnectors(deps))
 
   // ── Google OAuth start routes — mounted inline (sub-router nesting causes
   // path-resolution quirks in Express when using full /api/auth/... paths) ────

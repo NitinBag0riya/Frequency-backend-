@@ -40,6 +40,10 @@ export type ConnectorCategory =
   | 'data'
   | 'accounting'
   | 'email'
+  | 'logistics'
+  | 'quick_commerce'
+  | 'food_delivery'
+  | 'lead_gen'
 
 /**
  * Workflow-builder field schema. Each input field declares its type and,
@@ -1766,11 +1770,66 @@ const NOTION: ConnectorDef = {
   capabilities: [],
 }
 const WOOCOMMERCE: ConnectorDef = {
-  key: 'woocommerce', name: 'WooCommerce', category: 'commerce', tier: 1, status: 'planned',
+  key: 'woocommerce', name: 'WooCommerce', category: 'commerce', tier: 1, status: 'live',
   authMode: 'api_key', brandColor: '#7F54B3', iconName: 'ShoppingCart',
   shortDescription: 'D2C alternative to Shopify (very common in IN). REST API key + URL.',
   docsUrl: 'https://woocommerce.github.io/woocommerce-rest-api-docs/',
-  capabilities: [],
+  consoleUrl: 'https://woocommerce.github.io/woocommerce-rest-api-docs/#rest-api-keys',
+  setupNote: 'In your WP admin: WooCommerce → Settings → Advanced → REST API → Add key (Read/Write). Paste the ck_/cs_ pair + store URL.',
+  capabilities: [
+    { key: 'list_products', label: 'Catalog products', description: 'Products in your WooCommerce store.', iconName: 'Package', apiPath: '/api/connectors/woocommerce/products', apiMethod: 'GET', uiKind: 'list', status: 'live',
+      outputSchema: { fields: [
+        { key: 'id',            label: 'Product ID',  type: 'number', sample: 412 },
+        { key: 'name',          label: 'Name',        type: 'string', sample: 'Cotton kurta — M' },
+        { key: 'price',         label: 'Price',       type: 'string', sample: '1499' },
+        { key: 'stock_status',  label: 'Stock',       type: 'string', sample: 'instock' },
+        { key: 'permalink',     label: 'Product URL', type: 'string', sample: 'https://shop.example.com/product/cotton-kurta' },
+      ] },
+    },
+    { key: 'list_orders', label: 'Orders', description: 'Recent store orders with status + totals.', iconName: 'ShoppingCart', apiPath: '/api/connectors/woocommerce/orders', apiMethod: 'GET', uiKind: 'list', status: 'live',
+      outputSchema: { fields: [
+        { key: 'id',            label: 'Order ID',    type: 'number', sample: 10231 },
+        { key: 'status',        label: 'Status',      type: 'string', sample: 'processing' },
+        { key: 'total',         label: 'Total',       type: 'string', sample: '2998.00' },
+        { key: 'currency',      label: 'Currency',    type: 'string', sample: 'INR' },
+        { key: 'date_created',  label: 'Created at',  type: 'string', sample: '2026-05-18T10:00:00' },
+      ] },
+    },
+    { key: 'get_order', label: 'Order detail', description: 'Full line items + billing/shipping for one order.', iconName: 'FileText', apiPath: '/api/connectors/woocommerce/orders/:id', apiMethod: 'GET', uiKind: 'list', status: 'live',
+      inputSchema: { fields: [
+        { key: 'id', label: 'Order ID', type: 'text', required: true, supportsVariables: true, placeholder: '10231' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'id',         label: 'Order ID',   type: 'number', sample: 10231 },
+        { key: 'status',     label: 'Status',     type: 'string', sample: 'processing' },
+        { key: 'total',      label: 'Total',      type: 'string', sample: '2998.00' },
+        { key: 'line_items', label: 'Line items', type: 'array',  sample: [{ name: 'Cotton kurta — M', quantity: 2 }] },
+      ] },
+    },
+    { key: 'list_customers', label: 'Customers', description: 'Store customers — search by name / email.', iconName: 'Users', apiPath: '/api/connectors/woocommerce/customers', apiMethod: 'GET', uiKind: 'list', status: 'live',
+      outputSchema: { fields: [
+        { key: 'id',          label: 'Customer ID', type: 'number', sample: 88 },
+        { key: 'email',       label: 'Email',       type: 'string', sample: 'asha@example.com' },
+        { key: 'first_name',  label: 'First name',  type: 'string', sample: 'Asha' },
+        { key: 'billing',     label: 'Billing',     type: 'object', sample: { phone: '+919876543210', city: 'Pune' } },
+      ] },
+    },
+    { key: 'create_order', label: 'Create order', description: 'Create a new store order from line items (e.g. from a WhatsApp chat).', iconName: 'PlusSquare', apiPath: '/api/connectors/woocommerce/orders', apiMethod: 'POST', workflowNodeType: 'woocommerce_create_order', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'line_items', label: 'Line items (JSON)', type: 'textarea', required: true, supportsVariables: true,
+          description: 'JSON array of { product_id, quantity } — e.g. [{"product_id":412,"quantity":2}]', placeholder: '[{"product_id":412,"quantity":2}]' },
+        { key: 'status',     label: 'Status',       type: 'text', placeholder: 'pending',
+          description: 'WooCommerce order status — defaults to pending.' },
+        { key: 'customer_note', label: 'Customer note', type: 'textarea', supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'id',            label: 'Order ID',    type: 'number', sample: 10232 },
+        { key: 'status',        label: 'Status',      type: 'string', sample: 'pending' },
+        { key: 'total',         label: 'Total',       type: 'string', sample: '2998.00' },
+        { key: 'order_key',     label: 'Order key',   type: 'string', sample: 'wc_order_abc123' },
+      ] },
+    },
+  ],
 }
 const ZOHO: ConnectorDef = {
   key: 'zoho_crm', name: 'Zoho CRM', category: 'crm', tier: 1, status: 'planned',
@@ -1780,12 +1839,613 @@ const ZOHO: ConnectorDef = {
   capabilities: [],
 }
 
+// Brevo — paste-key (single xkeysib- API key, no provider app registration).
+// Shippable today for any tenant. Email + SMS marketing rail.
+const BREVO: ConnectorDef = {
+  key: 'brevo', name: 'Brevo', category: 'email_marketing', tier: 2, status: 'live',
+  authMode: 'api_key', brandColor: '#0B996E', iconName: 'Mail',
+  shortDescription: 'Email + SMS marketing (formerly Sendinblue). Paste one API key.',
+  docsUrl: 'https://developers.brevo.com/',
+  consoleUrl: 'https://app.brevo.com/settings/keys/api',
+  setupNote: 'In Brevo: Settings → SMTP & API → API Keys → Generate a new API key (starts with xkeysib-). Paste it here.',
+  capabilities: [
+    { key: 'list_contacts', label: 'Contacts', description: 'Contacts in your Brevo account.', iconName: 'Users', apiPath: '/api/connectors/brevo/contacts', apiMethod: 'GET', uiKind: 'list', status: 'live',
+      outputSchema: { fields: [
+        { key: 'id',         label: 'Contact ID', type: 'number', sample: 42 },
+        { key: 'email',      label: 'Email',      type: 'string', sample: 'asha@example.com' },
+        { key: 'attributes', label: 'Attributes', type: 'object', sample: { FIRSTNAME: 'Asha', SMS: '+919876543210' } },
+      ] },
+    },
+    { key: 'create_contact', label: 'Add contact', description: 'Create or update a contact (optionally add to lists).', iconName: 'UserPlus', apiPath: '/api/connectors/brevo/contacts', apiMethod: 'POST', workflowNodeType: 'brevo_create_contact', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'email',         label: 'Email',         type: 'text',     required: true, supportsVariables: true, placeholder: 'asha@example.com' },
+        { key: 'attributes',    label: 'Attributes (JSON)', type: 'textarea', supportsVariables: true, description: 'e.g. {"FIRSTNAME":"Asha","SMS":"+919876543210"}', placeholder: '{"FIRSTNAME":"Asha"}' },
+        { key: 'listIds',       label: 'List IDs (JSON array)', type: 'text', description: 'e.g. [3]', placeholder: '[3]' },
+        { key: 'updateEnabled', label: 'Update if exists', type: 'boolean', description: 'Update the contact when the email already exists.' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'id', label: 'Contact ID', type: 'number', sample: 42 },
+      ] },
+    },
+    { key: 'send_email', label: 'Send email', description: 'Send a transactional email (HTML or template).', iconName: 'Send', apiPath: '/api/connectors/brevo/email', apiMethod: 'POST', workflowNodeType: 'brevo_send_email', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'to',          label: 'Recipients (JSON)', type: 'textarea', required: true, supportsVariables: true, description: 'JSON array of { email, name } — e.g. [{"email":"asha@example.com"}]', placeholder: '[{"email":"asha@example.com"}]' },
+        { key: 'subject',     label: 'Subject',     type: 'text',     required: true, supportsVariables: true },
+        { key: 'htmlContent', label: 'HTML body',   type: 'textarea', supportsVariables: true, description: 'HTML content (or use a templateId instead).' },
+        { key: 'sender',      label: 'Sender (JSON)', type: 'text',   supportsVariables: true, description: 'e.g. {"email":"hello@yourbrand.com","name":"Your Brand"}' },
+        { key: 'templateId',  label: 'Template ID', type: 'text',     description: 'Use a Brevo template instead of inline HTML.' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'messageId', label: 'Message ID', type: 'string', sample: '<202605.123@smtp-relay.brevo.com>' },
+      ] },
+    },
+    { key: 'send_sms', label: 'Send SMS', description: 'Send a transactional SMS.', iconName: 'MessageSquare', apiPath: '/api/connectors/brevo/sms', apiMethod: 'POST', workflowNodeType: 'brevo_send_sms', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'recipient', label: 'Recipient phone', type: 'text', required: true, supportsVariables: true, placeholder: '+919876543210' },
+        { key: 'content',   label: 'Message',         type: 'textarea', required: true, supportsVariables: true },
+        { key: 'sender',    label: 'Sender (max 11 chars)', type: 'text', placeholder: 'Brevo' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'reference',     label: 'Reference',    type: 'string', sample: 'sms-abc123' },
+        { key: 'messageId',     label: 'Message ID',   type: 'number', sample: 1633695587 },
+        { key: 'remainingCredits', label: 'Credits left', type: 'number', sample: 92 },
+      ] },
+    },
+  ],
+}
+
+// MSG91 — paste-key (single Auth Key, no provider app registration).
+// India-first transactional SMS + OTP rail. Shippable today.
+const MSG91: ConnectorDef = {
+  key: 'msg91', name: 'MSG91', category: 'communication', tier: 1, status: 'live',
+  authMode: 'api_key', brandColor: '#1E88E5', iconName: 'MessageSquare',
+  shortDescription: 'India SMS + OTP (TRAI/DLT). Paste one Auth Key.',
+  docsUrl: 'https://docs.msg91.com/',
+  consoleUrl: 'https://control.msg91.com/user/index.php#api',
+  setupNote: 'In MSG91: top-right menu → Auth Key (or Settings → API). Paste the key. India SMS needs a DLT-approved template_id per message.',
+  capabilities: [
+    { key: 'send_sms', label: 'Send SMS', description: 'Send a DLT-template SMS to one or more recipients.', iconName: 'MessageSquare', apiPath: '/api/connectors/msg91/sms', apiMethod: 'POST', workflowNodeType: 'msg91_send_sms', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'template_id', label: 'DLT Template ID', type: 'text', required: true, supportsVariables: true, placeholder: '1707xxxxxxxxxxxxx' },
+        { key: 'recipients',  label: 'Recipients (JSON)', type: 'textarea', required: true, supportsVariables: true,
+          description: 'JSON array — each { mobiles, ...template vars }. e.g. [{"mobiles":"919876543210","name":"Asha"}]', placeholder: '[{"mobiles":"919876543210"}]' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'type',    label: 'Status',     type: 'string', sample: 'success' },
+        { key: 'message', label: 'Request ID', type: 'string', sample: '3637...' },
+      ] },
+    },
+    { key: 'send_otp', label: 'Send OTP', description: 'Generate and send an OTP to a mobile number.', iconName: 'KeyRound', apiPath: '/api/connectors/msg91/otp', apiMethod: 'POST', workflowNodeType: 'msg91_send_otp', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'template_id', label: 'OTP Template ID', type: 'text', required: true, supportsVariables: true },
+        { key: 'mobile',      label: 'Mobile (with country code)', type: 'text', required: true, supportsVariables: true, placeholder: '919876543210' },
+        { key: 'otp',         label: 'OTP (optional — auto-generated if blank)', type: 'text', supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'type',    label: 'Status',     type: 'string', sample: 'success' },
+        { key: 'request_id', label: 'Request ID', type: 'string', sample: '3637...' },
+      ] },
+    },
+    { key: 'verify_otp', label: 'Verify OTP', description: 'Verify an OTP a user submitted.', iconName: 'ShieldCheck', apiPath: '/api/connectors/msg91/otp/verify', apiMethod: 'POST', workflowNodeType: 'msg91_verify_otp', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'mobile', label: 'Mobile (with country code)', type: 'text', required: true, supportsVariables: true, placeholder: '919876543210' },
+        { key: 'otp',    label: 'OTP entered by user', type: 'text', required: true, supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'type',    label: 'Result',  type: 'string', sample: 'success' },
+        { key: 'message', label: 'Message', type: 'string', sample: 'OTP verified success' },
+      ] },
+    },
+  ],
+}
+
+// Shiprocket — API-user login (email/password → JWT, no provider app reg).
+// India D2C shipping aggregator. Shippable today.
+const SHIPROCKET: ConnectorDef = {
+  key: 'shiprocket', name: 'Shiprocket', category: 'logistics', tier: 1, status: 'live',
+  authMode: 'api_key', brandColor: '#7B2FF7', iconName: 'Truck',
+  shortDescription: 'India shipping aggregator — orders, labels, tracking, serviceability.',
+  docsUrl: 'https://apidocs.shiprocket.in/',
+  consoleUrl: 'https://app.shiprocket.in/api-user',
+  setupNote: 'In Shiprocket: Settings → API → Configure → Create an API User. Paste THAT user\'s email + password (not your dashboard login).',
+  capabilities: [
+    { key: 'list_orders', label: 'Orders', description: 'Recent Shiprocket orders with status + AWB.', iconName: 'Package', apiPath: '/api/connectors/shiprocket/orders', apiMethod: 'GET', uiKind: 'list', status: 'live',
+      outputSchema: { fields: [
+        { key: 'id',       label: 'Order ID',   type: 'number', sample: 564738 },
+        { key: 'channel_order_id', label: 'Your order #', type: 'string', sample: '10231' },
+        { key: 'status',   label: 'Status',     type: 'string', sample: 'NEW' },
+        { key: 'awb_code', label: 'AWB',        type: 'string', sample: '1234567890' },
+        { key: 'courier_name', label: 'Courier', type: 'string', sample: 'Delhivery Surface' },
+      ] },
+    },
+    { key: 'create_order', label: 'Create shipment order', description: 'Create a custom (adhoc) order for fulfilment.', iconName: 'PlusSquare', apiPath: '/api/connectors/shiprocket/orders', apiMethod: 'POST', workflowNodeType: 'shiprocket_create_order', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'order_id',       label: 'Your order ID', type: 'text', required: true, supportsVariables: true, placeholder: '10231' },
+        { key: 'order_items',    label: 'Order items (JSON)', type: 'textarea', required: true, supportsVariables: true,
+          description: 'JSON array — each { name, sku, units, selling_price }. e.g. [{"name":"Cotton kurta","sku":"K-M","units":2,"selling_price":1499}]', placeholder: '[{"name":"Item","sku":"SKU1","units":1,"selling_price":499}]' },
+        { key: 'payment_method', label: 'Payment method', type: 'text', required: true, supportsVariables: true, placeholder: 'Prepaid', description: '"Prepaid" or "COD".' },
+        { key: 'billing_customer_name', label: 'Customer name', type: 'text', supportsVariables: true },
+        { key: 'billing_address', label: 'Address',  type: 'textarea', supportsVariables: true },
+        { key: 'billing_city',    label: 'City',      type: 'text', supportsVariables: true },
+        { key: 'billing_pincode', label: 'Pincode',   type: 'text', supportsVariables: true },
+        { key: 'billing_state',   label: 'State',     type: 'text', supportsVariables: true },
+        { key: 'billing_phone',   label: 'Phone',     type: 'text', supportsVariables: true },
+        { key: 'sub_total',       label: 'Sub total', type: 'text', supportsVariables: true },
+        { key: 'weight',          label: 'Weight (kg)', type: 'text', supportsVariables: true },
+        { key: 'length',          label: 'Length (cm)', type: 'text', supportsVariables: true },
+        { key: 'breadth',         label: 'Breadth (cm)', type: 'text', supportsVariables: true },
+        { key: 'height',          label: 'Height (cm)', type: 'text', supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'order_id',    label: 'Shiprocket order ID', type: 'number', sample: 564738 },
+        { key: 'shipment_id', label: 'Shipment ID', type: 'number', sample: 561290 },
+        { key: 'status',      label: 'Status',      type: 'string', sample: 'NEW' },
+      ] },
+    },
+    { key: 'track_awb', label: 'Track shipment', description: 'Live tracking for an AWB number.', iconName: 'MapPin', apiPath: '/api/connectors/shiprocket/track/:awb', apiMethod: 'GET', workflowNodeType: 'shiprocket_track_awb', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'awb', label: 'AWB number', type: 'text', required: true, supportsVariables: true, placeholder: '1234567890' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'tracking_data', label: 'Tracking data', type: 'object', sample: { shipment_status: 7, shipment_track: [{ current_status: 'Delivered' }] } },
+      ] },
+    },
+    { key: 'check_serviceability', label: 'Check serviceability', description: 'Which couriers serve a pickup→delivery pincode pair, with rates + ETA.', iconName: 'Search', apiPath: '/api/connectors/shiprocket/serviceability', apiMethod: 'GET', workflowNodeType: 'shiprocket_check_serviceability', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'pickup_postcode',   label: 'Pickup pincode',   type: 'text', required: true, supportsVariables: true, placeholder: '560001' },
+        { key: 'delivery_postcode', label: 'Delivery pincode', type: 'text', required: true, supportsVariables: true, placeholder: '110001' },
+        { key: 'weight',            label: 'Weight (kg)',      type: 'text', required: true, supportsVariables: true, placeholder: '0.5' },
+        { key: 'cod',               label: 'COD?',             type: 'text', supportsVariables: true, placeholder: '0', description: '1 for COD, 0 for prepaid.' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'data', label: 'Couriers', type: 'object', sample: { available_courier_companies: [{ courier_name: 'Delhivery Surface', rate: 62, estimated_delivery_days: '3' }] } },
+      ] },
+    },
+  ],
+}
+
+// Cashfree — App ID + Secret Key (sandbox/production). Second India payment
+// rail after Razorpay. Pure paste-key, shippable today.
+const CASHFREE: ConnectorDef = {
+  key: 'cashfree', name: 'Cashfree', category: 'payments', tier: 1, status: 'live',
+  authMode: 'api_key', brandColor: '#1A1A6E', iconName: 'CreditCard',
+  shortDescription: 'India payments — orders, payment links, refunds. Paste App ID + Secret.',
+  docsUrl: 'https://docs.cashfree.com/',
+  consoleUrl: 'https://merchant.cashfree.com/merchants/developers',
+  setupNote: 'In Cashfree: Developers → API Keys. Copy your App ID + Secret Key and pick the matching environment (sandbox keys work for testing).',
+  capabilities: [
+    { key: 'create_order', label: 'Create payment order', description: 'Start a payment — returns a payment_session_id to drive checkout.', iconName: 'CreditCard', apiPath: '/api/connectors/cashfree/orders', apiMethod: 'POST', workflowNodeType: 'cashfree_create_order', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'order_amount',   label: 'Amount (INR)', type: 'text', required: true, supportsVariables: true, placeholder: '499' },
+        { key: 'order_currency', label: 'Currency', type: 'text', supportsVariables: true, placeholder: 'INR' },
+        { key: 'customer_details', label: 'Customer (JSON)', type: 'textarea', required: true, supportsVariables: true,
+          description: 'JSON — { customer_id, customer_phone, customer_email, customer_name }. e.g. {"customer_id":"c1","customer_phone":"9876543210"}', placeholder: '{"customer_id":"c1","customer_phone":"9876543210"}' },
+        { key: 'order_id',   label: 'Order ID (optional)', type: 'text', supportsVariables: true },
+        { key: 'order_note', label: 'Note (optional)', type: 'text', supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'order_id',           label: 'Order ID',          type: 'string', sample: 'order_8u1Hk...' },
+        { key: 'payment_session_id', label: 'Payment session ID', type: 'string', sample: 'session_abc...' },
+        { key: 'order_status',       label: 'Status',            type: 'string', sample: 'ACTIVE' },
+      ] },
+    },
+    { key: 'create_payment_link', label: 'Create payment link', description: 'Generate a shareable payment link (great for WhatsApp/SMS collection).', iconName: 'Link', apiPath: '/api/connectors/cashfree/links', apiMethod: 'POST', workflowNodeType: 'cashfree_create_payment_link', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'link_amount',  label: 'Amount (INR)', type: 'text', required: true, supportsVariables: true, placeholder: '499' },
+        { key: 'link_purpose', label: 'Purpose', type: 'text', required: true, supportsVariables: true, placeholder: 'Order #10231' },
+        { key: 'customer_details', label: 'Customer (JSON)', type: 'textarea', required: true, supportsVariables: true,
+          description: 'JSON — must include customer_phone. e.g. {"customer_phone":"9876543210","customer_name":"Asha"}', placeholder: '{"customer_phone":"9876543210"}' },
+        { key: 'link_id',       label: 'Link ID (optional)', type: 'text', supportsVariables: true },
+        { key: 'link_currency', label: 'Currency', type: 'text', supportsVariables: true, placeholder: 'INR' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'link_id',     label: 'Link ID',  type: 'string', sample: 'lnk_10231' },
+        { key: 'link_url',    label: 'Pay URL',  type: 'string', sample: 'https://payments.cashfree.com/links/...' },
+        { key: 'link_status', label: 'Status',   type: 'string', sample: 'ACTIVE' },
+      ] },
+    },
+    { key: 'get_order', label: 'Get order', description: 'Fetch an order + its payment status by ID.', iconName: 'Search', apiPath: '/api/connectors/cashfree/orders/:order_id', apiMethod: 'GET', workflowNodeType: 'cashfree_get_order', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'order_id', label: 'Order ID', type: 'text', required: true, supportsVariables: true, placeholder: 'order_8u1Hk...' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'order_id',     label: 'Order ID', type: 'string', sample: 'order_8u1Hk...' },
+        { key: 'order_status', label: 'Status',   type: 'string', sample: 'PAID' },
+        { key: 'order_amount', label: 'Amount',   type: 'number', sample: 499 },
+      ] },
+    },
+    { key: 'create_refund', label: 'Refund a payment', description: 'Issue a (full or partial) refund against a paid order.', iconName: 'RotateCcw', apiPath: '/api/connectors/cashfree/orders/:order_id/refunds', apiMethod: 'POST', workflowNodeType: 'cashfree_create_refund', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'order_id',      label: 'Order ID', type: 'text', required: true, supportsVariables: true, placeholder: 'order_8u1Hk...' },
+        { key: 'refund_amount', label: 'Refund amount (INR)', type: 'text', required: true, supportsVariables: true, placeholder: '499' },
+        { key: 'refund_id',     label: 'Refund ID (your unique id)', type: 'text', required: true, supportsVariables: true, placeholder: 'rfnd_10231' },
+        { key: 'refund_note',   label: 'Note (optional)', type: 'text', supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'refund_id',     label: 'Refund ID',  type: 'string', sample: 'rfnd_10231' },
+        { key: 'refund_status', label: 'Status',     type: 'string', sample: 'PENDING' },
+        { key: 'cf_refund_id',  label: 'CF Refund ID', type: 'number', sample: 1234567 },
+      ] },
+    },
+  ],
+}
+
+// Gupshup — API key + app name (India WhatsApp/SMS BSP). Pure paste-key.
+const GUPSHUP: ConnectorDef = {
+  key: 'gupshup', name: 'Gupshup', category: 'communication', tier: 2, status: 'live',
+  authMode: 'api_key', brandColor: '#FA4D17', iconName: 'MessageCircle',
+  shortDescription: 'India WhatsApp BSP — session messages, templates, opt-ins.',
+  docsUrl: 'https://docs.gupshup.io/',
+  consoleUrl: 'https://www.gupshup.io/whatsapp/dashboard',
+  setupNote: 'In your Gupshup app dashboard: copy the API key, app name, and registered WhatsApp number. Template messages are required after the 24h session window (Meta rule).',
+  capabilities: [
+    { key: 'send_message', label: 'Send WhatsApp message', description: 'Free-form session text (only valid within a 24h customer window).', iconName: 'MessageCircle', apiPath: '/api/connectors/gupshup/message', apiMethod: 'POST', workflowNodeType: 'gupshup_send_message', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'destination', label: 'To (with country code)', type: 'text', required: true, supportsVariables: true, placeholder: '919876543210' },
+        { key: 'text',        label: 'Message', type: 'textarea', required: true, supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'status',     label: 'Status', type: 'string', sample: 'submitted' },
+        { key: 'messageId',  label: 'Message ID', type: 'string', sample: 'a1b2c3...' },
+      ] },
+    },
+    { key: 'send_template', label: 'Send WhatsApp template', description: 'Send an approved HSM/template (required outside the 24h window).', iconName: 'FileText', apiPath: '/api/connectors/gupshup/template', apiMethod: 'POST', workflowNodeType: 'gupshup_send_template', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'destination', label: 'To (with country code)', type: 'text', required: true, supportsVariables: true, placeholder: '919876543210' },
+        { key: 'template_id', label: 'Template ID', type: 'text', required: true, supportsVariables: true },
+        { key: 'params',      label: 'Template params (JSON array)', type: 'textarea', supportsVariables: true,
+          description: 'JSON array of values that fill the template placeholders, in order. e.g. ["Asha","10231"]', placeholder: '["Asha","10231"]' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'status',     label: 'Status', type: 'string', sample: 'submitted' },
+        { key: 'messageId',  label: 'Message ID', type: 'string', sample: 'a1b2c3...' },
+      ] },
+    },
+    { key: 'opt_in_user', label: 'Opt-in a user', description: 'Register a number as opted-in so you can message it.', iconName: 'UserPlus', apiPath: '/api/connectors/gupshup/opt-in', apiMethod: 'POST', workflowNodeType: 'gupshup_opt_in_user', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'user', label: 'User (with country code)', type: 'text', required: true, supportsVariables: true, placeholder: '919876543210' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'status', label: 'Status', type: 'string', sample: 'success' },
+      ] },
+    },
+  ],
+}
+
+// Exotel — API key + token + account SID (India cloud telephony). Paste-key.
+const EXOTEL: ConnectorDef = {
+  key: 'exotel', name: 'Exotel', category: 'communication', tier: 2, status: 'live',
+  authMode: 'api_key', brandColor: '#5A3FFF', iconName: 'Phone',
+  shortDescription: 'India cloud telephony — connect calls, send SMS, fetch call details.',
+  docsUrl: 'https://developer.exotel.com/',
+  consoleUrl: 'https://my.exotel.com/apisettings/site#api-credentials',
+  setupNote: 'In Exotel: Settings → API Settings. Paste API Key, API Token, and Account SID. Indian accounts use the Mumbai region.',
+  capabilities: [
+    { key: 'make_call', label: 'Connect a call', description: 'Bridge an agent and a customer over your ExoPhone.', iconName: 'PhoneCall', apiPath: '/api/connectors/exotel/call', apiMethod: 'POST', workflowNodeType: 'exotel_make_call', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'from',      label: 'From (agent number)', type: 'text', required: true, supportsVariables: true, placeholder: '+9180XXXXXXXX' },
+        { key: 'to',        label: 'To (customer number)', type: 'text', required: true, supportsVariables: true, placeholder: '+9198XXXXXXXX' },
+        { key: 'caller_id', label: 'Caller ID (ExoPhone)', type: 'text', required: true, supportsVariables: true, placeholder: '08047XXXXXX' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'Call', label: 'Call', type: 'object', sample: { Sid: 'abc123', Status: 'in-progress' } },
+      ] },
+    },
+    { key: 'send_sms', label: 'Send SMS', description: 'Send a transactional SMS via your Exotel sender.', iconName: 'MessageSquare', apiPath: '/api/connectors/exotel/sms', apiMethod: 'POST', workflowNodeType: 'exotel_send_sms', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'to',   label: 'To (E.164)', type: 'text', required: true, supportsVariables: true, placeholder: '+9198XXXXXXXX' },
+        { key: 'body', label: 'Message', type: 'textarea', required: true, supportsVariables: true },
+        { key: 'from', label: 'From / sender ID (optional)', type: 'text', supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'SMSMessage', label: 'SMS', type: 'object', sample: { Sid: 'sms123', Status: 'queued' } },
+      ] },
+    },
+    { key: 'get_call_details', label: 'Get call details', description: 'Status + duration + recording for a call SID.', iconName: 'Info', apiPath: '/api/connectors/exotel/call/:call_sid', apiMethod: 'GET', workflowNodeType: 'exotel_get_call_details', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'call_sid', label: 'Call SID', type: 'text', required: true, supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'Call', label: 'Call', type: 'object', sample: { Sid: 'abc123', Status: 'completed', Duration: 47 } },
+      ] },
+    },
+  ],
+}
+
+// PayU — merchant key + salt (India payment gateway). Hash-based, paste-key.
+const PAYU: ConnectorDef = {
+  key: 'payu', name: 'PayU', category: 'payments', tier: 2, status: 'live',
+  authMode: 'api_key', brandColor: '#5AC53A', iconName: 'CreditCard',
+  shortDescription: 'India payment gateway — checkout hash, verify, refund.',
+  docsUrl: 'https://docs.payu.in/',
+  consoleUrl: 'https://onboarding.payu.in/app/account',
+  setupNote: 'In PayU: copy your Merchant Key + Salt and pick the matching environment. Test keys are self-serve from the dashboard.',
+  capabilities: [
+    { key: 'generate_payment_hash', label: 'Generate checkout request', description: 'Build a signed PayU payment request (hash + fields + checkout URL) to launch a payment.', iconName: 'CreditCard', apiPath: '/api/connectors/payu/payment-hash', apiMethod: 'POST', workflowNodeType: 'payu_generate_payment_hash', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'txnid',       label: 'Transaction ID', type: 'text', required: true, supportsVariables: true, placeholder: 'TXN10231' },
+        { key: 'amount',      label: 'Amount (INR)', type: 'text', required: true, supportsVariables: true, placeholder: '499.00' },
+        { key: 'productinfo', label: 'Product info', type: 'text', required: true, supportsVariables: true, placeholder: 'Order #10231' },
+        { key: 'firstname',   label: 'Customer first name', type: 'text', required: true, supportsVariables: true },
+        { key: 'email',       label: 'Customer email', type: 'text', required: true, supportsVariables: true },
+        { key: 'phone',       label: 'Customer phone', type: 'text', supportsVariables: true },
+        { key: 'surl',        label: 'Success URL', type: 'text', supportsVariables: true },
+        { key: 'furl',        label: 'Failure URL', type: 'text', supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'hash',   label: 'Request hash', type: 'string', sample: 'e4d909c290d0...' },
+        { key: 'action', label: 'Checkout URL', type: 'string', sample: 'https://secure.payu.in/_payment' },
+        { key: 'fields', label: 'Form fields', type: 'object', sample: { key: 'JPM7Fg', txnid: 'TXN10231', amount: '499.00' } },
+      ] },
+    },
+    { key: 'verify_payment', label: 'Verify payment', description: 'Look up the live status of a transaction by your txnid.', iconName: 'Search', apiPath: '/api/connectors/payu/verify', apiMethod: 'POST', workflowNodeType: 'payu_verify_payment', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'txnid', label: 'Transaction ID', type: 'text', required: true, supportsVariables: true, placeholder: 'TXN10231' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'status', label: 'API status', type: 'number', sample: 1 },
+        { key: 'transaction_details', label: 'Transaction details', type: 'object', sample: { TXN10231: { status: 'success', amt: '499.00' } } },
+      ] },
+    },
+    { key: 'refund_payment', label: 'Refund a payment', description: 'Initiate a refund against a captured PayU payment.', iconName: 'RotateCcw', apiPath: '/api/connectors/payu/refund', apiMethod: 'POST', workflowNodeType: 'payu_refund_payment', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'mihpayid',      label: 'PayU payment ID (mihpayid)', type: 'text', required: true, supportsVariables: true },
+        { key: 'refund_amount', label: 'Refund amount (INR)', type: 'text', required: true, supportsVariables: true, placeholder: '499.00' },
+        { key: 'token',         label: 'Refund reference (unique)', type: 'text', required: true, supportsVariables: true, placeholder: 'RFND10231' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'status',     label: 'API status', type: 'number', sample: 1 },
+        { key: 'request_id', label: 'Refund request ID', type: 'string', sample: '5638...' },
+      ] },
+    },
+  ],
+}
+
+// LeadSquared — Access Key + Secret Key + region host (India CRM). Paste-key.
+const LEADSQUARED: ConnectorDef = {
+  key: 'leadsquared', name: 'LeadSquared', category: 'crm', tier: 2, status: 'live',
+  authMode: 'api_key', brandColor: '#2C7BE5', iconName: 'Briefcase',
+  shortDescription: 'India sales+marketing CRM — capture leads, look up, log activities.',
+  docsUrl: 'https://apidocs.leadsquared.com/',
+  consoleUrl: 'https://help.leadsquared.com/how-do-i-obtain-api-access-keys-in-leadsquared/',
+  setupNote: 'In LeadSquared: My Profile → Settings → API and Webhooks → API Access Keys. Paste the Host URL, Access Key, and Secret Key (host is region-specific, e.g. api-in21.leadsquared.com).',
+  capabilities: [
+    { key: 'create_or_update_lead', label: 'Create / update lead', description: 'Capture or upsert a lead (dedupes on email by default).', iconName: 'UserPlus', apiPath: '/api/connectors/leadsquared/lead', apiMethod: 'POST', workflowNodeType: 'leadsquared_create_or_update_lead', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'email',      label: 'Email', type: 'text', supportsVariables: true, placeholder: 'asha@example.com' },
+        { key: 'first_name', label: 'First name', type: 'text', supportsVariables: true },
+        { key: 'last_name',  label: 'Last name', type: 'text', supportsVariables: true },
+        { key: 'phone',      label: 'Phone', type: 'text', supportsVariables: true },
+        { key: 'company',    label: 'Company', type: 'text', supportsVariables: true },
+        { key: 'source',     label: 'Source', type: 'text', supportsVariables: true },
+        { key: 'attributes', label: 'Extra attributes (JSON)', type: 'textarea', supportsVariables: true,
+          description: 'JSON array of { Attribute, Value } using LeadSquared schema names. e.g. [{"Attribute":"mx_City","Value":"Pune"}]', placeholder: '[{"Attribute":"mx_City","Value":"Pune"}]' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'Status',  label: 'Status', type: 'string', sample: 'Success' },
+        { key: 'Message', label: 'Result', type: 'object', sample: { RelatedId: 'a1b2c3-...' } },
+      ] },
+    },
+    { key: 'get_lead_by_email', label: 'Get lead by email', description: 'Look up a lead (and its ProspectId) by email address.', iconName: 'Search', apiPath: '/api/connectors/leadsquared/lead', apiMethod: 'GET', workflowNodeType: 'leadsquared_get_lead_by_email', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'email', label: 'Email', type: 'text', required: true, supportsVariables: true, placeholder: 'asha@example.com' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'leads', label: 'Matching leads', type: 'array', sample: [{ ProspectID: 'a1b2c3-...', FirstName: 'Asha' }] },
+      ] },
+    },
+    { key: 'post_activity', label: 'Log activity', description: 'Post a custom activity against a lead (call, note, event).', iconName: 'Activity', apiPath: '/api/connectors/leadsquared/activity', apiMethod: 'POST', workflowNodeType: 'leadsquared_post_activity', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'related_prospect_id', label: 'Lead ProspectId', type: 'text', required: true, supportsVariables: true },
+        { key: 'activity_event',      label: 'Activity Event code', type: 'text', required: true, supportsVariables: true, placeholder: '201' },
+        { key: 'activity_note',       label: 'Note', type: 'textarea', supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'Status',  label: 'Status', type: 'string', sample: 'Success' },
+        { key: 'Message', label: 'Result', type: 'object', sample: { Id: 'act-123' } },
+      ] },
+    },
+  ],
+}
+
+const KYLAS: ConnectorDef = {
+  key: 'kylas', name: 'Kylas', category: 'crm', tier: 2, status: 'live',
+  authMode: 'api_key', brandColor: '#0B5FFF', iconName: 'Briefcase',
+  shortDescription: 'India SMB sales CRM — create leads, contacts, deals & search.',
+  docsUrl: 'https://api.kylas.io/docs',
+  consoleUrl: 'https://support.kylas.io/portal/en/kb/articles/how-to-use-api-key-in-to-access-kylas-apis',
+  setupNote: 'In Kylas: Settings → Integrations → API Key (needs an Explore or Elevate plan). Paste the API key — it is verified read-only before saving.',
+  capabilities: [
+    { key: 'create_lead', label: 'Create lead', description: 'Create a new lead in Kylas.', iconName: 'UserPlus', apiPath: '/api/connectors/kylas/lead', apiMethod: 'POST', workflowNodeType: 'kylas_create_lead', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'first_name',   label: 'First name', type: 'text', required: true, supportsVariables: true },
+        { key: 'last_name',    label: 'Last name', type: 'text', supportsVariables: true },
+        { key: 'email',        label: 'Email', type: 'text', supportsVariables: true, placeholder: 'asha@example.com' },
+        { key: 'phone',        label: 'Phone', type: 'text', supportsVariables: true, placeholder: '9999999999' },
+        { key: 'dial_code',    label: 'Dial code', type: 'text', supportsVariables: true, placeholder: '+91' },
+        { key: 'company_name', label: 'Company', type: 'text', supportsVariables: true },
+        { key: 'fields',       label: 'Extra fields (JSON)', type: 'textarea', supportsVariables: true,
+          description: 'JSON object merged onto the Kylas lead payload, e.g. {"source":{"id":1}}', placeholder: '{"city":"Pune"}' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'id', label: 'Lead ID', type: 'number', sample: 123456 },
+        { key: 'firstName', label: 'First name', type: 'string', sample: 'Asha' },
+      ] },
+    },
+    { key: 'create_contact', label: 'Create contact', description: 'Create a new contact in Kylas.', iconName: 'UserPlus', apiPath: '/api/connectors/kylas/contact', apiMethod: 'POST', workflowNodeType: 'kylas_create_contact', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'first_name',   label: 'First name', type: 'text', required: true, supportsVariables: true },
+        { key: 'last_name',    label: 'Last name', type: 'text', supportsVariables: true },
+        { key: 'email',        label: 'Email', type: 'text', supportsVariables: true, placeholder: 'asha@example.com' },
+        { key: 'phone',        label: 'Phone', type: 'text', supportsVariables: true, placeholder: '9999999999' },
+        { key: 'dial_code',    label: 'Dial code', type: 'text', supportsVariables: true, placeholder: '+91' },
+        { key: 'company_name', label: 'Company', type: 'text', supportsVariables: true },
+        { key: 'fields',       label: 'Extra fields (JSON)', type: 'textarea', supportsVariables: true, placeholder: '{"city":"Pune"}' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'id', label: 'Contact ID', type: 'number', sample: 123456 },
+        { key: 'firstName', label: 'First name', type: 'string', sample: 'Asha' },
+      ] },
+    },
+    { key: 'create_deal', label: 'Create deal', description: 'Create a new deal/opportunity in Kylas.', iconName: 'DollarSign', apiPath: '/api/connectors/kylas/deal', apiMethod: 'POST', workflowNodeType: 'kylas_create_deal', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'name',   label: 'Deal name', type: 'text', required: true, supportsVariables: true },
+        { key: 'fields', label: 'Deal fields (JSON)', type: 'textarea', supportsVariables: true,
+          description: 'JSON merged onto the deal, e.g. {"estimatedValue":{"currencyId":1,"value":50000},"pipeline":{"id":1}}', placeholder: '{"estimatedValue":{"value":50000}}' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'id', label: 'Deal ID', type: 'number', sample: 123456 },
+        { key: 'name', label: 'Deal name', type: 'string', sample: 'Website project' },
+      ] },
+    },
+    { key: 'search_leads', label: 'Search leads', description: 'Search leads by email/phone (or a raw Kylas jsonRule).', iconName: 'Search', apiPath: '/api/connectors/kylas/search-leads', apiMethod: 'POST', workflowNodeType: 'kylas_search_leads', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'email', label: 'Email', type: 'text', supportsVariables: true, placeholder: 'asha@example.com' },
+        { key: 'phone', label: 'Phone', type: 'text', supportsVariables: true, placeholder: '9999999999' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'content', label: 'Matching leads', type: 'array', sample: [{ id: 123456, firstName: 'Asha' }] },
+        { key: 'totalElements', label: 'Total matches', type: 'number', sample: 1 },
+      ] },
+    },
+  ],
+}
+
+// ── Lead-generation marketplaces with real self-serve PULL APIs ──────────────
+const INDIAMART: ConnectorDef = {
+  key: 'indiamart', name: 'IndiaMART', category: 'lead_gen', tier: 1, status: 'live',
+  authMode: 'api_key', brandColor: '#221F1F', iconName: 'Store',
+  shortDescription: "India's #1 B2B marketplace — auto-pull your buy-leads & enquiries.",
+  docsUrl: 'https://help.indiamart.com/knowledge-base/lms-crm-integration-v2/',
+  consoleUrl: 'https://seller.indiamart.com/leadmanager/crmapi',
+  setupNote: 'In IndiaMART: Lead Manager → CRM API (seller.indiamart.com/leadmanager/crmapi). Generate & paste the CRM key — it is verified with a read-only lead pull before saving.',
+  capabilities: [
+    { key: 'fetch_leads', label: 'Fetch leads', description: 'Pull recent IndiaMART leads (default last 24h, or a date window).', iconName: 'Download', apiPath: '/api/connectors/indiamart/leads', apiMethod: 'POST', workflowNodeType: 'indiamart_fetch_leads', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'start_time', label: 'Start (DD-Mon-YYYY)', type: 'text', supportsVariables: true, placeholder: '01-May-2026', description: 'Optional. Leave both blank for the last 24 hours.' },
+        { key: 'end_time',   label: 'End (DD-Mon-YYYY)', type: 'text', supportsVariables: true, placeholder: '30-May-2026' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'RESPONSE', label: 'Leads', type: 'array', sample: [{ SENDERNAME: 'Asha', SENDER_MOBILE: '+9199...', SUBJECT: 'Need 100 units' }] },
+        { key: 'TOTAL_RECORDS', label: 'Count', type: 'number', sample: 3 },
+      ] },
+    },
+  ],
+}
+
+const TRADEINDIA: ConnectorDef = {
+  key: 'tradeindia', name: 'TradeIndia', category: 'lead_gen', tier: 2, status: 'live',
+  authMode: 'api_key', brandColor: '#0F4C81', iconName: 'Store',
+  shortDescription: 'India B2B marketplace — auto-pull your inquiries & leads.',
+  docsUrl: 'https://www.tradeindia.com/about-us/user-guide.html',
+  consoleUrl: 'https://www.tradeindia.com/',
+  setupNote: 'In TradeIndia: account menu → Inquiries & Contacts → My Inquiry API. Paste the User ID, Profile ID and Key — verified with a read-only inquiry pull before saving.',
+  capabilities: [
+    { key: 'fetch_leads', label: 'Fetch inquiries', description: 'Pull TradeIndia inquiries for a date window (default last 7 days).', iconName: 'Download', apiPath: '/api/connectors/tradeindia/leads', apiMethod: 'POST', workflowNodeType: 'tradeindia_fetch_leads', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'from_date', label: 'From (YYYY-MM-DD)', type: 'text', supportsVariables: true, placeholder: '2026-05-01', description: 'Optional. Defaults to the last 7 days.' },
+        { key: 'to_date',   label: 'To (YYYY-MM-DD)', type: 'text', supportsVariables: true, placeholder: '2026-05-30' },
+      ] },
+      outputSchema: { fields: [
+        { key: 'inquiries', label: 'Inquiries', type: 'array', sample: [{ sender_name: 'Asha', sender_mobile: '+9199...', message: 'Need a quote' }] },
+      ] },
+    },
+  ],
+}
+
+// ── Inbound lead-webhook portals (leads are PUSHed; we mint a capture URL) ────
+// These have no self-serve pull API — the honest integration is an inbound
+// webhook. Connecting mints a per-tenant URL the user pastes into the portal;
+// leads land in a dedicated Leads table. authMode 'api_key' is reused for the
+// FE flow but the connect handler takes NO key — it returns a URL to copy OUT.
+const LEAD_WEBHOOK_META: Record<string, { color: string; icon: string; desc: string }> = {
+  justdial:         { color: '#00A4E4', icon: 'Magnet',   desc: 'Capture JustDial leads via an inbound webhook.' },
+  magicbricks:      { color: '#D5232E', icon: 'Magnet',   desc: 'Capture MagicBricks property enquiries via webhook.' },
+  '99acres':        { color: '#1F5DA0', icon: 'Magnet',   desc: 'Capture 99acres property enquiries via webhook.' },
+  housing:          { color: '#FC5830', icon: 'Magnet',   desc: 'Capture Housing.com enquiries via webhook.' },
+  quikr:            { color: '#00A94F', icon: 'Magnet',   desc: 'Capture Quikr leads via an inbound webhook.' },
+  sulekha:          { color: '#F58220', icon: 'Magnet',   desc: 'Capture Sulekha leads via an inbound webhook.' },
+  facebook_leadads: { color: '#1877F2', icon: 'Facebook', desc: 'Capture Facebook Lead Ads submissions via webhook.' },
+  // Real-estate property portals — push leads by webhook, no pull API.
+  commonfloor:      { color: '#FF6C2C', icon: 'Building2', desc: 'Capture CommonFloor property enquiries via webhook.' },
+  makaan:           { color: '#ED1C7C', icon: 'Building2', desc: 'Capture Makaan.com property enquiries via webhook.' },
+  propertywala:     { color: '#2E7D32', icon: 'Building2', desc: 'Capture PropertyWala enquiries via webhook.' },
+  indiaproperty:    { color: '#0E76A8', icon: 'Building2', desc: 'Capture IndiaProperty enquiries via webhook.' },
+  roofandfloor:     { color: '#00A99D', icon: 'Building2', desc: 'Capture RoofandFloor enquiries via webhook.' },
+}
+const LEAD_WEBHOOK_CONNECTORS: ConnectorDef[] = (
+  [
+    ['justdial', 'JustDial'], ['magicbricks', 'MagicBricks'], ['99acres', '99acres'],
+    ['housing', 'Housing.com'], ['quikr', 'Quikr'], ['sulekha', 'Sulekha'],
+    ['facebook_leadads', 'Facebook Lead Ads'],
+    ['commonfloor', 'CommonFloor'], ['makaan', 'Makaan'], ['propertywala', 'PropertyWala'],
+    ['indiaproperty', 'IndiaProperty'], ['roofandfloor', 'RoofandFloor'],
+  ] as Array<[string, string]>
+).map(([key, name]) => {
+  const m = LEAD_WEBHOOK_META[key]
+  return {
+    key, name, category: 'lead_gen', tier: 2, status: 'live',
+    authMode: 'api_key', brandColor: m.color, iconName: m.icon,
+    shortDescription: m.desc,
+    docsUrl: 'https://help.getfrequency.app/lead-webhooks',
+    setupNote: `Connect to mint a unique inbound URL, then paste it into ${name}'s lead webhook / push field. New leads land in a dedicated "${name} Leads" table.`,
+    capabilities: [],
+  } as ConnectorDef
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// India-first roadmap — top player per category for the Indian SMB stack.
+// HONESTY POLICY: status:'planned' = not yet wired. requiresPartnerRegistration
+// flags providers that DO NOT expose an open self-serve API — they need a
+// signed BD/partner agreement before any tenant can connect, so we never
+// pretend they're one paste away. The setupNote states the real gate.
+// ─────────────────────────────────────────────────────────────────────────────
+const INDIA_PLANNED: ConnectorDef[] = [
+  // Payments — Razorpay is already LIVE. These are the other top rails.
+  { key: 'phonepe',     name: 'PhonePe',     category: 'payments',      tier: 1, status: 'planned', authMode: 'api_key', brandColor: '#5F259F', iconName: 'CreditCard', shortDescription: 'PhonePe Payment Gateway — UPI-first.', docsUrl: 'https://developer.phonepe.com/', requiresPartnerRegistration: true, setupNote: 'Needs an onboarded PhonePe merchant account (merchantId + saltKey + saltIndex). Sandbox available; production credentials are issued after KYC.', capabilities: [] },
+  CASHFREE,
+  { key: 'paytm',       name: 'Paytm',       category: 'payments',      tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#00BAF2', iconName: 'CreditCard', shortDescription: 'Paytm Payment Gateway.', docsUrl: 'https://business.paytm.com/docs', requiresPartnerRegistration: true, setupNote: 'Needs an onboarded Paytm merchant (MID + key). Production access issued after KYC.', capabilities: [] },
+  PAYU,
+
+  // Communication — WhatsApp + MSG91 already LIVE. Other India comms players.
+  GUPSHUP,
+  EXOTEL,
+
+  // CRM — Zoho CRM already on the roadmap (OAuth). India CRM challengers.
+  LEADSQUARED,
+  KYLAS,
+
+  // Lead generation — Indian B2B marketplaces + classified/real-estate portals.
+  // IndiaMART & TradeIndia expose real self-serve pull APIs (paste a key, we
+  // fetch leads). The rest deliver leads by webhook push, so connecting mints
+  // an inbound capture URL (no fake key form).
+  INDIAMART,
+  TRADEINDIA,
+  ...LEAD_WEBHOOK_CONNECTORS,
+
+  // Logistics / shipping — critical for D2C order fulfilment.
+  SHIPROCKET,
+  { key: 'delhivery',   name: 'Delhivery',   category: 'logistics',     tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#E2231A', iconName: 'Truck', shortDescription: 'Courier — pickup, tracking, waybills.', docsUrl: 'https://www.delhivery.com/', requiresPartnerRegistration: true, setupNote: 'Needs a Delhivery business account; API token is issued by your account manager.', capabilities: [] },
+
+  // Accounting / GST.
+  { key: 'zoho_books',  name: 'Zoho Books',  category: 'accounting',    tier: 2, status: 'planned', authMode: 'oauth',   brandColor: '#089949', iconName: 'Calculator', shortDescription: 'GST-ready accounting (Zoho suite).', docsUrl: 'https://www.zoho.com/books/api/v3/', setupNote: 'OAuth, .in/.com data-center aware (shares Zoho app registration with Zoho CRM).', capabilities: [] },
+  { key: 'tally',       name: 'Tally',       category: 'accounting',    tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#1B6CB3', iconName: 'Calculator', shortDescription: 'Desktop accounting via Tally connector.', docsUrl: 'https://tallysolutions.com/', requiresPartnerRegistration: true, setupNote: 'Tally runs on-prem; needs a local Tally bridge/agent — not a cloud API. Connection requires the on-site setup.', capabilities: [] },
+
+  // Quick commerce — PARTNER-GATED. No open merchant API for general sellers.
+  { key: 'blinkit',     name: 'Blinkit',     category: 'quick_commerce', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#F8CB46', iconName: 'ShoppingBag', shortDescription: 'Quick commerce (brand/seller ops).', docsUrl: 'https://blinkit.com/', requiresPartnerRegistration: true, setupNote: 'No public/self-serve API. Integration requires a Blinkit brand-partner agreement; access is provisioned by Blinkit category teams.', capabilities: [] },
+  { key: 'zepto',       name: 'Zepto',       category: 'quick_commerce', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#6B1EE6', iconName: 'ShoppingBag', shortDescription: 'Quick commerce (brand/seller ops).', docsUrl: 'https://www.zeptonow.com/', requiresPartnerRegistration: true, setupNote: 'No public/self-serve API. Requires a Zepto brand-partner agreement; access is provisioned by Zepto.', capabilities: [] },
+
+  // Food delivery — PARTNER-GATED. Public APIs were retired; restaurant-partner only.
+  { key: 'zomato',      name: 'Zomato',      category: 'food_delivery', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#E23744', iconName: 'Utensils', shortDescription: 'Restaurant partner ops.', docsUrl: 'https://www.zomato.com/', requiresPartnerRegistration: true, setupNote: 'Public API was discontinued. Only Zomato restaurant partners get API access, provisioned through Zomato.', capabilities: [] },
+  { key: 'swiggy',      name: 'Swiggy',      category: 'food_delivery', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#FC8019', iconName: 'Utensils', shortDescription: 'Restaurant partner ops.', docsUrl: 'https://www.swiggy.com/', requiresPartnerRegistration: true, setupNote: 'No public API. Only Swiggy restaurant/Instamart partners get API access, provisioned through Swiggy.', capabilities: [] },
+]
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tier 2 — backlog (visible roadmap only; no setup yet)
 // ─────────────────────────────────────────────────────────────────────────────
 const TIER_2_PLANNED: ConnectorDef[] = [
   { key: 'pipedrive',   name: 'Pipedrive',   category: 'crm',         tier: 2, status: 'planned', authMode: 'oauth',   brandColor: '#1A1A1A', iconName: 'Briefcase', shortDescription: 'Sales-focused CRM, deal stages.',                docsUrl: 'https://developers.pipedrive.com/docs/api/v1', capabilities: [] },
-  { key: 'brevo',       name: 'Brevo',       category: 'email_marketing', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#0B996E', iconName: 'Mail',     shortDescription: 'Email + SMS marketing (formerly Sendinblue).',  docsUrl: 'https://developers.brevo.com/',                  capabilities: [] },
+  BREVO,
   { key: 'twilio',      name: 'Twilio',      category: 'communication', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#F22F46', iconName: 'Phone',     shortDescription: 'SMS / voice fallback — global reach.',          docsUrl: 'https://www.twilio.com/docs',                    capabilities: [] },
   { key: 'cal_com',     name: 'Cal.com',     category: 'calendar',     tier: 2, status: 'planned', authMode: 'oauth',   brandColor: '#111827', iconName: 'Calendar',  shortDescription: 'Open-source Calendly alternative.',             docsUrl: 'https://cal.com/docs',                            capabilities: [] },
   { key: 'jotform',     name: 'Jotform',     category: 'forms',        tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#0A1551', iconName: 'FileText',  shortDescription: 'Form builder — on-submission triggers.',         docsUrl: 'https://api.jotform.com/docs/',                  capabilities: [] },
@@ -1807,8 +2467,12 @@ export const CONNECTOR_REGISTRY: ConnectorDef[] = [
   // Productivity / data
   GOOGLE_DRIVE, GOOGLE_SHEETS, GOOGLE_CALENDAR, GMAIL,
   RAZORPAY, AIRTABLE, SHOPIFY,
+  // India-first live: SMS/OTP rail
+  MSG91,
   // Tier 1 planned
   STRIPE, CALENDLY, TYPEFORM, MAILCHIMP, HUBSPOT, SLACK, NOTION, WOOCOMMERCE, ZOHO,
+  // India-first roadmap (top player per category)
+  ...INDIA_PLANNED,
   // Tier 2
   ...TIER_2_PLANNED,
 ]
