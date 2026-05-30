@@ -3089,7 +3089,12 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
           // but the row was inserted with NULL because we discarded the
           // tgSend response. Reaction silently dropped, inbox never updates.
           const sendRes = await tgSend(token, 'sendMessage', { chat_id: cleanPhone, text })
-          const pmid = sendRes?.result?.message_id ? String(sendRes.result.message_id) : null
+          // tgSend ALREADY unwraps Telegram's envelope (returns data.result),
+          // so the message_id is at sendRes.message_id — NOT sendRes.result.
+          // The earlier sendRes.result.message_id double-unwrap always yielded
+          // undefined → platform_message_id saved NULL → inbound reactions on
+          // bot messages could never resolve their parent. THIS was the bug.
+          const pmid = sendRes?.message_id ? String(sendRes.message_id) : null
           await supabase.from('messages').insert({
             tenant_id: tenantId, channel: 'telegram', direction: 'outbound',
             contact_phone: cleanPhone, content: { type: 'text', text },
@@ -3099,7 +3104,9 @@ app.post('/api/inbox/send', requireAuth, identifyTenant, checkPermission('inbox'
           const method = ({ image: 'sendPhoto', video: 'sendVideo', audio: 'sendAudio', document: 'sendDocument' } as any)[media_kind!]
           const fieldKey = ({ image: 'photo', video: 'video', audio: 'audio', document: 'document' } as any)[media_kind!]
           const sendRes = await tgSend(token, method, { chat_id: cleanPhone, [fieldKey]: media_url, caption: caption ?? undefined })
-          const pmid = sendRes?.result?.message_id ? String(sendRes.result.message_id) : null
+          // Same unwrap fix as the text branch above — sendRes is already
+          // data.result, so the id is sendRes.message_id.
+          const pmid = sendRes?.message_id ? String(sendRes.message_id) : null
           await supabase.from('messages').insert({
             tenant_id: tenantId, channel: 'telegram', direction: 'outbound',
             contact_phone: cleanPhone, content: { type: media_kind, url: media_url, caption, filename },
