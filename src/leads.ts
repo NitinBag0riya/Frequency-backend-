@@ -548,6 +548,55 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
     res.json({ success: true })
   })
 
+  // ── Columns: read for live pickers (Dynamic Config skill) ───────────────────
+  // GET list of columns — feeds the catalog's `column_name_*` live_select
+  // (label_field/value_field = 'name'). Pure DB read, no AI tokens.
+  router.get('/lead-tables/:id/columns', requireAuth, identifyTenant, checkPermission('leads', 'view'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data, error } = await supabase
+      .from('lead_columns')
+      .select('id, name, key, type')
+      .eq('table_id', req.params.id)
+      .eq('tenant_id', tenantId)
+      .order('position', { ascending: true })
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data ?? [])
+  })
+
+  // GET distinct VALUES in a column — feeds the catalog's `column_value_*`
+  // live_select (label_field/value_field = 'value'). Rows store cells in a
+  // `data` JSONB keyed by column key; we resolve the key from the name, then
+  // collect distinct non-empty values (capped). No AI tokens.
+  router.get('/lead-tables/:id/columns/:colName/values', requireAuth, identifyTenant, checkPermission('leads', 'view'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const tableId = String(req.params.id)
+    const colName = decodeURIComponent(String(req.params.colName))
+    const { data: cols } = await supabase
+      .from('lead_columns')
+      .select('key, name')
+      .eq('table_id', tableId)
+      .eq('tenant_id', tenantId)
+    const col = (cols ?? []).find((c: any) => c.name === colName || c.key === colName)
+    const key: string | undefined = (col as any)?.key
+    const name: string = (col as any)?.name ?? colName
+    const { data: rows, error } = await supabase
+      .from('lead_rows')
+      .select('data')
+      .eq('table_id', tableId)
+      .eq('tenant_id', tenantId)
+      .limit(2000)
+    if (error) { res.status(500).json({ error: error.message }); return }
+    const seen = new Set<string>()
+    for (const r of rows ?? []) {
+      const d = ((r as any).data ?? {}) as Record<string, unknown>
+      const raw = (key != null ? d[key] : undefined) ?? d[name] ?? d[colName]
+      const v = raw == null ? '' : String(raw).trim()
+      if (v) seen.add(v)
+      if (seen.size >= 200) break
+    }
+    res.json(Array.from(seen).sort((a, b) => a.localeCompare(b)).map(value => ({ value })))
+  })
+
   // ── Rows ────────────────────────────────────────────────────────────────────
 
   router.get('/lead-tables/:id/rows', requireAuth, identifyTenant, checkPermission('leads', 'view'), async (req, res) => {
