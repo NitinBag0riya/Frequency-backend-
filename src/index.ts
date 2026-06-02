@@ -1054,6 +1054,11 @@ EMAIL RULES (enforce for trigger_email_received / send_email / forward_email nod
 - Always flag missing OAuth / API credentials in missing_config
 - forward_email should preserve original sender in the forwarded body when possible
 
+CONFIG PREFILL (reduce what the user has to re-enter):
+- Whenever the user states a CONCRETE value — an amount ("₹999" → amount_paise: 99900), a message/body, an email, a phone, a time/schedule, a URL, a tag name, a delay ("after 2 days") — put it directly in that node's "config" with the value, and DO NOT also list it in missing_config.
+- Only list a field in missing_config when its value is genuinely unknown from the user's words (e.g. they said "a table" but no name, or "our template" but no name).
+- For send_text / message bodies the user dictated, fill config.message verbatim; only leave a placeholder when they didn't give the wording.
+
 ${composePickerPromptSection()}
 
 
@@ -1730,6 +1735,44 @@ app.post('/api/voice/realtime/session', requireAuth, identifyTenant, async (req,
   } catch (e: any) {
     console.warn(`[voice/realtime/session] ${e?.message ?? e}`)
     res.status(502).json({ error: 'Could not start the voice session.' })
+  }
+})
+
+// ── Draft a WhatsApp template with AI (token-optimized) ───────────────────────
+// Feeds the FE template_picker's "Draft with AI". Token discipline: minimal
+// context (just the brief — never the whole blueprint), max_tokens capped, and
+// a 30-min in-memory cache keyed by brief+language so repeat asks cost nothing.
+const _templateDraftCache = new Map<string, { at: number; data: any }>()
+app.post('/api/wa-templates/draft', requireAuth, identifyTenant, async (req, res) => {
+  const brief = String(req.body?.brief ?? '').trim().slice(0, 600)
+  const language = String(req.body?.language ?? 'en')
+  if (!brief) { res.status(400).json({ error: 'brief required' }); return }
+  if (!process.env.ANTHROPIC_API_KEY) { res.status(503).json({ error: 'AI is offline right now.' }); return }
+  const cacheKey = `${language}::${brief.toLowerCase()}`
+  const hit = _templateDraftCache.get(cacheKey)
+  if (hit && Date.now() - hit.at < 30 * 60_000) { res.json({ ...hit.data, cached: true }); return }
+  try {
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 500,
+      system: 'You draft WhatsApp message templates for Indian SMBs. Return ONLY compact JSON, no prose, no code fences: {"name":"snake_case_name","category":"MARKETING"|"UTILITY","body":"short text, may use {{1}} {{2}} variables","buttons":["up to 3 quick-reply labels"]}. Body must be ≤ 3 short lines.',
+      messages: [{ role: 'user', content: `Language: ${language}. Draft a template for: ${brief}` }],
+    })
+    const text = (msg.content as any[]).map(c => (c.type === 'text' ? c.text : '')).join('').trim()
+    const json = JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ''))
+    const data = {
+      name: String(json.name || 'template'),
+      category: json.category === 'UTILITY' ? 'UTILITY' : 'MARKETING',
+      language,
+      body: String(json.body || ''),
+      buttons: Array.isArray(json.buttons) ? json.buttons.slice(0, 3).map(String) : [],
+    }
+    _templateDraftCache.set(cacheKey, { at: Date.now(), data })
+    try { const { recordAiUsage } = await import('./lib/ai-usage'); recordAiUsage(supabase, (req as any).tenantId, msg.usage as any, 'template_draft', 'claude-sonnet-4-6') } catch { /* non-fatal */ }
+    res.json(data)
+  } catch (e: any) {
+    console.warn(`[wa-templates/draft] ${e?.message ?? e}`)
+    res.status(502).json({ error: 'Could not draft the template. Try rephrasing.' })
   }
 })
 

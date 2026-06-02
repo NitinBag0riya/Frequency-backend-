@@ -41,6 +41,8 @@ export type AiUsageSource =
   | 'call_transcript'
   | 'call_sentiment'
   | 'wa_flow_chat_edit'
+  // Voice/builder: AI-drafted WhatsApp template (cached 30m by brief hash).
+  | 'template_draft'
   // P1 #14 — plain-English flow explainer (one call per (workflow, version),
   // cached on workflow_versions.explainer_text afterward).
   | 'explain_workflow'
