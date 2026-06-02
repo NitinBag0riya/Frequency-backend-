@@ -383,6 +383,47 @@ const CURATED_CATALOG: PickerCategory[] = [
         placeholder: 'Signing secret' },
     ],
   },
+
+  // ────────────────────────────────────────────────────────────────────────
+  // I. Airtable (base → table → record). Curated rather than registry-derived
+  //    because Airtable's resources are NESTED (a table only exists inside a
+  //    base, a record only inside a table) — exactly the dependent-picker
+  //    chain the generic generator skips (its :param list endpoints can't be
+  //    flat live_selects). Endpoints: GET /api/connectors/airtable/bases,
+  //    GET .../bases/:baseId/tables. Status in the registry is 'beta' but the
+  //    5 capabilities (bases/tables/records + create/update) are all live.
+  // ────────────────────────────────────────────────────────────────────────
+  {
+    key: 'airtable',
+    name: 'Airtable',
+    blurb: 'Pick an Airtable base, then a table inside it, then create or update records.',
+    trigger_phrases: [
+      'airtable', 'airtable base', 'airtable table', 'add a row to airtable',
+      'create an airtable record', 'update airtable', 'save to airtable',
+    ],
+    pickers: [
+      { field: 'airtable_base_id', label: 'Airtable base', type: 'live_select', required: true,
+        placeholder: 'Pick a base',
+        live_endpoint: '/api/connectors/airtable/bases',
+        label_field: 'name', value_field: 'id' },
+      { field: 'airtable_table_id', label: 'Airtable table', type: 'live_select', required: true,
+        depends_on: 'airtable_base_id',
+        live_endpoint: '/api/connectors/airtable/bases/{airtable_base_id}/tables',
+        label_field: 'name', value_field: 'id',
+        placeholder: 'Pick a table' },
+      { field: 'airtable_record_id', label: 'Record ID', type: 'text', required: false,
+        placeholder: '{{trigger.record_id}} — required only when updating' },
+    ],
+    operation_picker: {
+      field: 'operation_airtable',
+      label: 'Airtable action',
+      placeholder: 'Pick an Airtable action',
+      operations: [
+        { key: 'airtable_create_record', label: 'Create record', requires: ['airtable_base_id', 'airtable_table_id'] },
+        { key: 'airtable_update_record', label: 'Update record', requires: ['airtable_base_id', 'airtable_table_id', 'airtable_record_id'] },
+      ],
+    },
+  },
 ]
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -398,6 +439,7 @@ const CURATED_APP_KEYS = new Set([
   'whatsapp', 'instagram', 'telegram',
   'google_drive', 'google_sheets', 'google_calendar', 'google_gmail',
   'razorpay',
+  'airtable', // curated above (nested base→table→record chain); don't double-add
 ])
 
 function singularizeCapKey(capKey: string): string {
