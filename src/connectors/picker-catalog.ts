@@ -411,8 +411,16 @@ function generateRegistryCategories(): PickerCategory[] {
     const caps: any[] = (app.capabilities ?? []).filter((c: any) => (c?.status ?? 'live') === 'live')
     if (!caps.length) continue
 
+    // A capability whose key starts with `trigger_` is an event trigger, not a
+    // selectable resource — never a picker.
+    const isTrigger = (c: any) => String(c?.key ?? '').startsWith('trigger_')
+
+    // Resource list pickers: list-kind GET endpoints with NO path param
+    // (a `:id` path is a detail/sub-resource, not a list). Dedupe by field.
+    const seenFields = new Set<string>()
     const pickers: PickerDef[] = caps
-      .filter(c => c.uiKind === 'list' && (c.apiMethod ?? 'GET') === 'GET' && c.apiPath)
+      .filter(c => c.uiKind === 'list' && (c.apiMethod ?? 'GET') === 'GET'
+        && c.apiPath && !String(c.apiPath).includes(':') && !isTrigger(c))
       .map(c => {
         const fields: any[] = c.outputSchema?.fields ?? []
         const labelField =
@@ -431,8 +439,13 @@ function generateRegistryCategories(): PickerCategory[] {
           value_field: valueField,
         }
       })
+      .filter(p => { if (seenFields.has(p.field)) return false; seenFields.add(p.field); return true })
 
-    const actions = caps.filter(c => c.workflowNodeType)
+    // Actions = non-trigger capabilities with a workflow node type. Each
+    // operation declares its REQUIRED input fields (from inputSchema) so the AI
+    // emits them; they render via the typed default input (raw keys → the
+    // executor reads node.config[key], so no global picker-name collisions).
+    const actions = caps.filter(c => c.workflowNodeType && !isTrigger(c))
     const category: PickerCategory = {
       key: app.key,
       name: `${app.name} (${app.category})`,
@@ -449,7 +462,11 @@ function generateRegistryCategories(): PickerCategory[] {
         field: `operation_${app.key}`,
         label: `${app.name} action`,
         placeholder: `Pick a ${app.name} action`,
-        operations: actions.map(a => ({ key: a.workflowNodeType ?? a.key, label: a.label ?? a.key, requires: [] as string[] })),
+        operations: actions.map(a => ({
+          key: a.workflowNodeType ?? a.key,
+          label: a.label ?? a.key,
+          requires: ((a.inputSchema?.fields ?? []) as any[]).filter(f => f?.required).map(f => String(f.key)),
+        })),
       }
     }
     out.push(category)
