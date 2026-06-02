@@ -33,6 +33,7 @@
  *     `/api/google/spreadsheets/{spreadsheet_id}` and the FE knows
  *     to substitute the upstream value into the URL.
  */
+import { CONNECTOR_REGISTRY } from './registry'
 
 export type PickerType =
   | 'text' | 'textarea' | 'number' | 'email' | 'phone' | 'url' | 'date'
@@ -102,7 +103,7 @@ export interface PickerCategory {
 // CATALOG — one entry per category. Add a new connector by appending here.
 // ═══════════════════════════════════════════════════════════════════════════
 
-export const PICKER_CATALOG: PickerCategory[] = [
+const CURATED_CATALOG: PickerCategory[] = [
 
   // ────────────────────────────────────────────────────────────────────────
   // A. Frequency Tables (internal lead_tables)
@@ -383,6 +384,82 @@ export const PICKER_CATALOG: PickerCategory[] = [
     ],
   },
 ]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Registry-derived categories — EVERY live connector, generated from
+// CONNECTOR_REGISTRY so we never hand-maintain 20+ apps. Resource list
+// capabilities (uiKind:'list', GET) become live_select pickers the FE renders
+// from the registry's apiPath; action capabilities become the operation enum.
+// Kept concise on purpose: this lands in the prompt-cached SYSTEM_PROMPT, so
+// warm production calls read it at cache rates (cold cache-write is the only
+// extra cost, ~once per 5-min window). Curated categories above win on key.
+// ═══════════════════════════════════════════════════════════════════════════
+const CURATED_APP_KEYS = new Set([
+  'whatsapp', 'instagram', 'telegram',
+  'google_drive', 'google_sheets', 'google_calendar', 'google_gmail',
+  'razorpay',
+])
+
+function singularizeCapKey(capKey: string): string {
+  return capKey.replace(/^(list_|get_|fetch_|search_)/, '').replace(/s$/, '') || capKey
+}
+
+function generateRegistryCategories(): PickerCategory[] {
+  const out: PickerCategory[] = []
+  for (const app of CONNECTOR_REGISTRY as any[]) {
+    if (app?.status !== 'live' || CURATED_APP_KEYS.has(app.key)) continue
+    const caps: any[] = (app.capabilities ?? []).filter((c: any) => (c?.status ?? 'live') === 'live')
+    if (!caps.length) continue
+
+    const pickers: PickerDef[] = caps
+      .filter(c => c.uiKind === 'list' && (c.apiMethod ?? 'GET') === 'GET' && c.apiPath)
+      .map(c => {
+        const fields: any[] = c.outputSchema?.fields ?? []
+        const labelField =
+          (fields.find(f => f.type === 'string' && /name|title|label|email|number/i.test(f.key))
+            ?? fields.find(f => f.type === 'string') ?? fields[0])?.key ?? 'name'
+        const valueField =
+          (fields.find(f => f.key === 'id' || /(^|[._])id$/.test(f.key)) ?? fields[0])?.key ?? 'id'
+        return {
+          field: `${app.key}_${singularizeCapKey(c.key)}_id`,
+          label: `${app.name} — ${c.label}`,
+          type: 'live_select' as const,
+          required: false,
+          placeholder: `Pick from ${c.label}`,
+          live_endpoint: c.apiPath as string,
+          label_field: labelField,
+          value_field: valueField,
+        }
+      })
+
+    const actions = caps.filter(c => c.workflowNodeType)
+    const category: PickerCategory = {
+      key: app.key,
+      name: `${app.name} (${app.category})`,
+      blurb: app.shortDescription ?? `${app.name} actions and lookups.`,
+      trigger_phrases: Array.from(new Set([
+        String(app.name).toLowerCase(),
+        String(app.key).replace(/_/g, ' '),
+        String(app.category ?? ''),
+      ].filter(Boolean))),
+      pickers,
+    }
+    if (actions.length) {
+      category.operation_picker = {
+        field: `operation_${app.key}`,
+        label: `${app.name} action`,
+        placeholder: `Pick a ${app.name} action`,
+        operations: actions.map(a => ({ key: a.workflowNodeType ?? a.key, label: a.label ?? a.key, requires: [] as string[] })),
+      }
+    }
+    out.push(category)
+  }
+  return out
+}
+
+/** The full catalog: hand-curated high-use categories + every other live
+ *  connector generated from the registry. */
+export const PICKER_CATALOG: PickerCategory[] = [...CURATED_CATALOG, ...generateRegistryCategories()]
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Lookups + serializers
