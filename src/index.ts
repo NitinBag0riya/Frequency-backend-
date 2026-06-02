@@ -1662,6 +1662,77 @@ app.post('/api/copilot/stream', async (req, res) => {
   }
 })
 
+// ── Realtime voice agent — session broker ─────────────────────────────────────
+// Mints a SHORT-LIVED ephemeral key so the browser can open a WebRTC connection
+// to the OpenAI Realtime model directly (full-duplex audio, barge-in, server
+// VAD) WITHOUT ever holding our real key. The agent's behaviour (the
+// requirements-interview dialogue policy) + its tool schema are injected here.
+// Frontend: src/lib/voice/realtimeClient.ts + voiceTools.ts execute the tools.
+// See the FE repo docs/voice-realtime-workflow-builder.md.
+const VOICE_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview'
+const VOICE_REALTIME_VOICE = process.env.OPENAI_REALTIME_VOICE || 'alloy'
+const VOICE_AGENT_INSTRUCTIONS = `You are Frequency's voice agent for Indian SMBs — a sharp requirements analyst who builds the automation FOR the user. Speak warm, concise Indian English; mirror Hinglish ("price kya hai", "kitna") when they do. Never read JSON or tool names aloud — speak outcomes.
+
+Method: capture their goal, then fill the requirements checklist by asking ONE question at a time. ALWAYS offer concrete options, never an open void:
+- When they mention data ("a sheet", "my list"): call list_resources(table) and ask "Use your <existing table>, import your sheet, or shall I create a new one?". If they pick a table, call get_table_columns and confirm the fields, or ask which columns to capture.
+- When they mention a message/reply: call list_resources(template) — "Use your <template>, or shall I write a new one?". If new, draft it and read it back for a yes.
+- Same pattern for forms/pages, payments, CRM tags.
+
+Proactively fill what they DIDN'T say, each with options:
+- Timing/schedule: "Run instantly on every message, or batch it — say every morning at 10?"
+- Conditions/filters: "Only for new customers, everyone, or only when they mention price?"
+- Quiet hours/fallback: "After business hours — auto-reply anyway or queue for morning?"
+
+Keep a running summary. When the checklist is filled, read back the whole flow in one breath and ask "Shall I build it?". On yes, call build_workflow with the FULL intent (including the schedule, conditions and columns you gathered), auto-create any tables/templates/pages via tools, then tell them only the apps to connect and offer Test or Go Live. Default to doing, not asking — only connecting apps needs the human.`
+
+const VOICE_AGENT_TOOLS = [
+  { type: 'function', name: 'list_resources', description: "List what the user ALREADY has so you can offer 'use existing or create new'. Call before proposing a table/template/page.", parameters: { type: 'object', required: ['kind'], properties: { kind: { type: 'string', enum: ['table', 'template', 'form', 'site'] } } } },
+  { type: 'function', name: 'get_table_columns', description: "Read an existing table's columns so you can ask which fields to use / what's missing.", parameters: { type: 'object', required: ['table_id'], properties: { table_id: { type: 'string' } } } },
+  { type: 'function', name: 'create_template', description: 'Create a new WhatsApp message template when the user has none to reuse.', parameters: { type: 'object', required: ['name', 'body'], properties: { name: { type: 'string' }, body: { type: 'string' }, category: { type: 'string', enum: ['MARKETING', 'UTILITY', 'AUTHENTICATION'] }, language: { type: 'string' } } } },
+  { type: 'function', name: 'build_workflow', description: "Turn the user's described automation into a Frequency workflow. Pass the FULL plain-English automation including trigger, channel, actions, conditions and schedule.", parameters: { type: 'object', required: ['intent'], properties: { intent: { type: 'string' } } } },
+  { type: 'function', name: 'create_table', description: 'Create a data/leads table the workflow needs.', parameters: { type: 'object', required: ['name'], properties: { name: { type: 'string' }, description: { type: 'string' }, columns: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, type: { type: 'string', enum: ['text', 'number', 'date', 'phone', 'email', 'select'] } } } } } } },
+  { type: 'function', name: 'create_page', description: 'Create a public form/landing page to capture leads.', parameters: { type: 'object', required: ['title'], properties: { title: { type: 'string' }, kind: { type: 'string', enum: ['form', 'site'] } } } },
+  { type: 'function', name: 'connect_app', description: 'Tell the user which app to connect and open its connect flow.', parameters: { type: 'object', required: ['app_key'], properties: { app_key: { type: 'string' } } } },
+  { type: 'function', name: 'set_status', description: 'Put the workflow into test or live.', parameters: { type: 'object', required: ['workflow_id', 'status'], properties: { workflow_id: { type: 'string' }, status: { type: 'string', enum: ['test', 'live'] } } } },
+  { type: 'function', name: 'ask_user', description: 'Ask the user a multiple-choice question; the UI shows option chips.', parameters: { type: 'object', required: ['question', 'options'], properties: { question: { type: 'string' }, options: { type: 'array', items: { type: 'string' } } } } },
+  { type: 'function', name: 'navigate', description: 'Open a page in the app.', parameters: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } } },
+]
+
+app.post('/api/voice/realtime/session', requireAuth, identifyTenant, async (req, res) => {
+  const key = process.env.OPENAI_API_KEY
+  if (!key) { res.status(503).json({ error: 'Voice agent is not configured.' }); return }
+  try {
+    const r = await fetch('https://api.openai.com/v1/realtime/sessions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: VOICE_REALTIME_MODEL,
+        voice: VOICE_REALTIME_VOICE,
+        modalities: ['audio', 'text'],
+        input_audio_transcription: { model: 'whisper-1' },
+        turn_detection: { type: 'server_vad', silence_duration_ms: 500 },
+        instructions: VOICE_AGENT_INSTRUCTIONS,
+        tools: VOICE_AGENT_TOOLS,
+        tool_choice: 'auto',
+      }),
+    })
+    if (!r.ok) {
+      const detail = await r.text().catch(() => '')
+      console.warn(`[voice/realtime/session] OpenAI ${r.status}: ${detail.slice(0, 200)}`)
+      res.status(502).json({ error: 'Could not start the voice session.' }); return
+    }
+    const data: any = await r.json()
+    res.json({
+      client_secret: data?.client_secret?.value ?? data?.client_secret,
+      model: VOICE_REALTIME_MODEL,
+      expires_at: data?.client_secret?.expires_at ?? data?.expires_at,
+    })
+  } catch (e: any) {
+    console.warn(`[voice/realtime/session] ${e?.message ?? e}`)
+    res.status(502).json({ error: 'Could not start the voice session.' })
+  }
+})
+
 // ── Workflows CRUD ────────────────────────────────────────────────────────────
 app.get('/api/workflows', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'view'), async (req, res) => {
   const tenantId = (req as any).tenantId
