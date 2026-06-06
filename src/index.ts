@@ -591,7 +591,13 @@ app.use(/^\/api\/workflows\/[^/]+\/analyze$/, aiLimiter)
 // 30/min covers manual inbox replies + a moderate broadcast trigger rate.
 const sendLimiter = makeLimiter({ windowMs: 60_000, max: 30, perUser: true })
 app.use('/api/inbox/send',           sendLimiter)
-app.use('/api/broadcasts',           sendLimiter)  // covers /:id/send
+// ONLY the credit-burning send action — NOT the whole /api/broadcasts
+// namespace. The previous `app.use('/api/broadcasts', …)` put the tight
+// 30/min cap on GET list reads too, so normal browsing (search debounce +
+// filter + paging) tripped a 429 "Too many requests" on the Broadcasts page.
+// List / create-draft / delete now fall back to the 600/min global limiter;
+// only POST /api/broadcasts/:id/send is throttled here.
+app.use(/^\/api\/broadcasts\/[^/]+\/send$/, sendLimiter)
 app.use('/api/wa-calling/dispatch',  sendLimiter)
 
 // Auth / onboarding — brute-force surface. IP-only keying so a single bad
