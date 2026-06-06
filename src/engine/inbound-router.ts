@@ -161,6 +161,19 @@ async function checkKeywordTriggers(
   text: string,
   channel: InboundChannel,
 ): Promise<void> {
+  // Take-over gate: when an agent clicks "Take over" in the inbox we set
+  // contacts.bot_paused=true. Honour it here so the bot stops auto-replying
+  // and the human owns the conversation. (Previously bot_paused was set +
+  // shown in the UI but never read on inbound, so "Take over" didn't actually
+  // pause the bot.) Matches the same id shapes as notifyMobileAgents above.
+  const { data: pausedContact } = await supabase.from('contacts')
+    .select('bot_paused')
+    .eq('tenant_id', tenant.id)
+    .or(`phone.eq.+${contactId},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
+    .limit(1)
+    .maybeSingle()
+  if (pausedContact?.bot_paused) return
+
   // Tenant-scoped — was user_id-scoped before; broken once a user owned
   // multiple tenants.
   const { data: workflows } = await supabase.from('workflows')

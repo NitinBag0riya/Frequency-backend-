@@ -139,15 +139,24 @@ export async function retrieveChunks(
   if (!tenantId) throw new Error('retrieveChunks: tenantId required')
   const q = (query ?? '').trim()
   if (!q) return []
-  // websearch_to_tsquery handles user-typed queries gracefully (quotes,
-  // OR, negation) without throwing on punctuation. supabase-js exposes
-  // tsvector matching via `.textSearch(column, query, { type: 'websearch' })`.
+  // websearch_to_tsquery defaults to AND between terms — so a full inbound
+  // sentence ("do you have 2 BHK and what's the price?") would only match a
+  // chunk that contains EVERY content word, which almost never happens and
+  // left the responder with zero context (it then deflected to a human).
+  // Instead, OR the significant tokens so a chunk matching ANY of them is
+  // retrieved; the trust+recency re-rank below keeps the best ones on top.
+  const tokens = q
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter(t => t.length > 1)
+  const orQuery = tokens.length ? tokens.join(' OR ') : q
   // The tenant filter is FIRST.
   const { data, error } = await supabase
     .from('tenant_knowledge_chunks')
     .select('id, source_type, source_ref, chunk_text, metadata, created_at')
     .eq('tenant_id', tenantId)   // tenant-isolation primary filter
-    .textSearch('search_tsv', q, { type: 'websearch', config: 'english' })
+    .textSearch('search_tsv', orQuery, { type: 'websearch', config: 'english' })
     .order('created_at', { ascending: false })
     .limit(Math.max(1, Math.min(20, limit * 3)))   // pull 3× then re-rank in app
   if (error) {

@@ -529,10 +529,18 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         // Resolve the inbound message. Workflow cfg can override the source
         // via `inbound_message_var` / `user_message` interpolation; default
         // is the reply that triggered this resume.
-        const inboundText = interpolate(
-          cfg.user_message ?? cfg.inbound_message_var ?? '{{trigger.message.text}}',
-          { ...vars, trigger: { message: { text: ctx.reply?.text ?? '' }, channel: (ctx.session as any).channel, contact: ctx.session.contact_phone } },
-        ) || ctx.reply?.text || ''
+        // Resolve the customer's message. On a keyword-trigger START the text
+        // is seeded into session vars at `trigger.text` (see seedSessionVars);
+        // on a collect_input RESUME it's `ctx.reply.text`. Previously this only
+        // read `{{trigger.message.text}}` bound to ctx.reply.text — empty on a
+        // fresh start — so the RAG query was '' and the bot ALWAYS deflected
+        // ("I don't have that information") for every keyword-triggered inbound.
+        const triggerText = String((vars as any)?.trigger?.text ?? (vars as any)?.trigger?.message?.text ?? '')
+        const inboundText = (
+          cfg.user_message
+            ? interpolate(cfg.user_message, vars)
+            : (ctx.reply?.text || triggerText)
+        ).toString().trim()
 
         const retrieved = inboundText
           ? await retrieveChunks(supabase, ctx.tenant.id, inboundText, 5)
@@ -550,10 +558,15 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         const systemPrompt = buildSystemPrompt(bizName, promptAddon, retrieved)
         const model = cfg.model ?? settings.model ?? 'claude-opus-4-7'
 
+        // `temperature` is REJECTED (deprecated) by the newer Claude models
+        // (opus-4-x / sonnet-4-x / haiku-4-x) — passing it returns a 400 and
+        // the auto-reply silently fails. Only send it for models that still
+        // accept it.
+        const supportsTemperature = !/(opus|sonnet|haiku)-4/i.test(model)
         const resp = await anthropic.messages.create({
           model,
           max_tokens:  cfg.max_tokens  ?? settings.max_tokens  ?? 500,
-          temperature: cfg.temperature ?? settings.temperature ?? 0.7,
+          ...(supportsTemperature ? { temperature: cfg.temperature ?? settings.temperature ?? 0.7 } : {}),
           system: [
             { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
           ] as any,
