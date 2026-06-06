@@ -9,6 +9,9 @@
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
     "build": "tsc",
+    "email:dev": "email dev --dir src/emails/templates --port 3030",
+    "email:auth": "tsx src/emails/scripts/build-auth-templates.ts",
+    "email:test": "tsx tests/email-previews/render-all.ts",
     "smoke": "tsx tests/smoke/runner.ts",
     "smoke:local": "SMOKE_BASE_URL=http://localhost:3000 tsx tests/smoke/runner.ts",
     "smoke:stage": "SMOKE_BASE_URL=https://api.getfrequency.app tsx tests/smoke/runner.ts"
@@ -20,8 +23,11 @@
     "@anthropic-ai/sdk": "^0.92.0",
     "@bull-board/api": "^7.0.0",
     "@bull-board/express": "^7.0.0",
+    "@react-email/components": "^1.0.12",
+    "@react-email/render": "^2.0.8",
     "@supabase/supabase-js": "^2.105.1",
     "@types/pdfkit": "^0.17.6",
+    "@xenova/transformers": "^2.17.2",
     "bullmq": "^5.76.5",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -30,6 +36,8 @@
     "helmet": "^8.1.0",
     "ioredis": "^5.10.1",
     "pdfkit": "^0.18.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "xlsx": "^0.18.5",
     "zod": "^4.4.2"
   },
@@ -37,7 +45,10 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "puppeteer": "^25.0.4",
+    "react-email": "^6.5.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3"
   }

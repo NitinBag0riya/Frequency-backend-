@@ -139,56 +139,89 @@ export async function retrieveChunks(
   if (!tenantId) throw new Error('retrieveChunks: tenantId required')
   const q = (query ?? '').trim()
   if (!q) return []
-  // websearch_to_tsquery defaults to AND between terms — so a full inbound
-  // sentence ("do you have 2 BHK and what's the price?") would only match a
-  // chunk that contains EVERY content word, which almost never happens and
-  // left the responder with zero context (it then deflected to a human).
-  // Instead, OR the significant tokens so a chunk matching ANY of them is
-  // retrieved; the trust+recency re-rank below keeps the best ones on top.
-  const tokens = q
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .split(/\s+/)
-    .filter(t => t.length > 1)
-  const orQuery = tokens.length ? tokens.join(' OR ') : q
-  // The tenant filter is FIRST.
-  const { data, error } = await supabase
-    .from('tenant_knowledge_chunks')
-    .select('id, source_type, source_ref, chunk_text, metadata, created_at')
-    .eq('tenant_id', tenantId)   // tenant-isolation primary filter
-    .textSearch('search_tsv', orQuery, { type: 'websearch', config: 'english' })
-    .order('created_at', { ascending: false })
-    .limit(Math.max(1, Math.min(20, limit * 3)))   // pull 3× then re-rank in app
-  if (error) {
-    // textSearch can throw on weird queries; degrade gracefully so a
-    // bad query doesn't crash the AI responder. Caller treats [] as
-    // "no context found".
-    console.warn(`[ai-knowledge] retrieveChunks tsquery failed for tenant=${tenantId}: ${error.message}`)
-    return []
+
+  const candPool = Math.max(8, Math.min(24, limit * 4))
+  type Cand = {
+    id: string; source_type: string; source_ref: string | null
+    chunk_text: string; metadata: any; created_at?: string
+    sim?: number  // semantic cosine similarity (0..1), set only for vector hits
   }
-  if (!data || data.length === 0) return []
-  // Re-rank: prefer qa_wizard > manual > wa_profile > product > conversation,
-  // then by recency. Keeps high-trust chunks at the top when their tsvector
-  // match isn't dominant.
-  const trust: Record<string, number> = {
-    qa_wizard:   5,
-    manual:      4,
-    wa_profile:  3,
-    product:     2,
-    conversation:1,
+  const byId = new Map<string, Cand>()
+
+  // ── 1. SEMANTIC retrieval ───────────────────────────────────────────────
+  // Embed the query and find nearest chunks by cosine distance (pgvector RPC).
+  // This catches paraphrases that keyword search misses — e.g. "how expensive
+  // is a two-bedroom apartment?" matches a "2 BHK … ₹75 lakh" chunk even with
+  // no shared keywords. Degrades gracefully to keyword-only if embeddings or
+  // the vector column aren't available.
+  try {
+    const { embedText, toVectorLiteral } = await import('./embeddings')
+    const emb = await embedText(q)
+    if (emb && emb.length) {
+      const { data, error } = await supabase.rpc('match_knowledge_chunks', {
+        p_tenant: tenantId, p_embedding: toVectorLiteral(emb), p_limit: candPool,
+      })
+      if (error) throw new Error(error.message)
+      for (const r of (data ?? []) as any[]) {
+        byId.set(r.id, {
+          id: r.id, source_type: r.source_type, source_ref: r.source_ref,
+          chunk_text: r.chunk_text, metadata: r.metadata ?? {}, created_at: r.created_at,
+          sim: Math.max(0, 1 - Number(r.distance ?? 1)),
+        })
+      }
+    }
+  } catch (e: any) {
+    console.warn(`[ai-knowledge] semantic retrieval unavailable (keyword fallback) for tenant=${tenantId}: ${e?.message ?? e}`)
   }
-  const ranked = (data as any[])
-    .map(row => ({
-      id:          row.id,
-      source_type: row.source_type,
-      source_ref:  row.source_ref,
-      chunk_text:  row.chunk_text,
-      metadata:    row.metadata ?? {},
-      rank:        (trust[row.source_type] ?? 1) + (row.created_at ? Math.min(1, (Date.now() - new Date(row.created_at).getTime()) / (90 * 86400_000)) : 0),
+
+  // ── 2. KEYWORD retrieval ────────────────────────────────────────────────
+  // OR the significant tokens (lexical recall + exact term/number hits that
+  // embeddings can under-weight, e.g. an exact SKU or "₹75 lakh").
+  const tokens = q.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(t => t.length > 1)
+  try {
+    const orQuery = tokens.length ? tokens.join(' OR ') : q
+    const { data } = await supabase
+      .from('tenant_knowledge_chunks')
+      .select('id, source_type, source_ref, chunk_text, metadata, created_at')
+      .eq('tenant_id', tenantId)
+      .textSearch('search_tsv', orQuery, { type: 'websearch', config: 'english' })
+      .limit(candPool)
+    for (const r of (data ?? []) as any[]) {
+      if (!byId.has(r.id)) {
+        byId.set(r.id, {
+          id: r.id, source_type: r.source_type, source_ref: r.source_ref,
+          chunk_text: r.chunk_text, metadata: r.metadata ?? {}, created_at: r.created_at,
+        })
+      }
+    }
+  } catch (e: any) {
+    console.warn(`[ai-knowledge] keyword retrieval failed for tenant=${tenantId}: ${e?.message ?? e}`)
+  }
+
+  if (byId.size === 0) return []
+
+  // ── 3. RERANK ───────────────────────────────────────────────────────────
+  // Lightweight hybrid reranker over both candidate sets: semantic similarity
+  // (primary signal) + lexical overlap + source trust + recency. Keeps the
+  // most relevant chunks on top before they're handed to the LLM.
+  const trust: Record<string, number> = { qa_wizard: 1, manual: 0.9, wa_profile: 0.7, product: 0.6, conversation: 0.4 }
+  const tks = new Set(tokens)
+  const kwScore = (text: string) => {
+    if (!tks.size) return 0
+    const lt = text.toLowerCase(); let hit = 0
+    for (const t of tks) if (lt.includes(t)) hit++
+    return hit / tks.size
+  }
+  const recency = (c?: string) => (c ? Math.max(0, 1 - (Date.now() - new Date(c).getTime()) / (180 * 86400_000)) : 0)
+
+  return [...byId.values()]
+    .map(e => ({
+      id: e.id, source_type: e.source_type, source_ref: e.source_ref,
+      chunk_text: e.chunk_text, metadata: e.metadata ?? {},
+      rank: 0.62 * (e.sim ?? 0) + 0.28 * kwScore(e.chunk_text) + 0.07 * (trust[e.source_type] ?? 0.5) + 0.03 * recency(e.created_at),
     }))
     .sort((a, b) => b.rank - a.rank)
     .slice(0, limit)
-  return ranked
 }
 
 export interface ChunkInsert {
@@ -219,6 +252,19 @@ export async function insertChunks(
       metadata:    i.metadata ?? {},
     }))
   if (rows.length === 0) return 0
+  // Embed each chunk for semantic retrieval (provider-agnostic — see
+  // embeddings.ts). Best-effort: if embedding fails the chunk still stores and
+  // stays keyword-searchable; the backfill script can fill vectors later.
+  try {
+    const { embedTexts, toVectorLiteral, embedModelName } = await import('./embeddings')
+    const vecs = await embedTexts(rows.map(r => r.chunk_text))
+    if (vecs.length === rows.length) {
+      const model = embedModelName()
+      rows.forEach((r, i) => { (r as any).embedding = toVectorLiteral(vecs[i]); (r as any).embed_model = model })
+    }
+  } catch (e: any) {
+    console.warn(`[ai-knowledge] insertChunks embed failed (stored without vector): ${e?.message ?? e}`)
+  }
   const { error } = await supabase.from('tenant_knowledge_chunks').insert(rows)
   if (error) throw new Error(`insertChunks: ${error.message}`)
   return rows.length
