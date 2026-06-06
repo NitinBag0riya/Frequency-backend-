@@ -198,6 +198,32 @@ export async function retrieveChunks(
     console.warn(`[ai-knowledge] keyword retrieval failed for tenant=${tenantId}: ${e?.message ?? e}`)
   }
 
+  // ── 2b. CONTEXT PADDING (Anthropic-native fallback) ─────────────────────
+  // When vector search is unavailable (no embedding provider) a paraphrase
+  // with no keyword overlap ("two-bedroom" vs "2 BHK") would surface nothing.
+  // For SMB knowledge bases the cheapest, key-free fix is to hand Claude — the
+  // model we already use — enough of the KB as context and let IT do the
+  // semantic matching. So pad with the most recent chunks up to `limit`.
+  if (byId.size < limit) {
+    try {
+      const { data } = await supabase
+        .from('tenant_knowledge_chunks')
+        .select('id, source_type, source_ref, chunk_text, metadata, created_at')
+        .eq('tenant_id', tenantId)
+        .order('created_at', { ascending: false })
+        .limit(limit * 2)
+      for (const r of (data ?? []) as any[]) {
+        if (byId.size >= limit * 2) break
+        if (!byId.has(r.id)) {
+          byId.set(r.id, {
+            id: r.id, source_type: r.source_type, source_ref: r.source_ref,
+            chunk_text: r.chunk_text, metadata: r.metadata ?? {}, created_at: r.created_at,
+          })
+        }
+      }
+    } catch { /* best-effort padding */ }
+  }
+
   if (byId.size === 0) return []
 
   // ── 3. RERANK ───────────────────────────────────────────────────────────

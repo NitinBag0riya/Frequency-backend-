@@ -543,7 +543,7 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         ).toString().trim()
 
         const retrieved = inboundText
-          ? await retrieveChunks(supabase, ctx.tenant.id, inboundText, 5)
+          ? await retrieveChunks(supabase, ctx.tenant.id, inboundText, 12)
           : []
 
         // ── 4. Build prompt + call Anthropic ────────────────────────────────
