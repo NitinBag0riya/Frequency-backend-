@@ -549,14 +549,48 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         // ── 4. Build prompt + call Anthropic ────────────────────────────────
         const { buildSystemPrompt } = await import('../routes/ai-responder')
         const bizName = (settings.business_context as any)?.business_name || ctx.tenant.business_name || 'our business'
+        // Tenant business category/vertical (realestate / d2c / clinic / …) so
+        // the persona is category-aware. Mirrors the WA business profile.
+        const { data: bizProfile } = await supabase.from('wa_business_profiles')
+          .select('vertical').eq('tenant_id', ctx.tenant.id).maybeSingle()
+        const vertical = bizProfile?.vertical ?? (settings.business_context as any)?.vertical ?? null
         // Allow cfg.system_prompt to OVERRIDE the per-tenant addon for this
         // specific node (e.g. a workflow that wants a different tone for
         // VIP customers). Falls back to settings.system_prompt_addon.
         const promptAddon = cfg.system_prompt
           ? interpolate(cfg.system_prompt, vars)
           : settings.system_prompt_addon
-        const systemPrompt = buildSystemPrompt(bizName, promptAddon, retrieved)
+        const systemPrompt = buildSystemPrompt(bizName, promptAddon, retrieved, { vertical })
         const model = cfg.model ?? settings.model ?? 'claude-opus-4-7'
+
+        // ── Multi-turn memory ───────────────────────────────────────────────
+        // Modern support bots ground on prior dialogue turns so follow-ups
+        // ("yes", "and the 3 BHK?", "how much?") are understood instead of
+        // each message being answered in isolation. Pull the recent thread for
+        // this contact and pass it as alternating user/assistant turns. The
+        // current inbound is already the latest row (the webhook inserts it
+        // before routing), so it's the final user turn.
+        const cp = String(ctx.session.contact_phone)
+        const { data: hist } = await supabase.from('messages')
+          .select('direction, content, created_at')
+          .eq('tenant_id', ctx.tenant.id)
+          .eq('channel', (ctx.session as any).channel)
+          .or(`contact_phone.eq.${cp},contact_phone.eq.tg:${cp}`)
+          .order('created_at', { ascending: false })
+          .limit(12)
+        const turns = (hist ?? [])
+          .slice().reverse()
+          .map((m: any) => ({ role: m.direction === 'inbound' ? 'user' : 'assistant', text: String(m.content?.text ?? '').trim().slice(0, 2000) }))
+          .filter((t: any) => t.text)
+        const messages: Array<{ role: 'user' | 'assistant'; content: string }> = []
+        for (const t of turns) {
+          const last = messages[messages.length - 1]
+          if (last && last.role === t.role) last.content += `\n${t.text}`            // collapse consecutive same-role
+          else messages.push({ role: t.role as 'user' | 'assistant', content: t.text })
+        }
+        while (messages.length && messages[0].role !== 'user') messages.shift()        // Anthropic: must start with user
+        if (!messages.length) messages.push({ role: 'user', content: inboundText || 'Hello' })
+        if (messages[messages.length - 1].role !== 'user') messages.push({ role: 'user', content: inboundText || '(continue)' })
 
         // `temperature` is REJECTED (deprecated) by the newer Claude models
         // (opus-4-x / sonnet-4-x / haiku-4-x) — passing it returns a 400 and
@@ -570,7 +604,7 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
           system: [
             { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
           ] as any,
-          messages: [{ role: 'user', content: inboundText }],
+          messages,
         })
         void import('../lib/ai-usage').then(({ recordAiUsage }) =>
           recordAiUsage(supabase, ctx.tenant.id, resp.usage as any, 'ai_responder', model))
