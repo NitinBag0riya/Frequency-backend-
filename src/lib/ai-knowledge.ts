@@ -230,7 +230,9 @@ export async function retrieveChunks(
   // Lightweight hybrid reranker over both candidate sets: semantic similarity
   // (primary signal) + lexical overlap + source trust + recency. Keeps the
   // most relevant chunks on top before they're handed to the LLM.
-  const trust: Record<string, number> = { qa_wizard: 1, manual: 0.9, wa_profile: 0.7, product: 0.6, conversation: 0.4 }
+  // 'document' = operator-uploaded brochure/price-list → authoritative, on par
+  // with hand-written 'manual' knowledge (and above passively-captured chats).
+  const trust: Record<string, number> = { qa_wizard: 1, manual: 0.9, document: 0.9, wa_profile: 0.7, product: 0.6, conversation: 0.4 }
   const tks = new Set(tokens)
   const kwScore = (text: string) => {
     if (!tks.size) return 0
@@ -251,7 +253,7 @@ export async function retrieveChunks(
 }
 
 export interface ChunkInsert {
-  source_type: 'qa_wizard' | 'conversation' | 'manual' | 'wa_profile' | 'product'
+  source_type: 'qa_wizard' | 'conversation' | 'manual' | 'wa_profile' | 'product' | 'document'
   source_ref:  string | null
   chunk_text:  string
   metadata?:   Record<string, any>

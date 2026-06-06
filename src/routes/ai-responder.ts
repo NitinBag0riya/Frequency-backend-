@@ -32,6 +32,7 @@
  */
 
 import express from 'express'
+import multer from 'multer'
 import { SupabaseClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 import {
@@ -40,6 +41,15 @@ import {
   chunkText, qaWizardToChunks, looksUncertain,
   type QaWizardPayload,
 } from '../lib/ai-knowledge'
+import { parseDocument, UnsupportedDocumentError } from '../lib/document-parser'
+
+// In-memory upload for knowledge documents. Files never hit disk — we parse
+// the buffer to text, chunk it, and discard. 15 MB ceiling covers large
+// brochures/price lists while bounding worker memory on the parse.
+const docUpload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 15 * 1024 * 1024, files: 1 },
+})
 import { recordAiUsage } from '../lib/ai-usage'
 import { blockIfOverLimit } from '../lib/limits'
 import { apiError } from '../lib/api-error'
@@ -238,6 +248,71 @@ export function createAiResponderRouter(deps: Deps): express.Router {
     }
   })
 
+  // ── POST /api/ai/knowledge/document ───────────────────────────────────────
+  // Upload a PDF / DOCX / TXT / MD / CSV. We parse it to plain text, chunk it,
+  // and store the chunks (source_type='document') so the AI responder draws
+  // from it exactly like Q&A pairs — no separate pipeline, same RAG path.
+  // multipart/form-data, field name "file".
+  r.post(
+    '/api/ai/knowledge/document',
+    requireAuth, identifyTenant, checkPermission('settings', 'edit'),
+    (req, res, next) => docUpload.single('file')(req, res, (err: any) => {
+      if (err) {
+        const code = err?.code === 'LIMIT_FILE_SIZE' ? 413 : 400
+        apiError(res, code, 'upload_failed', err?.message === 'File too large'
+          ? 'File exceeds the 15 MB limit.' : (err?.message ?? 'Upload failed.'))
+        return
+      }
+      next()
+    }),
+    async (req, res) => {
+      const tenantId = (req as any).tenantId
+      if (!tenantId) { apiError(res, 401, 'no_tenant', 'No tenant resolved.'); return }
+      const file = (req as any).file as { buffer: Buffer; originalname: string; mimetype: string } | undefined
+      if (!file?.buffer?.length) { apiError(res, 400, 'no_file', 'No file uploaded (field name must be "file").'); return }
+
+      // Satisfy the wizard gate transparently — uploading a document is a
+      // valid way to "teach" the bot, so it should also unlock the toggle.
+      try {
+        const existing = await getTenantAiSettings(supabase, tenantId)
+        if (!existing?.qa_wizard_completed_at) {
+          await supabase.from('tenant_ai_settings')
+            .update({ qa_wizard_completed_at: new Date().toISOString() })
+            .eq('tenant_id', tenantId)
+        }
+      } catch { /* non-fatal: the toggle gate just won't auto-clear */ }
+
+      try {
+        const parsed = await parseDocument(file.buffer, file.originalname, file.mimetype)
+        const clean = parsed.text.trim()
+        if (clean.length < 20) {
+          apiError(res, 422, 'empty_document',
+            'Could not extract readable text. If this is a scanned PDF (images only), it has no selectable text to ingest.')
+          return
+        }
+        const parts = chunkText(clean)
+        const items = parts.map((p, i) => ({
+          source_type: 'document' as const,
+          source_ref:  file.originalname.slice(0, 200),
+          chunk_text:  p,
+          metadata:    {
+            kind: 'document', filename: file.originalname, mimetype: file.mimetype,
+            doc_kind: parsed.kind, ...(parsed.pages ? { pages: parsed.pages } : {}),
+            chunk_index: i, chunk_total: parts.length,
+          },
+        }))
+        const inserted = await insertChunks(supabase, tenantId, items)
+        res.json({
+          ok: true, chunks_inserted: inserted, filename: file.originalname,
+          doc_kind: parsed.kind, pages: parsed.pages ?? null, chars: clean.length,
+        })
+      } catch (e: any) {
+        if (e instanceof UnsupportedDocumentError) { apiError(res, 422, 'unsupported_document', e.message); return }
+        apiError(res, 500, 'document_ingest_failed', e?.message ?? String(e))
+      }
+    },
+  )
+
   // ── DELETE /api/ai/knowledge/:id ──────────────────────────────────────────
   r.delete('/api/ai/knowledge/:id', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId
@@ -289,10 +364,14 @@ export function createAiResponderRouter(deps: Deps): express.Router {
       const systemPrompt = buildSystemPrompt(bizName, settings.system_prompt_addon, chunks)
       const model = settings.model || DEFAULT_MODEL
 
+      // Claude 4.x (opus/sonnet/haiku-4) rejects the `temperature` param
+      // ("temperature is deprecated for this model"). Mirror the guard in
+      // engine/executor.ts so the Test playground works on those models.
+      const supportsTemperature = !/(opus|sonnet|haiku)-4/i.test(model)
       const resp = await anthropic.messages.create({
         model,
         max_tokens:  settings.max_tokens,
-        temperature: settings.temperature,
+        ...(supportsTemperature ? { temperature: settings.temperature } : {}),
         system: [
           { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
         ] as any,

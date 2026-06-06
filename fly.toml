@@ -109,20 +109,29 @@ kill_timeout = "30s"
 # auto_stop_machines = "off" — never let Fly stop a worker between jobs;
 # queue lag would accumulate during cold-start (~2-4s for BullMQ to
 # reconnect, plus the cron-tick singletons need a warm Worker to fire).
-# auto_start_machines = false for the same reason: we don't want Fly
-# spinning extras up reactively on a metric it doesn't observe (queue
-# depth). Operator-driven scale is the right knob here.
 #
-# Trigger to bump from 1 → 2:
+# auto_start_machines = TRUE — REQUIRED so Fly enforces min_machines_running.
+# (Regression 2026-06-07: with auto_start=false, a rolling `fly deploy`
+# updates the worker machines to the new release but leaves them in the
+# `stopped` state, and Fly will NOT bring them back — min_machines_running
+# is a no-op without auto_start. Result: inbound webhooks (web process)
+# kept returning 200 and enqueuing jobs, but no worker consumed them, so
+# AI auto-replies silently stopped. Setting auto_start=true makes Fly
+# restart a worker after every deploy/crash to satisfy the min. auto_stop
+# stays "off" so it never idles back down — no reactive scaling, the min
+# is simply always held.)
+#
+# Operator-driven scale-up (1 → 2/3) is still the knob for sustained load:
 #   - Bull Board shows webhook.inbound waiting > 100 sustained
 #   - broadcast volume > 100 msg/min for >15min
 #   - message.send average wait > 5s in p95
+#   via `fly scale count worker=N` (N ≤ max_machines_running below).
 [[services]]
   processes             = ["worker"]
   protocol              = "tcp"
   internal_port         = 0
   auto_stop_machines    = "off"
-  auto_start_machines   = false
+  auto_start_machines   = true
   min_machines_running  = 1
   max_machines_running  = 3
 
