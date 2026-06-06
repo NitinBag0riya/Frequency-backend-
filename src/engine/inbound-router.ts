@@ -54,6 +54,19 @@ export async function routeInboundToWorkflow(
     console.warn(`[inbound-push] notifyMobileAgents threw (non-fatal): ${e?.message ?? e}`)
   })
 
+  // Take-over gate (covers BOTH the resume path AND the keyword-trigger path):
+  // when an agent clicks "Take over" in the inbox we set contacts.bot_paused=
+  // true. Honour it here so the bot stops auto-replying and the human owns the
+  // conversation. (Previously bot_paused was set + shown in the UI but never
+  // read on inbound, so "Take over" didn't actually pause the bot.)
+  const { data: pausedContact } = await supabase.from('contacts')
+    .select('bot_paused')
+    .eq('tenant_id', tenant.id)
+    .or(`phone.eq.+${contactId},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
+    .limit(1)
+    .maybeSingle()
+  if (pausedContact?.bot_paused) return
+
   // 1. Active workflow session for this (tenant, channel, contact)?
   // The composite filter prevents cross-channel collisions when two
   // different channels happen to use the same numeric identifier.
@@ -161,21 +174,9 @@ async function checkKeywordTriggers(
   text: string,
   channel: InboundChannel,
 ): Promise<void> {
-  // Take-over gate: when an agent clicks "Take over" in the inbox we set
-  // contacts.bot_paused=true. Honour it here so the bot stops auto-replying
-  // and the human owns the conversation. (Previously bot_paused was set +
-  // shown in the UI but never read on inbound, so "Take over" didn't actually
-  // pause the bot.) Matches the same id shapes as notifyMobileAgents above.
-  const { data: pausedContact } = await supabase.from('contacts')
-    .select('bot_paused')
-    .eq('tenant_id', tenant.id)
-    .or(`phone.eq.+${contactId},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
-    .limit(1)
-    .maybeSingle()
-  if (pausedContact?.bot_paused) return
-
   // Tenant-scoped — was user_id-scoped before; broken once a user owned
-  // multiple tenants.
+  // multiple tenants. (Take-over / bot_paused is gated upstream in
+  // routeInboundToWorkflow so it covers both resume + keyword paths.)
   const { data: workflows } = await supabase.from('workflows')
     .select('id, nodes')
     .eq('tenant_id', tenant.id)
@@ -191,8 +192,13 @@ async function checkKeywordTriggers(
     const allowedChannels: string[] | undefined = trigger.config?.channels
     if (allowedChannels && allowedChannels.length > 0 && !allowedChannels.includes(channel)) continue
 
+    // `match_all: true` (or a '*' keyword) fires on EVERY inbound on the
+    // allowed channel — used for an always-on AI chatbot that answers any
+    // message, not just keyword hits. Otherwise match when the text contains
+    // any configured keyword.
     const keywords: string[] = trigger.config?.keywords ?? []
-    if (keywords.some((kw: string) => text.toLowerCase().includes(kw.toLowerCase()))) {
+    const matchAll = trigger.config?.match_all === true || keywords.includes('*')
+    if (matchAll || keywords.some((kw: string) => text.toLowerCase().includes(kw.toLowerCase()))) {
       await startWorkflow(supabase, tenant, wf, contactId, channel, { text })
       break  // first match wins; matches mental model of priority by workflow order
     }
