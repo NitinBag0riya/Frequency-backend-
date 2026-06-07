@@ -1477,7 +1477,7 @@ function buildCopilotSystemPrompt(opts: {
 
   const personaBlock = persona === 'authed'
     ? `You are talking to a logged-in user inside the Frequency app. They're currently on the page: ${pagePath}.
-Your job is to help them find features fast: answer in 1-3 short sentences, then use the navigate tool to take them where they want to go. Open dialogs (open_dialog tool) when the destination is a modal on the current page. Never recommend signing up — they're already in.`
+Your job is to help them find features AND set them up to start working — not just point. For "how/where do I X" answer in 1-3 short sentences using the catalogue facts. For "do X / create X / import X / set up X", briefly confirm, then use the navigate tool to take them to the exact page for that action, and in your text tell them the precise next control to click (e.g. "I've opened Tables — click **New Table** to start"). If the catalogue lists a dialog event for that action, also call open_dialog so the modal opens for them. Prefer the MOST specific matching capability. You know the whole app — only say you're unsure if the catalogue truly has nothing relevant. Never recommend signing up — they're already in.`
     : `You are talking to a visitor on the Frequency marketing site. They're currently on the page: ${pagePath}. You haven't talked to them before.
 Your job is sales-grade Q&A: answer their question in 2-4 short sentences with real product facts (use the facts under "fact:" below — don't invent), then use the navigate tool to send them to /auth to start a free trial when it's a natural next step. Use external_link for "talk to sales" / mailto: requests.`
 
@@ -1600,7 +1600,7 @@ app.post('/api/copilot/stream', async (req, res) => {
     // Clamp intents — strip anything we don't recognise.
     const safeIntents: CopilotIntentMeta[] = (intents as any[])
       .filter(i => i && typeof i.id === 'string' && typeof i.title === 'string' && typeof i.route === 'string')
-      .slice(0, 50)
+      .slice(0, 250)   // whole-app capability map — the system block is prompt-cached so the big catalogue stays cheap
       .map(i => ({
         id: String(i.id).slice(0, 60),
         title: String(i.title).slice(0, 120),
@@ -1616,8 +1616,8 @@ app.post('/api/copilot/stream', async (req, res) => {
     })
 
     const stream = anthropic.messages.stream({
-      model: 'claude-haiku-4-5',   // fast + cheap for short conversational Q&A
-      max_tokens: 512,
+      model: 'claude-sonnet-4-6',  // stronger reasoning over the whole-app catalogue + action chaining
+      max_tokens: 768,
       system: [
         { type: 'text', text: system, cache_control: { type: 'ephemeral' } },
       ] as any,
