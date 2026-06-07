@@ -1616,7 +1616,7 @@ app.post('/api/copilot/stream', async (req, res) => {
     })
 
     const stream = anthropic.messages.stream({
-      model: 'claude-sonnet-4-6',  // stronger reasoning over the whole-app catalogue + action chaining
+      model: 'claude-haiku-4-5',   // cost-effective; the whole-app catalogue is prompt-cached (cache_control below) so context stays cheap + fresh
       max_tokens: 768,
       system: [
         { type: 'text', text: system, cache_control: { type: 'ephemeral' } },
