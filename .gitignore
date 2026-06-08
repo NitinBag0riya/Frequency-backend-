@@ -15,3 +15,45 @@ scripts/*.xlsx
 # Generated email artifacts (regenerate via `npm run email:test` / `npm run email:auth`)
 tests/email-previews/out/
 src/emails/auth-dist/
+tests/email-previews/
+
+# Ad-hoc throwaway debug / browser-automation scripts (snake_case verb prefixes).
+# Committed scripts are kebab-case (e.g. add-app-role.ts) and unaffected —
+# .gitignore never un-tracks already-tracked files.
+scripts/add_*
+scripts/check_*
+scripts/click_*
+scripts/complete_*
+scripts/configure_*
+scripts/connect_*
+scripts/create_*
+scripts/debug_*
+scripts/dump_*
+scripts/enter_*
+scripts/fill_*
+scripts/find_*
+scripts/fix_*
+scripts/go_to_*
+scripts/inspect_*
+scripts/list_*
+scripts/save_*
+scripts/screenshot_*
+scripts/scroll_*
+scripts/search_*
+scripts/select_*
+scripts/send_*
+scripts/setup_*
+scripts/step_*
+scripts/submit_*
+scripts/test_*
+scripts/unsuspend_*
+scripts/wait_*
+# A few hyphen-named throwaway scripts + root debug files
+scripts/check-telegram-webhook.ts
+scripts/inspect-workflow-tables.ts
+/check-connections.ts
+/check-realtime.ts
+/tg-info.ts
+# Local CLI/session state
+supabase/.temp/
+.claude/
