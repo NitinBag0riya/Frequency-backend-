@@ -24,6 +24,8 @@ import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { apiError } from '../lib/api-error'
 import { sendEmail } from '../lib/email'
+import { renderEmail } from '../emails/render'
+import IntegrationRequestAlert from '../emails/templates/IntegrationRequestAlert'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -141,18 +143,17 @@ async function notifyDeveloperTeam(args: {
       `Super-admin link: ${dashLink}`,
     ].filter(Boolean).join('\n')
 
-    const html = `<!doctype html><html><body style="font-family:DM Sans,system-ui,sans-serif;color:#1a1a1a;line-height:1.55">
-      <h2 style="margin:0 0 12px;font-size:18px">New integration request: ${escapeHtml(args.app_name)}</h2>
-      <table cellspacing="0" cellpadding="6" style="border-collapse:collapse;font-size:14px">
-        <tr><td><b>Tenant</b></td><td>${escapeHtml(tenantLabel)} <span style="color:#888">(${args.tenantId})</span></td></tr>
-        <tr><td><b>Requested by</b></td><td>${escapeHtml(userEmail)}</td></tr>
-        ${args.n8n_type ? `<tr><td><b>n8n type</b></td><td><code>${escapeHtml(args.n8n_type)}</code></td></tr>` : ''}
-        ${args.reason ? `<tr><td valign="top"><b>Reason</b></td><td>${escapeHtml(args.reason).replace(/\n/g, '<br>')}</td></tr>` : ''}
-        ${args.context ? `<tr><td valign="top"><b>Context</b></td><td><pre style="margin:0;padding:8px;background:#f5f5f5;border-radius:6px;font-size:12px">${escapeHtml(JSON.stringify(args.context, null, 2))}</pre></td></tr>` : ''}
-        <tr><td><b>Created</b></td><td>${args.row.created_at}</td></tr>
-      </table>
-      <p style="margin-top:16px"><a href="${dashLink}" style="color:#0F6E56;font-weight:600">Open in super-admin →</a></p>
-    </body></html>`
+    const { html } = await renderEmail(IntegrationRequestAlert, {
+      appName:     args.app_name,
+      tenantLabel,
+      tenantId:    args.tenantId,
+      userEmail,
+      n8nType:     args.n8n_type ?? null,
+      reason:      args.reason ?? null,
+      context:     args.context ?? null,
+      createdAt:   args.row.created_at,
+      dashLink,
+    })
 
     const recipients: string[] = [to]
     if (ccRaw) for (const cc of ccRaw.split(',').map(s => s.trim()).filter(Boolean)) recipients.push(cc)
@@ -161,20 +162,11 @@ async function notifyDeveloperTeam(args: {
       to: recipients,
       subject,
       html,
-      text: lines,
+      text: lines,                 // keep the rich plain-text internal log (incl. ids)
       idempotency_key: `integration-request:${args.row.id}`,
     })
     console.log('[integration-requests] notified', to, 'about', args.app_name, args.row.id)
   } catch (e: any) {
     console.warn('[integration-requests] email failed (row already persisted):', e?.message ?? e)
   }
-}
-
-function escapeHtml(s: string): string {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
 }

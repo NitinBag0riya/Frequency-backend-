@@ -26,6 +26,9 @@ import crypto from 'crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { z } from 'zod'
 import { sendEmail } from '../lib/email'
+import { renderEmail } from '../emails/render'
+import AgencySubAccountInvite from '../emails/templates/AgencySubAccountInvite'
+import AgencyMemberInvite from '../emails/templates/AgencyMemberInvite'
 import {
   ensureCustomer, createSubscription, cancelSubscription,
   createPlan, listSubscriptionPayments, createRefund,
@@ -457,11 +460,15 @@ export function createAgencyRouter(deps: Deps): express.Router {
     const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/agency-link/accept?token=${encodeURIComponent(token)}`
 
     try {
+      const { html, text } = await renderEmail(AgencySubAccountInvite, {
+        agencyName: agency.name,
+        acceptUrl,
+      })
       await sendEmail({
         to: parsed.data.tenant_owner_email,
         subject: `${agency.name} invited you to connect your workspace`,
-        html: `<p>Hi,</p><p><strong>${agency.name}</strong> has invited you to connect your Frequency workspace as a managed sub-account. You'll keep your account; they'll get a read-only view + (optionally) take over billing.</p><p><a href="${acceptUrl}" style="display:inline-block;background:#0F6E56;color:#fff;text-decoration:none;font-weight:600;padding:10px 20px;border-radius:8px">Review & accept</a></p><p>This link expires in 7 days. If you didn't expect this, ignore the email.</p>`,
-        text: `${agency.name} invited you to connect your workspace.\n\nAccept: ${acceptUrl}\n\nLink expires in 7 days.`,
+        html,
+        text,
       })
     } catch (e: any) {
       // Surface but don't fail — the agency operator can re-send / share the URL manually.
@@ -688,11 +695,16 @@ export function createAgencyRouter(deps: Deps): express.Router {
     const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/agency-invite/accept?token=${encodeURIComponent(token)}`
 
     try {
+      const { html, text } = await renderEmail(AgencyMemberInvite, {
+        agencyName: agency.name,
+        role: parsed.data.role,
+        acceptUrl,
+      })
       await sendEmail({
         to: parsed.data.email,
         subject: `You're invited to ${agency.name} on Frequency`,
-        html: `<p>You've been invited to join <strong>${agency.name}</strong> as <em>${parsed.data.role.replace(/_/g, ' ')}</em>.</p><p><a href="${acceptUrl}" style="display:inline-block;background:#0F6E56;color:#fff;text-decoration:none;font-weight:600;padding:10px 20px;border-radius:8px">Accept invite</a></p><p>This link expires in 7 days.</p>`,
-        text: `Invited to ${agency.name} as ${parsed.data.role}.\n\nAccept: ${acceptUrl}\n\nLink expires in 7 days.`,
+        html,
+        text,
       })
     } catch (e: any) {
       console.warn('[agency] member invite email failed (non-fatal):', e?.message)

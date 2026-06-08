@@ -21,6 +21,8 @@
 
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
+import { renderEmail } from '../emails/render'
+import NotificationEmail from '../emails/templates/NotificationEmail'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -290,11 +292,9 @@ async function dispatchEmails(
   // (we want a graceful degradation: in-app keeps working even if Resend
   // isn't configured).
   let sendEmail: typeof import('../lib/email').sendEmail
-  let renderNotificationEmail: typeof import('../lib/email').renderNotificationEmail
   try {
     const mod = await import('../lib/email')
     sendEmail = mod.sendEmail
-    renderNotificationEmail = mod.renderNotificationEmail
   } catch (e: any) {
     console.warn('[notifications] email module load failed:', e?.message ?? e)
     return
@@ -366,7 +366,7 @@ async function dispatchEmails(
       return
     }
 
-    const { html, text } = renderNotificationEmail({ title: n.title, body: n.body, link: n.link })
+    const { html, text } = await renderEmail(NotificationEmail, { title: n.title, body: n.body, link: n.link })
     try {
       const result = await sendEmail({
         to,

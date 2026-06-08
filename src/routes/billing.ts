@@ -25,6 +25,7 @@ import {
 } from '../lib/razorpay'
 import { emitNotification } from './notifications'
 import { withIdempotency } from '../lib/idempotency'
+import { renderInvoiceEmail } from '../emails/invoice'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -950,10 +951,20 @@ async function generateAndEmailGstInvoice(
     } else {
       try {
         const { sendEmail } = await import('../lib/email')
+        // Wrap the unchanged legal invoice (`html`) in a branded email shell.
+        const emailHtml = await renderInvoiceEmail({
+          heading:       'Tax invoice',
+          invoiceNumber,
+          amountLabel:   `₹${(Number(gst.total_paise) / 100).toLocaleString('en-IN')}`,
+          dateLabel:     issueDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+          buyerName:     tenant.legal_name ?? tenant.business_name ?? 'Customer',
+          description:   `Frequency ${planLabel} Plan — subscription period ending ${issueDate.toLocaleDateString('en-IN', { month: 'short', year: 'numeric' })}`,
+          viewUrl:       '/settings/billing',
+        }, html)
         await sendEmail({
           to:      recipient,
           subject: subjectLine,
-          html,
+          html:    emailHtml,
           text:    `Tax Invoice ${invoiceNumber} for ₹${(Number(gst.total_paise) / 100).toLocaleString('en-IN')} attached. Open in a browser for the full HTML invoice.`,
           idempotency_key: `inv_email_${args.razorpay_inv_id}`,
         })
@@ -1130,10 +1141,18 @@ async function handleAgencyWebhookEvent(
 
           if (recipient && process.env.RESEND_API_KEY && process.env.RESEND_FROM_EMAIL) {
             const { sendEmail } = await import('../lib/email')
+            const emailHtml = await renderInvoiceEmail({
+              heading:       'Agency invoice',
+              invoiceNumber,
+              amountLabel:   `₹${(Number(gst.total_paise) / 100).toLocaleString('en-IN')}`,
+              dateLabel:     issueDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+              buyerName:     agency?.name ?? 'Agency',
+              description:   `Frequency ${planLabel} (Agency platform fee)`,
+            }, html)
             await sendEmail({
               to:      recipient,
               subject: `Tax Invoice ${invoiceNumber} — ₹${(Number(gst.total_paise) / 100).toLocaleString('en-IN')}`,
-              html,
+              html:    emailHtml,
               text:    `Tax Invoice ${invoiceNumber} attached.`,
               idempotency_key: `agency_inv_email_${rzInvId}`,
             })

@@ -11,3 +11,7 @@ dist/
 scratch/
 scripts/*.xlsx
 .vercel
+
+# Generated email artifacts (regenerate via `npm run email:test` / `npm run email:auth`)
+tests/email-previews/out/
+src/emails/auth-dist/
