@@ -140,8 +140,11 @@ Output STRICT JSON: { "recommendations": [...] }. No markdown, no commentary.`
       }
       res.json({ source: 'ai', recommendations: [] })
     } catch (err: any) {
+      // Recommendations are a non-critical enhancement — a failed AI call must
+      // never hard-fail the page. Log for debugging and degrade to an empty set
+      // (same shape/contract as the no-API-key branch above).
       console.error('[workflow-recos] AI error:', err.message)
-      res.status(500).json({ error: 'Recommendation generation failed', detail: err.message })
+      res.json({ source: 'error', recommendations: [], note: 'Could not generate recommendations right now.' })
     }
   })
 

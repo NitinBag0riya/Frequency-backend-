@@ -238,6 +238,11 @@ async function probeAuthed(ep: DiscoveredEndpoint, ctx: ProbeContext): Promise<P
                   || status === 405
                   || status === 403
                   || status === 422
+                  // 424 Failed Dependency — connector endpoints return this when
+                  // the integration isn't connected (loadCreds throws). The probe
+                  // tenant has no live integrations, so this is the correct,
+                  // intentional response ("connect X first"), not a panic.
+                  || status === 424
   return {
     endpoint: ep, status, ok: expected,
     reason: expected ? `${status} (expected)` : `unexpected status ${status}`,

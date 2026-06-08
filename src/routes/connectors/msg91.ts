@@ -134,7 +134,7 @@ export function createMsg91Connector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok || body?.type === 'error') { res.status(r2.ok ? 400 : r2.status).json({ error: msgErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/msg91/otp', ...guardEdit,
@@ -152,7 +152,7 @@ export function createMsg91Connector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok || body?.type === 'error') { res.status(r2.ok ? 400 : r2.status).json({ error: msgErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/msg91/otp/verify', ...guardEdit,
@@ -169,7 +169,7 @@ export function createMsg91Connector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok || body?.type === 'error') { res.status(r2.ok ? 400 : r2.status).json({ error: msgErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -183,6 +183,6 @@ export async function loadKey(supabase: SupabaseClient, tenantId: string): Promi
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token')
     .eq('tenant_id', tenantId).eq('key', 'msg91').maybeSingle()
-  if (!row?.access_token) throw new Error('MSG91 not connected')
+  if (!row?.access_token) throw Object.assign(new Error('MSG91 not connected'), { status: 424 })
   return decrypt(row.access_token)
 }

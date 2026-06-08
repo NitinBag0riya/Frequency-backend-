@@ -268,7 +268,7 @@ export function createRazorpayConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.description ?? `Razorpay ${r2.status}` }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   // list_payments
@@ -286,7 +286,7 @@ export function createRazorpayConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.description ?? `Razorpay ${r2.status}` }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   // get_payment
@@ -299,7 +299,7 @@ export function createRazorpayConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.description ?? `Razorpay ${r2.status}` }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   // refund_payment
@@ -317,7 +317,7 @@ export function createRazorpayConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.description ?? `Razorpay ${r2.status}` }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   // list_subscriptions
@@ -332,7 +332,7 @@ export function createRazorpayConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.description ?? `Razorpay ${r2.status}` }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   // list_customers
@@ -347,7 +347,7 @@ export function createRazorpayConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.description ?? `Razorpay ${r2.status}` }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -435,7 +435,7 @@ export async function getRazorpayAuthHeader(supabase: SupabaseClient, tenantId: 
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, refresh_token, metadata, token_expires_at')
     .eq('tenant_id', tenantId).eq('key', 'razorpay').maybeSingle()
-  if (!row?.access_token) throw new Error('Razorpay not connected — connect it in Apps')
+  if (!row?.access_token) throw Object.assign(new Error('Razorpay not connected — connect it in Apps'), { status: 424 })
 
   const mode = (row.metadata as any)?.auth_mode ?? 'api_key'
   if (mode === 'api_key') {

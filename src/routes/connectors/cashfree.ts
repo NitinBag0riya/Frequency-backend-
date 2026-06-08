@@ -162,7 +162,7 @@ export function createCashfreeConnector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok) { res.status(r2.status).json({ error: cfErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.get('/api/connectors/cashfree/orders/:order_id', ...guardView, async (req, res) => {
@@ -173,7 +173,7 @@ export function createCashfreeConnector(deps: Deps): express.Router {
       const body = await r2.json().catch(() => ({})) as any
       if (!r2.ok) { res.status(r2.status).json({ error: cfErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.post('/api/connectors/cashfree/links', ...guardEdit,
@@ -185,7 +185,7 @@ export function createCashfreeConnector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok) { res.status(r2.status).json({ error: cfErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/cashfree/orders/:order_id/refunds', ...guardEdit,
@@ -198,7 +198,7 @@ export function createCashfreeConnector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok) { res.status(r2.status).json({ error: cfErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -214,9 +214,9 @@ export async function loadCreds(
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, metadata')
     .eq('tenant_id', tenantId).eq('key', 'cashfree').maybeSingle()
-  if (!row?.access_token) throw new Error('Cashfree not connected')
+  if (!row?.access_token) throw Object.assign(new Error('Cashfree not connected'), { status: 424 })
   const md = (row.metadata as any) ?? {}
-  if (!md.app_id) throw new Error('Cashfree connection missing App ID — please reconnect')
+  if (!md.app_id) throw Object.assign(new Error('Cashfree connection missing App ID — please reconnect'), { status: 424 })
   const environment: 'production' | 'sandbox' = md.environment === 'sandbox' ? 'sandbox' : 'production'
   return { appId: String(md.app_id), secret: decrypt(row.access_token), base: CF_BASE[environment], environment }
 }

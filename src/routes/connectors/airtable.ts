@@ -175,7 +175,7 @@ export function createAirtableConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: body.error?.message ?? body.error ?? 'Airtable error' }); return }
       res.json({ bases: body.bases ?? [] })
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.get('/api/connectors/airtable/bases/:baseId/tables', ...guard, async (req, res) => {
@@ -187,7 +187,7 @@ export function createAirtableConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: body.error?.message ?? body.error ?? 'Airtable error' }); return }
       res.json({ tables: body.tables ?? [] })
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.get('/api/connectors/airtable/bases/:baseId/tables/:tableId', ...guard, async (req, res) => {
@@ -203,7 +203,7 @@ export function createAirtableConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: body.error?.message ?? body.error ?? 'Airtable error' }); return }
       res.json({ records: body.records ?? [], offset: body.offset ?? null })
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.post('/api/connectors/airtable/bases/:baseId/tables/:tableId',
@@ -219,7 +219,7 @@ export function createAirtableConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.message ?? body.error ?? 'Airtable error' }); return }
         res.json({ record: body })
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.patch('/api/connectors/airtable/bases/:baseId/tables/:tableId/:recordId',
@@ -235,7 +235,7 @@ export function createAirtableConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: body.error?.message ?? body.error ?? 'Airtable error' }); return }
         res.json({ record: body })
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -266,7 +266,7 @@ export async function getValidToken(supabase: SupabaseClient, tenantId: string):
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, refresh_token, token_expires_at')
     .eq('tenant_id', tenantId).eq('key', 'airtable').maybeSingle()
-  if (!row?.access_token) throw new Error('Airtable not connected for this tenant')
+  if (!row?.access_token) throw Object.assign(new Error('Airtable not connected for this tenant'), { status: 424 })
 
   const oldExpiresAtIso = row.token_expires_at as string | null
   const expiresAt = oldExpiresAtIso ? new Date(oldExpiresAtIso).getTime() : 0
@@ -278,7 +278,7 @@ export async function getValidToken(supabase: SupabaseClient, tenantId: string):
   const clientId = process.env.AIRTABLE_CLIENT_ID
   if (!clientId) throw new Error('AIRTABLE_CLIENT_ID not configured')
   const refreshToken = decrypt(row.refresh_token)
-  if (!refreshToken) throw new Error('No refresh_token on file — please reconnect Airtable')
+  if (!refreshToken) throw Object.assign(new Error('No refresh_token on file — please reconnect Airtable'), { status: 424 })
 
   const r2 = await fetch('https://airtable.com/oauth2/v1/token', {
     method: 'POST',

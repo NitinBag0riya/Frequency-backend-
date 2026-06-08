@@ -159,7 +159,7 @@ export function createPayuConnector(deps: Deps): express.Router {
         if (p.furl)  fields.furl  = p.furl
         for (const k of ['udf1', 'udf2', 'udf3', 'udf4', 'udf5'] as const) if (p[k]) fields[k] = p[k] as string
         res.json({ hash, action: payUrl, fields })
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/payu/verify', ...guardEdit,
@@ -173,7 +173,7 @@ export function createPayuConnector(deps: Deps): express.Router {
         const out = await r2.json().catch(() => ({})) as any
         if (String(out?.status) !== '1') { res.status(400).json({ error: out?.msg ? String(out.msg) : `PayU verify failed (${r2.status})` }); return }
         res.json(out)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/payu/refund', ...guardEdit,
@@ -189,7 +189,7 @@ export function createPayuConnector(deps: Deps): express.Router {
         const out = await r2.json().catch(() => ({})) as any
         if (String(out?.status) !== '1') { res.status(400).json({ error: out?.msg ? String(out.msg) : `PayU refund failed (${r2.status})` }); return }
         res.json(out)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -205,9 +205,9 @@ export async function loadCreds(
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, metadata')
     .eq('tenant_id', tenantId).eq('key', 'payu').maybeSingle()
-  if (!row?.access_token) throw new Error('PayU not connected')
+  if (!row?.access_token) throw Object.assign(new Error('PayU not connected'), { status: 424 })
   const md = (row.metadata as any) ?? {}
-  if (!md.merchant_key) throw new Error('PayU connection missing merchant key — please reconnect')
+  if (!md.merchant_key) throw Object.assign(new Error('PayU connection missing merchant key — please reconnect'), { status: 424 })
   const environment: 'production' | 'test' = md.environment === 'test' ? 'test' : 'production'
   return { key: String(md.merchant_key), salt: decrypt(row.access_token), payUrl: PAYU[environment].pay, infoUrl: PAYU[environment].info, environment }
 }

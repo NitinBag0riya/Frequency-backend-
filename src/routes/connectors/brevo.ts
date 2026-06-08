@@ -150,7 +150,7 @@ export function createBrevoConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: brevoErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.post('/api/connectors/brevo/contacts', ...guardEdit,
@@ -166,7 +166,7 @@ export function createBrevoConnector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok) { res.status(r2.status).json({ error: brevoErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/brevo/email', ...guardEdit,
@@ -180,7 +180,7 @@ export function createBrevoConnector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok) { res.status(r2.status).json({ error: brevoErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/brevo/sms', ...guardEdit,
@@ -197,7 +197,7 @@ export function createBrevoConnector(deps: Deps): express.Router {
         const body = await r2.json().catch(() => ({})) as any
         if (!r2.ok) { res.status(r2.status).json({ error: brevoErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -211,6 +211,6 @@ export async function loadKey(supabase: SupabaseClient, tenantId: string): Promi
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token')
     .eq('tenant_id', tenantId).eq('key', 'brevo').maybeSingle()
-  if (!row?.access_token) throw new Error('Brevo not connected')
+  if (!row?.access_token) throw Object.assign(new Error('Brevo not connected'), { status: 424 })
   return decrypt(row.access_token)
 }

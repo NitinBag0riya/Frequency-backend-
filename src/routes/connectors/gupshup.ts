@@ -148,7 +148,7 @@ export function createGupshupConnector(deps: Deps): express.Router {
         const out = await r2.json().catch(() => ({})) as any
         if (!r2.ok || out?.status === 'error') { res.status(r2.ok ? 400 : r2.status).json({ error: gsErr(r2, out) }); return }
         res.json(out)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/gupshup/template', ...guardEdit,
@@ -173,7 +173,7 @@ export function createGupshupConnector(deps: Deps): express.Router {
         const out = await r2.json().catch(() => ({})) as any
         if (!r2.ok || out?.status === 'error') { res.status(r2.ok ? 400 : r2.status).json({ error: gsErr(r2, out) }); return }
         res.json(out)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/gupshup/opt-in', ...guardEdit,
@@ -190,7 +190,7 @@ export function createGupshupConnector(deps: Deps): express.Router {
         const out = await r2.json().catch(() => ({})) as any
         if (!r2.ok || out?.status === 'error') { res.status(r2.ok ? 400 : r2.status).json({ error: gsErr(r2, out) }); return }
         res.json(out)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -206,8 +206,8 @@ export async function loadCreds(
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, metadata')
     .eq('tenant_id', tenantId).eq('key', 'gupshup').maybeSingle()
-  if (!row?.access_token) throw new Error('Gupshup not connected')
+  if (!row?.access_token) throw Object.assign(new Error('Gupshup not connected'), { status: 424 })
   const md = (row.metadata as any) ?? {}
-  if (!md.app_name || !md.source) throw new Error('Gupshup connection missing app name/source — please reconnect')
+  if (!md.app_name || !md.source) throw Object.assign(new Error('Gupshup connection missing app name/source — please reconnect'), { status: 424 })
   return { apiKey: decrypt(row.access_token), appName: String(md.app_name), source: String(md.source) }
 }

@@ -141,7 +141,7 @@ export function createExotelConnector(deps: Deps): express.Router {
         const out = await r2.json().catch(() => ({})) as any
         if (!r2.ok) { res.status(r2.status).json({ error: exoErr(r2, out) }); return }
         res.json(out)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/exotel/sms', ...guardEdit,
@@ -159,7 +159,7 @@ export function createExotelConnector(deps: Deps): express.Router {
         const out = await r2.json().catch(() => ({})) as any
         if (!r2.ok) { res.status(r2.status).json({ error: exoErr(r2, out) }); return }
         res.json(out)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.get('/api/connectors/exotel/call/:call_sid', ...guardView, async (req, res) => {
@@ -172,7 +172,7 @@ export function createExotelConnector(deps: Deps): express.Router {
       const out = await r2.json().catch(() => ({})) as any
       if (!r2.ok) { res.status(r2.status).json({ error: exoErr(r2, out) }); return }
       res.json(out)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   return r
@@ -195,9 +195,9 @@ export async function loadCreds(
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, metadata')
     .eq('tenant_id', tenantId).eq('key', 'exotel').maybeSingle()
-  if (!row?.access_token) throw new Error('Exotel not connected')
+  if (!row?.access_token) throw Object.assign(new Error('Exotel not connected'), { status: 424 })
   const md = (row.metadata as any) ?? {}
-  if (!md.api_key || !md.account_sid) throw new Error('Exotel connection missing api_key/account_sid — please reconnect')
+  if (!md.api_key || !md.account_sid) throw Object.assign(new Error('Exotel connection missing api_key/account_sid — please reconnect'), { status: 424 })
   const region: 'in' | 'sg' = md.region === 'sg' ? 'sg' : 'in'
   return { authHeader: basic(String(md.api_key), decrypt(row.access_token)), base: EXO_BASE[region], sid: String(md.account_sid) }
 }
