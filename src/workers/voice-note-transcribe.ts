@@ -38,6 +38,7 @@
 import '../env'
 import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
+import { recordFlatAiCostCents } from '../lib/ai-usage'
 import { Q, VoiceNoteTranscribeJob, connection } from '../queue'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
@@ -135,6 +136,11 @@ export function startVoiceNoteTranscribeWorker() {
       const durationSec = clampNumber(whisperResp.duration, 0, MAX_DURATION_SECONDS)
       const language    = typeof whisperResp.language === 'string' ? whisperResp.language : null
       const costPaise   = computeCostPaise(durationSec ?? 0)
+
+      // Roll Whisper cost into the tenant's ai_dollars_per_month cap — it was
+      // only stored per-transcript (cost_paise) before, invisible to the cap.
+      // Whisper-1 is billed per-minute ($0.006/min) → USD cents = minutes × 0.6.
+      void recordFlatAiCostCents(supabase, tenantId, 'voice_note_transcribe', Math.ceil(((durationSec ?? 0) / 60) * 0.6))
 
       await upsertTranscript(tenantId, messageId, {
         provider:          PROVIDER_TAG,

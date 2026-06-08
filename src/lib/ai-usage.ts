@@ -17,6 +17,7 @@
  * separately is the only way to guarantee a per-tenant margin floor.
  *
  * Cost rates (Anthropic public pricing, USD per 1M tokens):
+ *   Opus 4.7:    input $15.00   output $75.00   cache_read $1.50   cache_write $18.75
  *   Sonnet 4:    input  $3.00   output $15.00   cache_read $0.30   cache_write $3.75
  *   Haiku 4.5:   input  $1.00   output $5.00    cache_read $0.10   cache_write $1.25
  *
@@ -64,15 +65,25 @@ export interface AiUsage {
 /**
  * Per-model price points in CENTS PER 1,000,000 TOKENS.
  *
- * Add a new model = add a new entry. Models we don't recognise fall back
- * to Sonnet rates (the more expensive of the two we use) so we
- * never under-bill the cost counter on an unknown model.
+ * Add a new model = add a new entry. EVERY model the codebase can actually
+ * invoke MUST be listed here. Unrecognised models fall back to Sonnet rates
+ * (FALLBACK_RATES) — which is safe ONLY for models at or below Sonnet's
+ * price. Opus is 5× Sonnet, so an unlisted Opus string would silently
+ * under-bill by 5×. (This is exactly what happened: 'claude-opus-4-7' is the
+ * production model in ai-responder.ts, ai-knowledge.ts, wa-features.ts and
+ * the executor's run_ai_responder node, but was missing here.) Keep this
+ * table in sync with the model strings in those call sites.
  *
  * Bumping rates: Anthropic publishes price changes; reflect them here +
  * any per-tenant grandfathering should be handled in the plan-limit
  * layer, not here.
  */
 const RATES_CPM: Record<string, { in: number; out: number; cache_read: number; cache_write: number }> = {
+  'claude-opus-4-7':      { in: 1500, out: 7500, cache_read: 150, cache_write: 1875 },
+  // Defensive aliases for any older Opus string that may surface (none in the
+  // codebase today). Opus pricing has been flat across these generations.
+  'claude-opus-4-5':      { in: 1500, out: 7500, cache_read: 150, cache_write: 1875 },
+  'claude-3-opus':        { in: 1500, out: 7500, cache_read: 150, cache_write: 1875 },
   'claude-sonnet-4-6':    { in: 300, out: 1500, cache_read: 30,  cache_write: 375 },
   'claude-sonnet-4-5':    { in: 300, out: 1500, cache_read: 30,  cache_write: 375 },
   'claude-3-5-sonnet':    { in: 300, out: 1500, cache_read: 30,  cache_write: 375 },
@@ -151,6 +162,30 @@ export async function recordAiUsage(
     }
   } catch (e: any) {
     console.warn(`[ai-usage] write failed (tenant=${tenantId} src=${source}): ${e?.message ?? e}`)
+  }
+}
+
+/**
+ * Record a FLAT USD-cent AI cost (no token counts) against the tenant's
+ * monthly ai_cost_cents counter — for non-token AI spend that must still count
+ * toward `ai_dollars_per_month`, e.g. OpenAI Whisper voice-note transcription
+ * (billed per audio-minute). Fire-and-forget, same contract as recordAiUsage.
+ */
+export async function recordFlatAiCostCents(
+  supabase: SupabaseClient,
+  tenantId: string,
+  source: string,
+  costCents: number,
+): Promise<void> {
+  if (!tenantId || !(costCents > 0)) return
+  const { startIso, endIso } = currentIstMonthBounds()
+  try {
+    await upsertCounter(supabase, tenantId, 'ai_cost_cents', startIso, endIso, Math.ceil(costCents))
+    if (process.env.LOG_AI_USAGE === '1') {
+      console.log(`[ai-usage] tenant=${tenantId} src=${source} flat cents=+${Math.ceil(costCents)}`)
+    }
+  } catch (e: any) {
+    console.warn(`[ai-usage] flat-cost write failed (tenant=${tenantId} src=${source}): ${e?.message ?? e}`)
   }
 }
 

@@ -150,12 +150,11 @@ const FAIL_CLOSED_FREE_DEFAULTS: Record<string, number> = {
   broadcasts_per_day:   1,
   team_size_max:        1,
   ai_tokens_per_month:  0,
-  // Hardcoded $1/mo ceiling for the fail-closed Free tier — covers
-  // typical experimental usage (a handful of parse-workflow calls)
-  // without ever exposing Frequency to runaway AI cost on a misconfigured
-  // plans table. Real Free tier in DB is $0.50; this is the SAFETY NET
-  // when the DB read fails entirely.
-  ai_dollars_per_month: 1,
+  // Hardcoded $0.50/mo ceiling for the fail-closed Free tier — matches the
+  // real Free value in the DB so this fallback can't silently grant 2× the
+  // intended AI budget on a misconfigured plans table. Still covers typical
+  // experimental usage without exposing Frequency to runaway AI cost.
+  ai_dollars_per_month: 0.5,
 }
 
 /**

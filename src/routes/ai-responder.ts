@@ -52,6 +52,7 @@ const docUpload = multer({
 })
 import { recordAiUsage } from '../lib/ai-usage'
 import { blockIfOverLimit } from '../lib/limits'
+import { resolveAiModel } from '../lib/plans'
 import { apiError } from '../lib/api-error'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -73,9 +74,14 @@ const anthropic = process.env.ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null
 
-// Default model — overridable per-tenant via tenant_ai_settings.model.
-// Matches the system-prompt recommendation.
-const DEFAULT_MODEL = 'claude-opus-4-7'
+// Default model for the AI responder — overridable per-tenant via
+// tenant_ai_settings.model. Sonnet (not Opus) by design: the responder is the
+// highest-frequency AI call site (fires on every inbound reply), Sonnet is ~5×
+// cheaper per call than Opus 4.7, AND Sonnet's 1,024-token prompt-cache floor
+// actually engages for our ~1k-token system prompt whereas Opus 4.7's 4,096
+// floor never does — so the real cost gap is even larger than 5×. Opus stays
+// available for tenants who explicitly opt in via tenant_ai_settings.model.
+const DEFAULT_MODEL = 'claude-sonnet-4-6'
 
 export function createAiResponderRouter(deps: Deps): express.Router {
   const r = express.Router()
@@ -362,7 +368,8 @@ export function createAiResponderRouter(deps: Deps): express.Router {
 
       const bizName = (settings.business_context as any)?.business_name || 'our business'
       const systemPrompt = buildSystemPrompt(bizName, settings.system_prompt_addon, chunks)
-      const model = settings.model || DEFAULT_MODEL
+      // Free tenants are pinned to Haiku regardless of their saved model.
+      const model = await resolveAiModel(supabase, tenantId, settings.model, DEFAULT_MODEL)
 
       // Claude 4.x (opus/sonnet/haiku-4) rejects the `temperature` param
       // ("temperature is deprecated for this model"). Mirror the guard in

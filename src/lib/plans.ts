@@ -56,3 +56,25 @@ export async function getActivePlanForTenant(
     limits:   (planRow?.limits ?? {}) as Record<string, number>,
   }
 }
+
+/**
+ * Resolve the AI model a tenant's reply should actually use. Free tenants are
+ * pinned to Haiku (the cheapest model) regardless of their
+ * tenant_ai_settings.model — this bounds free-abuse AI COGS on the
+ * highest-volume responder path (Haiku ≈ 1/5 Sonnet, ≈ 1/27 Opus per call).
+ * Paid tenants get the model they requested. Fails OPEN to the requested
+ * model on any lookup error — never change/block a paid reply over a plan read.
+ */
+export async function resolveAiModel(
+  supabase: SupabaseClient,
+  tenantId: string,
+  requestedModel: string | null | undefined,
+  fallback = 'claude-sonnet-4-6',
+): Promise<string> {
+  try {
+    const active = await getActivePlanForTenant(supabase, tenantId)
+    const planId = (active?.plan_id ?? 'free').toLowerCase()
+    if (planId === 'free') return 'claude-haiku-4-5'
+  } catch { /* fail open */ }
+  return requestedModel || fallback
+}

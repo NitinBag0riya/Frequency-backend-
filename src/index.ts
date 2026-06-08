@@ -609,16 +609,26 @@ app.use('/api/onboarding', authLimiter)
 
 app.get('/api/ping', (req, res) => res.json({ pong: true }))
 
-// Public catalogue of available plans — used by the UpgradeBanner so the
-// modal can render the actual monthly price (₹) when surfacing a 402.
-// No auth required: this is marketing-grade information, same as a public
-// pricing page would expose.
+// Public catalogue of available plans — the SINGLE SOURCE OF TRUTH for the
+// pricing UI. Consumed by the landing page (HomeNewPage), the in-app
+// BillingPage plan picker, and the UpgradeBanner 402 modal. No auth required:
+// this is marketing-grade information, same as a public pricing page exposes.
+//
+// scope='tenant' filter excludes the agency plans (agency_starter/_growth/
+// _scale, migration 088) which live in the same table but are sold through a
+// separate surface — without it they'd leak into the tenant pricing grid.
+//
+// Returns the paise columns (price_inr_mo / price_inr_yr) alongside the rupee
+// `monthly_price_inr` so the FE can render annual pricing without a second
+// source. `limits` (jsonb) is what lib/limits.ts actually enforces — so the
+// displayed limits and the enforced limits can never diverge again.
 app.get('/api/plans', async (_req, res) => {
   try {
     const { data, error } = await supabase
       .from('plans')
-      .select('id, name, monthly_price_inr, features, limits, sort_order, trial_days, is_active')
+      .select('id, name, monthly_price_inr, price_inr_mo, price_inr_yr, features, limits, sort_order, trial_days, is_active')
       .eq('is_active', true)
+      .eq('scope', 'tenant')
       .order('sort_order', { ascending: true })
     if (error) throw error
     res.json(data || [])
@@ -1212,6 +1222,16 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
     if (await blockIfOverLimit(res, supabase, tenantId, 'ai_dollars_per_month'))  return
   }
 
+  // Free tier gets a tighter parse-output ceiling to bound worst-case Sonnet
+  // output cost on huge pastes; paid tiers keep the full 16000 for big n8n
+  // imports. Fails open to 16000 on any plan-read error.
+  let parseMaxTokens = 16000
+  try {
+    const { getActivePlanForTenant } = await import('./lib/plans')
+    const active = await getActivePlanForTenant(supabase, tenantId)
+    if (((active?.plan_id ?? 'free').toLowerCase()) === 'free') parseMaxTokens = 4096
+  } catch { /* fail open to 16000 */ }
+
   // ── SSE setup ───────────────────────────────────────────────────────────────
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
   res.setHeader('Cache-Control', 'no-cache, no-transform')
@@ -1279,7 +1299,7 @@ app.post('/api/parse-workflow', requireAuth, identifyTenant, async (req, res) =>
       // every realistic Frequency blueprint while keeping latency
       // bounded. Truncation is also explicitly detected below via
       // stop_reason='max_tokens' so we can surface a clean error.
-      max_tokens: 16000,
+      max_tokens: parseMaxTokens,
       // Prompt-cache the (long, stable) system prompt for ~70% cost / latency win.
       // First call seeds the cache; subsequent calls in the next 5 min hit it.
       system: [

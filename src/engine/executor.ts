@@ -19,6 +19,7 @@ import {
   connection as redisConnection,
 } from '../queue'
 import { interpolate, interpolateDeep } from './interpolator'
+import { resolveAiModel } from '../lib/plans'
 import {
   sheetsAppendRow, sheetsUpdateRange,
   calendarCreateEvent, calendarCheckAvailability,
@@ -455,10 +456,10 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
           return simAdvance(ctx, node, {
             system_prompt: systemPromptPreview,
             user_message: interpolate(cfg.user_message ?? '', vars),
-            model: cfg.model ?? 'claude-opus-4-7',
+            model: cfg.model ?? 'claude-sonnet-4-6',
           }, {
             variableUpdates: updates,
-            output: { simulated: true, length: synthText.length, model: cfg.model ?? 'claude-opus-4-7' },
+            output: { simulated: true, length: synthText.length, model: cfg.model ?? 'claude-sonnet-4-6' },
           })
         }
 
@@ -561,7 +562,8 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
           ? interpolate(cfg.system_prompt, vars)
           : settings.system_prompt_addon
         const systemPrompt = buildSystemPrompt(bizName, promptAddon, retrieved, { vertical })
-        const model = cfg.model ?? settings.model ?? 'claude-opus-4-7'
+        // Free tenants are pinned to Haiku; paid tenants keep their node/tenant model.
+        const model = await resolveAiModel(supabase, ctx.tenant.id, cfg.model ?? settings.model)
 
         // ── Multi-turn memory ───────────────────────────────────────────────
         // Modern support bots ground on prior dialogue turns so follow-ups
