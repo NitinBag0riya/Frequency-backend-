@@ -306,6 +306,56 @@ export function createTelegramRouter(deps: Deps): express.Router {
     res.json({ success: true })
   })
 
+  // Install a mini-app as the bot's global menu button (the "≡" button in
+  // every chat with the bot). Without this call the mini-app row in the
+  // DB has no effect on what users see in Telegram — it's just a URL
+  // registry the FE composer can pick from. Calling setChatMenuButton
+  // with menu_button.type='web_app' is what makes the bot's chats show
+  // a "Open <name>" button that launches the mini-app inline.
+  //
+  // Telegram supports only ONE global menu button per bot, so installing
+  // a second mini-app REPLACES the first. Telegram is the source of
+  // truth — we don't track an `is_active` column.
+  r.post('/api/telegram/mini-apps/:id/install', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: app } = await supabase.from('tg_mini_apps')
+      .select('id, name, url')
+      .eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+    if (!app) { res.status(404).json({ error: 'mini app not found' }); return }
+    const bot = await getBot(supabase, tenantId)
+    if (!bot) { res.status(404).json({ error: 'Telegram bot not connected' }); return }
+    try {
+      // setChatMenuButton with no chat_id sets the DEFAULT (global) menu
+      // button — applied to every chat that doesn't have a per-chat override.
+      await tgCall(bot.token, 'setChatMenuButton', {
+        menu_button: {
+          type: 'web_app',
+          text: app.name.slice(0, 64),   // TG caps button text at 64 chars
+          web_app: { url: app.url },
+        },
+      })
+      res.json({ success: true })
+    } catch (err: any) {
+      res.status(502).json({ error: err.message })
+    }
+  })
+
+  // Reset to the default Telegram menu button (the "/" commands menu).
+  // Use when an operator wants to UN-install a mini-app from the chat UI.
+  r.post('/api/telegram/mini-apps/uninstall-menu', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const bot = await getBot(supabase, tenantId)
+    if (!bot) { res.status(404).json({ error: 'Telegram bot not connected' }); return }
+    try {
+      await tgCall(bot.token, 'setChatMenuButton', {
+        menu_button: { type: 'default' },
+      })
+      res.json({ success: true })
+    } catch (err: any) {
+      res.status(502).json({ error: err.message })
+    }
+  })
+
   // ── Payments (Stars) ──────────────────────────────────────────────────────
   r.get('/api/telegram/payments', ...guardView, async (req, res) => {
     const tenantId = (req as any).tenantId
