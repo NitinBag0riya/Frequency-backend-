@@ -43,8 +43,10 @@ interface Deps {
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
 
-// Same default as ai-responder.ts. Overridable via env for ops.
-const FLOW_EDIT_MODEL = process.env.WA_FLOW_EDIT_MODEL || 'claude-opus-4-7'
+// Same default as ai-responder.ts (Sonnet). Flow JSON edits are well within
+// Sonnet's quality; Opus 4.7 was ~5× pricier per call (the largest per-call
+// cost in the AI stack). Overridable via env for ops who want Opus.
+const FLOW_EDIT_MODEL = process.env.WA_FLOW_EDIT_MODEL || 'claude-sonnet-4-6'
 const anthropic = process.env.ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null
@@ -371,8 +373,9 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       const resp = await anthropic.messages.create({
         model: FLOW_EDIT_MODEL,
         max_tokens: 4096,
-        // Note: `temperature` is deprecated on claude-opus-4-7 (returns 400);
-        // the model is deterministic enough at default settings for this task.
+        // No `temperature` set — deterministic enough at default settings for
+        // structured JSON edits. (Also: the previous default Opus 4.7 rejected
+        // `temperature` with a 400, so it was never passed here.)
         system: [
           // System prompt is cached — same for every chat-edit call so we
           // only pay full token cost on the first request per 5-minute window.

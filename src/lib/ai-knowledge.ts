@@ -71,7 +71,11 @@ export interface RetrievedChunk {
 export const DEFAULT_AI_SETTINGS: Omit<TenantAiSettings, 'tenant_id'> = {
   enabled:                          false,
   qa_wizard_completed_at:           null,
-  model:                            'claude-opus-4-7',
+  // Sonnet by default — the responder is our highest-volume AI path; Opus 4.7
+  // is ~5× pricier per call and its 4,096-token cache floor never engages on
+  // our ~1k-token prompt (Sonnet's 1,024 floor does). Tenants can opt into
+  // Opus explicitly. Keep in sync with the column default in tenant_ai_settings.
+  model:                            'claude-sonnet-4-6',
   system_prompt_addon:              null,
   max_tokens:                       500,
   temperature:                      0.7,
