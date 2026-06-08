@@ -30,6 +30,7 @@ scripts/create_*
 scripts/debug_*
 scripts/dump_*
 scripts/enter_*
+scripts/expand_*
 scripts/fill_*
 scripts/find_*
 scripts/fix_*

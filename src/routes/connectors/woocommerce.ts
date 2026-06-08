@@ -147,7 +147,7 @@ export function createWoocommerceConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: wcErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.get('/api/connectors/woocommerce/orders', ...guardView, async (req, res) => {
@@ -160,7 +160,7 @@ export function createWoocommerceConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: wcErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.get('/api/connectors/woocommerce/orders/:id', ...guardView, async (req, res) => {
@@ -170,7 +170,7 @@ export function createWoocommerceConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: wcErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.get('/api/connectors/woocommerce/customers', ...guardView, async (req, res) => {
@@ -183,7 +183,7 @@ export function createWoocommerceConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: wcErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.post('/api/connectors/woocommerce/orders',
@@ -200,7 +200,7 @@ export function createWoocommerceConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: wcErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -215,9 +215,9 @@ export async function loadCreds(supabase: SupabaseClient, tenantId: string) {
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, metadata')
     .eq('tenant_id', tenantId).eq('key', 'woocommerce').maybeSingle()
-  if (!row?.access_token) throw new Error('WooCommerce not connected')
+  if (!row?.access_token) throw Object.assign(new Error('WooCommerce not connected'), { status: 424 })
   const md = (row.metadata as any) ?? {}
-  if (!md.store_url || !md.consumer_key) throw new Error('WooCommerce connection missing store_url/consumer_key — please reconnect')
+  if (!md.store_url || !md.consumer_key) throw Object.assign(new Error('WooCommerce connection missing store_url/consumer_key — please reconnect'), { status: 424 })
   const auth = basicAuth(md.consumer_key as string, decrypt(row.access_token))
   return { store: md.store_url as string, auth }
 }

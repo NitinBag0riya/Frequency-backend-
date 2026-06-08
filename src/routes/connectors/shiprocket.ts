@@ -139,7 +139,7 @@ export function createShiprocketConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: srErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.post('/api/connectors/shiprocket/orders', ...guardEdit,
@@ -155,7 +155,7 @@ export function createShiprocketConnector(deps: Deps): express.Router {
         const body = await r2.json() as any
         if (!r2.ok) { res.status(r2.status).json({ error: srErr(r2, body) }); return }
         res.json(body)
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.get('/api/connectors/shiprocket/track/:awb', ...guardView, async (req, res) => {
@@ -166,7 +166,7 @@ export function createShiprocketConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: srErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   r.get('/api/connectors/shiprocket/serviceability', ...guardView, async (req, res) => {
@@ -180,7 +180,7 @@ export function createShiprocketConnector(deps: Deps): express.Router {
       const body = await r2.json() as any
       if (!r2.ok) { res.status(r2.status).json({ error: srErr(r2, body) }); return }
       res.json(body)
-    } catch (err: any) { res.status(500).json({ error: err.message }) }
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   return r
@@ -198,9 +198,9 @@ export async function loadToken(supabase: SupabaseClient, tenantId: string): Pro
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, metadata')
     .eq('tenant_id', tenantId).eq('key', 'shiprocket').maybeSingle()
-  if (!row?.access_token) throw new Error('Shiprocket not connected')
+  if (!row?.access_token) throw Object.assign(new Error('Shiprocket not connected'), { status: 424 })
   const md = (row.metadata as any) ?? {}
-  if (!md.email) throw new Error('Shiprocket connection missing API-user email — please reconnect')
+  if (!md.email) throw Object.assign(new Error('Shiprocket connection missing API-user email — please reconnect'), { status: 424 })
 
   const cached = md.sr_token as string | undefined
   const exp = md.sr_token_expires ? new Date(md.sr_token_expires).getTime() : 0

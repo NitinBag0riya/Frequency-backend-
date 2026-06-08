@@ -222,7 +222,7 @@ export function createKylasConnector(deps: Deps): express.Router {
 
 function sendErr(res: express.Response, err: any) {
   if (err?.kylasStatus) { res.status(err.kylasStatus).json({ error: err.message }); return }
-  res.status(500).json({ error: err?.message ?? 'Kylas error' })
+  res.status(err?.status ?? 500).json({ error: err?.message ?? 'Kylas error' })
 }
 
 /** POST helper that throws a status-bearing error on non-2xx for the routes. */
@@ -245,7 +245,7 @@ export async function loadKey(supabase: SupabaseClient, tenantId: string): Promi
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token')
     .eq('tenant_id', tenantId).eq('key', 'kylas').maybeSingle()
-  if (!row?.access_token) throw new Error('Kylas not connected')
+  if (!row?.access_token) throw Object.assign(new Error('Kylas not connected'), { status: 424 })
   return decrypt(row.access_token)
 }
 

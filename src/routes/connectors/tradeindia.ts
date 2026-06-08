@@ -136,7 +136,7 @@ export function createTradeindiaConnector(deps: Deps): express.Router {
         if (!r2.ok) { res.status(r2.status).json({ error: `TradeIndia ${r2.status}` }); return }
         if (tiMissingParams(out) || tiInvalidCreds(out)) { res.status(400).json({ error: String(out) }); return }
         res.json({ inquiries: out })
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   r.post('/api/connectors/tradeindia/leads', requireAuth, identifyTenant, checkPermission('integrations', 'view'),
@@ -150,7 +150,7 @@ export function createTradeindiaConnector(deps: Deps): express.Router {
         if (!r2.ok) { res.status(r2.status).json({ error: `TradeIndia ${r2.status}` }); return }
         if (tiMissingParams(out) || tiInvalidCreds(out)) { res.status(400).json({ error: String(out) }); return }
         res.json({ inquiries: out })
-      } catch (err: any) { res.status(500).json({ error: err.message }) }
+      } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
     })
 
   return r
@@ -166,9 +166,9 @@ export async function loadCreds(
   const { data: row } = await supabase.from('tenant_integrations')
     .select('access_token, metadata')
     .eq('tenant_id', tenantId).eq('key', 'tradeindia').maybeSingle()
-  if (!row?.access_token) throw new Error('TradeIndia not connected')
+  if (!row?.access_token) throw Object.assign(new Error('TradeIndia not connected'), { status: 424 })
   const md = (row.metadata as any) ?? {}
-  if (!md.userid || !md.profile_id) throw new Error('TradeIndia connection missing userid/profile_id — please reconnect')
+  if (!md.userid || !md.profile_id) throw Object.assign(new Error('TradeIndia connection missing userid/profile_id — please reconnect'), { status: 424 })
   return { userid: String(md.userid), profile_id: String(md.profile_id), key: decrypt(row.access_token) }
 }
 

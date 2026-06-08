@@ -63,6 +63,9 @@ const PUBLIC_PATHS = new Set<string>([
   '/api/incidents/active',
   '/api/wa-templates/public',
   '/api/agency-plans',
+  // OAuth callback — public by design; Meta redirects the browser here and we
+  // return a 200 HTML/redirect (no JWT). Not an auth leak.
+  '/api/auth/meta/callback',
   '/api/connectors/registry',
   '/api/plans',
   '/api/ping',
@@ -71,6 +74,9 @@ const PUBLIC_PATHS = new Set<string>([
   // Public invite preview — drives AcceptInvitePage with ?token=. 400 'token
   // required' is the correct response when no token supplied.
   '/api/team/invite-info',
+  // In-app Copilot widget — intentionally unauthenticated (rate-limited per-IP
+  // at /api/copilot/). Empty body → 400, never a 200 leak.
+  '/api/copilot/stream',
 ])
 
 // Paths where the auto-probe should SKIP entirely (require special data
@@ -127,6 +133,14 @@ const SKIP_PATHS = new Set<string>([
   '/api/connectors/shopify/orders/:id',
   '/api/connectors/shopify/products',
   '/api/meta-ads/leads',
+  // Voice agent needs OPENAI_API_KEY (OpenAI realtime). Staging leaves it unset,
+  // so the handler correctly returns 503 'Voice agent is not configured' — same
+  // class as the OAuth-start endpoints above, not a handler panic.
+  '/api/voice/realtime/session',
+  // Template sync calls the Meta Graph API with the tenant's live WABA token.
+  // Staging's test tenant has no valid Meta hookup, so the upstream call returns
+  // a 502 (token/permission). Requires a real WABA — covered by integration tests.
+  '/api/wa-templates/sync',
 ])
 
 function shouldSkip(path: string): boolean {
