@@ -213,51 +213,108 @@ export function createZomatoConnector(deps: Deps): express.Router {
       }, { onConflict: 'tenant_id,key' })
       if (error) { res.status(500).json({ error: 'Failed to persist connection: ' + error.message }); return }
 
+      // One named webhook URL per event — these paste 1:1 into the POS-vendor
+      // onboarding form's per-flow endpoint fields.
+      const base = `${PUBLIC_BASE_URL}/api/connectors/zomato/webhook/${ingestToken}`
       res.json({
         success: true,
         account: outletId ? `Zomato · ${outletId}` : 'Zomato',
-        webhookUrl: `${PUBLIC_BASE_URL}/api/connectors/zomato/webhook/${ingestToken}`,
-        note: 'Paste this webhook URL into your Zomato partner portal (Order Relay + status webhooks). Connection is in beta until the partner spec + sandbox are wired.',
+        webhookUrl: base,                         // legacy/catch-all
+        webhooks: {
+          placeOrder:   `${base}/place-order`,    // form: "Place Order Endpoint"
+          orderStatus:  `${base}/status`,         // form: "Update Order Status Endpoint"
+          riderStatus:  `${base}/rider`,          // form: "Order Rider Status Endpoint"
+          menuSync:     `${base}/menu-sync`,      // form: "Callback endpoint for menu sync response"
+          outletStatus: `${base}/outlet-status`,  // form: "Endpoint for sending outlet status details"
+          rating:       `${base}/rating`,
+          complaint:    `${base}/complaint`,
+          cancellation: `${base}/cancellation`,
+        },
+        note: 'Paste each webhook URL into the matching field on the Zomato POS-vendor onboarding form. Connection is in beta until the partner spec + sandbox are wired.',
       })
     })
 
-  // ── Inbound webhook (public; tenant resolved by the URL token) ─────────────
-  // Zomato → us: new orders + status/rider/rating/complaint/cancellation events.
-  // Optional :event segment lets each webhook type post to its own path; we
-  // also fall back to inferring the type from the payload.
-  const onWebhook = async (req: express.Request, res: express.Response) => {
+  // ── Inbound webhooks (public; tenant resolved by the URL token) ────────────
+  // Zomato → us. One named endpoint per event so the URLs map 1:1 to the
+  // POS-vendor onboarding form (Place Order / Update Order Status / Order Rider
+  // Status / Menu Sync response / Outlet status). A generic catch-all remains
+  // for any event we haven't named yet.
+
+  // Resolve tenant by URL token + best-effort signature check (token is primary
+  // auth, same model as the lead-ingest webhooks).
+  const resolveWebhook = async (req: express.Request): Promise<{ tenantId: string; md: any } | null> => {
     const token = String(req.params.token || '')
-    const eventType = String(req.params.event || req.body?.type || req.body?.event || 'orders/relay')
     const { data: conn } = await supabase.from('tenant_integrations')
       .select('tenant_id, metadata')
       .eq('key', 'zomato').eq('metadata->>ingest_token', token).maybeSingle()
-    if (!conn?.tenant_id) { res.status(404).json({ error: 'Unknown webhook token' }); return }
-
-    // Defence-in-depth signature check (token is the primary auth).
+    if (!conn?.tenant_id) return null
     const md = (conn.metadata as any) ?? {}
     if (md.api_secret) {
       const sig = req.header('x-zomato-signature') || req.header('x-signature') || undefined
       const ok = verifySignature(decrypt(md.api_secret), JSON.stringify(req.body ?? {}), sig)
-      if (sig && !ok) console.warn('[zomato webhook] signature mismatch (processing on token auth) — TODO confirm scheme')
+      if (sig && !ok) console.warn('[zomato webhook] signature mismatch (processing on token auth) — TODO(zomato-spec) confirm scheme')
     }
+    return { tenantId: conn.tenant_id as string, md }
+  }
 
+  // Order-bearing events → normalise + upsert into zomato_orders.
+  const ingestOrderEvent = async (tenantId: string, eventType: string, body: any) => {
     try {
-      const row = mapZomatoOrder(conn.tenant_id as string, eventType, req.body ?? {})
+      const row = mapZomatoOrder(tenantId, eventType, body ?? {})
       if (row.zomato_order_id) {
         const { error } = await supabase.from('zomato_orders')
           .upsert({ ...row, updated_at: new Date().toISOString() }, { onConflict: 'tenant_id,zomato_order_id' })
         if (error) console.error(`[zomato webhook] upsert failed: ${error.message}`)
       } else {
-        console.warn(`[zomato webhook] ${eventType} had no resolvable order id — stored event only`)
+        console.warn(`[zomato webhook] ${eventType} had no resolvable order id — event ignored`)
       }
     } catch (e: any) {
       console.error(`[zomato webhook] processing error: ${e?.message}`)
     }
-    // Always ack 2xx fast so Zomato doesn't retry/penalise.
+  }
+
+  // Factory for an order-event endpoint (ack 2xx fast so Zomato doesn't retry).
+  const orderHook = (eventType: string) => async (req: express.Request, res: express.Response) => {
+    const ctx = await resolveWebhook(req)
+    if (!ctx) { res.status(404).json({ error: 'Unknown webhook token' }); return }
+    await ingestOrderEvent(ctx.tenantId, eventType, req.body)
     res.json({ received: true })
   }
-  r.post('/api/connectors/zomato/webhook/:token', onWebhook)
-  r.post('/api/connectors/zomato/webhook/:token/:event', onWebhook)
+
+  // Named per-event endpoints (match the onboarding form 1:1). Registered before
+  // the generic catch-all so Express matches these first.
+  r.post('/api/connectors/zomato/webhook/:token/place-order',  orderHook('orders/relay'))
+  r.post('/api/connectors/zomato/webhook/:token/status',       orderHook('vendor-order-status-update'))
+  r.post('/api/connectors/zomato/webhook/:token/rider',        orderHook('order-rider-status-update'))
+  r.post('/api/connectors/zomato/webhook/:token/rating',       orderHook('push-rating-to-client'))
+  r.post('/api/connectors/zomato/webhook/:token/complaint',    orderHook('complaints-relay'))
+  r.post('/api/connectors/zomato/webhook/:token/cancellation', orderHook('mac-relay'))
+
+  // Non-order events — ack + log for ops. TODO(zomato-spec): wire menu-sync into
+  // the menu pipeline and outlet-status into the store on/off toggle.
+  const noteHook = (label: string) => async (req: express.Request, res: express.Response) => {
+    const ctx = await resolveWebhook(req)
+    if (!ctx) { res.status(404).json({ error: 'Unknown webhook token' }); return }
+    console.log(`[zomato ${label}] tenant=${ctx.tenantId} ${JSON.stringify(req.body ?? {}).slice(0, 500)}`)
+    res.json({ received: true })
+  }
+  r.post('/api/connectors/zomato/webhook/:token/menu-sync',     noteHook('menu-sync'))
+  r.post('/api/connectors/zomato/webhook/:token/outlet-status', noteHook('outlet-status'))
+
+  // Generic catch-all: infer the event from :event or payload.
+  r.post('/api/connectors/zomato/webhook/:token/:event', async (req, res) => {
+    const ctx = await resolveWebhook(req)
+    if (!ctx) { res.status(404).json({ error: 'Unknown webhook token' }); return }
+    const eventType = String(req.params.event || req.body?.type || req.body?.event || 'orders/relay')
+    await ingestOrderEvent(ctx.tenantId, eventType, req.body)
+    res.json({ received: true })
+  })
+  r.post('/api/connectors/zomato/webhook/:token', async (req, res) => {
+    const ctx = await resolveWebhook(req)
+    if (!ctx) { res.status(404).json({ error: 'Unknown webhook token' }); return }
+    await ingestOrderEvent(ctx.tenantId, String(req.body?.type || req.body?.event || 'orders/relay'), req.body)
+    res.json({ received: true })
+  })
 
   // ── Outbound order actions (operator advances the order on Zomato) ─────────
   const guardEdit = [requireAuth, identifyTenant, checkPermission('integrations', 'edit')]
