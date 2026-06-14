@@ -40,6 +40,7 @@ import { createKylasConnector } from './kylas'
 import { createIndiamartConnector } from './indiamart'
 import { createTradeindiaConnector } from './tradeindia'
 import { createLeadWebhookConnectors } from './lead-webhooks'
+import { createZomatoConnector } from './zomato'
 import { signOauthState } from '../../lib/oauth-state'
 
 // Meta Graph API base — kept inline to avoid pulling in unrelated config modules.
@@ -1504,6 +1505,7 @@ export function createConnectorsRouter(deps: Deps): express.Router {
   r.use(createIndiamartConnector(deps))
   r.use(createTradeindiaConnector(deps))
   r.use(createLeadWebhookConnectors(deps))
+  r.use(createZomatoConnector(deps))
 
   // ── Google OAuth start routes — mounted inline (sub-router nesting causes
   // path-resolution quirks in Express when using full /api/auth/... paths) ────

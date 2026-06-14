@@ -2436,7 +2436,21 @@ const INDIA_PLANNED: ConnectorDef[] = [
   { key: 'zepto',       name: 'Zepto',       category: 'quick_commerce', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#6B1EE6', iconName: 'ShoppingBag', shortDescription: 'Quick commerce (brand/seller ops).', docsUrl: 'https://www.zeptonow.com/', requiresPartnerRegistration: true, setupNote: 'No public/self-serve API. Requires a Zepto brand-partner agreement; access is provisioned by Zepto.', capabilities: [] },
 
   // Food delivery — PARTNER-GATED. Public APIs were retired; restaurant-partner only.
-  { key: 'zomato',      name: 'Zomato',      category: 'food_delivery', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#E23744', iconName: 'Utensils', shortDescription: 'Restaurant partner ops.', docsUrl: 'https://www.zomato.com/', requiresPartnerRegistration: true, setupNote: 'Public API was discontinued. Only Zomato restaurant partners get API access, provisioned through Zomato.', capabilities: [] },
+  { key: 'zomato', name: 'Zomato', category: 'food_delivery', tier: 2, status: 'beta', authMode: 'api_key', brandColor: '#E23744', iconName: 'Utensils',
+    shortDescription: 'Receive & manage Zomato orders.',
+    docsUrl: 'https://www.zomato.com/developer/integration/docs/api-documentation/order-management',
+    requiresPartnerRegistration: true,
+    setupNote: 'Order-Management integration. Requires a Zomato restaurant-partner API key/secret (provisioned by Zomato). Beta: the order-relay webhook + outbound actions are wired against the documented endpoints; exact payload/auth fields are finalised once a partner account + sandbox are connected.',
+    capabilities: [
+      { key: 'orders',          label: 'Zomato orders',   description: 'Orders relayed from Zomato in real time.',      iconName: 'ClipboardList', apiPath: '/api/connectors/zomato/orders',                apiMethod: 'GET',  uiKind: 'list',   status: 'stub' },
+      { key: 'confirm',         label: 'Confirm order',   description: 'Accept a relayed Zomato order.',                iconName: 'Check',         apiPath: '/api/connectors/zomato/order/confirm',         apiMethod: 'POST', uiKind: 'action', status: 'stub' },
+      { key: 'reject',          label: 'Reject order',    description: 'Reject a relayed order.',                       iconName: 'X',             apiPath: '/api/connectors/zomato/order/reject',          apiMethod: 'POST', uiKind: 'action', status: 'stub' },
+      { key: 'ready',           label: 'Mark ready',      description: 'Order is ready for pickup.',                    iconName: 'ChefHat',       apiPath: '/api/connectors/zomato/order/ready',           apiMethod: 'POST', uiKind: 'action', status: 'stub' },
+      { key: 'pickedup',        label: 'Mark picked up',  description: 'Picked up by the delivery partner.',            iconName: 'Bike',          apiPath: '/api/connectors/zomato/order/pickedup',        apiMethod: 'POST', uiKind: 'action', status: 'stub' },
+      { key: 'delivered',       label: 'Mark delivered',  description: 'Delivered to the customer.',                    iconName: 'PackageCheck',  apiPath: '/api/connectors/zomato/order/delivered',       apiMethod: 'POST', uiKind: 'action', status: 'stub' },
+      { key: 'contact_details', label: 'Contact details', description: 'Masked customer / rider contact for an order.', iconName: 'Phone',         apiPath: '/api/connectors/zomato/order/contact-details', apiMethod: 'POST', uiKind: 'action', status: 'stub' },
+      { key: 'ratings',         label: 'Order ratings',   description: 'Ratings for a specific order or date.',         iconName: 'Star',          apiPath: '/api/connectors/zomato/ratings',               apiMethod: 'POST', uiKind: 'action', status: 'stub' },
+    ] },
   { key: 'swiggy',      name: 'Swiggy',      category: 'food_delivery', tier: 2, status: 'planned', authMode: 'api_key', brandColor: '#FC8019', iconName: 'Utensils', shortDescription: 'Restaurant partner ops.', docsUrl: 'https://www.swiggy.com/', requiresPartnerRegistration: true, setupNote: 'No public API. Only Swiggy restaurant/Instamart partners get API access, provisioned through Swiggy.', capabilities: [] },
 ]
 
