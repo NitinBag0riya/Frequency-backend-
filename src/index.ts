@@ -46,6 +46,7 @@ import { createN8nImportRouter }        from './routes/n8n-import'
 import { createIntegrationRequestsRouter } from './routes/integration-requests'
 import { createWaCallingRouter }     from './routes/wa-calling'
 import { createAiResponderRouter }   from './routes/ai-responder'
+import { createOperatorRouter }      from './routes/operator'
 import { createDsrRouter }           from './routes/dsr'
 import { createBreachNotificationsRouter } from './routes/breach-notifications'
 import { createDataResidencyRouter } from './routes/data-residency'
@@ -5332,6 +5333,12 @@ app.use(createIntegrationRequestsRouter({ supabase, requireAuth, identifyTenant 
 // chunks. Strict tenant isolation: every helper in lib/ai-knowledge.ts
 // takes tenantId as the first filter on every read/write.
 app.use(createAiResponderRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Operator agent (autonomous "reason → tool-call → observe" loop) ─────────
+// Self-contained module under src/operator/*. Reuses the connector tool layer
+// (engine/connector-ops.ts) and the approval engine. Tenant-isolated; gated by
+// the whatsapp_automation permission.
+app.use(createOperatorRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── WhatsApp Business Calling (intent → initiate → dispatch → events) ───────
 // The router owns the public /webhook/wa-calls endpoint AND all /api/calls/*
