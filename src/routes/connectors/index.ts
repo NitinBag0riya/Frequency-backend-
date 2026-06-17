@@ -1421,6 +1421,42 @@ export function createConnectorsRouter(deps: Deps): express.Router {
       } catch (err: any) { res.status(500).json({ error: err.message }) }
     })
 
+  // ── Verify connection — live Meta check for the "Test connection" button in
+  //    the Apps modal. Read-only: fetches the phone + counts templates, sends
+  //    nothing. Returns { ok:false, error } (HTTP 200) on a bad/expired token
+  //    so the FE can render a clear ✗ without treating it as a request error. ──
+  r.get('/api/connectors/whatsapp/verify',
+    requireAuth, identifyTenant, checkPermission('integrations', 'view'),
+    async (req, res) => {
+      try {
+        const tenantId = (req as any).tenantId
+        const { data: tenant } = await supabase.from('tenants')
+          .select('waba_id, phone_number_id, access_token, status').eq('id', tenantId).single()
+        if (!tenant || tenant.status !== 'active' || !tenant.access_token || !tenant.phone_number_id) {
+          res.json({ ok: false, error: 'WhatsApp is not connected for this workspace.' }); return
+        }
+        const tok = tenant.access_token as string
+        // 1) Phone — proves the token + phone-number id are live.
+        const pr = await fetch(`${GRAPH}/${encodeURIComponent(tenant.phone_number_id)}?fields=display_phone_number,verified_name,quality_rating&access_token=${encodeURIComponent(tok)}`)
+        const pj = await pr.json() as any
+        if (!pr.ok || pj.error) { res.json({ ok: false, error: pj.error?.message ?? `Meta returned ${pr.status}` }); return }
+        // 2) Templates — count the first page (proves WABA access too).
+        let templateCount = 0
+        if (tenant.waba_id) {
+          const tr = await fetch(`${GRAPH}/${encodeURIComponent(tenant.waba_id)}/message_templates?fields=name&limit=200&access_token=${encodeURIComponent(tok)}`)
+          const tj = await tr.json() as any
+          if (tr.ok && Array.isArray(tj.data)) templateCount = tj.data.length
+        }
+        res.json({
+          ok: true,
+          displayPhone: pj.display_phone_number,
+          verifiedName: pj.verified_name ?? null,
+          quality: pj.quality_rating ?? null,
+          templateCount,
+        })
+      } catch (err: any) { res.json({ ok: false, error: err?.message ?? 'Verification failed' }) }
+    })
+
   // ── Disconnect (revokes local; user revokes upstream from provider dashboard) ──
   // Three storage shapes have to be handled:
   //   1. tenant_integrations rows  → delete the row (Airtable, Razorpay, …)
