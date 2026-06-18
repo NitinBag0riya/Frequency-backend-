@@ -264,6 +264,51 @@ export async function fireIgEventTrigger(
   }
 }
 
+// Phone aliases seen across lead-form / webhook payloads (mirrors the dedup
+// keys in src/leads.ts). The workflow messages the lead, so a phone is required.
+const LEAD_PHONE_KEYS = ['phone', 'Phone', 'PHONE', 'phone_number', 'phoneNumber', 'mobile', 'Mobile', 'contact', 'tel', 'telephone']
+
+/**
+ * New-lead trigger fan-out. Called right after a SINGLE lead lands — webhook
+ * intake (JustDial / 99acres / FB Lead Ads / …) or a row created in one of our
+ * Leads tables. Finds live workflows whose `trigger_new_lead` entry matches this
+ * table/source (and optional column filter) and starts a session per match with
+ * the lead's fields in scope as {{trigger.lead.*}}.
+ *
+ * NOT called from bulk/CSV import paths on purpose — mass-firing one workflow
+ * per imported row would be a footgun.
+ */
+export async function fireNewLeadTrigger(
+  supabase: SupabaseClient,
+  tenantId: string,
+  lead: { tableId: string; source?: string | null; row: { id?: string; data?: Record<string, any> } },
+): Promise<void> {
+  const data = lead.row?.data ?? {}
+  let phone: string | undefined
+  for (const k of LEAD_PHONE_KEYS) { const v = (data as any)[k]; if (v != null && String(v).trim()) { phone = String(v).trim(); break } }
+  if (!phone) return   // no contactable phone → nothing a workflow could message
+
+  const { data: workflows } = await supabase.from('workflows')
+    .select('id, nodes').eq('tenant_id', tenantId).eq('status', 'live')
+
+  for (const wf of workflows ?? []) {
+    const trigger = ((wf as any).nodes as any[])?.find((n: any) => n.type === 'trigger_new_lead')
+    if (!trigger) continue
+    const cfg = trigger.config ?? {}
+    // Match by table and/or source; an unset filter means "any".
+    if (cfg.table_id && String(cfg.table_id) !== String(lead.tableId)) continue
+    if (cfg.source && lead.source && String(cfg.source) !== String(lead.source)) continue
+    // Optional single-column filter (e.g. only fire when status = 'new').
+    if (cfg.filter_column) {
+      const actual = String((data as any)[cfg.filter_column] ?? '').toLowerCase()
+      if (cfg.filter_value != null && actual !== String(cfg.filter_value).toLowerCase()) continue
+    }
+    await startWorkflow(supabase, { id: tenantId }, wf, phone, 'whatsapp', {
+      lead: data, row: data, source: lead.source ?? null, lead_row_id: lead.row?.id ?? null,
+    })
+  }
+}
+
 async function startWorkflow(
   supabase: SupabaseClient,
   tenant: any,

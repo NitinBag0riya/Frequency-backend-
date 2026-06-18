@@ -696,6 +696,12 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       })
     ).catch(e => console.warn('[create-row] contact resolve (non-fatal):', e?.message))
 
+    // New-lead workflow trigger — a single row landed in one of our tables.
+    // Fire-and-forget; never blocks the create response.
+    void import('./engine/inbound-router').then(({ fireNewLeadTrigger }) =>
+      fireNewLeadTrigger(supabase, tenantId, { tableId: tableIdStr, source: null, row: { id: data.id, data: data.data } })
+    ).catch(e => console.warn('[create-row] new-lead trigger (non-fatal):', e?.message))
+
     res.json({ ...data, _rule_applied: !!ruleResult })
   })
 
@@ -1124,6 +1130,10 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
     // rows mirror to contacts — the upsert resolver itself is idempotent
     // by (tenant_id, phone), so re-mirroring a dedup-merged row is safe.
     const persistedRows: Array<{ id: string; data: any; tags?: string[] }> = []
+    // Genuinely-NEW leads only (not dedup-merged updates) — these fire the
+    // new-lead workflow trigger so a re-POSTed lead doesn't re-message the
+    // customer. Populated at the two INSERT sites below.
+    const newLeadRows: Array<{ id: string; data: any }> = []
 
     // ── Plain insert path (no dedup_key) ──────────────────────────────
     if (plainRows.length > 0) {
@@ -1133,7 +1143,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       insertedCount += plainRows.length
       if (Array.isArray(insertedRows)) {
         for (const r of insertedRows as Array<{ id: string; data: any; tags?: string[] }>) {
-          persistedRows.push(r)
+          persistedRows.push(r); newLeadRows.push({ id: r.id, data: r.data })
         }
       }
     }
@@ -1210,7 +1220,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
         } else {
           insertedCount += toInsert.length
           for (const r of (newRows ?? []) as Array<{ id: string; data: any; tags?: string[] }>) {
-            persistedRows.push(r)
+            persistedRows.push(r); newLeadRows.push({ id: r.id, data: r.data })
           }
         }
       }
@@ -1271,6 +1281,18 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
           upsertContactFromLead(supabase, table.tenant_id, { id: r.id, data: r.data, tags: r.tags ?? [] })
         ))
       }).catch(e => console.warn('[ingest] contact resolve (non-fatal):', e?.message))
+    }
+
+    // New-lead workflow trigger — one fire per genuinely-new intake lead
+    // (dedup-merged re-POSTs excluded). Source = the table's configured intake
+    // source (justdial / 99acres / facebook_leadads / …). Fire-and-forget,
+    // capped, never blocks the ingest ack.
+    if (newLeadRows.length > 0) {
+      void import('./engine/inbound-router').then(({ fireNewLeadTrigger }) =>
+        Promise.allSettled(newLeadRows.slice(0, 100).map(r =>
+          fireNewLeadTrigger(supabase, table.tenant_id, { tableId: table.id, source: (table as any).source ?? null, row: r })
+        ))
+      ).catch(e => console.warn('[ingest] new-lead trigger (non-fatal):', e?.message))
     }
 
     res.json({ inserted: insertedCount, updated: updatedCount, auto_assigned: assigned })

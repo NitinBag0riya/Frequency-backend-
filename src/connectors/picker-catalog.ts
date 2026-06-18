@@ -106,6 +106,40 @@ export interface PickerCategory {
 const CURATED_CATALOG: PickerCategory[] = [
 
   // ────────────────────────────────────────────────────────────────────────
+  // A0. New-lead TRIGGER — entry point. Fires when a single lead lands, either
+  //     from a connected intake source (JustDial / 99acres / FB Lead Ads / …)
+  //     or a row created in one of our Leads tables. Drives the
+  //     `trigger_new_lead` node; the lead's fields are in scope as
+  //     {{trigger.lead.*}} downstream.
+  // ────────────────────────────────────────────────────────────────────────
+  {
+    key: 'lead_intake_trigger',
+    name: 'New lead (trigger)',
+    blurb: 'Starts a workflow when a new lead arrives — from a lead-intake source or a row created in one of the tenant\'s Leads tables. Emit trigger_new_lead as the entry node.',
+    trigger_phrases: [
+      'when a new lead', 'new lead comes in', 'lead intake', 'lead arrives',
+      'new enquiry', 'when a lead lands', 'lead from', 'incoming lead',
+      'when a row is created', 'new row in my table', 'new contact captured',
+    ],
+    pickers: [
+      { field: 'table_id', label: 'Leads table', type: 'live_select', required: false,
+        placeholder: 'Any table, or pick one',
+        live_endpoint: '/api/lead-tables',
+        label_field: 'name', value_field: 'id' },
+      { field: 'filter_column', label: 'Only when column…', type: 'live_select', required: false,
+        depends_on: 'table_id',
+        live_endpoint: '/api/lead-tables/{table_id}/columns',
+        label_field: 'name', value_field: 'name',
+        placeholder: 'Optional: filter by a column' },
+      { field: 'filter_value', label: '…equals value', type: 'live_select', required: false,
+        depends_on: 'filter_column',
+        live_endpoint: '/api/lead-tables/{table_id}/columns/{filter_column}/values',
+        label_field: 'value', value_field: 'value',
+        placeholder: 'Optional: required value' },
+    ],
+  },
+
+  // ────────────────────────────────────────────────────────────────────────
   // A. Frequency Tables (internal lead_tables)
   // ────────────────────────────────────────────────────────────────────────
   {

@@ -54,6 +54,11 @@ export const CONNECTOR_OP_NODE_TYPES = [
  *  as their runtime hooks land. */
 export const TRIGGER_NODE_TYPES = [
   'trigger_inbound_keyword',
+  // Fires when a single new lead lands — webhook intake (JustDial, 99acres,
+  // FB Lead Ads, …) or a row created in one of our Leads tables. Deliberately
+  // does NOT fire on bulk/CSV import (would blast one workflow per row). See
+  // fireNewLeadTrigger in engine/inbound-router.ts.
+  'trigger_new_lead',
 ] as const
 
 export const NODE_TYPES = [
