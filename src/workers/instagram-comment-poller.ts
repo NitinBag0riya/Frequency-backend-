@@ -1,5 +1,5 @@
 /**
- * Worker: instagram-comment-poller (singleton repeatable, every 60s by default)
+ * Worker: instagram-comment-poller (singleton repeatable, every 5 min in prod)
  *
  * Safety net for the IG webhook. Even with the `comments` change-field
  * subscribed in the Meta App Dashboard, deliveries can lag, drop, or get
@@ -33,8 +33,12 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.s
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
-// 60s prod (webhook safety net) · 5 min dev.
-const TICK_INTERVAL_MS = pollIntervalMs('IG_COMMENT_POLL_INTERVAL_MS', { prod: 60_000, dev: 5 * 60_000 })
+// 5 min prod — this is a SAFETY NET for IG comment webhook gaps, not the
+// primary path; webhooks deliver comments in real time. Polling every 5 min
+// (was 60s) still backfills anything the webhook dropped while cutting the
+// external Graph API cost — O(connected_accts × 50 media) per tick — 5×. Set
+// IG_COMMENT_POLL_INTERVAL_MS=60000 to restore 60s if webhooks prove unreliable.
+const TICK_INTERVAL_MS = pollIntervalMs('IG_COMMENT_POLL_INTERVAL_MS', { prod: 5 * 60_000, dev: 5 * 60_000 })
 const MAX_TENANTS_PER_TICK = Number(process.env.IG_COMMENT_POLL_MAX_TENANTS ?? 200)
 const MAX_POSTS_PER_TENANT = Number(process.env.IG_COMMENT_POLL_MAX_POSTS  ?? 50)
 

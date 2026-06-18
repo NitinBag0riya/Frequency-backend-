@@ -1,5 +1,5 @@
 /**
- * Worker: sla-monitor (singleton repeatable, runs every 30s)
+ * Worker: sla-monitor (singleton repeatable, runs every 60s in prod)
  *
  * Phase 3 of the post-deploy roadmap. Scans open conversations across
  * all tenants every tick; emits sla_breaches rows when first_response
@@ -58,8 +58,11 @@ import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollInte
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
-// 30s prod (SLA breaches need fast detection) · 5 min dev.
-const TICK_INTERVAL_MS = pollIntervalMs('SLA_MONITOR_INTERVAL_MS', { prod: 30_000, dev: 5 * 60_000 })
+// 60s prod — breach detection within a minute is plenty for SLA thresholds
+// (typically minutes-to-hours), and halving the tick rate halves this poller's
+// fixed 24/7 baseline. Was 30s; set SLA_MONITOR_INTERVAL_MS=30000 to restore
+// the tighter cadence. 5 min dev.
+const TICK_INTERVAL_MS = pollIntervalMs('SLA_MONITOR_INTERVAL_MS', { prod: 60_000, dev: 5 * 60_000 })
 // Lookback for the message scan. 7 days is enough for the common
 // "customer pinged Friday, agent ghost over the weekend" pattern.
 // Beyond that we treat the conversation as abandoned (janitor sweep
@@ -99,7 +102,7 @@ interface SlaConfig {
 //
 // Pure JS implementation — uses Intl.DateTimeFormat with the configured
 // timezone to bucket each minute. We walk the window in 1-minute steps;
-// at 30s tick frequency and typical resolution thresholds (< 24h) this
+// at 60s tick frequency and typical resolution thresholds (< 24h) this
 // is a few hundred iterations per breach candidate, fine.
 const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const
 type DayKey = typeof DAY_KEYS[number]

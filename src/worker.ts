@@ -24,7 +24,7 @@ import { startTrialEndingWorker }      from './workers/trial-ending'
 import { startConsentExpirySweepWorker } from './workers/consent-expiry-sweep'
 import { startGmailPollerWorker }      from './workers/gmail-poller'
 import { startLookalikeRefreshWorker } from './workers/lookalike-refresh'
-// P0.9 — Instagram comment poller (60s tick, safety net for webhook gaps)
+// P0.9 — Instagram comment poller (5 min tick, safety net for webhook gaps)
 import { startInstagramCommentPollerWorker } from './workers/instagram-comment-poller'
 // P0.7 — DPDPA breach notification fan-out (migration 075)
 import { startBreachNotificationSenderWorker } from './workers/breach-notification-sender'
@@ -99,7 +99,7 @@ async function main() {
   // row per agency aggregating last month's accrued ledger entries.
   const apa = await startAgencyPayoutAggregatorWorker()
 
-  // Phase 3 — SLA monitor. Runs every 30s, computes breach state for
+  // Phase 3 — SLA monitor. Runs every 60s, computes breach state for
   // every open conversation in every tenant with sla_configs rows.
   const slam = await startSlaMonitorWorker()
 
