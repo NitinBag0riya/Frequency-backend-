@@ -349,6 +349,29 @@ export async function fireOrderTrigger(
   }
 }
 
+/**
+ * Generic event-trigger fan-out — the reusable core behind every event-driven
+ * trigger (payment, CRM stage, missed call, message status, …). Finds live
+ * workflows whose entry node is `triggerType`, applies an optional config
+ * match, and starts a session per match with `payload` in scope as
+ * {{trigger.*}}. Each new trigger source is now a one-liner that calls this.
+ */
+export async function fireWorkflowTrigger(
+  supabase: SupabaseClient,
+  tenantId: string,
+  triggerType: string,
+  opts: { contactId: string; channel?: InboundChannel; payload?: Record<string, any>; match?: (cfg: any) => boolean },
+): Promise<void> {
+  const { data: workflows } = await supabase.from('workflows')
+    .select('id, nodes').eq('tenant_id', tenantId).eq('status', 'live')
+  for (const wf of workflows ?? []) {
+    const trigger = ((wf as any).nodes as any[])?.find((n: any) => n.type === triggerType)
+    if (!trigger) continue
+    if (opts.match && !opts.match(trigger.config ?? {})) continue
+    await startWorkflow(supabase, { id: tenantId }, wf, opts.contactId, opts.channel ?? 'whatsapp', opts.payload ?? {})
+  }
+}
+
 async function startWorkflow(
   supabase: SupabaseClient,
   tenant: any,

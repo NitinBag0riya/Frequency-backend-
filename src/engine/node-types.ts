@@ -63,6 +63,8 @@ export const TRIGGER_NODE_TYPES = [
   // See fireOrderTrigger in engine/inbound-router.ts.
   'trigger_new_order',
   'trigger_order_status',
+  // A lead/deal changed pipeline status. Fired from the lead-row PATCH.
+  'trigger_crm_stage',
 ] as const
 
 export const NODE_TYPES = [

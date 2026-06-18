@@ -165,6 +165,30 @@ const CURATED_CATALOG: PickerCategory[] = [
   },
 
   // ────────────────────────────────────────────────────────────────────────
+  // A2. CRM stage-change TRIGGER. Fires when a lead/deal moves pipeline status.
+  //     Emit trigger_crm_stage. Lead is in scope as {{trigger.lead.*}}.
+  // ────────────────────────────────────────────────────────────────────────
+  {
+    key: 'crm_stage_trigger',
+    name: 'Stage changed (trigger)',
+    blurb: 'Starts a workflow when a lead/deal changes pipeline status (e.g. → qualified, → won). Emit trigger_crm_stage.',
+    trigger_phrases: [
+      'when a lead is qualified', 'when status changes', 'stage change',
+      'moved to', 'marked won', 'marked lost', 'when a deal moves',
+      'pipeline stage', 'when a lead becomes',
+    ],
+    pickers: [
+      { field: 'table_id', label: 'Leads table', type: 'live_select', required: false,
+        placeholder: 'Any table, or pick one',
+        live_endpoint: '/api/lead-tables',
+        label_field: 'name', value_field: 'id' },
+      { field: 'to_status', label: 'When status becomes', type: 'select', required: false,
+        placeholder: 'Optional: a specific status',
+        options: ['new', 'contacted', 'qualified', 'won', 'lost'] },
+    ],
+  },
+
+  // ────────────────────────────────────────────────────────────────────────
   // A. Frequency Tables (internal lead_tables)
   // ────────────────────────────────────────────────────────────────────────
   {

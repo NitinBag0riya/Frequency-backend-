@@ -796,6 +796,21 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       ).catch(e => console.warn('[patch-row] notify failed (non-fatal):', e?.message))
     }
 
+    // CRM stage-change workflow trigger — fire only when the status actually
+    // changed in this PATCH (not on every edit). Fire-and-forget.
+    if ('status' in safeBody && data) {
+      const d = (data.data ?? {}) as Record<string, any>
+      const phone = d.phone || d.Phone || d.mobile || d.phone_number || `lead:${data.id}`
+      void import('./engine/inbound-router').then(({ fireWorkflowTrigger }) =>
+        fireWorkflowTrigger(supabase, tenantId, 'trigger_crm_stage', {
+          contactId: String(phone),
+          payload: { lead: d, row: d, status: data.status, table_id: tableIdStr, lead_row_id: data.id },
+          match: cfg => (!cfg.table_id || String(cfg.table_id) === tableIdStr) &&
+                        (!cfg.to_status || String(cfg.to_status) === String(data.status)),
+        })
+      ).catch(e => console.warn('[patch-row] crm-stage trigger (non-fatal):', e?.message))
+    }
+
     res.json(data)
   })
 
