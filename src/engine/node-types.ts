@@ -65,6 +65,8 @@ export const TRIGGER_NODE_TYPES = [
   'trigger_order_status',
   // A lead/deal changed pipeline status. Fired from the lead-row PATCH.
   'trigger_crm_stage',
+  // A call was missed (Exotel/Meta call lifecycle). Powers callback flows.
+  'trigger_missed_call',
 ] as const
 
 export const NODE_TYPES = [

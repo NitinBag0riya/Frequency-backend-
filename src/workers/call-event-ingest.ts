@@ -164,6 +164,21 @@ export function startCallEventIngestWorker() {
       // Notifications
       if (transition.to === 'missed') {
         await emitMissedCall(tenantId, session.id as string, session.contact_id ?? null).catch(() => {})
+        // Missed-call workflow trigger — "we missed you" / callback flows.
+        void (async () => {
+          let phone: string | null = null
+          if (session.contact_id) {
+            const { data: c } = await supabase.from('contacts')
+              .select('phone').eq('id', session.contact_id).eq('tenant_id', tenantId).maybeSingle()
+            phone = (c?.phone as string) ?? null
+          }
+          const { fireWorkflowTrigger } = await import('../engine/inbound-router')
+          await fireWorkflowTrigger(supabase, tenantId, 'trigger_missed_call', {
+            contactId: phone || `call:${session.id}`,
+            payload: { call_id: session.id, direction: session.direction, missed: true },
+            match: cfg => !cfg.direction || String(cfg.direction) === String(session.direction),
+          })
+        })().catch(e => console.warn(`[call.event.ingest] missed-call trigger (non-fatal): ${e?.message}`))
       }
       if (transition.to === 'ringing' && session.direction === 'inbound') {
         await emitIncomingCall(tenantId, session.id as string, session.contact_id ?? null).catch(() => {})

@@ -189,6 +189,25 @@ const CURATED_CATALOG: PickerCategory[] = [
   },
 
   // ────────────────────────────────────────────────────────────────────────
+  // A3. Missed-call TRIGGER. Fires when a call is missed. Emit
+  //     trigger_missed_call. Caller is the contact; {{trigger.call_id}} in scope.
+  // ────────────────────────────────────────────────────────────────────────
+  {
+    key: 'missed_call_trigger',
+    name: 'Missed call (trigger)',
+    blurb: 'Starts a workflow when a call is missed — e.g. WhatsApp "sorry we missed you" + book a callback. Emit trigger_missed_call.',
+    trigger_phrases: [
+      'missed call', 'when we miss a call', 'someone calls and we miss',
+      'callback', 'call back the caller', 'no one answered the call',
+    ],
+    pickers: [
+      { field: 'direction', label: 'Call direction', type: 'select', required: false,
+        placeholder: 'Any, or inbound/outbound',
+        options: ['inbound', 'outbound'] },
+    ],
+  },
+
+  // ────────────────────────────────────────────────────────────────────────
   // A. Frequency Tables (internal lead_tables)
   // ────────────────────────────────────────────────────────────────────────
   {
