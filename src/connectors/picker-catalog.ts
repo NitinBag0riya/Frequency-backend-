@@ -140,6 +140,31 @@ const CURATED_CATALOG: PickerCategory[] = [
   },
 
   // ────────────────────────────────────────────────────────────────────────
+  // A1. Order TRIGGER — entry point. Fires when an order lands or changes
+  //     state on a commerce channel (storefront mini-app / Zomato / Shopify /
+  //     WooCommerce). Emit trigger_new_order (placed) or trigger_order_status
+  //     (ready/cancelled/…). Order is in scope as {{trigger.order.*}}.
+  // ────────────────────────────────────────────────────────────────────────
+  {
+    key: 'order_trigger',
+    name: 'New order / order status (trigger)',
+    blurb: 'Starts a workflow when a commerce order is placed (trigger_new_order) or its status changes (trigger_order_status). Channel = storefront / zomato / shopify / woocommerce.',
+    trigger_phrases: [
+      'when an order is placed', 'new order', 'order received', 'someone orders',
+      'order status changes', 'when an order is ready', 'order cancelled',
+      'cod order', 'zomato order', 'storefront order', 'food order',
+    ],
+    pickers: [
+      { field: 'channel', label: 'Order channel', type: 'select', required: false,
+        placeholder: 'Any channel, or pick one',
+        options: ['storefront', 'zomato', 'shopify', 'woocommerce'] },
+      { field: 'status', label: 'Only on status', type: 'select', required: false,
+        placeholder: 'Optional: a specific status (for status changes)',
+        options: ['placed', 'confirmed', 'preparing', 'ready', 'picked_up', 'delivered', 'cancelled'] },
+    ],
+  },
+
+  // ────────────────────────────────────────────────────────────────────────
   // A. Frequency Tables (internal lead_tables)
   // ────────────────────────────────────────────────────────────────────────
   {

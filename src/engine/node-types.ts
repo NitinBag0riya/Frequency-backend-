@@ -59,6 +59,10 @@ export const TRIGGER_NODE_TYPES = [
   // does NOT fire on bulk/CSV import (would blast one workflow per row). See
   // fireNewLeadTrigger in engine/inbound-router.ts.
   'trigger_new_lead',
+  // Commerce order events across channels (storefront / Zomato / Shopify / Woo).
+  // See fireOrderTrigger in engine/inbound-router.ts.
+  'trigger_new_order',
+  'trigger_order_status',
 ] as const
 
 export const NODE_TYPES = [

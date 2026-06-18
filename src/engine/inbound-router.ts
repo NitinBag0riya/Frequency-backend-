@@ -309,6 +309,46 @@ export async function fireNewLeadTrigger(
   }
 }
 
+/**
+ * Order trigger fan-out. Called when a single order lands or changes state on
+ * any commerce channel (storefront mini-app, Zomato, Shopify, WooCommerce).
+ * `trigger_new_order` fires on a fresh order; `trigger_order_status` fires on a
+ * status change (ready / cancelled / …). Workflows match by channel and/or
+ * status. The order is in scope downstream as {{trigger.order.*}}.
+ */
+export async function fireOrderTrigger(
+  supabase: SupabaseClient,
+  tenantId: string,
+  evt: {
+    kind: 'new_order' | 'order_status'
+    channel: string                       // storefront | zomato | shopify | woocommerce
+    status?: string | null                // for order_status events
+    contactPhone?: string | null          // customer phone if the channel exposes it
+    orderId: string
+    order: Record<string, any>
+  },
+): Promise<void> {
+  const triggerType = evt.kind === 'new_order' ? 'trigger_new_order' : 'trigger_order_status'
+  // Orders may have no customer phone (Zomato masks it) — a unique session key
+  // is still needed, so fall back to the order id. Workflows that message the
+  // customer should guard on a real phone; staff-notify flows don't need one.
+  const contactId = (evt.contactPhone && String(evt.contactPhone).trim()) || `order:${evt.channel}:${evt.orderId}`
+
+  const { data: workflows } = await supabase.from('workflows')
+    .select('id, nodes').eq('tenant_id', tenantId).eq('status', 'live')
+
+  for (const wf of workflows ?? []) {
+    const trigger = ((wf as any).nodes as any[])?.find((n: any) => n.type === triggerType)
+    if (!trigger) continue
+    const cfg = trigger.config ?? {}
+    if (cfg.channel && String(cfg.channel) !== String(evt.channel)) continue
+    if (evt.kind === 'order_status' && cfg.status && evt.status && String(cfg.status) !== String(evt.status)) continue
+    await startWorkflow(supabase, { id: tenantId }, wf, contactId, 'whatsapp', {
+      order: evt.order, channel: evt.channel, status: evt.status ?? null, order_id: evt.orderId,
+    })
+  }
+}
+
 async function startWorkflow(
   supabase: SupabaseClient,
   tenant: any,

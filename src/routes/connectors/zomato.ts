@@ -265,6 +265,20 @@ export function createZomatoConnector(deps: Deps): express.Router {
         const { error } = await supabase.from('zomato_orders')
           .upsert({ ...row, updated_at: new Date().toISOString() }, { onConflict: 'tenant_id,zomato_order_id' })
         if (error) console.error(`[zomato webhook] upsert failed: ${error.message}`)
+
+        // Fire the order workflow trigger — order-relay = a new order, every
+        // other event = a status change. Fire-and-forget; never blocks the ack.
+        const isNew = /relay/i.test(eventType)
+        void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
+          fireOrderTrigger(supabase, tenantId, {
+            kind: isNew ? 'new_order' : 'order_status',
+            channel: 'zomato',
+            status: row.status ?? null,
+            contactPhone: (row.customer_phone_masked as string) ?? null,
+            orderId: String(row.zomato_order_id),
+            order: row,
+          })
+        ).catch(e => console.warn(`[zomato webhook] order trigger (non-fatal): ${e?.message}`))
       } else {
         console.warn(`[zomato webhook] ${eventType} had no resolvable order id — event ignored`)
       }
