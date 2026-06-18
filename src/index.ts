@@ -3773,6 +3773,15 @@ app.post('/webhook/whatsapp', async (req, res) => {
         for (const status of value.statuses ?? []) {
           if (status.status === 'failed') {
             console.error(`[webhook] STATUS FAILED platform_message_id=${status.id} errors=${JSON.stringify(status.errors)}`)
+            // Failed-delivery workflow trigger (resend via SMS / alert ops).
+            // Gated to 'failed' so delivered/read floods don't scan workflows.
+            void import('./engine/inbound-router').then(({ fireWorkflowTrigger }) =>
+              fireWorkflowTrigger(supabase, tenant.id, 'trigger_message_status', {
+                contactId: String(status.recipient_id ?? `msg:${status.id}`),
+                payload: { message_id: status.id, status: 'failed', errors: status.errors ?? [] },
+                match: cfg => !cfg.on_status || String(cfg.on_status) === 'failed',
+              })
+            ).catch(() => {})
           }
           // Race fix: Meta's webhook can arrive in the brief window between
           // the outbound send-call returning and our post-fetch PATCH

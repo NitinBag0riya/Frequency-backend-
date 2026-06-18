@@ -208,6 +208,25 @@ const CURATED_CATALOG: PickerCategory[] = [
   },
 
   // ────────────────────────────────────────────────────────────────────────
+  // A4. Message-status TRIGGER. Fires when an outbound WhatsApp FAILS delivery.
+  //     Emit trigger_message_status. {{trigger.message_id}} in scope.
+  // ────────────────────────────────────────────────────────────────────────
+  {
+    key: 'message_status_trigger',
+    name: 'Message failed (trigger)',
+    blurb: 'Starts a workflow when an outbound WhatsApp message fails delivery — e.g. fall back to SMS or alert ops. Emit trigger_message_status.',
+    trigger_phrases: [
+      'when a message fails', 'delivery failed', 'message not delivered',
+      'fall back to sms', 'if whatsapp fails', 'undelivered message',
+    ],
+    pickers: [
+      { field: 'on_status', label: 'On status', type: 'select', required: false,
+        placeholder: 'failed (default)',
+        options: ['failed'] },
+    ],
+  },
+
+  // ────────────────────────────────────────────────────────────────────────
   // A. Frequency Tables (internal lead_tables)
   // ────────────────────────────────────────────────────────────────────────
   {

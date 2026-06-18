@@ -67,6 +67,9 @@ export const TRIGGER_NODE_TYPES = [
   'trigger_crm_stage',
   // A call was missed (Exotel/Meta call lifecycle). Powers callback flows.
   'trigger_missed_call',
+  // An outbound WhatsApp message FAILED delivery. Powers failed-delivery
+  // recovery (resend via SMS, alert ops). Gated to 'failed' to bound volume.
+  'trigger_message_status',
 ] as const
 
 export const NODE_TYPES = [
