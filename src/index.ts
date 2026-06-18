@@ -1989,6 +1989,46 @@ app.delete('/api/workflows/:id', requireAuth, identifyTenant, checkPermission('w
   res.json({ success: true })
 })
 
+// ── Internal: storefront-order → workflow trigger ────────────────────────────
+//
+// Our first-party storefront-api (or any trusted in-house order source) POSTs
+// here when a customer places an order or its status changes. Server-to-server,
+// shared-secret auth (INTERNAL_TRIGGER_SECRET) — NOT a public endpoint. If the
+// secret env is unset the route is fail-closed (always 401), so it's inert
+// until explicitly configured.
+//
+// Deliberately reuses fireOrderTrigger(channel='storefront'): it rides the
+// EXISTING trigger_new_order / trigger_order_status node types and the
+// order_trigger picker — no new trigger type, no new picker, same path Zomato
+// already uses. Event-driven (fires only on a real order) → zero idle cost, no
+// always-on worker. The customer's storefront order can now auto-start a
+// WhatsApp workflow (order confirmation, prep ETA, feedback ask, loyalty nudge).
+app.post('/api/internal/storefront-order', async (req, res) => {
+  const secret = process.env.INTERNAL_TRIGGER_SECRET
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  // Fail closed when unconfigured; constant-time compare otherwise.
+  if (!secret || provided.length !== secret.length ||
+      !crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(secret, 'utf8'))) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const { tenant_id, kind, status, contact_phone, order_id, order } = (req.body ?? {}) as any
+  if (!tenant_id || !order_id) {
+    res.status(400).json({ error: 'tenant_id and order_id are required' }); return
+  }
+  // Ack immediately; fire the trigger fan-out async so the storefront's
+  // checkout response is never blocked on workflow start.
+  res.json({ ok: true })
+  void import('./engine/inbound-router').then(({ fireOrderTrigger }) =>
+    fireOrderTrigger(supabase, String(tenant_id), {
+      kind:         kind === 'order_status' ? 'order_status' : 'new_order',
+      channel:      'storefront',
+      status:       status ?? null,
+      contactPhone: contact_phone ?? null,
+      orderId:      String(order_id),
+      order:        order ?? {},
+    })).catch(() => {})
+})
+
 // ── Pre-flight workflow validation ───────────────────────────────────────────
 //
 // Two endpoints, same engine (engine/workflow-validator.ts):
