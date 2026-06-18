@@ -70,6 +70,10 @@ export const TRIGGER_NODE_TYPES = [
   // An outbound WhatsApp message FAILED delivery. Powers failed-delivery
   // recovery (resend via SMS, alert ops). Gated to 'failed' to bound volume.
   'trigger_message_status',
+  // Recurring/cron start (daily digest, weekly report, interval reminder).
+  // No always-on worker: parks one scheduled_jobs row per occurrence on the
+  // existing poller, self-rescheduling. See engine/schedule-trigger.ts.
+  'trigger_schedule',
 ] as const
 
 export const NODE_TYPES = [

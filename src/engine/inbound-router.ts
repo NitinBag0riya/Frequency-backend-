@@ -372,6 +372,28 @@ export async function fireWorkflowTrigger(
   }
 }
 
+/**
+ * Start ONE specific workflow by id — the entry point for the schedule poller
+ * (trigger_schedule). Unlike fireWorkflowTrigger this does not fan out across
+ * all live workflows; the scheduled_jobs row already names the workflow. Re-checks
+ * that it's still live and still owns a trigger_schedule node so a paused/edited/
+ * deleted workflow simply stops (the caller skips re-enqueue when this returns
+ * false → the recurring chain self-cleans). Returns whether a session was started.
+ */
+export async function fireScheduledWorkflow(
+  supabase: SupabaseClient,
+  tenantId: string,
+  opts: { workflowId: string; contactId: string; payload?: Record<string, any> },
+): Promise<boolean> {
+  const { data: wf } = await supabase.from('workflows')
+    .select('id, nodes, status').eq('tenant_id', tenantId).eq('id', opts.workflowId).maybeSingle()
+  if (!wf || (wf as any).status !== 'live') return false
+  const hasSchedule = ((wf as any).nodes as any[] | undefined)?.some(n => n?.type === 'trigger_schedule')
+  if (!hasSchedule) return false
+  await startWorkflow(supabase, { id: tenantId }, wf, opts.contactId, 'whatsapp', opts.payload ?? {})
+  return true
+}
+
 async function startWorkflow(
   supabase: SupabaseClient,
   tenant: any,

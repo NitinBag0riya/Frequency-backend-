@@ -227,6 +227,42 @@ const CURATED_CATALOG: PickerCategory[] = [
   },
 
   // ────────────────────────────────────────────────────────────────────────
+  // A5. Schedule TRIGGER. Recurring/cron start — daily digest, weekly report,
+  //     interval reminder. Emit trigger_schedule. No always-on worker: parks
+  //     one self-rescheduling scheduled_jobs row per occurrence on the existing
+  //     poller. See engine/schedule-trigger.ts.
+  // ────────────────────────────────────────────────────────────────────────
+  {
+    key: 'schedule_trigger',
+    name: 'Schedule (trigger)',
+    blurb: 'Starts a workflow on a recurring schedule — daily/weekly at a time, or every N minutes. e.g. "every morning at 9am send yesterday\'s order summary". Emit trigger_schedule. For a single recipient set contact_id; otherwise the workflow body should fetch its own audience.',
+    trigger_phrases: [
+      'every day at', 'every morning', 'daily at', 'weekly', 'every monday',
+      'every week', 'on a schedule', 'recurring', 'every hour', 'every 30 minutes',
+      'send a daily', 'scheduled report', 'remind', 'cron',
+    ],
+    pickers: [
+      { field: 'frequency', label: 'Frequency', type: 'select', required: true,
+        placeholder: 'daily / weekly / interval',
+        options: ['daily', 'weekly', 'interval'] },
+      { field: 'time', label: 'Time of day (HH:MM)', type: 'text', required: false,
+        depends_on: 'frequency',
+        placeholder: 'e.g. 09:00 — for daily/weekly' },
+      { field: 'weekday', label: 'Day of week', type: 'select', required: false,
+        depends_on: 'frequency',
+        placeholder: 'for weekly (0=Sun … 6=Sat)',
+        options: ['0', '1', '2', '3', '4', '5', '6'] },
+      { field: 'interval_minutes', label: 'Every N minutes', type: 'text', required: false,
+        depends_on: 'frequency',
+        placeholder: 'for interval — min 15' },
+      { field: 'timezone', label: 'Timezone', type: 'text', required: false,
+        placeholder: 'Asia/Kolkata (default)' },
+      { field: 'contact_id', label: 'Recipient contact (optional)', type: 'text', required: false,
+        placeholder: 'phone for a 1:1 reminder; blank = body fetches audience' },
+    ],
+  },
+
+  // ────────────────────────────────────────────────────────────────────────
   // A. Frequency Tables (internal lead_tables)
   // ────────────────────────────────────────────────────────────────────────
   {

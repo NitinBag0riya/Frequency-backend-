@@ -1901,6 +1901,10 @@ app.post('/api/workflows', requireAuth, identifyTenant, checkPermission('whatsap
   const { data, error } = await supabase.from('workflows')
     .insert({ ...req.body, tenant_id: tenantId, user_id: userId }).select().single()
   if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
+  // A workflow can be created directly as 'live' with a trigger_schedule node —
+  // park its first occurrence. Fire-and-forget. See engine/schedule-trigger.ts.
+  void import('./engine/schedule-trigger').then(({ syncScheduleTrigger }) =>
+    syncScheduleTrigger(supabase, tenantId, data)).catch(() => {})
   res.json(data)
 })
 
@@ -1969,6 +1973,11 @@ app.patch('/api/workflows/:id', requireAuth, identifyTenant, checkPermission('wh
     .update({ ...patch, updated_at: new Date().toISOString() })
     .eq('id', req.params.id).eq('tenant_id', tenantId).select().single()
   if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
+  // Reconcile the parked schedule job (trigger_schedule). Fire-and-forget — a
+  // scheduling hiccup must never block the save. Parks/cancels one row on the
+  // existing poller; no always-on worker. See engine/schedule-trigger.ts.
+  void import('./engine/schedule-trigger').then(({ syncScheduleTrigger }) =>
+    syncScheduleTrigger(supabase, tenantId, data)).catch(() => {})
   res.json(data)
 })
 

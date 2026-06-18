@@ -86,6 +86,31 @@ export async function startSchedulePollerWorker() {
           } else if (row.kind === 'broadcast_send') {
             const p = row.payload as any
             if (p?.broadcastId) await enqueueBroadcast(p.broadcastId)
+          } else if (row.kind === 'workflow_schedule') {
+            // Recurring workflow start (trigger_schedule). Fire the named
+            // workflow, then re-enqueue the next occurrence — the chain
+            // perpetuates itself with no always-on scan. If the workflow is no
+            // longer live / has no schedule node, fireScheduledWorkflow returns
+            // false and we DON'T re-enqueue, so the chain self-cleans.
+            const p = row.payload as any
+            if (p?.workflowId) {
+              const { fireScheduledWorkflow } = await import('../engine/inbound-router')
+              const fired = await fireScheduledWorkflow(supabase, row.tenant_id, {
+                workflowId: p.workflowId,
+                contactId:  p.contactId ?? `schedule:${p.workflowId}`,
+                payload:    { scheduled: true, fired_at: nowIso },
+              })
+              if (fired) {
+                const { computeNextRun } = await import('../engine/schedule-trigger')
+                const next = computeNextRun(p.schedule ?? {}, Date.now())
+                if (next) {
+                  await supabase.from('scheduled_jobs').insert({
+                    tenant_id: row.tenant_id, kind: 'workflow_schedule',
+                    resume_at: next, status: 'pending', payload: p,
+                  })
+                }
+              }
+            }
           } else if (row.kind === 'campaign_step') {
             // Lightweight — execute inline. The step itself enqueues message.send
             // jobs and re-schedules the next step via scheduled_jobs.
