@@ -74,6 +74,11 @@ export const TRIGGER_NODE_TYPES = [
   // No always-on worker: parks one scheduled_jobs row per occurrence on the
   // existing poller, self-rescheduling. See engine/schedule-trigger.ts.
   'trigger_schedule',
+  // A tenant CUSTOMER payment event (Razorpay / Cashfree) — paid / failed /
+  // refunded. Per-tenant signature-verified webhook, no poller. Powers
+  // payment-confirmation, failed-payment recovery, refund acknowledgement.
+  // See routes/payment-webhook.ts.
+  'trigger_payment',
 ] as const
 
 export const NODE_TYPES = [

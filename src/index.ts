@@ -19,6 +19,7 @@ import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
 import { createConnectorsRouter }  from './routes/connectors'
+import { createPaymentWebhookRouter } from './routes/payment-webhook'
 import { createBillingRouter }     from './routes/billing'
 import { createCtwaAnalyticsRouter } from './routes/ctwa-analytics'
 import { createWaitlistRouter }    from './routes/waitlist'
@@ -369,6 +370,14 @@ app.use('/webhook/instagram', express.raw({ type: 'application/json', limit: '5m
 // handler can re-hash the original bytes via (req as any).rawBody.
 app.use('/api/webhooks/shopify', express.json({
   limit: '5mb',
+  verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
+}))
+
+// Tenant customer-payment webhooks (Razorpay / Cashfree). HMAC is over the
+// exact bytes, so capture rawBody here while still handing the handler a parsed
+// req.body. Verified + routed per-tenant in routes/payment-webhook.ts.
+app.use('/api/webhooks/payment', express.json({
+  limit: '1mb',
   verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
 }))
 
@@ -5190,6 +5199,11 @@ app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPe
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
 app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Tenant customer-payment webhooks (Razorpay / Cashfree) → trigger_payment ─
+// Public signature-verified inbound + authed config endpoints to mint the
+// per-tenant webhook URL. See routes/payment-webhook.ts.
+app.use(createPaymentWebhookRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Public waitlist (apex landing page signups, no auth) ────────────────────
 // Mounted at /api/waitlist. Per-IP rate limit lives inside the router.

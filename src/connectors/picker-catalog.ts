@@ -263,6 +263,33 @@ const CURATED_CATALOG: PickerCategory[] = [
   },
 
   // ────────────────────────────────────────────────────────────────────────
+  // A6. Payment TRIGGER. A tenant's CUSTOMER pays / fails / is refunded via
+  //     their own Razorpay or Cashfree account. Per-tenant signature-verified
+  //     webhook (routes/payment-webhook.ts). Emit trigger_payment.
+  //     {{trigger.amount}}, {{trigger.payment_id}}, {{trigger.outcome}} in scope.
+  // ────────────────────────────────────────────────────────────────────────
+  {
+    key: 'payment_trigger',
+    name: 'Payment received / failed (trigger)',
+    blurb: 'Starts a workflow on a customer payment event from the tenant\'s own Razorpay or Cashfree account — e.g. send a receipt on success, a retry link on failure, or a refund acknowledgement. Emit trigger_payment. The tenant pastes a Frequency-generated webhook URL into their PSP dashboard (see the payment-webhook config endpoint).',
+    trigger_phrases: [
+      'when a payment is received', 'payment success', 'when someone pays',
+      'payment failed', 'failed payment', 'send a receipt', 'payment confirmation',
+      'razorpay payment', 'cashfree payment', 'when a refund', 'refund processed',
+    ],
+    pickers: [
+      { field: 'provider', label: 'Payment provider', type: 'select', required: false,
+        placeholder: 'Any, or razorpay / cashfree',
+        options: ['razorpay', 'cashfree'] },
+      { field: 'on_event', label: 'On event', type: 'select', required: false,
+        placeholder: 'paid (default any)',
+        options: ['any', 'paid', 'failed', 'refunded'] },
+      { field: 'min_amount', label: 'Minimum amount', type: 'text', required: false,
+        placeholder: 'e.g. 500 — only fire above this (optional)' },
+    ],
+  },
+
+  // ────────────────────────────────────────────────────────────────────────
   // A. Frequency Tables (internal lead_tables)
   // ────────────────────────────────────────────────────────────────────────
   {
