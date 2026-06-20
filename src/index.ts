@@ -20,6 +20,7 @@ import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
 import { createConnectorsRouter }  from './routes/connectors'
 import { createPaymentWebhookRouter } from './routes/payment-webhook'
+import { createTestConnectionRouter } from './routes/connectors/test-connection'
 import { createBillingRouter }     from './routes/billing'
 import { createCtwaAnalyticsRouter } from './routes/ctwa-analytics'
 import { createWaitlistRouter }    from './routes/waitlist'
@@ -5199,6 +5200,11 @@ app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPe
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
 app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+
+// ── Generic "Test connection" for every connected app ────────────────────────
+// GET /api/connectors/:key/test — real read-only probe where wired, honest
+// credentials-present fallback otherwise. See routes/connectors/test-connection.ts.
+app.use(createTestConnectionRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Tenant customer-payment webhooks (Razorpay / Cashfree) → trigger_payment ─
 // Public signature-verified inbound + authed config endpoints to mint the
