@@ -75,6 +75,16 @@ async function main() {
     const tplWrongLang = await findDuplicateByName(sb, 'wa_templates', tenantId, `welcome_${stamp}`, { language: 'hi' })
     check('wa_template wrong language → no duplicate', tplWrongLang === null)
 
+    // ── 5b. ilike metacharacters are escaped (fix #2): a name of "%" must NOT
+    //        match every row, and a literal "%" name still matches itself ──
+    const wildcard = await findDuplicateByName(sb, 'broadcasts', tenantId, '%', { channel: 'whatsapp' })
+    check('"%" does NOT wildcard-match existing rows', wildcard === null, `got ${wildcard?.name}`)
+    await sb.from('broadcasts').insert({ tenant_id: tenantId, channel: 'whatsapp', name: `50% off ${stamp}`, status: 'draft' })
+    const pctExact = await findDuplicateByName(sb, 'broadcasts', tenantId, `50% off ${stamp}`, { channel: 'whatsapp' })
+    check('literal "%"-containing name still matches itself', !!pctExact)
+    const pctMiss = await findDuplicateByName(sb, 'broadcasts', tenantId, `50X off ${stamp}`, { channel: 'whatsapp' })
+    check('"%" is not a wildcard for a different name', pctMiss === null, `got ${pctMiss?.name}`)
+
     // ── 6. Cross-tenant isolation: a different tenant id never matches ──
     const otherTenant = await findDuplicateByName(sb, 'broadcasts', randomUUID(), `Diwali Sale ${stamp}`, { channel: 'whatsapp' })
     check('cross-tenant → no duplicate', otherTenant === null)

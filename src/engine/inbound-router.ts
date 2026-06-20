@@ -120,10 +120,15 @@ export async function routeFlowSubmission(
   if (pausedContact?.bot_paused) return { resumed: false, triggered: false }
 
   // A session waiting on send_flow's wait_input → resume it with the answers.
+  // Match BOTH phone formats: the WhatsApp webhook gives a bare number while a
+  // session started by a lead/order/payment/schedule trigger may have stored
+  // +E.164 — a strict eq would miss those and hang the session forever. Mirrors
+  // the bot_paused lookup above.
   const { data: session } = await supabase.from('workflow_sessions')
     .select('id, current_node_id')
     .eq('tenant_id', tenant.id).eq('channel', channel)
-    .eq('contact_phone', contactId).eq('status', 'active')
+    .or(`contact_phone.eq.+${contactId},contact_phone.eq.${contactId}`)
+    .eq('status', 'active')
     .order('started_at', { ascending: false }).limit(1).maybeSingle()
   if (session) {
     await enqueueWorkflowExecution({

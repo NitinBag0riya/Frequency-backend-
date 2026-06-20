@@ -82,6 +82,16 @@ async function main() {
     check('active session → resumed, not triggered', rB.resumed === true && rB.triggered === false, JSON.stringify(rB))
     check('resume did not create a new session', bSessions.length === 1, `got ${bSessions.length}`)
 
+    // ── B2. Session stored as +E.164 (lead/order/payment-triggered) resumes
+    //        even though the WhatsApp webhook gives a bare phone (fix #1) ──
+    await clearSessions()
+    await sb.from('workflow_sessions').insert({
+      tenant_id: tenant.id, workflow_id: wfId, contact_phone: `+${phone}`,
+      channel: 'whatsapp', current_node_id: 'a1', variables: {}, status: 'active',
+    })
+    const rB2 = await routeFlowSubmission(sb, tenant, 'whatsapp', phone, flowData, {}, { flow_id: flowId })
+    check('resumes a +E.164 session when webhook gives a bare phone', rB2.resumed === true && rB2.triggered === false, JSON.stringify(rB2))
+
     // ── C. bot_paused take-over gate → does nothing ──
     await clearSessions()
     await sb.from('contacts').update({ bot_paused: true }).eq('tenant_id', tenant.id).eq('phone', `+${phone}`)

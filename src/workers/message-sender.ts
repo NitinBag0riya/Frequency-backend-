@@ -215,10 +215,16 @@ async function sendWhatsApp(data: MessageSendJob) {
     const f = data.flow
     if (!f?.flow_id) throw new UnrecoverableError('send_flow: missing flow_id')
     const { data: flowRow } = await supabase.from('wa_flows')
-      .select('meta_flow_id, status, name').eq('tenant_id', data.tenantId).eq('id', f.flow_id).maybeSingle()
+      .select('meta_flow_id, status, name, definition').eq('tenant_id', data.tenantId).eq('id', f.flow_id).maybeSingle()
     if (!flowRow?.meta_flow_id) {
       throw new UnrecoverableError(`send_flow: flow ${f.flow_id} has no published Meta flow id — publish it first`)
     }
+    // Meta's flow_action='navigate' requires an entry screen. Use the configured
+    // screen, else the first screen declared in the flow definition. If neither
+    // resolves, fall back to data_exchange (the flow's endpoint decides the
+    // screen) so we never send an invalid navigate with no screen.
+    const firstScreen = (flowRow.definition as any)?.screens?.[0]?.id
+    const screen = f.screen || firstScreen
     payload = {
       messaging_product: 'whatsapp', to, type: 'interactive',
       interactive: {
@@ -232,8 +238,9 @@ async function sendWhatsApp(data: MessageSendJob) {
             flow_token: f.flow_token || f.flow_id,
             flow_id: flowRow.meta_flow_id,
             flow_cta: (f.cta || 'Open form').slice(0, 30),
-            flow_action: 'navigate',
-            ...(f.screen ? { flow_action_payload: { screen: f.screen } } : {}),
+            ...(screen
+              ? { flow_action: 'navigate', flow_action_payload: { screen } }
+              : { flow_action: 'data_exchange' }),
           },
         },
       },

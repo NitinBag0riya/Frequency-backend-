@@ -36,10 +36,14 @@ export async function findDuplicateByName(
 ): Promise<DuplicateMatch | null> {
   const trimmed = String(name ?? '').trim()
   if (!trimmed) return null
+  // Escape LIKE metacharacters so a name like "50% off" or "order_1" is matched
+  // literally (case-insensitively) rather than as a wildcard pattern — otherwise
+  // "%" would match every row and raise spurious duplicates.
+  const escaped = trimmed.replace(/([\\%_])/g, '\\$1')
   let q: any = supabase.from(table)
     .select('id, name, status, created_at')
     .eq('tenant_id', tenantId)
-    .ilike('name', trimmed)            // case-insensitive exact (no wildcards in `trimmed`)
+    .ilike('name', escaped)            // case-insensitive exact (metachars escaped)
   for (const [k, v] of Object.entries(extra)) q = q.eq(k, v)
   const { data, error } = await q.limit(1)
   if (error) {
