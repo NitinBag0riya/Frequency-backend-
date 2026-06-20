@@ -34,6 +34,7 @@
  *     to substitute the upstream value into the URL.
  */
 import { CONNECTOR_REGISTRY } from './registry'
+import { isKnownNodeType } from '../engine/node-types'
 
 export type PickerType =
   | 'text' | 'textarea' | 'number' | 'email' | 'phone' | 'url' | 'date'
@@ -667,11 +668,15 @@ function generateRegistryCategories(): PickerCategory[] {
       })
       .filter(p => { if (seenFields.has(p.field)) return false; seenFields.add(p.field); return true })
 
-    // Actions = non-trigger capabilities with a workflow node type. Each
-    // operation declares its REQUIRED input fields (from inputSchema) so the AI
-    // emits them; they render via the typed default input (raw keys → the
-    // executor reads node.config[key], so no global picker-name collisions).
-    const actions = caps.filter(c => c.workflowNodeType && !isTrigger(c))
+    // Actions = non-trigger capabilities with a workflow node type the executor
+    // can ACTUALLY run. Each operation declares its REQUIRED input fields (from
+    // inputSchema) so the AI emits them; they render via the typed default input
+    // (raw keys → the executor reads node.config[key], so no global picker-name
+    // collisions). The isKnownNodeType filter is the load-bearing guard: a
+    // registry capability whose nodeType isn't wired into the executor yet
+    // (roadmap/backlog) is NEVER offered to the builder, so it can't emit a node
+    // that's valid-in-draft but breaks-live.
+    const actions = caps.filter(c => c.workflowNodeType && isKnownNodeType(c.workflowNodeType) && !isTrigger(c))
     const category: PickerCategory = {
       key: app.key,
       name: `${app.name} (${app.category})`,

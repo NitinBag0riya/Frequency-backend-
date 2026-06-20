@@ -1068,8 +1068,7 @@ WHATSAPP RULES (enforce for send_text / send_template / send_interactive nodes):
 - Marketing templates require opt-in proof
 - Quick reply buttons: max 3; CTA buttons: max 2; never mix types
 
-EMAIL RULES (enforce for trigger_email_received / send_email / forward_email nodes):
-- trigger_email_received requires: email_provider (gmail|outlook|smtp), filter_from_email, optional filter_subject
+EMAIL RULES (enforce for send_email / forward_email ACTION nodes — note: there is NO inbound-email trigger; email is an action you run inside a flow started by one of the trigger types above):
 - send_email / forward_email requires: smtp_provider (sendgrid|mailgun|ses|smtp), to_email, subject, body_template
 - Always flag missing OAuth / API credentials in missing_config
 - forward_email should preserve original sender in the forwarded body when possible
@@ -1143,24 +1142,35 @@ OUTPUT SCHEMA (omit keys with null / empty array values):
 
 COMMON INTENT PATTERNS (with picker chains — emit these as missing_config[]):
 
-- "forward email from X to Y" → trigger_email_received (filter_from_email=X) → forward_email (to=Y).
-  Pickers: email_provider, gmail_account_id, filter_from_email (text), filter_subject (text).
+- "when a new lead comes in from 99acres / a form / our Leads table, WhatsApp them" →
+  trigger_new_lead → send_template (outside 24h) or send_text.
+  Pickers: table_id (live, the Leads table to watch), template_name, template_language.
 
-- "when form submitted" → trigger_form_submit → send_template (outside 24 h).
-  Pickers: form provider (select), template_name + template_language.
+- "when a customer pays, send a confirmation" →
+  trigger_payment (event=paid) → send_template (payment confirmation).
+  Pickers: provider (razorpay|cashfree), template_name, template_language.
 
-- "payment received" → trigger_webhook (Razorpay) → send_template (payment confirmation).
-  Pickers: webhook_secret (text), template_name, template_language.
+- "when a new order is placed, confirm it on WhatsApp" →
+  trigger_new_order → send_template.
+  Pickers: template_name, template_language.
+
+- "if an outbound WhatsApp message fails, fall back to SMS" →
+  trigger_message_status (status=failed) → connector_call (msg91.send_sms) or send_text.
+  Pickers: operation_msg91='send_sms', sms_text.
+
+- "when a call is missed, text the caller back" →
+  trigger_missed_call → send_template.
+  Pickers: template_name, template_language.
 
 - "every Monday at 10am send a campaign to hot leads" →
-  trigger_scheduled (cron) → send_template (broadcast-style).
-  Pickers: segment_id (live), template_name (live), template_language.
+  trigger_schedule (cron) → send_template (broadcast-style).
+  Pickers: schedule_cron or schedule_time + schedule_days, segment_id (live), template_name (live), template_language.
 
 - "respond to inbound 'pricing' message" → trigger_inbound_keyword → send_text or send_template.
   Pickers: channel, quick_reply_id (live) OR template_name.
 
 - "when status in my Leads table changes to 'Qualified', notify the assigned agent on WhatsApp" →
-  trigger_sheet_row (table_id) → condition_variable (column_name_status, column_value_status='Qualified') → send_text.
+  trigger_crm_stage (table_id, to_stage='Qualified') → send_text.
   Pickers: table_id, column_name_status (depends_on table_id), column_value_status (depends_on column_name_status),
            assigned_agent_id, template_name (if outside 24h).
 
@@ -1168,8 +1178,8 @@ COMMON INTENT PATTERNS (with picker chains — emit these as missing_config[]):
   trigger_inbound_keyword → http_request (Razorpay create) → send_text.
   Pickers: operation_razorpay='create_payment_link', amount_paise=50000, customer_email, description.
 
-- "when Razorpay payment is captured, mark customer row in my Customers table as Paid" →
-  trigger_webhook (razorpay.payment.captured) → update_sheet/update_table.
+- "when a payment is captured, mark the customer row in my Customers table as Paid" →
+  trigger_payment (event=paid) → update_sheet.
   Pickers: table_id (live), column_name_status, column_value_status='Paid'.
 
 - "move deal to 'Closed Won' when customer says 'yes'" →
@@ -1188,8 +1198,8 @@ TOKEN GRAMMAR — supported namespaces in {{...}} placeholders (anything else re
 NEVER use {{conversation.*}}, {{user.*}}, {{tenant.*}}, {{message.*}} — those namespaces don't exist in the executor. Only reference fields you've explicitly seeded or set as a step output.
 
 - "broadcast offer to all VIP segment customers every Friday at 6pm" →
-  trigger_scheduled → send_template (broadcast to segment).
-  Pickers: segment_id (live), template_name (live), template_language.
+  trigger_schedule → send_template (broadcast to segment).
+  Pickers: schedule_time + schedule_days, segment_id (live), template_name (live), template_language.
 
 - "assign new inbound conversations from Instagram to Priya's team" →
   trigger_inbound_keyword (channel=instagram) → assign_agent.

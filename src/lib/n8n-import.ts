@@ -114,14 +114,18 @@ interface MissingConfigField {
 // Frequency already supports natively (this exact bug happened with
 // Google Calendar — see Arihant import case, 2026-05).
 const SUPPORTED_MAP: Record<string, string> = {
-  'n8n-nodes-base.webhook':         'trigger_webhook',
-  'n8n-nodes-base.scheduleTrigger': 'trigger_scheduled',
-  'n8n-nodes-base.cron':            'trigger_scheduled',
-  'n8n-nodes-base.formTrigger':     'trigger_form_submit',
-  'n8n-nodes-base.emailReadImap':   'trigger_email_received',
+  // Map to REAL Frequency triggers (node-types.ts) — a generic inbound webhook
+  // or form submit lands as a new lead; schedule/cron → trigger_schedule. (We
+  // have no inbound-email trigger, so emailReadImap is intentionally absent →
+  // it falls through to "request onboarding" rather than emitting a node the
+  // executor can't run.)
+  'n8n-nodes-base.webhook':         'trigger_new_lead',
+  'n8n-nodes-base.scheduleTrigger': 'trigger_schedule',
+  'n8n-nodes-base.cron':            'trigger_schedule',
+  'n8n-nodes-base.formTrigger':     'trigger_new_lead',
   'n8n-nodes-base.wait':            'wait_delay',
   'n8n-nodes-base.if':              'condition_variable',
-  'n8n-nodes-base.switch':          'split_ab',           // multi-way → see notes below
+  'n8n-nodes-base.switch':          'condition_variable', // multi-way → collapsed to a branch
   'n8n-nodes-base.httpRequest':     'http_request',       // unless WhatsApp / Razorpay detected
   'n8n-nodes-base.googleSheets':    'update_sheet',
   'n8n-nodes-base.gmail':           'send_email',
@@ -136,7 +140,6 @@ const SUPPORTED_MAP: Record<string, string> = {
   'n8n-nodes-base.googleCalendar': 'create_calendar_event',
   'n8n-nodes-base.airtable':       'airtable_create_record',
   'n8n-nodes-base.shopify':        'shopify_create_draft_order',
-  'n8n-nodes-base.telegram':       'telegram_send_message',
 }
 
 const REQUEST_ONBOARDING_MAP: Record<string, string> = {
@@ -439,7 +442,7 @@ function translateNode(
     } else if (rawType === 'n8n-nodes-base.merge') {
       out.warnings = ['n8n Merge node — Frequency runs a linear graph; review the branch you actually need.']
     } else if (rawType === 'n8n-nodes-base.switch') {
-      out.warnings = ['n8n Switch is multi-way — emitted as split_ab. If you need >2 branches, chain condition_variable nodes.']
+      out.warnings = ['n8n Switch is multi-way — collapsed to a single condition_variable branch. If you need >2 branches, chain condition_variable nodes.']
     }
     return out
   }
@@ -482,15 +485,12 @@ function enrichMissingConfig(
     node.missing_config.push(m)
   }
   switch (fxType) {
-    case 'trigger_webhook':
-      add({ field: 'webhook_secret', label: 'Webhook signing secret', required: false, type: 'text' })
+    case 'trigger_new_lead':
+      add({ field: 'table_id', label: 'Lead table to watch', required: true, type: 'integration_picker' })
       break
-    case 'trigger_scheduled':
+    case 'trigger_schedule':
       add({ field: 'schedule_cron', label: 'Cron expression', required: true, type: 'text',
             placeholder: '0 10 * * 1 — every Monday at 10am' })
-      break
-    case 'trigger_form_submit':
-      add({ field: 'form_id', label: 'Frequency form', required: true, type: 'integration_picker' })
       break
     case 'send_email':
       add({ field: 'to_email',  label: 'Recipient email', required: true, type: 'email' })
@@ -546,21 +546,10 @@ function enrichMissingConfig(
             placeholder: '{"Name": "{{trigger.name}}", "Phone": "{{trigger.phone}}"}' })
       break
     case 'shopify_create_draft_order':
-    case 'shopify_fulfill_order':
       add({ field: 'store_id',     label: 'Shopify store', required: true, type: 'integration_picker' })
       add({ field: 'line_items',   label: 'Line items (JSON)', required: true, type: 'textarea',
             placeholder: '[{"variant_id": 12345, "quantity": 1}]' })
       add({ field: 'customer_phone', label: 'Customer phone', required: false, type: 'phone' })
-      break
-    case 'telegram_send_message':
-      add({ field: 'chat_id', label: 'Chat ID', required: true, type: 'text',
-            placeholder: '{{trigger.chat_id}}' })
-      add({ field: 'text',    label: 'Message', required: true, type: 'textarea' })
-      break
-    case 'telegram_create_invoice':
-      add({ field: 'title',       label: 'Invoice title', required: true, type: 'text' })
-      add({ field: 'amount',      label: 'Amount (Stars / XTR)', required: true, type: 'number' })
-      add({ field: 'payload',     label: 'Internal reference', required: true, type: 'text' })
       break
   }
 }
@@ -587,11 +576,11 @@ function routeByOperation(rawType: string, params: Record<string, unknown>): str
       if (op === 'append' || op === 'create')                     return 'airtable_create_record'
       return 'airtable_create_record'
     case 'n8n-nodes-base.shopify':
-      if (resource === 'order' && (op === 'fulfill' || op === 'fulfilment')) return 'shopify_fulfill_order'
+      // shopify_fulfill_order isn't a runnable node yet (registry backlog) —
+      // only the draft-order op is wired into the executor.
       return 'shopify_create_draft_order'
-    case 'n8n-nodes-base.telegram':
-      if (op === 'sendinvoice' || op === 'invoice' || resource === 'invoice') return 'telegram_create_invoice'
-      return 'telegram_send_message'
+    // Telegram send/invoice aren't runnable nodes yet (registry backlog) — let
+    // it fall through to "request onboarding" rather than emit a dead node.
   }
   return null
 }
@@ -713,11 +702,10 @@ function extractRazorpayAmount(params: Record<string, unknown>): number | null {
 
 function deriveTriggerKind(n: any): string {
   // Fallback for trigger-suffixed types we don't have a direct map for.
-  if (typeof n.type === 'string' && n.type.toLowerCase().includes('webhook')) return 'trigger_webhook'
-  if (typeof n.type === 'string' && n.type.toLowerCase().includes('schedule')) return 'trigger_scheduled'
-  if (typeof n.type === 'string' && n.type.toLowerCase().includes('cron'))     return 'trigger_scheduled'
-  if (typeof n.type === 'string' && n.type.toLowerCase().includes('email'))    return 'trigger_email_received'
-  return 'trigger_webhook'
+  if (typeof n.type === 'string' && n.type.toLowerCase().includes('schedule')) return 'trigger_schedule'
+  if (typeof n.type === 'string' && n.type.toLowerCase().includes('cron'))     return 'trigger_schedule'
+  // Webhooks / forms / inbound items → a new lead lands in a table.
+  return 'trigger_new_lead'
 }
 
 function extractNotes(n: any): string {
@@ -741,13 +729,10 @@ function prettyName(raw: string): string {
 function defaultDescription(fxType: string, label: string): string {
   // Short, deterministic fallback used when the n8n node has no `notes`.
   const map: Record<string, string> = {
-    trigger_webhook:             'Fires when the webhook is called',
-    trigger_scheduled:           'Runs on the configured schedule',
-    trigger_form_submit:         'Fires when a Frequency form is submitted',
-    trigger_email_received:      'Fires when a matching email arrives',
+    trigger_new_lead:            'Fires when a new lead lands (webhook / form / table row)',
+    trigger_schedule:            'Runs on the configured schedule',
     wait_delay:                  'Wait before the next step',
     condition_variable:          'Branch based on a variable',
-    split_ab:                    'Split into multiple branches',
     http_request:                'Call an external API',
     update_sheet:                'Write to a Frequency Lead Table',
     send_email:                  'Send a transactional email',
@@ -758,9 +743,6 @@ function defaultDescription(fxType: string, label: string): string {
     airtable_create_record:      'Append a record to an Airtable table',
     airtable_update_record:      'Update an Airtable record',
     shopify_create_draft_order:  'Create a Shopify draft order',
-    shopify_fulfill_order:       'Fulfil a Shopify order',
-    telegram_send_message:       'Send a Telegram message',
-    telegram_create_invoice:     'Issue a Telegram Stars invoice',
   }
   return map[fxType] ?? label
 }

@@ -26,6 +26,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { isKnownNodeType } from './node-types'
 
 export type ConnectorKey =
   | 'whatsapp' | 'instagram' | 'telegram'
@@ -213,6 +214,17 @@ function validateNodeConfig(node: any): NodeIssue[] {
   const err = (message: string): NodeIssue => ({ node_id: nid, node_type: t, severity: 'error', message })
   const warn = (message: string): NodeIssue => ({ node_id: nid, node_type: t, severity: 'warning', message })
 
+  // Safety net: a node type the executor can't run would silently no-op at
+  // runtime (executor.ts emits a 'unknown node type' warning and advances).
+  // Catch it here so it surfaces as a pre-save error in the inspector instead
+  // of a mid-conversation dead step. This is the last line of defence behind
+  // the prompt grounding — even if the AI hallucinates a node or copies one
+  // from another tool, the workflow can't be saved as runnable.
+  if (!isKnownNodeType(t)) {
+    issues.push(err(`Unknown node type "${t}" — the engine can't run this. Use a supported node (see the builder's node catalog).`))
+    return issues
+  }
+
   switch (t) {
     case 'send_text':
       if (!cfg.text) issues.push(err('send_text: cfg.text is required'))
@@ -381,7 +393,7 @@ export async function validateWorkflow(
   if (triggers.length === 0 && safeNodes.length > 0) {
     nodeIssues.push({
       node_id: '(workflow)', node_type: '(workflow)', severity: 'error',
-      message: 'Workflow has no trigger node — it will never fire automatically. Add a trigger_inbound_keyword or trigger_inbound_email node.',
+      message: 'Workflow has no trigger node — it will never fire automatically. Add a trigger node (e.g. trigger_inbound_keyword, trigger_new_lead, trigger_new_order, trigger_payment, trigger_schedule).',
     })
   }
 

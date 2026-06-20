@@ -1,8 +1,11 @@
 // Capability-manifest drift check — run in dev / CI to catch the moment a
 // registry capability advertises a node the executor can't run.
 //   npx tsx scripts/manifest-check.ts        (exit 1 if drift, for CI gating)
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { buildStaticManifest } from '../src/engine/capability-manifest'
-import { CORE_NODE_TYPES, TRIGGER_NODE_TYPES, NODE_DESCRIPTIONS } from '../src/engine/node-types'
+import { CORE_NODE_TYPES, TRIGGER_NODE_TYPES, NODE_DESCRIPTIONS, isKnownNodeType } from '../src/engine/node-types'
 
 const m = buildStaticManifest()
 console.log(`apps: ${m.apps.length}`)
@@ -34,8 +37,26 @@ const undocumented = [...CORE_NODE_TYPES, ...TRIGGER_NODE_TYPES].filter(t => !NO
 console.log(`\nUNDOCUMENTED nodes (no NODE_DESCRIPTIONS entry → builder unaware): ${undocumented.length}`)
 for (const t of undocumented) console.log(`  ✗ ${t}`)
 
-// Hard-fail the build ONLY on undocumented nodes — that's the guarantee we can
-// keep: the builder is aware of every node the engine runs. Connector backlog
-// (m.drift) is reported above but doesn't block, since those nodes are never
+// Prompt-token audit: scan the parser source for trigger_* tokens that the
+// engine can't run. This catches the "stale few-shot example teaches a
+// non-existent trigger" bug class (e.g. trigger_webhook / trigger_scheduled /
+// trigger_form_submit) — the few-shot examples dominate what the AI emits, so a
+// fake one there is as bad as a wrong catalog. Hard-fails the build.
+const __dir = dirname(fileURLToPath(import.meta.url))
+// Legit non-node identifiers that happen to start with trigger_ (output-schema
+// fields, API body keys) — not workflow node types, so don't flag them.
+const NON_NODE_TRIGGER_TOKENS = new Set(['trigger_summary', 'trigger_input'])
+let staleTokens: string[] = []
+try {
+  const src = readFileSync(join(__dir, '../src/index.ts'), 'utf8')
+  const found = new Set((src.match(/trigger_[a-z_]+/g) ?? []))
+  staleTokens = [...found].filter(t => !isKnownNodeType(t) && !NON_NODE_TRIGGER_TOKENS.has(t))
+} catch { /* file move — skip the audit rather than crash the gate */ }
+console.log(`\nSTALE PROMPT TOKENS in src/index.ts (trigger_* the engine can't run): ${staleTokens.length}`)
+for (const t of staleTokens) console.log(`  ✗ ${t}`)
+
+// Hard-fail the build on undocumented nodes (builder unaware of a real power)
+// and on stale prompt tokens (builder taught a fake one). Connector backlog
+// (m.drift) is reported above but doesn't block — those nodes are never
 // surfaced to the builder.
-if (undocumented.length) process.exitCode = 1
+if (undocumented.length || staleTokens.length) process.exitCode = 1
