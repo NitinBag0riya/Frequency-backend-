@@ -93,6 +93,7 @@ async function runTick() {
       let result: { imported: number; updated: number; warning?: string }
       if      (sub.source_type === 'google_sheet') result = await syncGoogleSheet(sub)
       else if (sub.source_type === 'airtable')     result = await syncAirtable(sub)
+      else if (sub.source_type === 'lead_table')   result = await syncLeadTable(sub)
       else throw new Error(`source_type=${sub.source_type} not supported yet`)
       await supabase.from('data_source_subscriptions').update({
         last_synced_at: new Date().toISOString(),
@@ -372,6 +373,57 @@ async function syncAirtable(sub: any): Promise<{ imported: number; updated: numb
     imported, updated,
     warning: hitCap ? 'Sync truncated at 5000 records — only the first 5000 are mirrored each tick. Use Airtable views to filter or contact support to raise the cap.' : undefined,
   }
+}
+
+// Mirror rows from another lead_table (source) into this one (target), applying
+// the feed's mapping. Dedupes by the source row id stashed in data._source_row_id
+// so re-syncs update in place rather than duplicating.
+async function syncLeadTable(sub: any): Promise<{ imported: number; updated: number; warning?: string }> {
+  const sourceTableId = (sub.source_config as any)?.source_table_id
+  if (!sourceTableId) throw new Error('source_table_id missing')
+  if (sourceTableId === sub.lead_table_id) throw new Error('a table cannot feed itself')
+
+  const { data: tenant } = await supabase.from('tenants').select('id, user_id').eq('id', sub.tenant_id).maybeSingle()
+  if (!tenant) throw new Error('tenant not found')
+
+  const pinnedMapping = await loadMapping(supabase, sub.tenant_id, sub.default_mapping_id)
+
+  const { data: srcRows } = await supabase.from('lead_rows')
+    .select('id, data').eq('table_id', sourceTableId).limit(10000)
+  if (!srcRows || srcRows.length === 0) return { imported: 0, updated: 0 }
+
+  const { data: existingRows } = await supabase.from('lead_rows')
+    .select('id, data').eq('table_id', sub.lead_table_id).limit(10000)
+  const bySrc = new Map<string, { id: string; data: any }>()
+  for (const r of existingRows ?? []) {
+    const sid = (r.data as any)?._source_row_id
+    if (sid) bySrc.set(String(sid), r)
+  }
+
+  let imported = 0, updated = 0
+  for (const row of srcRows) {
+    const raw = (row.data ?? {}) as Record<string, unknown>
+    const data: Record<string, any> = pinnedMapping
+      ? { ...applyMappingToPayload(pinnedMapping, raw), _source_row_id: row.id }
+      : { _source_row_id: row.id, ...raw }
+    const existing = bySrc.get(String(row.id))
+    if (existing) {
+      const prev = existing.data as Record<string, any>
+      let changed = false
+      for (const k of Object.keys(data)) if (String(prev?.[k] ?? '') !== String(data[k] ?? '')) { changed = true; break }
+      if (changed) {
+        await supabase.from('lead_rows').update({ data, updated_at: new Date().toISOString() }).eq('id', existing.id)
+        updated++
+      }
+    } else {
+      await supabase.from('lead_rows').insert({
+        tenant_id: sub.tenant_id, user_id: tenant.user_id, table_id: sub.lead_table_id,
+        data, status: 'new', tags: [], ingest_source: 'sync',
+      })
+      imported++
+    }
+  }
+  return { imported, updated, warning: srcRows.length >= 10000 ? 'Sync truncated at 10000 rows.' : undefined }
 }
 
 function keyify(label: string): string {

@@ -23,6 +23,7 @@ import { sheetsGetMetadata, sheetsReadRange } from '../google'
 import { getTableSchema, listRecords, airtableFieldToLeadType } from '../lib/airtable'
 import { validateBody } from '../validation'
 import { randomToken } from '../crypto'
+import { loadMapping, applyMappingToPayload } from '../lib/apply-mapping'
 
 const PUBLIC_BASE = (process.env.PUBLIC_API_URL ?? 'http://localhost:3001').replace(/\/+$/, '')
 const ingestUrlFor = (token: string) => `${PUBLIC_BASE}/api/ingest/${token}`
@@ -148,6 +149,65 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
         res.status(404).json({ error: 'not a webhook feed' }); return
       }
       res.json({ url: ingestUrlFor((sub as any).ingest_token) })
+    })
+
+  // ── Add an existing table as a data source (table → table mirror) ───────────
+  // Source table's rows mirror into the target, applying the feed's mapping.
+  // Does an inline initial import; the sync worker re-mirrors on cadence.
+  r.post('/api/data-sources/lead-table',
+    requireAuth, identifyTenant, checkPermission('integrations', 'edit'),
+    validateBody(z.object({
+      lead_table_id: z.string().uuid(),
+      source_table_id: z.string().uuid(),
+      name: z.string().max(120).optional(),
+      default_mapping_id: z.string().uuid().nullable().optional(),
+      sync_interval_minutes: z.number().int().min(1).max(1440).optional(),
+    }).strict()),
+    async (req, res) => {
+      const tenantId = (req as any).tenantId
+      const userId = (req as any).user?.id ?? null
+      const { lead_table_id, source_table_id, name, default_mapping_id, sync_interval_minutes } =
+        req.body as { lead_table_id: string; source_table_id: string; name?: string; default_mapping_id?: string | null; sync_interval_minutes?: number }
+      if (lead_table_id === source_table_id) { res.status(400).json({ error: 'a table cannot feed itself' }); return }
+      const { data: tbls } = await supabase.from('lead_tables')
+        .select('id, name, user_id').in('id', [lead_table_id, source_table_id]).eq('tenant_id', tenantId)
+      if (!tbls || tbls.length !== 2) { res.status(400).json({ error: 'both tables must belong to this tenant' }); return }
+      if (default_mapping_id) {
+        const { data: mp } = await supabase.from('lead_field_mappings')
+          .select('id').eq('id', default_mapping_id).eq('tenant_id', tenantId).maybeSingle()
+        if (!mp) { res.status(400).json({ error: 'default_mapping_id does not belong to this tenant' }); return }
+      }
+      const srcName = tbls.find(t => t.id === source_table_id)?.name
+      const { data: sub, error } = await supabase.from('data_source_subscriptions').insert({
+        tenant_id: tenantId,
+        lead_table_id,
+        source_type: 'lead_table',
+        source_config: { source_table_id, name: name?.trim() || `From ${srcName ?? 'table'}` },
+        default_mapping_id: default_mapping_id ?? null,
+        sync_interval_minutes: sync_interval_minutes ?? 5,
+        status: 'active',
+        created_by: userId,
+      }).select().single()
+      if (error) { res.status(500).json({ error: error.message }); return }
+
+      // Inline initial import (worker handles ongoing re-sync).
+      let imported = 0
+      try {
+        const pinned = await loadMapping(supabase, tenantId, default_mapping_id ?? null)
+        const targetUserId = tbls.find(t => t.id === lead_table_id)?.user_id ?? userId
+        const { data: srcRows } = await supabase.from('lead_rows')
+          .select('id, data').eq('table_id', source_table_id).limit(10000)
+        const rows = (srcRows ?? []).map(r => {
+          const raw = (r.data ?? {}) as Record<string, unknown>
+          const data = pinned ? { ...applyMappingToPayload(pinned, raw), _source_row_id: r.id } : { _source_row_id: r.id, ...raw }
+          return { tenant_id: tenantId, user_id: targetUserId, table_id: lead_table_id, data, status: 'new', tags: [], ingest_source: 'sync' }
+        })
+        if (rows.length) { await supabase.from('lead_rows').insert(rows); imported = rows.length }
+        await supabase.from('data_source_subscriptions')
+          .update({ rows_imported: imported, last_synced_at: new Date().toISOString() }).eq('id', sub.id)
+      } catch { /* non-fatal — worker retries on next tick */ }
+
+      res.json({ subscription: stripToken(sub), imported })
     })
 
   r.patch('/api/data-sources/:id',
