@@ -95,3 +95,71 @@ export const NODE_TYPE_SET: ReadonlySet<string> = new Set(NODE_TYPES)
 export function isKnownNodeType(t: string): boolean {
   return NODE_TYPE_SET.has(t)
 }
+
+/**
+ * One-line description per node type — the builder's grounding. EVERY core +
+ * trigger node MUST have an entry here; the manifest drift check fails the build
+ * otherwise, so the workflow builder can never be unaware of a power the engine
+ * has. Connector-op nodes are summarised generically (their config lives in the
+ * picker catalog / connector registry).
+ */
+export const NODE_DESCRIPTIONS: Record<string, string> = {
+  // ── Triggers ──
+  trigger_inbound_keyword: 'Start when an inbound WhatsApp/Instagram/Telegram message matches a keyword or phrase (e.g. STOP, "brochure").',
+  trigger_new_lead:        'Start when a single new lead arrives — a lead-table row created OR a webhook intake (99acres, FB/IG lead ads, JustDial…). Not on bulk/CSV import.',
+  trigger_new_order:       'Start on a new commerce order (storefront / Zomato / Shopify / WooCommerce).',
+  trigger_order_status:    'Start when an order\'s status changes (e.g. paid, shipped).',
+  trigger_crm_stage:       'Start when a lead/deal moves to a pipeline stage (e.g. Visit Completed → kick off post-visit flow).',
+  trigger_missed_call:     'Start when a call is missed (Exotel / Meta calling) — powers callback flows.',
+  trigger_message_status:  'Start when an outbound WhatsApp message FAILS delivery — powers SMS fallback / ops alerts.',
+  trigger_schedule:        'Recurring/cron start — daily/weekly at a time, or every N minutes (digests, reminders, stale-lead scans).',
+  trigger_payment:         'Start on a tenant CUSTOMER payment event (Razorpay/Cashfree): paid / failed / refunded.',
+  // ── Core actions ──
+  send_text:               'Send a free-form WhatsApp text (only valid inside the 24h window; outside it use send_template).',
+  send_template:           'Send an approved WhatsApp template (required outside the 24h window). Supports buttons defined on the template.',
+  send_interactive:        'Send quick-reply buttons (≤3) or a list picker — the in-session way to offer choices (BHK, budget, actions).',
+  send_media:              'Send a media message — PDF brochure, video, or image (by URL).',
+  collect_input:           'Ask the contact for a value and capture their reply into a variable.',
+  wait_delay:              'Pause the flow for a duration or until a date/time, then resume (powers drip sequences + scheduled reminders).',
+  condition_reply:         'Branch on the contact\'s free-text reply.',
+  condition_button_click:  'Branch on which quick-reply button the contact tapped.',
+  condition_variable:      'Branch on a stored variable (e.g. BHK × budget → pick the right brochure; status == Healthy).',
+  add_tag:                 'Add a tag to the contact.',
+  assign_agent:            'Assign the conversation/lead to a human agent (round-robin or specific).',
+  http_request:            'Call an arbitrary external HTTP API (GET/POST…) — escape hatch for anything without a dedicated connector.',
+  update_crm:              'Update a CRM/lead record — set stage, status, fields (e.g. mark Unsubscribed/Closed).',
+  update_sheet:            'Write/update a row in a connected sheet or lead table.',
+  create_calendar_event:   'Create a Google Calendar event (visit, callback, meeting) with attendees + reminders.',
+  check_calendar_availability: 'Check free/busy on a calendar before offering slots.',
+  run_ai_responder:        'Hand the turn to the AI responder (knowledge-grounded) to answer free-form questions.',
+  send_email:              'Send an email (SendGrid/Mailgun/SES/SMTP).',
+  forward_email:           'Forward a received email, preserving the original sender.',
+  payment:                 'Create + send a payment link (Razorpay/Cashfree/PayU) and wait for payment.',
+  notify_human:            'Notify a human/team (in-app + push) — e.g. an exec alert.',
+  followup:                'Schedule a follow-up message after a delay if no reply.',
+  start_workflow:          'Start/chain another workflow (e.g. T1 → T2 → T3). Cycle-checked.',
+  end_flow:                'End the current workflow session.',
+  connector_call:          'Run any connected app\'s operation generically (see the connector operations + App Capabilities below).',
+}
+
+/**
+ * The builder's node vocabulary, generated from the arrays above — the SINGLE
+ * SOURCE OF TRUTH. Inject this into the parser prompt instead of a hand-written
+ * list so a node/trigger added to node-types.ts is AUTOMATICALLY known to the
+ * builder (no stale, no "valid in draft / breaks live").
+ */
+export function composeNodeCatalogPromptSection(): string {
+  const line = (t: string) => `  ${t} — ${NODE_DESCRIPTIONS[t] ?? '(no description — add one to NODE_DESCRIPTIONS)'}`
+  return [
+    'NODE TYPES — the EXACT, CURRENT vocabulary (auto-generated from the engine; use these strings ONLY, never invent or copy n8n/Zapier node names):',
+    '',
+    'Triggers (what STARTS a workflow — every workflow begins with exactly one):',
+    TRIGGER_NODE_TYPES.map(line).join('\n'),
+    '',
+    'Actions & logic (core engine):',
+    CORE_NODE_TYPES.map(line).join('\n'),
+    '',
+    `Connector operations (sugar over connector_call — pick the matching app + operation; full config in the App Capabilities section below):`,
+    `  ${CONNECTOR_OP_NODE_TYPES.join(', ')}`,
+  ].join('\n')
+}

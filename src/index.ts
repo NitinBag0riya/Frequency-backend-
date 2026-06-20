@@ -91,6 +91,7 @@ import { createSlaRouter }                     from './routes/sla'
 import {
   PICKER_CATALOG, composePickerPromptSection, flattenPickers,
 } from './connectors/picker-catalog'
+import { composeNodeCatalogPromptSection } from './engine/node-types'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import { syncTenant as syncTenantTemplates } from './workers/template-sync'
 import {
@@ -1059,14 +1060,7 @@ If the user pastes a large existing workflow (n8n JSON, Zapier zap, Make scenari
 
 Output a single, complete, balanced JSON object. Better to ship one tight workflow that parses than half of a giant one that gets cut off.
 
-NODE TYPES (use exact strings):
-Triggers:  trigger_form_submit, trigger_webhook, trigger_sheet_row, trigger_inbound_keyword,
-           trigger_scheduled, trigger_api, trigger_broadcast_reply, trigger_email_received
-Actions:   send_text, send_template, send_interactive, collect_input, send_payment_link,
-           update_crm, update_sheet, http_request, run_ai_responder, assign_agent,
-           add_tag, wait_delay, send_email, forward_email
-Logic:     condition_reply, condition_button_click, condition_variable, condition_time,
-           split_ab, end_flow
+${composeNodeCatalogPromptSection()}
 
 WHATSAPP RULES (enforce for send_text / send_template / send_interactive nodes):
 - Free-form text only valid within 24 h of last inbound message
