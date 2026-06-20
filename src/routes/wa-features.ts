@@ -208,6 +208,16 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
     const { name, category, definition } = req.body
     if (!name) { res.status(400).json({ error: 'name required' }); return }
 
+    // Check-before-create: warn on a same-named flow unless confirmed, so we
+    // don't end up with two "Booking" flows. Resend with ?confirm=true.
+    {
+      const { findDuplicateByName, duplicateResponse, isConfirmedCreate } = await import('../lib/dedupe-guard')
+      if (!isConfirmedCreate(req)) {
+        const dup = await findDuplicateByName(supabase, 'wa_flows', tenantId, name)
+        if (dup) { res.status(409).json(duplicateResponse('WhatsApp Flow', dup)); return }
+      }
+    }
+
     // Seed with a valid single-screen DRAFT so the chat-edit loop can start
     // from a clean baseline that already passes validateDefinition().
     const seed = definition ?? DEFAULT_DEFINITION

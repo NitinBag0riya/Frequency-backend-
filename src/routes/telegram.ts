@@ -267,6 +267,14 @@ export function createTelegramRouter(deps: Deps): express.Router {
     const tenantId = (req as any).tenantId
     const { name, text, audience } = req.body
     if (!name || !text) { res.status(400).json({ error: 'name + text required' }); return }
+    // Check-before-create: warn on a same-named Telegram broadcast unless confirmed.
+    {
+      const { findDuplicateByName, duplicateResponse, isConfirmedCreate } = await import('../lib/dedupe-guard')
+      if (!isConfirmedCreate(req)) {
+        const dup = await findDuplicateByName(supabase, 'broadcasts', tenantId, name, { channel: 'telegram' })
+        if (dup) { res.status(409).json(duplicateResponse('Telegram broadcast', dup)); return }
+      }
+    }
     const { data, error } = await supabase.from('broadcasts').insert({
       tenant_id: tenantId, channel: 'telegram',
       name, audience: audience ?? { all: true },

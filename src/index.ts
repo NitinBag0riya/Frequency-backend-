@@ -1073,6 +1073,11 @@ EMAIL RULES (enforce for send_email / forward_email ACTION nodes — note: there
 - Always flag missing OAuth / API credentials in missing_config
 - forward_email should preserve original sender in the forwarded body when possible
 
+REUSE BEFORE CREATE (never make a duplicate of something the tenant already has):
+- Before proposing to CREATE a new template / WhatsApp Flow / broadcast, assume they may already have one. Prefer reusing an existing resource by name over creating a new one.
+- When you DO propose a new template in templates_needed[], treat it as needing human confirmation — it is a proposal, not an auto-create. The create endpoints reject a same-named resource with a 409 unless the user confirms, so the UI will ask the user to reuse-or-create. Word body_preview/suggested_name so the user can tell it apart from an existing one.
+- If the user's wording implies an existing asset ("our welcome template", "the Diwali broadcast"), do NOT invent a new one — reference it and let the picker/confirm step resolve it.
+
 CONFIG PREFILL (reduce what the user has to re-enter):
 - Whenever the user states a CONCRETE value — an amount ("₹999" → amount_paise: 99900), a message/body, an email, a phone, a time/schedule, a URL, a tag name, a delay ("after 2 days") — put it directly in that node's "config" with the value, and DO NOT also list it in missing_config.
 - Only list a field in missing_config when its value is genuinely unknown from the user's words (e.g. they said "a table" but no name, or "our template" but no name).
@@ -1721,7 +1726,7 @@ const VOICE_AGENT_INSTRUCTIONS = `You are Frequency's voice agent for Indian SMB
 Method: capture their goal, then fill the requirements checklist by asking ONE question at a time. ALWAYS offer concrete options, never an open void:
 - When they mention data ("a sheet", "my list"): call list_resources(table) and ask "Use your <existing table>, import your sheet, or shall I create a new one?". If they pick a table, call get_table_columns and confirm the fields, or ask which columns to capture.
 - When they mention a message/reply: call list_resources(template) — "Use your <template>, or shall I write a new one?". If new, draft it and read it back for a yes.
-- Same pattern for forms/pages, payments, CRM tags.
+- Same pattern for forms/pages, payments, CRM tags, broadcasts and WhatsApp Flows — always check what they already have before making a new one; if a same-named one exists, offer to reuse it rather than creating a duplicate.
 
 Proactively fill what they DIDN'T say, each with options:
 - Timing/schedule: "Run instantly on every message, or batch it — say every morning at 10?"
@@ -2761,6 +2766,17 @@ app.post('/api/wa-templates', requireAuth, identifyTenant, checkPermission('what
   const { name, category = 'MARKETING', language = 'en_US', body, buttons = [], components: providedComponents } = req.body
   if (!name) { res.status(400).json({ error: 'name required' }); return }
 
+  // Check-before-create: a template with this name+language already exists for
+  // the tenant → don't silently overwrite it (or duplicate it on Meta). Surface
+  // it and let a human decide. Resend with ?confirm=true to overwrite/recreate.
+  {
+    const { findDuplicateByName, duplicateResponse, isConfirmedCreate } = await import('./lib/dedupe-guard')
+    if (!isConfirmedCreate(req)) {
+      const dup = await findDuplicateByName(supabase, 'wa_templates', tenantId, name, { language: String(language) })
+      if (dup) { res.status(409).json(duplicateResponse('WhatsApp template', dup)); return }
+    }
+  }
+
   let components: any[]
   if (Array.isArray(providedComponents) && providedComponents.length > 0) {
     components = providedComponents
@@ -2936,6 +2952,16 @@ app.post('/api/broadcasts', requireAuth, identifyTenant, checkPermission('whatsa
     if (!seg) {
       res.status(400).json({ error: 'segment_id does not belong to this tenant (or is archived)' })
       return
+    }
+  }
+  // Check-before-create: warn on a same-named broadcast for this channel unless
+  // the caller confirmed. Keeps a human in the loop instead of silently making
+  // a duplicate. Resend with ?confirm=true to override.
+  {
+    const { findDuplicateByName, duplicateResponse, isConfirmedCreate } = await import('./lib/dedupe-guard')
+    if (!isConfirmedCreate(req)) {
+      const dup = await findDuplicateByName(supabase, 'broadcasts', tenantId, incoming.name, { channel: incoming.channel ?? 'whatsapp' })
+      if (dup) { res.status(409).json(duplicateResponse('broadcast', dup)); return }
     }
   }
   const { data, error } = await supabase.from('broadcasts')
