@@ -22,6 +22,12 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { sheetsGetMetadata, sheetsReadRange } from '../google'
 import { getTableSchema, listRecords, airtableFieldToLeadType } from '../lib/airtable'
 import { validateBody } from '../validation'
+import { randomToken } from '../crypto'
+
+const PUBLIC_BASE = (process.env.PUBLIC_API_URL ?? 'http://localhost:3001').replace(/\/+$/, '')
+const ingestUrlFor = (token: string) => `${PUBLIC_BASE}/api/ingest/${token}`
+/** Never leak a webhook feed's ingest_token in list/detail payloads. */
+const stripToken = <T extends Record<string, any>>(row: T) => { const { ingest_token, ...rest } = row; return { ...rest, has_token: !!ingest_token } }
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -80,7 +86,7 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
       const { data, error } = await supabase.from('data_source_subscriptions').select('*')
         .eq('tenant_id', tenantId).order('created_at', { ascending: false })
       if (error) { res.status(500).json({ error: error.message }); return }
-      res.json(data ?? [])
+      res.json((data ?? []).map(stripToken))
     })
 
   r.get('/api/data-sources/:id',
@@ -91,7 +97,57 @@ export function createDataSourcesRouter(deps: Deps): express.Router {
         .eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
       if (error)  { res.status(500).json({ error: error.message }); return }
       if (!data)  { res.status(404).json({ error: 'subscription not found' }); return }
-      res.json(data)
+      res.json(stripToken(data))
+    })
+
+  // ── Create a webhook data source (push feed: its own ingest token + mapping) ─
+  // Lets a table accept several push sources (Meta, 99acres, …), each with its
+  // own URL + mapping — the webhook equivalent of a mirror feed.
+  r.post('/api/data-sources/webhook',
+    requireAuth, identifyTenant, checkPermission('integrations', 'edit'),
+    validateBody(z.object({
+      lead_table_id: z.string().uuid(),
+      name: z.string().max(120).optional(),
+      default_mapping_id: z.string().uuid().nullable().optional(),
+    }).strict()),
+    async (req, res) => {
+      const tenantId = (req as any).tenantId
+      const userId = (req as any).user?.id ?? null
+      const { lead_table_id, name, default_mapping_id } = req.body as { lead_table_id: string; name?: string; default_mapping_id?: string | null }
+      const { data: tbl } = await supabase.from('lead_tables')
+        .select('id').eq('id', lead_table_id).eq('tenant_id', tenantId).maybeSingle()
+      if (!tbl) { res.status(400).json({ error: 'lead_table_id is not in this tenant' }); return }
+      if (default_mapping_id) {
+        const { data: mp } = await supabase.from('lead_field_mappings')
+          .select('id').eq('id', default_mapping_id).eq('tenant_id', tenantId).maybeSingle()
+        if (!mp) { res.status(400).json({ error: 'default_mapping_id does not belong to this tenant' }); return }
+      }
+      const token = randomToken(24)
+      const { data: sub, error } = await supabase.from('data_source_subscriptions').insert({
+        tenant_id: tenantId,
+        lead_table_id,
+        source_type: 'webhook',
+        source_config: { name: name?.trim() || 'Webhook' },
+        ingest_token: token,
+        default_mapping_id: default_mapping_id ?? null,
+        status: 'active',
+        created_by: userId,
+      }).select().single()
+      if (error) { res.status(500).json({ error: error.message }); return }
+      res.json({ subscription: stripToken(sub), ingest_url: ingestUrlFor(token) })
+    })
+
+  // ── Reveal a webhook feed's ingest URL on demand (token not in list payload) ─
+  r.get('/api/data-sources/:id/ingest-url',
+    requireAuth, identifyTenant, checkPermission('integrations', 'view'),
+    async (req, res) => {
+      const tenantId = (req as any).tenantId
+      const { data: sub } = await supabase.from('data_source_subscriptions')
+        .select('ingest_token, source_type').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+      if (!sub || (sub as any).source_type !== 'webhook' || !(sub as any).ingest_token) {
+        res.status(404).json({ error: 'not a webhook feed' }); return
+      }
+      res.json({ url: ingestUrlFor((sub as any).ingest_token) })
     })
 
   r.patch('/api/data-sources/:id',

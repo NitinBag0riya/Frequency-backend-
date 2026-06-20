@@ -1007,19 +1007,50 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       res.status(429).json({ error: 'rate limit exceeded' }); return
     }
 
-    const { data: table, error: tableErr } = await supabase
-      .from('lead_tables')
-      .select('id, tenant_id, user_id, default_mapping_id')
-      .eq('ingest_token', token)
-      .maybeSingle()
-    if (tableErr || !table) { fail(); return }
+    // Legacy table-level token: lead_tables.ingest_token is a UUID column, so
+    // only probe it when the token is UUID-shaped (a non-UUID would throw 22P02).
+    let table: { id: string; tenant_id: string; user_id: string; default_mapping_id: string | null } | null = null
+    const isUuidToken = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)
+    if (isUuidToken) {
+      const { data } = await supabase
+        .from('lead_tables')
+        .select('id, tenant_id, user_id, default_mapping_id')
+        .eq('ingest_token', token)
+        .maybeSingle()
+      table = (data as any) ?? null
+    }
+
+    // Per-feed webhook token: a table can have several webhook data sources
+    // (Meta, 99acres, …), each with its own token + mapping. If the token isn't
+    // a table-level one, resolve it as a webhook feed → its table, and use the
+    // FEED's mapping instead of the table default. (Legacy table tokens above
+    // still work — additive, no behaviour change for existing integrations.)
+    let feedMappingId: string | null = null
+    if (!table) {
+      const { data: feed } = await supabase
+        .from('data_source_subscriptions')
+        .select('lead_table_id, default_mapping_id, status')
+        .eq('ingest_token', token)
+        .eq('source_type', 'webhook')
+        .maybeSingle()
+      if (feed && feed.status !== 'paused') {
+        const { data: t } = await supabase
+          .from('lead_tables')
+          .select('id, tenant_id, user_id, default_mapping_id')
+          .eq('id', feed.lead_table_id)
+          .maybeSingle()
+        if (t) { table = t as any; feedMappingId = (feed as any).default_mapping_id ?? null }
+      }
+    }
+    if (!table) { fail(); return }
 
     // Pinned mapping (if any) — loaded ONCE before processing the batch.
-    // Failure to load (e.g. mapping deleted concurrently) falls back to
+    // Webhook feeds use their own mapping; legacy table tokens use the table
+    // default. Failure to load (e.g. mapping deleted concurrently) falls back to
     // verbatim mode rather than rejecting the request; that matches the
     // ON DELETE SET NULL semantics on the column. See lib/apply-mapping.ts
     // for the shared transform pipeline (same one the FE preview uses).
-    const pinnedMapping = await loadMapping(supabase, table.tenant_id, (table as any).default_mapping_id)
+    const pinnedMapping = await loadMapping(supabase, table.tenant_id, feedMappingId ?? (table as any).default_mapping_id)
 
     // Coerce to an array of plain row objects.
     let rowList: Array<Record<string, unknown>>
