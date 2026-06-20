@@ -358,7 +358,21 @@ const WHATSAPP: ConnectorDef = {
         { key: 'updated_at',   label: 'Updated at',   type: 'string', sample: '2026-04-22T11:30:00Z' },
       ] },
     },
-    { key: 'flow_responses',      label: 'Flow responses',         description: 'Lead data captured via flows.',                                iconName: 'Inbox',         apiPath: '/api/wa-flows/:id/responses',      apiMethod: 'GET',                                         uiKind: 'list',   status: 'planned' },
+    { key: 'flow_responses',      label: 'Flow responses',         description: 'Lead data captured via flows.',                                iconName: 'Inbox',         apiPath: '/api/wa-flows/:id/responses',      apiMethod: 'GET',                                         uiKind: 'list',   status: 'live' },
+    // Send a WhatsApp Flow inside a workflow and pause for the submission.
+    { key: 'send_flow',           label: 'Send a Flow',            description: 'Send a WhatsApp Flow (interactive form) and wait for the contact to submit it.', iconName: 'ClipboardList', apiPath: '/api/inbox/send', apiMethod: 'POST', workflowNodeType: 'send_flow', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'flow_id', label: 'Flow',        type: 'resource', required: true  },
+        { key: 'cta',     label: 'Button text', type: 'text',     required: false },
+        { key: 'body',    label: 'Message',     type: 'text',     required: false },
+      ] },
+    },
+    // Trigger: a contact submitted a WhatsApp Flow.
+    { key: 'trigger_flow_response', label: 'Flow submitted',       description: 'Fire when a contact submits a WhatsApp Flow (interactive form).', iconName: 'Inbox',  apiPath: '/api/wa-flows/:id/responses', apiMethod: 'GET', workflowNodeType: 'trigger_flow_response', uiKind: 'list', status: 'live',
+      inputSchema: { fields: [
+        { key: 'flow_id', label: 'Flow (optional — any flow if blank)', type: 'resource', required: false },
+      ] },
+    },
     // QR codes
     { key: 'list_qr',             label: 'QR codes',               description: 'wa.me deep-link QR codes with prefilled messages.',            iconName: 'QrCode',        apiPath: '/api/wa-qr',                       apiMethod: 'GET',                                         uiKind: 'list',   status: 'live',
       outputSchema: { fields: [

@@ -24,6 +24,7 @@ export const CORE_NODE_TYPES = [
   'http_request', 'update_crm', 'update_sheet',
   'create_calendar_event', 'check_calendar_availability',
   'run_ai_responder',
+  'send_flow',
   'send_email', 'forward_email',
   'payment', 'notify_human', 'followup',
   'start_workflow', 'end_flow',
@@ -79,6 +80,12 @@ export const TRIGGER_NODE_TYPES = [
   // payment-confirmation, failed-payment recovery, refund acknowledgement.
   // See routes/payment-webhook.ts.
   'trigger_payment',
+  // A WhatsApp Flow (interactive form) was SUBMITTED by a contact. Fired from
+  // the inbound webhook's nfm_reply handling. If a workflow session is already
+  // waiting (it sent the flow via send_flow), the submission RESUMES it instead;
+  // this trigger STARTS a workflow for flows submitted with no session waiting.
+  // See routeFlowSubmission in engine/inbound-router.ts.
+  'trigger_flow_response',
 ] as const
 
 export const NODE_TYPES = [
@@ -114,6 +121,7 @@ export const NODE_DESCRIPTIONS: Record<string, string> = {
   trigger_message_status:  'Start when an outbound WhatsApp message FAILS delivery — powers SMS fallback / ops alerts.',
   trigger_schedule:        'Recurring/cron start — daily/weekly at a time, or every N minutes. Either a 1:1 reminder (set contact_id) OR fan out to an audience (set segment_id or audience.tags → one run per matching contact). Powers digests, reminders, stale-lead scans, scheduled broadcasts.',
   trigger_payment:         'Start on a tenant CUSTOMER payment event (Razorpay/Cashfree): paid / failed / refunded.',
+  trigger_flow_response:   'Start when a contact SUBMITS a WhatsApp Flow / interactive form (config: flow_id to scope to one flow). Submitted fields are in {{trigger.*}}. If a workflow already sent the flow and is waiting, the submission resumes that flow instead.',
   // ── Core actions ──
   send_text:               'Send a free-form WhatsApp text (only valid inside the 24h window; outside it use send_template).',
   send_template:           'Send an approved WhatsApp template (required outside the 24h window). Supports buttons defined on the template.',
@@ -132,6 +140,7 @@ export const NODE_DESCRIPTIONS: Record<string, string> = {
   create_calendar_event:   'Create a Google Calendar event (visit, callback, meeting) with attendees + reminders.',
   check_calendar_availability: 'Check free/busy on a calendar before offering slots.',
   run_ai_responder:        'Hand the turn to the AI responder (knowledge-grounded) to answer free-form questions.',
+  send_flow:               'Send a WhatsApp Flow (interactive form, config: flow_id + cta text) and PAUSE until the contact submits it — their answers resume the workflow (read via {{trigger.*}} / the reply). The in-chat way to collect structured multi-field input.',
   send_email:              'Send an email (SendGrid/Mailgun/SES/SMTP).',
   forward_email:           'Forward a received email, preserving the original sender.',
   payment:                 'Create + send a payment link (Razorpay/Cashfree/PayU) and wait for payment.',

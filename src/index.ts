@@ -4084,6 +4084,46 @@ async function handleInboundMessage(tenant: any, msg: any, contact: any) {
     }
   }
 
+  // ── WhatsApp Flow submission (nfm_reply) ──────────────────────────────────
+  // When a contact submits a WhatsApp Flow (interactive form), Meta delivers an
+  // interactive message of type 'nfm_reply' whose response_json is the submitted
+  // fields. Capture it in wa_flow_responses, then route it: resume a waiting
+  // workflow session (sent via send_flow) OR fire trigger_flow_response. This is
+  // the bridge that was missing — flows were management-only until now.
+  if (msg.type === 'interactive' && msg.interactive?.type === 'nfm_reply') {
+    let flowData: Record<string, any> = {}
+    try { flowData = JSON.parse(msg.interactive.nfm_reply?.response_json ?? '{}') }
+    catch { console.warn(`[wa-flow] nfm_reply response_json parse failed tenant=${tenant.id}`) }
+    const flowName: string | null = msg.interactive.nfm_reply?.name ?? null
+    // Resolve our internal flow row. send_flow stamps flow_token with the
+    // wa_flows.id; fall back to matching by name. Either may be null for a flow
+    // sent outside our system — the response is still stored (flow_id nullable).
+    const flowToken = String(flowData.flow_token ?? '')
+    let flowId: string | null = null
+    if (flowToken) {
+      const { data: byToken } = await supabase.from('wa_flows')
+        .select('id').eq('tenant_id', tenant.id).eq('id', flowToken).maybeSingle()
+      flowId = byToken?.id ?? null
+    }
+    if (!flowId && flowName) {
+      const { data: byName } = await supabase.from('wa_flows')
+        .select('id').eq('tenant_id', tenant.id).ilike('name', flowName).limit(1).maybeSingle()
+      flowId = byName?.id ?? null
+    }
+    await supabase.from('wa_flow_responses').insert({
+      flow_id:       flowId,
+      tenant_id:     tenant.id,
+      contact_id:    contactRow?.id ?? null,
+      contact_phone: `+${phone}`,
+      response_data: flowData,
+    }).then(() => {}, e => console.warn(`[wa-flow] response insert non-fatal: ${e?.message}`))
+
+    const { routeFlowSubmission } = await import('./engine/inbound-router')
+    await routeFlowSubmission(supabase, tenant, 'whatsapp', phone, flowData, msg,
+      { flow_id: flowId, flow_name: flowName })
+    return
+  }
+
   // Channel-aware delegation. Routes session-resume + keyword-trigger via
   // the shared helper used by Telegram + Instagram webhooks.
   const { routeInboundToWorkflow } = await import('./engine/inbound-router')

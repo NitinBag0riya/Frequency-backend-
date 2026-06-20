@@ -175,6 +175,33 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         return advance(node)
       }
 
+      // ── Send a WhatsApp Flow, then pause for the submission ─────────────────
+      case 'send_flow': {
+        const flowId = interpolate(String(cfg.flow_id ?? ''), vars).trim()
+        if (!flowId) {
+          // Misconfigured (no flow chosen) — don't hang the session forever.
+          ctx.recordWouldHaveDone?.('send_flow has no flow_id — skipping')
+          return advance(node)
+        }
+        if (isSim(ctx)) {
+          ctx.recordWouldHaveDone?.(`would have sent flow ${flowId} and waited for the submission (simulation ends here)`)
+          return { kind: 'end', output: { simulated: true, halted_at: 'send_flow', flow_id: flowId } }
+        }
+        await enqueueMessageSend(buildSendJob(ctx, {
+          kind: 'flow',
+          flow: {
+            flow_id:    flowId,
+            cta:        interpolate(cfg.cta ?? 'Open form', vars),
+            body:       interpolate(cfg.body ?? 'Please fill this form', vars),
+            header:     cfg.header ? interpolate(cfg.header, vars) : undefined,
+            flow_token: flowId,          // echoed on nfm_reply → links the submission
+            screen:     cfg.screen ?? undefined,
+          },
+        }))
+        // Pause until the contact submits — routeFlowSubmission resumes us.
+        return { kind: 'wait_input' }
+      }
+
       // ── Input (halt, wait for inbound) ──────────────────────────────────────
       case 'collect_input': {
         if (isSim(ctx)) {

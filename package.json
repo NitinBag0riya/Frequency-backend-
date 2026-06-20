@@ -12,6 +12,7 @@
     "manifest:check": "tsx scripts/manifest-check.ts",
     "test:schedule-audience": "tsx tests/integration/schedule-audience.ts",
     "test:dedupe-guard": "tsx tests/integration/dedupe-guard.ts",
+    "test:flow-submission": "tsx tests/integration/flow-submission.ts",
     "email:dev": "email dev --dir src/emails/templates --port 3030",
     "email:auth": "tsx src/emails/scripts/build-auth-templates.ts",
     "email:test": "tsx tests/email-previews/render-all.ts",

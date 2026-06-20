@@ -209,6 +209,35 @@ async function sendWhatsApp(data: MessageSendJob) {
     if (m.type !== 'audio' && m.caption)  asset.caption  = m.caption
     if (m.type === 'document' && m.filename) asset.filename = m.filename
     payload = { messaging_product: 'whatsapp', to, type: m.type, [m.type]: asset }
+  } else if (data.kind === 'flow') {
+    // WhatsApp Flow send. Resolve the published meta_flow_id from our wa_flows
+    // row; a flow that isn't published on Meta can't be sent (no retry).
+    const f = data.flow
+    if (!f?.flow_id) throw new UnrecoverableError('send_flow: missing flow_id')
+    const { data: flowRow } = await supabase.from('wa_flows')
+      .select('meta_flow_id, status, name').eq('tenant_id', data.tenantId).eq('id', f.flow_id).maybeSingle()
+    if (!flowRow?.meta_flow_id) {
+      throw new UnrecoverableError(`send_flow: flow ${f.flow_id} has no published Meta flow id — publish it first`)
+    }
+    payload = {
+      messaging_product: 'whatsapp', to, type: 'interactive',
+      interactive: {
+        type: 'flow',
+        ...(f.header ? { header: { type: 'text', text: f.header } } : {}),
+        body: { text: f.body || 'Please fill this form' },
+        action: {
+          name: 'flow',
+          parameters: {
+            flow_message_version: '3',
+            flow_token: f.flow_token || f.flow_id,
+            flow_id: flowRow.meta_flow_id,
+            flow_cta: (f.cta || 'Open form').slice(0, 30),
+            flow_action: 'navigate',
+            ...(f.screen ? { flow_action_payload: { screen: f.screen } } : {}),
+          },
+        },
+      },
+    }
   } else {
     throw new Error(`unsupported wa kind=${data.kind}`)
   }

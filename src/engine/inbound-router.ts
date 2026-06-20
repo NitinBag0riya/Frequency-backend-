@@ -94,6 +94,73 @@ export async function routeInboundToWorkflow(
 }
 
 /**
+ * Route a WhatsApp Flow SUBMISSION (nfm_reply). Two outcomes, mirroring the
+ * inbound router:
+ *   - if a workflow session is already waiting for this contact (it sent the
+ *     flow via send_flow and parked on wait_input), RESUME it — the submitted
+ *     fields arrive as the reply (raw = flowData), readable downstream.
+ *   - otherwise FIRE trigger_flow_response so a workflow can START on the
+ *     submission, with the fields in scope as {{trigger.*}}.
+ * Honours the bot_paused take-over gate. Returns what it did (for tests/logging).
+ */
+export async function routeFlowSubmission(
+  supabase: SupabaseClient,
+  tenant: any,
+  channel: InboundChannel,
+  contactId: string,
+  flowData: Record<string, any>,
+  rawMsg: any,
+  meta: { flow_id?: string | null; flow_name?: string | null } = {},
+): Promise<{ resumed: boolean; triggered: boolean }> {
+  const { data: pausedContact } = await supabase.from('contacts')
+    .select('bot_paused')
+    .eq('tenant_id', tenant.id)
+    .or(`phone.eq.+${contactId},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
+    .limit(1).maybeSingle()
+  if (pausedContact?.bot_paused) return { resumed: false, triggered: false }
+
+  // A session waiting on send_flow's wait_input → resume it with the answers.
+  const { data: session } = await supabase.from('workflow_sessions')
+    .select('id, current_node_id')
+    .eq('tenant_id', tenant.id).eq('channel', channel)
+    .eq('contact_phone', contactId).eq('status', 'active')
+    .order('started_at', { ascending: false }).limit(1).maybeSingle()
+  if (session) {
+    await enqueueWorkflowExecution({
+      sessionId: session.id,
+      nodeId:    session.current_node_id,
+      reply:     { text: summarizeFlow(flowData), raw: { ...rawMsg, flow: flowData } },
+    })
+    return { resumed: true, triggered: false }
+  }
+
+  // No session waiting → start any workflow whose entry is trigger_flow_response,
+  // optionally scoped to a specific flow_id.
+  let started = 0
+  await fireWorkflowTrigger(supabase, tenant.id, 'trigger_flow_response', {
+    contactId, channel,
+    payload: { ...flowData, flow_id: meta.flow_id ?? null, flow_name: meta.flow_name ?? null },
+    match: (cfg) => {
+      const want = String(cfg?.flow_id ?? '').trim()
+      if (want && want !== String(meta.flow_id ?? '')) return false
+      started++
+      return true
+    },
+  })
+  return { resumed: false, triggered: started > 0 }
+}
+
+/** Compact human-readable summary of submitted flow fields (for the reply text
+ *  + inbox preview). Keeps it short; full data lives in raw.flow + the response row. */
+function summarizeFlow(flowData: Record<string, any>): string {
+  const parts = Object.entries(flowData)
+    .filter(([k]) => k !== 'flow_token' && !k.startsWith('_'))
+    .slice(0, 6)
+    .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
+  return parts.length ? `Flow submitted — ${parts.join(', ')}`.slice(0, 300) : 'Flow submitted'
+}
+
+/**
  * Best-effort mobile push fan-out for new inbound messages (P0.10).
  *
  * We notify every user who has an active role assignment on the tenant —

@@ -114,10 +114,21 @@ export interface MessageSendJob {
   channel: 'whatsapp' | 'instagram' | 'telegram' | 'email'
   /** Common message shape across messaging channels. 'media' covers
    *  image/video/audio/document (kind further qualified by `media.type`). */
-  kind?: 'text' | 'template' | 'interactive' | 'media'
+  kind?: 'text' | 'template' | 'interactive' | 'media' | 'flow'
   text?: string
   template?: { name: string; language: string; parameters: string[] }
   interactive?: any
+  /** WhatsApp Flow send (kind='flow'). flow_id is OUR wa_flows.id; the sender
+   *  resolves the published meta_flow_id. flow_token is echoed back on the
+   *  nfm_reply so the webhook can link the submission to the flow. */
+  flow?: {
+    flow_id:    string
+    cta:        string
+    body:       string
+    header?:    string
+    flow_token: string
+    screen?:    string
+  }
   /** Media payload — used when kind='media'. type narrows to the actual
    *  asset; either link OR id (pre-uploaded Meta media id) must be set. */
   media?: {
