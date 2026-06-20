@@ -20,7 +20,12 @@
  *   time:             'HH:MM'     (frequency='daily'|'weekly'; wall-clock in `timezone`)
  *   weekday:          0..6        (frequency='weekly'; 0=Sunday)
  *   timezone:         IANA tz     (default 'Asia/Kolkata')
- *   contact_id:       string?     (1:1 reminders; absent → sentinel, body does its own audience query)
+ *   contact_id:       string?     (1:1 reminders; absent → audience fan-out)
+ *   segment_id:       string?     (audience schedule — saved segment to message)
+ *   audience:         { tags?: string[]; exclude_tags?: string[] }?  (audience by tag)
+ *                                 When contact_id is absent, fireScheduledWorkflow
+ *                                 resolves segment_id/audience → one session per
+ *                                 contact (see engine/inbound-router.ts).
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js'

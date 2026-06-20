@@ -380,18 +380,98 @@ export async function fireWorkflowTrigger(
  * deleted workflow simply stops (the caller skips re-enqueue when this returns
  * false → the recurring chain self-cleans). Returns whether a session was started.
  */
+/** Cost guard for audience schedules — a single "message my segment" run fans
+ *  out one workflow session per contact, so bound it. Excess is logged, never
+ *  silently dropped. Raise per-tenant later if a plan needs it. */
+const MAX_SCHEDULE_AUDIENCE = 1000
+
 export async function fireScheduledWorkflow(
   supabase: SupabaseClient,
   tenantId: string,
-  opts: { workflowId: string; contactId: string; payload?: Record<string, any> },
+  opts: { workflowId: string; contactId?: string | null; payload?: Record<string, any> },
 ): Promise<boolean> {
   const { data: wf } = await supabase.from('workflows')
     .select('id, nodes, status').eq('tenant_id', tenantId).eq('id', opts.workflowId).maybeSingle()
   if (!wf || (wf as any).status !== 'live') return false
-  const hasSchedule = ((wf as any).nodes as any[] | undefined)?.some(n => n?.type === 'trigger_schedule')
-  if (!hasSchedule) return false
-  await startWorkflow(supabase, { id: tenantId }, wf, opts.contactId, 'whatsapp', opts.payload ?? {})
+  const scheduleNode = ((wf as any).nodes as any[] | undefined)?.find(n => n?.type === 'trigger_schedule')
+  if (!scheduleNode) return false
+
+  // 1:1 reminder — a specific contact is named on the schedule.
+  if (opts.contactId) {
+    await startWorkflow(supabase, { id: tenantId }, wf, opts.contactId, 'whatsapp', opts.payload ?? {})
+    return true
+  }
+
+  // Audience schedule — no specific contact, so resolve the segment/tags on the
+  // trigger_schedule node and fan out one session per matching contact. Returns
+  // true (still schedulable) even when zero match this run, so the recurring
+  // chain keeps parking next occurrences.
+  const contacts = await resolveScheduleAudience(supabase, tenantId, scheduleNode.config ?? {})
+  if (contacts.length === 0) {
+    console.log(`[schedule] wf=${opts.workflowId} audience matched 0 contacts this run`)
+    return true
+  }
+  let started = 0
+  for (const c of contacts) {
+    const addr = c.phone
+    if (!addr) continue
+    try {
+      await startWorkflow(supabase, { id: tenantId }, wf, addr, 'whatsapp',
+        { ...(opts.payload ?? {}), audience: true })
+      started++
+    } catch (e) {
+      console.warn(`[schedule] wf=${opts.workflowId} start failed for contact ${c.id}:`, e)
+    }
+  }
+  console.log(`[schedule] wf=${opts.workflowId} fanned out to ${started}/${contacts.length} contacts`)
   return true
+}
+
+/** Resolve a trigger_schedule node's audience → contact rows. Supports
+ *  cfg.segment_id (saved segment, via the shared evaluator) or cfg.audience
+ *  {tags, exclude_tags}. Refuses an unscoped schedule (no segment, no tags) so a
+ *  schedule can never implicitly blast every contact. Caps at
+ *  MAX_SCHEDULE_AUDIENCE and logs when more matched. Exported for integration
+ *  testing (tests/integration/schedule-audience.ts). */
+export async function resolveScheduleAudience(
+  supabase: SupabaseClient,
+  tenantId: string,
+  cfg: any,
+): Promise<Array<{ id: string; phone: string | null }>> {
+  const aud = cfg?.audience ?? {}
+  if (!cfg?.segment_id && !(Array.isArray(aud.tags) && aud.tags.length)) {
+    console.warn(`[schedule] audience schedule has no segment_id or tags — skipping fan-out (refusing to message all contacts)`)
+    return []
+  }
+
+  let q: any
+  if (cfg.segment_id) {
+    const { data: seg } = await supabase.from('contact_segments')
+      .select('id, filters, archived_at').eq('id', cfg.segment_id).eq('tenant_id', tenantId).maybeSingle()
+    if (!seg || (seg as any).archived_at) {
+      console.warn(`[schedule] segment ${cfg.segment_id} missing/archived — skipping fan-out`)
+      return []
+    }
+    const { buildSegmentQuery } = await import('../lib/segment-filter')
+    const built = await buildSegmentQuery(supabase, tenantId, (seg as any).filters)
+    q = built.query.select('id, phone').eq('status', 'active')
+  } else {
+    q = supabase.from('contacts').select('id, phone')
+      .eq('tenant_id', tenantId).eq('status', 'active')
+      .overlaps('tags', aud.tags)
+    if (Array.isArray(aud.exclude_tags) && aud.exclude_tags.length) {
+      q = q.not('tags', 'ov', `{${aud.exclude_tags.join(',')}}`)
+    }
+  }
+  q = q.limit(MAX_SCHEDULE_AUDIENCE + 1)
+  const { data, error } = await q
+  if (error) { console.warn(`[schedule] audience query failed: ${error.message}`); return [] }
+  const rows = (data ?? []) as Array<{ id: string; phone: string | null }>
+  if (rows.length > MAX_SCHEDULE_AUDIENCE) {
+    console.warn(`[schedule] audience matched ${rows.length} (> cap ${MAX_SCHEDULE_AUDIENCE}); messaging first ${MAX_SCHEDULE_AUDIENCE} this run`)
+    return rows.slice(0, MAX_SCHEDULE_AUDIENCE)
+  }
+  return rows
 }
 
 async function startWorkflow(

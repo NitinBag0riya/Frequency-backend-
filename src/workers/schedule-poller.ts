@@ -97,9 +97,12 @@ export async function startSchedulePollerWorker() {
             const p = row.payload as any
             if (p?.workflowId) {
               const { fireScheduledWorkflow } = await import('../engine/inbound-router')
+              // contactId null → audience schedule: fireScheduledWorkflow
+              // resolves the segment/tags on the trigger_schedule node and fans
+              // out one session per contact. A real contactId → 1:1 reminder.
               const fired = await fireScheduledWorkflow(supabase, row.tenant_id, {
                 workflowId: p.workflowId,
-                contactId:  p.contactId ?? `schedule:${p.workflowId}`,
+                contactId:  p.contactId ?? null,
                 payload:    { scheduled: true, fired_at: nowIso },
               })
               if (fired) {

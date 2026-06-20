@@ -109,10 +109,10 @@ export const NODE_DESCRIPTIONS: Record<string, string> = {
   trigger_new_lead:        'Start when a single new lead arrives — a lead-table row created OR a webhook intake (99acres, FB/IG lead ads, JustDial…). Not on bulk/CSV import.',
   trigger_new_order:       'Start on a new commerce order (storefront / Zomato / Shopify / WooCommerce).',
   trigger_order_status:    'Start when an order\'s status changes (e.g. paid, shipped).',
-  trigger_crm_stage:       'Start when a lead/deal moves to a pipeline stage (e.g. Visit Completed → kick off post-visit flow).',
+  trigger_crm_stage:       'Start when a lead/deal status changes in a Leads table (config: table_id, to_status — e.g. to_status="Visit Completed" → post-visit flow). This is how "visit done / qualified / closed" events start a workflow.',
   trigger_missed_call:     'Start when a call is missed (Exotel / Meta calling) — powers callback flows.',
   trigger_message_status:  'Start when an outbound WhatsApp message FAILS delivery — powers SMS fallback / ops alerts.',
-  trigger_schedule:        'Recurring/cron start — daily/weekly at a time, or every N minutes (digests, reminders, stale-lead scans).',
+  trigger_schedule:        'Recurring/cron start — daily/weekly at a time, or every N minutes. Either a 1:1 reminder (set contact_id) OR fan out to an audience (set segment_id or audience.tags → one run per matching contact). Powers digests, reminders, stale-lead scans, scheduled broadcasts.',
   trigger_payment:         'Start on a tenant CUSTOMER payment event (Razorpay/Cashfree): paid / failed / refunded.',
   // ── Core actions ──
   send_text:               'Send a free-form WhatsApp text (only valid inside the 24h window; outside it use send_template).',

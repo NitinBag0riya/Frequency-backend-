@@ -1170,7 +1170,7 @@ COMMON INTENT PATTERNS (with picker chains — emit these as missing_config[]):
   Pickers: channel, quick_reply_id (live) OR template_name.
 
 - "when status in my Leads table changes to 'Qualified', notify the assigned agent on WhatsApp" →
-  trigger_crm_stage (table_id, to_stage='Qualified') → send_text.
+  trigger_crm_stage (table_id, to_status='Qualified') → send_text.
   Pickers: table_id, column_name_status (depends_on table_id), column_value_status (depends_on column_name_status),
            assigned_agent_id, template_name (if outside 24h).
 
