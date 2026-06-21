@@ -91,6 +91,7 @@ const NODE_CONNECTOR_MAP: Record<string, NodeConnectorReq> = {
   send_interactive:         'channel:dynamic',
   send_media:               'channel:dynamic',
   collect_input:            'channel:dynamic',
+  send_flow:                'whatsapp',        // WhatsApp Flows are WA-only
 
   // Email — Resend is the global fallback so technically nothing is required;
   // we surface a soft warning (not error) if Google's not connected so the
@@ -140,6 +141,7 @@ const NODE_CONNECTOR_MAP: Record<string, NodeConnectorReq> = {
 const TRIGGER_CHANNEL_MAP: Record<string, ConnectorKey | null> = {
   trigger_inbound_keyword: null,           // depends on cfg.channels filter
   trigger_inbound_email:   'google',
+  trigger_flow_response:   'whatsapp',     // WhatsApp Flow submissions arrive over WA
   // Future: trigger_inbound_comment (instagram), trigger_telegram_command, etc.
 }
 
@@ -272,6 +274,9 @@ function validateNodeConfig(node: any): NodeIssue[] {
       break
     case 'add_tag':
       if (!cfg.tag) issues.push(err('add_tag: cfg.tag is required'))
+      break
+    case 'send_flow':
+      if (!cfg.flow_id) issues.push(err('send_flow: cfg.flow_id is required (pick the WhatsApp Flow to send)'))
       break
     case 'payment':
       if (!cfg.amount)      issues.push(err('payment: cfg.amount (INR rupees) is required'))
