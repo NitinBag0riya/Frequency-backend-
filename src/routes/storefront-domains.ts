@@ -23,6 +23,12 @@ const VTEAM = process.env.VERCEL_TEAM_ID
 const VPROJECT = process.env.VERCEL_STOREFRONT_PROJECT || 'frequency-storefront'
 const vercelConfigured = !!(VTOKEN && VTEAM)
 
+// The customer storefront's admin API (db-backed) + its shared secret. The
+// dashboard never holds this secret — it calls our authenticated proxy below,
+// and we attach the secret + the active tenant's slug server-side.
+const SF_API = process.env.STOREFRONT_API_URL || 'http://localhost:5181'
+const SF_SECRET = process.env.STOREFRONT_ADMIN_SECRET || 'dev-admin'
+
 async function vercel(method: string, path: string, body?: unknown): Promise<{ ok: boolean; status: number; json: any }> {
   const sep = path.includes('?') ? '&' : '?'
   const r = await fetch(`https://api.vercel.com${path}${sep}teamId=${VTEAM}`, {
@@ -92,6 +98,37 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     const { error } = await supabase.from('tenant_domains').delete().eq('id', req.params.id).eq('tenant_id', tenantId)
     if (error) { res.status(500).json({ error: error.message }); return }
     res.json({ ok: true })
+  })
+
+  // ── menu / orders admin proxy ────────────────────────────────────────────────
+  // The dashboard's menu + orders editors hit /api/storefront/admin/*. We resolve
+  // the ACTIVE tenant's slug (from the authed X-Tenant-ID → tenants.slug) and
+  // forward to the storefront-api's /admin/* with that slug + the admin secret,
+  // both attached SERVER-SIDE. Result: each workspace edits its OWN storefront,
+  // and no slug/secret is hardcoded or shipped in the browser bundle.
+  r.all(/^\/api\/storefront\/admin(\/.*)?$/, requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data: t, error: tErr } = await supabase
+      .from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+    if (tErr) { res.status(500).json({ error: tErr.message }); return }
+    const slug = (t as any)?.slug
+    if (!slug) { res.status(404).json({ error: 'No storefront is set up for this workspace yet.' }); return }
+
+    const upstreamPath = req.originalUrl.replace(/^\/api\/storefront/, '') // → /admin/... (keeps query string)
+    const method = req.method.toUpperCase()
+    const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'DELETE'
+    try {
+      const up = await fetch(`${SF_API}${upstreamPath}`, {
+        method,
+        headers: { 'Content-Type': 'application/json', 'X-Tenant': slug, 'X-Admin-Secret': SF_SECRET },
+        body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+      })
+      const text = await up.text()
+      res.status(up.status)
+      try { res.json(JSON.parse(text)) } catch { res.send(text) }
+    } catch (e: any) {
+      res.status(502).json({ error: e?.message || 'Storefront service is unreachable.' })
+    }
   })
 
   return r
