@@ -18,6 +18,7 @@ import { createLeadsRouter } from './leads'
 import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
+import { createStorefrontDomainsRouter } from './routes/storefront-domains'
 import { createConnectorsRouter }  from './routes/connectors'
 import { createPaymentWebhookRouter } from './routes/payment-webhook'
 import { createTestConnectionRouter } from './routes/connectors/test-connection'
@@ -5267,6 +5268,7 @@ app.use(createPhase3Router({ supabase, requireAuth, identifyTenant, checkPermiss
 
 // ── Data-source mirroring (Google Sheets → Lead Tables, more sources later) ──
 app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+app.use(createStorefrontDomainsRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
 app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
