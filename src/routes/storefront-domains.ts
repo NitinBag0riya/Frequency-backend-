@@ -14,6 +14,7 @@
  */
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
+import { sendStorefrontOtp } from '../lib/storefront-otp.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -50,6 +51,23 @@ function isValidHostname(h: string): boolean {
 export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   const r = express.Router()
   const { supabase, requireAuth, identifyTenant } = deps
+
+  // Server-to-server: storefront-api asks us to deliver a login OTP over
+  // WhatsApp (tenant's WABA, else Frequency fallback). Authenticated by the
+  // shared admin secret — NOT a user session — and the slug comes from the body
+  // (storefront-api already knows which tenant). Returns 502 on delivery failure
+  // so storefront-api can fall back to its on-screen demo code.
+  r.post('/api/storefront/send-otp', async (req, res) => {
+    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    const { slug, phone, code } = (req.body || {}) as { slug?: string; phone?: string; code?: string }
+    if (!slug || !phone || !code) return res.status(400).json({ ok: false, error: 'slug, phone, code required' })
+    try {
+      const out = await sendStorefrontOtp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
+      res.json({ ok: true, via: out.via })
+    } catch (e: any) {
+      res.status(502).json({ ok: false, error: e?.message || 'send failed' })
+    }
+  })
 
   r.post('/api/storefront/domains', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId

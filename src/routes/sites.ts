@@ -42,6 +42,9 @@ import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { validateBody } from '../validation'
 import { apiError } from '../lib/api-error'
+import { sendEmail } from '../lib/email'
+import { renderEmailHtml } from '../emails/render'
+import { NotificationEmail } from '../emails/templates/NotificationEmail'
 
 // ── Validators ──────────────────────────────────────────────────────────
 
@@ -282,6 +285,36 @@ export function createSitesRouter({
     if (error) { apiError(res, 500, 'read_failed', error.message); return }
     if (!data)  { apiError(res, 404, 'not_found', 'Page not found.'); return }
     res.json({ page: data })
+  })
+
+  // Submissions captured by a Site page's form widget. Mirrors the standalone
+  // /api/forms/:id/submissions shape so the dashboard's FormSubmissionsPage can
+  // render both. Also returns a field-id → label map (from the form widget) so
+  // the viewer shows readable column labels instead of raw field ids.
+  r.get('/api/sites/:siteId/pages/:pageId/submissions', requireAuth, identifyTenant, requireUuid('siteId', 'pageId'), async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const limit  = Math.min(Number(req.query.limit  ?? 50), 500)
+    const offset = Math.max(Number(req.query.offset ?? 0),  0)
+    const { data: page } = await supabase.from('site_pages')
+      .select('id, title, status, schema_json')
+      .eq('id', req.params.pageId).eq('site_id', req.params.siteId).eq('tenant_id', tenantId).maybeSingle()
+    if (!page) { apiError(res, 404, 'not_found', 'Page not found.'); return }
+    const { data, count, error } = await supabase
+      .from('form_submissions')
+      .select('id, submitted_at, response_data, post_action_status, post_action_error, is_test, table_row_id, pdf_path, pdf_status, pdf_error, signer_name, signed_at', { count: 'exact' })
+      .eq('site_page_id', req.params.pageId)
+      .eq('tenant_id', tenantId)
+      .order('submitted_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+    if (error) { apiError(res, 500, 'list_failed', error.message); return }
+    const labels: Record<string, string> = {}
+    for (const w of (((page as any).schema_json?.widgets ?? []) as any[])) {
+      if (w?.kind === 'form' && Array.isArray(w.fields)) for (const f of w.fields) if (f?.id) labels[f.id] = f.label || f.id
+    }
+    res.json({
+      submissions: data ?? [], total: count ?? 0, limit, offset,
+      page: { title: (page as any).title, status: (page as any).status }, labels,
+    })
   })
 
   r.patch('/api/sites/:siteId/pages/:pageId', requireAuth, identifyTenant, requireUuid('siteId', 'pageId'), checkPermission('settings', 'edit'),
@@ -803,7 +836,7 @@ export function createSitesRouter({
       apiError(res, 404, 'not_found', 'Site not available.'); return
     }
     const { data: page } = await supabase.from('site_pages')
-      .select('id, status, schema_json, response_table_id, post_save_action_json, tenant_id')
+      .select('id, title, status, schema_json, response_table_id, post_save_action_json, tenant_id')
       .eq('site_id', (site as any).id).eq('slug', pageSlug).maybeSingle()
     if (!page)                { apiError(res, 404, 'not_found',     'Page not found.'); return }
     if ((page as any).status !== 'published') {
@@ -883,20 +916,51 @@ export function createSitesRouter({
     }).select('id').single()
     if (subErr) { apiError(res, 500, 'submit_failed', subErr.message); return }
 
-    // 7. Mirror into the destination lead_table (Step 2) if set. Best-effort.
+    // Readable label map (field id → label) for the table columns + email body.
+    const labelled: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(responseData)) labelled[fieldById.get(k)?.label || k] = v
+
+    // Resolve the owning tenant once — used for the table row's user_id and the
+    // owner email alert below.
+    const { data: tenantRow } = await supabase.from('tenants')
+      .select('billing_email, user_id').eq('id', (page as any).tenant_id).maybeSingle()
+
+    // 7. Mirror into the destination Table (Step 2) if set — writes to lead_rows
+    //    (same path forms use), with readable label keys. Best-effort.
     if ((page as any).response_table_id) {
-      try {
-        await supabase.from('lead_table_rows').insert({
-          table_id: (page as any).response_table_id,
-          tenant_id: (page as any).tenant_id,
-          data: responseData,
-        })
-      } catch (e: any) {
-        console.warn(`[sites] table mirror failed for submission ${submission?.id}: ${e?.message ?? e}`)
+      const { data: row, error: rowErr } = await supabase.from('lead_rows')
+        .insert({ table_id: (page as any).response_table_id, tenant_id: (page as any).tenant_id, user_id: (tenantRow as any)?.user_id ?? null, data: labelled, status: 'new' })
+        .select('id').single()
+      if (rowErr) {
+        await supabase.from('form_submissions')
+          .update({ post_action_status: 'failed', post_action_error: `table_write: ${rowErr.message}` })
+          .eq('id', (submission as any).id)
+      } else {
+        await supabase.from('form_submissions').update({ table_row_id: row.id }).eq('id', (submission as any).id)
       }
     }
 
-    res.json({ ok: true, submission_id: submission?.id ?? null })
+    // 8. Email the workspace owner that a response arrived. Best-effort, never
+    //    blocks the visitor; no-ops if email isn't configured (RESEND_* unset).
+    try {
+      let to: string | undefined = (tenantRow as any)?.billing_email || undefined
+      if (!to && (tenantRow as any)?.user_id) {
+        const { data: u } = await supabase.auth.admin.getUserById((tenantRow as any).user_id)
+        to = u?.user?.email ?? undefined
+      }
+      if (to) {
+        const summary = Object.entries(labelled).map(([k, v]) => `${k}: ${String(v ?? '')}`).slice(0, 8).join('\n')
+        const html = await renderEmailHtml(NotificationEmail, {
+          title: `New response · ${(page as any).title || 'your page'}`,
+          body: summary || 'A new form response just came in.',
+        })
+        await sendEmail({ to, subject: `New form response · ${(page as any).title || 'your storefront'}`, html })
+      }
+    } catch (e: any) {
+      console.warn(`[sites] owner alert failed for submission ${(submission as any)?.id}: ${e?.message ?? e}`)
+    }
+
+    res.json({ ok: true, submission_id: (submission as any)?.id ?? null })
   })
 
   return r

@@ -19,6 +19,7 @@ import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
 import { createStorefrontDomainsRouter } from './routes/storefront-domains'
+import { createStorefrontAppRouter } from './routes/storefront-app'
 import { createConnectorsRouter }  from './routes/connectors'
 import { createPaymentWebhookRouter } from './routes/payment-webhook'
 import { createTestConnectionRouter } from './routes/connectors/test-connection'
@@ -380,6 +381,13 @@ app.use('/api/webhooks/shopify', express.json({
 // exact bytes, so capture rawBody here while still handing the handler a parsed
 // req.body. Verified + routed per-tenant in routes/payment-webhook.ts.
 app.use('/api/webhooks/payment', express.json({
+  limit: '1mb',
+  verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
+}))
+
+// EAS build webhook — Expo HMAC-signs the body (header `expo-signature: sha1=…`).
+// Capture rawBody before the global parser so storefront-app.ts can verify it.
+app.use('/api/storefront/app/eas-webhook', express.json({
   limit: '1mb',
   verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
 }))
@@ -5269,6 +5277,7 @@ app.use(createPhase3Router({ supabase, requireAuth, identifyTenant, checkPermiss
 // ── Data-source mirroring (Google Sheets → Lead Tables, more sources later) ──
 app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createStorefrontDomainsRouter({ supabase, requireAuth, identifyTenant }))
+app.use(createStorefrontAppRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
 app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
