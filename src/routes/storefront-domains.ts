@@ -15,7 +15,7 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
-import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, syncOrderRow, syncCartRow } from '../lib/catalog.js'
+import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -97,6 +97,34 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       const tenantId = (t as any)?.id
       if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
       await syncCartRow(supabase, tenantId, String(slug), cart)
+      res.json({ ok: true })
+    } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
+  })
+
+  // Server-to-server: storefront-api mirrors a signed-in guest → Customers table.
+  r.post('/api/storefront/customer-sync', async (req, res) => {
+    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    const { slug, customer } = (req.body || {}) as { slug?: string; customer?: any }
+    if (!slug || !(customer?.key)) return res.status(400).json({ ok: false, error: 'slug and customer.key required' })
+    try {
+      const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+      const tenantId = (t as any)?.id
+      if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
+      await syncCustomerRow(supabase, tenantId, String(slug), customer)
+      res.json({ ok: true })
+    } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
+  })
+
+  // Server-to-server: storefront-api mirrors an outlet → Outlets table.
+  r.post('/api/storefront/outlet-sync', async (req, res) => {
+    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    const { slug, outlet } = (req.body || {}) as { slug?: string; outlet?: any }
+    if (!slug || !(outlet?.id)) return res.status(400).json({ ok: false, error: 'slug and outlet.id required' })
+    try {
+      const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+      const tenantId = (t as any)?.id
+      if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
+      await syncOutletRow(supabase, tenantId, String(slug), outlet)
       res.json({ ok: true })
     } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
   })

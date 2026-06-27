@@ -28,6 +28,8 @@ export interface CatalogConfig {
   itemsTableId: string
   ordersTableId?: string
   cartsTableId?: string
+  customersTableId?: string
+  outletsTableId?: string
   map: {
     category: { name: string }
     item: Record<string, string> // role → column key
@@ -87,6 +89,28 @@ const CART_COLS = [
   { name: 'Total', key: 'total', type: 'number' },
   { name: 'Status', key: 'status', type: 'select', options: ['open', 'converted', 'abandoned'] },
   { name: 'Updated at', key: 'updated_at', type: 'text' },
+]
+// Customers table — mirror of signed-in guests (CRM-grade, queryable, automatable).
+const CUSTOMER_COLS = [
+  { name: 'Customer key', key: 'customer_id', type: 'text', is_primary: true, is_required: true },
+  { name: 'Name', key: 'name', type: 'text' },
+  { name: 'Phone', key: 'phone', type: 'phone' },
+  { name: 'Email', key: 'email', type: 'email' },
+  { name: 'Coins', key: 'coins', type: 'number' },
+  { name: 'Tier', key: 'tier', type: 'text' },
+  { name: 'WhatsApp opt-in', key: 'whatsapp_optin', type: 'boolean' },
+  { name: 'Joined', key: 'created_at', type: 'text' },
+]
+// Outlets/Locations table — mirror of the operator's outlets.
+const OUTLET_COLS = [
+  { name: 'Outlet ID', key: 'outlet_id', type: 'text', is_primary: true, is_required: true },
+  { name: 'Name', key: 'name', type: 'text' },
+  { name: 'Address', key: 'address', type: 'text' },
+  { name: 'Phone', key: 'phone', type: 'phone' },
+  { name: 'Hours', key: 'hours', type: 'text' },
+  { name: 'Open', key: 'open', type: 'boolean' },
+  { name: 'Tables', key: 'table_count', type: 'number' },
+  { name: 'Services (JSON)', key: 'services', type: 'textarea' },
 ]
 const HORECA_MAP: CatalogConfig['map'] = {
   category: { name: 'name' },
@@ -260,6 +284,68 @@ export async function syncCartRow(supabase: SupabaseClient, tenantId: string, sl
   else await supabase.from('lead_rows').insert({ table_id: config.cartsTableId, tenant_id: tenantId, user_id: null, data, status: 'active' })
 }
 
+// ── customers mirror (signed-in guests → CRM-grade table) ───────────────────────
+function customerToRow(g: any): Record<string, string> {
+  const created = g.createdAt ? (typeof g.createdAt === 'number' ? new Date(g.createdAt).toISOString() : String(g.createdAt)) : ''
+  return {
+    customer_id: String(g.key || g.guestKey || ''),
+    name: String(g.name || ''),
+    phone: String(g.phone || ''),
+    email: String(g.email || ''),
+    coins: String(Math.max(0, Math.round(Number(g.coins) || 0))),
+    tier: String(g.tier || ''),
+    whatsapp_optin: String(!!g.whatsappOptin),
+    created_at: created,
+  }
+}
+export async function syncCustomerRow(supabase: SupabaseClient, tenantId: string, slug: string, guest: any): Promise<void> {
+  const config = await getCatalogConfig(slug)
+  const cid = guest && (guest.key || guest.guestKey)
+  if (!config?.customersTableId || !cid) return
+  const data = customerToRow(guest)
+  const { data: existing } = await supabase.from('lead_rows').select('id')
+    .eq('tenant_id', tenantId).eq('table_id', config.customersTableId).eq('data->>customer_id', String(cid)).maybeSingle()
+  if (existing) await supabase.from('lead_rows').update({ data }).eq('id', (existing as any).id)
+  else await supabase.from('lead_rows').insert({ table_id: config.customersTableId, tenant_id: tenantId, user_id: null, data, status: 'active' })
+}
+async function backfillCustomers(supabase: SupabaseClient, tenantId: string, userId: string | null, slug: string, customersTableId: string): Promise<void> {
+  let guests: any[] = []
+  try { guests = await sf('GET', '/admin/customers', slug) } catch { return }
+  if (!Array.isArray(guests) || !guests.length) return
+  const rows = guests.slice(0, 5000).map(g => ({ table_id: customersTableId, tenant_id: tenantId, user_id: userId, status: 'active', data: customerToRow(g) }))
+  await supabase.from('lead_rows').insert(rows)
+}
+
+// ── outlets/locations mirror ────────────────────────────────────────────────────
+function outletToRow(o: any): Record<string, string> {
+  return {
+    outlet_id: String(o.id || ''),
+    name: String(o.name || ''),
+    address: String(o.address || ''),
+    phone: String(o.phone || ''),
+    hours: String(o.hours || ''),
+    open: String(o.open !== false),
+    table_count: String(Math.max(0, Math.round(Number(o.tableCount) || 0))),
+    services: o.services ? JSON.stringify(o.services) : '',
+  }
+}
+export async function syncOutletRow(supabase: SupabaseClient, tenantId: string, slug: string, outlet: any): Promise<void> {
+  const config = await getCatalogConfig(slug)
+  if (!config?.outletsTableId || !outlet?.id) return
+  const data = outletToRow(outlet)
+  const { data: existing } = await supabase.from('lead_rows').select('id')
+    .eq('tenant_id', tenantId).eq('table_id', config.outletsTableId).eq('data->>outlet_id', String(outlet.id)).maybeSingle()
+  if (existing) await supabase.from('lead_rows').update({ data }).eq('id', (existing as any).id)
+  else await supabase.from('lead_rows').insert({ table_id: config.outletsTableId, tenant_id: tenantId, user_id: null, data, status: 'active' })
+}
+async function backfillOutlets(supabase: SupabaseClient, tenantId: string, userId: string | null, slug: string, outletsTableId: string): Promise<void> {
+  let outlets: any[] = []
+  try { outlets = await sf('GET', '/admin/outlets', slug) } catch { return }
+  if (!Array.isArray(outlets) || !outlets.length) return
+  const rows = outlets.slice(0, 500).map(o => ({ table_id: outletsTableId, tenant_id: tenantId, user_id: userId, status: 'active', data: outletToRow(o) }))
+  await supabase.from('lead_rows').insert(rows)
+}
+
 // ── operator edits via the rich menu editor (UI→Table), in tables-mode ──────────
 // The dashboard's dish form writes through here so add-ons get the proper group
 // editor (not raw JSON). Each write maps the dish onto the items-table row and
@@ -354,82 +440,75 @@ async function createTable(supabase: SupabaseClient, tenantId: string, userId: s
   return table.id
 }
 
+// Find an aux table by name, else create it (+ backfill only when newly created).
+async function ensureAuxTable(
+  supabase: SupabaseClient, tenantId: string, userId: string, name: string, cols: any[],
+  backfill: ((id: string) => Promise<void>) | null,
+): Promise<string> {
+  const existing = await findCatalogTable(supabase, tenantId, name)
+  if (existing) return existing
+  const id = await createTable(supabase, tenantId, userId, name, cols)
+  if (backfill) await backfill(id)
+  return id
+}
+
 export async function provisionCatalog(supabase: SupabaseClient, tenantId: string, userId: string, slug: string): Promise<{ created: boolean; config: CatalogConfig; counts: { categories: number; items: number } }> {
-  // Idempotent + self-upgrading: if already provisioned, ensure the Orders table
-  // exists (added after some tenants were provisioned), then re-materialize.
   const existing = await getCatalogConfig(slug)
+  let categoriesTableId: string
+  let itemsTableId: string
+  let created = false
+
   if (existing) {
-    let config = existing
-    if (!config.ordersTableId) {
-      const ordersTableId = await createTable(supabase, tenantId, userId, 'Orders', ORDER_COLS)
-      config = { ...config, ordersTableId }
-      await sf('PATCH', '/admin/config', slug, { catalogConfig: config })
-      await backfillOrders(supabase, tenantId, userId, slug, ordersTableId)
+    categoriesTableId = existing.categoriesTableId
+    itemsTableId = existing.itemsTableId
+  } else {
+    // Adopt an existing menu set (orphans/race) if present; else create from the file menu.
+    const adoptCat = await findCatalogTable(supabase, tenantId, 'Menu Categories')
+    const adoptItem = await findCatalogTable(supabase, tenantId, 'Menu Items')
+    if (adoptCat && adoptItem) {
+      categoriesTableId = adoptCat
+      itemsTableId = adoptItem
+    } else {
+      const menu = await sf('GET', '/admin/menu', slug) as { categories: any[]; items: any[] }
+      categoriesTableId = await createTable(supabase, tenantId, userId, 'Menu Categories', CATEGORY_COLS)
+      itemsTableId = await createTable(supabase, tenantId, userId, 'Menu Items', buildItemCols(categoriesTableId))
+      // Map file category id → NEW row id so items link by STABLE id.
+      const catRowIdByFileId = new Map<string, string>()
+      for (const c of (menu.categories || [])) {
+        const { data } = await supabase.from('lead_rows')
+          .insert({ table_id: categoriesTableId, tenant_id: tenantId, user_id: userId, data: { name: String(c.name || '') }, status: 'active' })
+          .select('id').single()
+        if (data) catRowIdByFileId.set(c.id, (data as any).id)
+      }
+      const itemRows = (menu.items || []).map((it: any) => ({
+        table_id: itemsTableId, tenant_id: tenantId, user_id: userId, status: 'active',
+        data: {
+          name: String(it.name || ''), description: String(it.description || ''),
+          price: String(it.priceInr ?? 0), coins: String(it.coins ?? 0),
+          veg: String(!!it.veg), sold_out: String(!!it.soldOut), image_url: String(it.imageUrl || ''),
+          category: catRowIdByFileId.get(it.categoryId) || '', // stable category ROW id
+          addons: JSON.stringify(it.options || []),
+        },
+      }))
+      if (itemRows.length) {
+        const { error } = await supabase.from('lead_rows').insert(itemRows)
+        if (error) throw new Error(`backfill items failed: ${error.message}`)
+      }
+      created = true
     }
-    if (!config.cartsTableId) {
-      const cartsTableId = await createTable(supabase, tenantId, userId, 'Carts', CART_COLS)
-      config = { ...config, cartsTableId }
-      await sf('PATCH', '/admin/config', slug, { catalogConfig: config })
-    }
-    const counts = await materializeCatalog(supabase, tenantId, slug)
-    return { created: false, config, counts: counts || { categories: 0, items: 0 } }
-  }
-  // Self-heal: a prior attempt may have created tables but failed before writing
-  // config (orphans), or raced. Adopt the existing set (oldest of each) instead of
-  // creating duplicates — and skip backfill since those tables already hold data.
-  const adoptCat = await findCatalogTable(supabase, tenantId, 'Menu Categories')
-  const adoptItem = await findCatalogTable(supabase, tenantId, 'Menu Items')
-  if (adoptCat && adoptItem) {
-    const adoptOrders = await findCatalogTable(supabase, tenantId, 'Orders')
-      || await createTable(supabase, tenantId, userId, 'Orders', ORDER_COLS)
-    const adoptCarts = await findCatalogTable(supabase, tenantId, 'Carts')
-      || await createTable(supabase, tenantId, userId, 'Carts', CART_COLS)
-    const config: CatalogConfig = { version: 1, categoriesTableId: adoptCat, itemsTableId: adoptItem, ordersTableId: adoptOrders, cartsTableId: adoptCarts, map: HORECA_MAP }
-    await sf('PATCH', '/admin/config', slug, { catalogConfig: config, catalogSource: 'tables' })
-    const counts = await materializeCatalog(supabase, tenantId, slug)
-    return { created: false, config, counts: counts || { categories: 0, items: 0 } }
   }
 
-  // Snapshot the current (file-store) menu to seed the tables.
-  const menu = await sf('GET', '/admin/menu', slug) as { categories: any[]; items: any[] }
-  const categoriesTableId = await createTable(supabase, tenantId, userId, 'Menu Categories', CATEGORY_COLS)
-  // Items.category is a lookup INTO the just-created Categories table (validated picker).
-  const itemsTableId = await createTable(supabase, tenantId, userId, 'Menu Items', buildItemCols(categoriesTableId))
-  const ordersTableId = await createTable(supabase, tenantId, userId, 'Orders', ORDER_COLS)
-  const cartsTableId = await createTable(supabase, tenantId, userId, 'Carts', CART_COLS)
+  // Every aux entity is a first-class table: find-or-create, backfill when new.
+  const ordersTableId = await ensureAuxTable(supabase, tenantId, userId, 'Orders', ORDER_COLS, id => backfillOrders(supabase, tenantId, userId, slug, id))
+  const cartsTableId = await ensureAuxTable(supabase, tenantId, userId, 'Carts', CART_COLS, null)
+  const customersTableId = await ensureAuxTable(supabase, tenantId, userId, 'Customers', CUSTOMER_COLS, id => backfillCustomers(supabase, tenantId, userId, slug, id))
+  const outletsTableId = await ensureAuxTable(supabase, tenantId, userId, 'Outlets', OUTLET_COLS, id => backfillOutlets(supabase, tenantId, userId, slug, id))
 
-  // Backfill categories (preserve order via insert order).
-  const catNameById = new Map<string, string>()
-  for (const c of (menu.categories || [])) {
-    const { data } = await supabase.from('lead_rows')
-      .insert({ table_id: categoriesTableId, tenant_id: tenantId, user_id: userId, data: { name: String(c.name || '') }, status: 'active' })
-      .select('id').single()
-    if (data) catNameById.set(c.id, String(c.name || ''))
+  const config: CatalogConfig = {
+    version: 1, categoriesTableId, itemsTableId,
+    ordersTableId, cartsTableId, customersTableId, outletsTableId, map: HORECA_MAP,
   }
-  // Backfill items. Cells are strings (Tables convention); add-ons → JSON string.
-  const itemRows = (menu.items || []).map((it: any) => ({
-    table_id: itemsTableId, tenant_id: tenantId, user_id: userId, status: 'active',
-    data: {
-      name: String(it.name || ''),
-      description: String(it.description || ''),
-      price: String(it.priceInr ?? 0),
-      coins: String(it.coins ?? 0),
-      veg: String(!!it.veg),
-      sold_out: String(!!it.soldOut),
-      image_url: String(it.imageUrl || ''),
-      category: catNameById.get(it.categoryId) || '',
-      addons: JSON.stringify(it.options || []),
-    },
-  }))
-  if (itemRows.length) {
-    const { error } = await supabase.from('lead_rows').insert(itemRows)
-    if (error) throw new Error(`backfill items failed: ${error.message}`)
-  }
-
-  const config: CatalogConfig = { version: 1, categoriesTableId, itemsTableId, ordersTableId, cartsTableId, map: HORECA_MAP }
-  // Persist the mapping + flip the serving flag, then materialize the snapshot.
   await sf('PATCH', '/admin/config', slug, { catalogConfig: config, catalogSource: 'tables' })
-  await backfillOrders(supabase, tenantId, userId, slug, ordersTableId)
   const counts = await materializeCatalog(supabase, tenantId, slug)
-  return { created: true, config, counts: counts || { categories: 0, items: 0 } }
+  return { created, config, counts: counts || { categories: 0, items: 0 } }
 }
