@@ -5,6 +5,7 @@ import type { Request, Response, NextFunction } from 'express'
 import { pickAllowed } from './security'
 import { emitNotification } from './routes/notifications'
 import { loadMapping, applyMappingToPayload } from './lib/apply-mapping'
+import { maybeSyncCatalog } from './lib/catalog'
 
 type AuthMiddleware = (req: Request, res: Response, next: NextFunction) => void
 
@@ -702,6 +703,9 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       fireNewLeadTrigger(supabase, tenantId, { tableId: tableIdStr, source: null, row: { id: data.id, data: data.data } })
     ).catch(e => console.warn('[create-row] new-lead trigger (non-fatal):', e?.message))
 
+    // If this row belongs to a catalog table, re-materialize the storefront menu.
+    void maybeSyncCatalog(supabase, tenantId, tableIdStr)
+
     res.json({ ...data, _rule_applied: !!ruleResult })
   })
 
@@ -811,6 +815,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       ).catch(e => console.warn('[patch-row] crm-stage trigger (non-fatal):', e?.message))
     }
 
+    void maybeSyncCatalog(supabase, tenantId, tableIdStr)
     res.json(data)
   })
 
@@ -822,6 +827,7 @@ export function createLeadsRouter(supabase: SupabaseClient, requireAuth: AuthMid
       .eq('id', req.params.rowId)
       .eq('tenant_id', tenantId)
     if (error) { res.status(500).json({ error: error.message }); return }
+    void maybeSyncCatalog(supabase, tenantId, String(req.params.id))
     res.json({ success: true })
   })
 

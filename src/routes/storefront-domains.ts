@@ -15,6 +15,7 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
+import { provisionCatalog, materializeCatalog, getCatalogConfig } from '../lib/catalog.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -116,6 +117,57 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     const { error } = await supabase.from('tenant_domains').delete().eq('id', req.params.id).eq('tenant_id', tenantId)
     if (error) { res.status(500).json({ error: error.message }); return }
     res.json({ ok: true })
+  })
+
+  // ── catalog: back the menu with the Database→Tables feature ──────────────────
+  // Resolve the active workspace's slug, then provision/sync the tenant's catalog
+  // tables. The dashboard never holds the admin secret — same trust model as the
+  // proxy below. See lib/catalog.ts for the architecture.
+  async function slugOf(req: express.Request, res: express.Response): Promise<string | null> {
+    const tenantId = (req as any).tenantId
+    const { data, error } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+    if (error) { res.status(500).json({ error: error.message }); return null }
+    const slug = (data as any)?.slug
+    if (!slug) { res.status(404).json({ error: 'No storefront is set up for this workspace yet.' }); return null }
+    return slug
+  }
+
+  // Is the menu Tables-backed yet?
+  r.get('/api/storefront/catalog/status', requireAuth, identifyTenant, async (req, res) => {
+    const slug = await slugOf(req, res); if (!slug) return
+    try {
+      const config = await getCatalogConfig(slug)
+      res.json({
+        provisioned: !!config,
+        catalogSource: config ? 'tables' : 'file',
+        categoriesTableId: config?.categoriesTableId || null,
+        itemsTableId: config?.itemsTableId || null,
+      })
+    } catch (e: any) { res.status(502).json({ error: e?.message || 'Storefront service is unreachable.' }) }
+  })
+
+  // Move this workspace's menu onto Tables: create the tables, backfill from the
+  // current menu, wire the mapping, and materialize. Idempotent.
+  r.post('/api/storefront/catalog/provision', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const userId = (req as any).user?.id
+    const slug = await slugOf(req, res); if (!slug) return
+    try {
+      const out = await provisionCatalog(supabase, tenantId, userId, slug)
+      res.json({ ok: true, ...out })
+    } catch (e: any) { res.status(500).json({ error: e?.message || 'Provisioning failed' }) }
+  })
+
+  // Re-compose the live menu snapshot from the Tables rows (manual trigger; the
+  // row handlers also auto-sync on edit).
+  r.post('/api/storefront/catalog/sync', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const slug = await slugOf(req, res); if (!slug) return
+    try {
+      const counts = await materializeCatalog(supabase, tenantId, slug)
+      if (!counts) return res.status(400).json({ error: 'This menu is not backed by Tables yet — provision it first.' })
+      res.json({ ok: true, ...counts })
+    } catch (e: any) { res.status(502).json({ error: e?.message || 'Sync failed' }) }
   })
 
   // ── menu / orders admin proxy ────────────────────────────────────────────────
