@@ -69,6 +69,8 @@ const ORDER_COLS = [
   { name: 'Line items (JSON)', key: 'items_json', type: 'textarea' },
   { name: 'Total', key: 'total', type: 'number' },
   { name: 'Coins', key: 'coins', type: 'number' },
+  { name: 'Customer', key: 'guest_id', type: 'text' },     // stable customer ref (guestKey)
+  { name: 'Outlet', key: 'outlet_id', type: 'text' },      // stable outlet ref
   { name: 'Guest', key: 'guest_name', type: 'text' },
   { name: 'Phone', key: 'guest_phone', type: 'phone' },
   { name: 'Paid', key: 'paid', type: 'boolean' },
@@ -206,6 +208,8 @@ function orderToRow(o: any): Record<string, string> {
     items_json: Array.isArray(o.lines) ? JSON.stringify(o.lines).slice(0, 6000) : '',
     total: String(Math.max(0, Math.round(Number(o.grand) || 0))),
     coins: String(Math.max(0, Math.round(Number(o.coinsEarned) || 0))),
+    guest_id: String(o.guestKey || ''),
+    outlet_id: String(o.outletId || ''),
     guest_name: String(o.guestName || ''),
     guest_phone: String(o.guestPhone || ''),
     paid: String(!!o.paid),
