@@ -121,6 +121,43 @@ const HORECA_MAP: CatalogConfig['map'] = {
   },
 }
 
+// ── D2C / ecommerce template (Products in Collections) ──────────────────────────
+// Same generic machinery, different columns: variants + inventory (stock) + SKU +
+// compare-at price. composeMenu reads roles off the map, so it serves either vertical.
+const D2C_ITEM_COLS = [
+  { name: 'Name', key: 'name', type: 'text', is_primary: true, is_required: true },
+  { name: 'Description', key: 'description', type: 'textarea' },
+  { name: 'Price', key: 'price', type: 'number' },
+  { name: 'Compare-at price', key: 'compare_at', type: 'number' },
+  { name: 'SKU', key: 'sku', type: 'text' },
+  { name: 'Stock', key: 'stock', type: 'number' },
+  { name: 'Image URL', key: 'image_url', type: 'url' },
+  { name: 'Collection', key: 'category', type: 'lookup' }, // → Collections table
+  { name: 'Variants (JSON)', key: 'variants', type: 'textarea' },
+  { name: 'Status', key: 'status', type: 'select', options: ['active', 'draft', 'archived'] },
+]
+function buildD2CItemCols(categoriesTableId: string) {
+  return D2C_ITEM_COLS.map(c => c.key === 'category' ? { ...c, type: 'lookup', options: [categoriesTableId, 'name'] } : c)
+}
+const D2C_MAP: CatalogConfig['map'] = {
+  category: { name: 'name' },
+  item: {
+    name: 'name', description: 'description', price: 'price', compareAt: 'compare_at', sku: 'sku',
+    stock: 'stock', image: 'image_url', category: 'category', variants: 'variants', status: 'status',
+  },
+}
+
+// Per-vertical catalog template: which tables to make, with which columns + role map.
+interface VerticalTemplate { categoriesTable: string; itemsTable: string; categoryCols: any[]; itemCols: (catId: string) => any[]; map: CatalogConfig['map'] }
+const VERTICALS: Record<string, VerticalTemplate> = {
+  horeca: { categoriesTable: 'Menu Categories', itemsTable: 'Menu Items', categoryCols: CATEGORY_COLS, itemCols: buildItemCols, map: HORECA_MAP },
+  d2c: { categoriesTable: 'Collections', itemsTable: 'Products', categoryCols: CATEGORY_COLS, itemCols: buildD2CItemCols, map: D2C_MAP },
+}
+function templateFor(businessType?: string): VerticalTemplate {
+  const k = String(businessType || '').toLowerCase()
+  return (k === 'd2c' || k === 'ecommerce' || k === 'retail') ? VERTICALS.d2c : VERTICALS.horeca
+}
+
 // ── storefront-api admin client (server-to-server, shared secret) ───────────────
 async function sf(method: string, path: string, slug: string, body?: unknown): Promise<any> {
   const r = await fetch(`${SF_API}${path}`, {
@@ -159,23 +196,31 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
     // rename-proof), falling back to name (grid lookup-picker value / legacy rows).
     const ref = String(d[im.category] ?? '').trim()
     const categoryId = byId.has(ref) ? ref : (byName.get(ref.toLowerCase()) || fallback)
+    // Options come from add-ons (HoReCa) or variants (D2C) — whichever the map defines.
+    const optsKey = (im as any).addons || (im as any).variants
     let options: any[] = []
-    if (d[im.addons]) { try { const p = JSON.parse(d[im.addons]); if (Array.isArray(p)) options = p } catch { /* leave empty */ } }
+    if (optsKey && d[optsKey]) { try { const p = JSON.parse(d[optsKey]); if (Array.isArray(p)) options = p } catch { /* leave empty */ } }
+    // Sold-out: explicit flag (HoReCa) or derived from stock <= 0 (D2C inventory).
+    const stockRaw = (im as any).stock ? d[(im as any).stock] : undefined
+    const stock = stockRaw !== undefined && stockRaw !== '' ? Number(stockRaw) : null
+    const soldOut = (im as any).soldOut ? truthy(d[(im as any).soldOut]) : (stock != null ? stock <= 0 : false)
+    // D2C status: draft/archived products don't show.
+    if ((im as any).status && ['draft', 'archived'].includes(String(d[(im as any).status] || '').toLowerCase())) return null
     return {
       id: r.id,
       name: String(d[im.name] ?? '').trim(),
       description: String(d[im.description] ?? ''),
       priceInr: Math.max(0, Math.round(Number(d[im.price]) || 0)),
-      coins: Math.max(0, Math.round(Number(d[im.coins]) || 0)),
-      veg: truthy(d[im.veg]),
-      soldOut: truthy(d[im.soldOut]),
-      // Default TRUE: only an explicit "false" (offer item) opts out of earning.
-      rewardEligible: String(d[im.rewardEligible] ?? '') !== 'false',
+      // Roles below are optional per vertical (absent → sensible default).
+      coins: (im as any).coins ? Math.max(0, Math.round(Number(d[(im as any).coins]) || 0)) : 0,
+      veg: (im as any).veg ? truthy(d[(im as any).veg]) : false,
+      soldOut,
+      rewardEligible: (im as any).rewardEligible ? String(d[(im as any).rewardEligible] ?? '') !== 'false' : true,
       categoryId,
       imageUrl: d[im.image] || null,
       options,
     }
-  }).filter(it => it.name && it.categoryId)
+  }).filter((it): it is NonNullable<typeof it> => !!it && !!it.name && !!it.categoryId)
   return { categories, items }
 }
 
@@ -458,6 +503,9 @@ async function ensureAuxTable(
 
 export async function provisionCatalog(supabase: SupabaseClient, tenantId: string, userId: string, slug: string): Promise<{ created: boolean; config: CatalogConfig; counts: { categories: number; items: number } }> {
   const existing = await getCatalogConfig(slug)
+  // Pick the catalog template for this tenant's vertical (HoReCa menu vs D2C products).
+  const { data: tRow } = await supabase.from('tenants').select('business_type').eq('id', tenantId).maybeSingle()
+  const tpl = templateFor((tRow as any)?.business_type)
   let categoriesTableId: string
   let itemsTableId: string
   let created = false
@@ -466,16 +514,16 @@ export async function provisionCatalog(supabase: SupabaseClient, tenantId: strin
     categoriesTableId = existing.categoriesTableId
     itemsTableId = existing.itemsTableId
   } else {
-    // Adopt an existing menu set (orphans/race) if present; else create from the file menu.
-    const adoptCat = await findCatalogTable(supabase, tenantId, 'Menu Categories')
-    const adoptItem = await findCatalogTable(supabase, tenantId, 'Menu Items')
+    // Adopt an existing set (orphans/race) if present; else create from the file menu.
+    const adoptCat = await findCatalogTable(supabase, tenantId, tpl.categoriesTable)
+    const adoptItem = await findCatalogTable(supabase, tenantId, tpl.itemsTable)
     if (adoptCat && adoptItem) {
       categoriesTableId = adoptCat
       itemsTableId = adoptItem
     } else {
       const menu = await sf('GET', '/admin/menu', slug) as { categories: any[]; items: any[] }
-      categoriesTableId = await createTable(supabase, tenantId, userId, 'Menu Categories', CATEGORY_COLS)
-      itemsTableId = await createTable(supabase, tenantId, userId, 'Menu Items', buildItemCols(categoriesTableId))
+      categoriesTableId = await createTable(supabase, tenantId, userId, tpl.categoriesTable, tpl.categoryCols)
+      itemsTableId = await createTable(supabase, tenantId, userId, tpl.itemsTable, tpl.itemCols(categoriesTableId))
       // Map file category id → NEW row id so items link by STABLE id.
       const catRowIdByFileId = new Map<string, string>()
       for (const c of (menu.categories || [])) {
@@ -511,7 +559,7 @@ export async function provisionCatalog(supabase: SupabaseClient, tenantId: strin
 
   const config: CatalogConfig = {
     version: 1, categoriesTableId, itemsTableId,
-    ordersTableId, cartsTableId, customersTableId, outletsTableId, map: HORECA_MAP,
+    ordersTableId, cartsTableId, customersTableId, outletsTableId, map: tpl.map,
   }
   await sf('PATCH', '/admin/config', slug, { catalogConfig: config, catalogSource: 'tables' })
   const counts = await materializeCatalog(supabase, tenantId, slug)
