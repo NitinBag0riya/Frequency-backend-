@@ -216,9 +216,10 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
       veg: (im as any).veg ? truthy(d[(im as any).veg]) : false,
       soldOut,
       rewardEligible: (im as any).rewardEligible ? String(d[(im as any).rewardEligible] ?? '') !== 'false' : true,
-      // D2C extras (null for HoReCa): strike-through compare-at price + SKU.
+      // D2C extras (null for HoReCa): strike-through compare-at price + SKU + stock.
       compareAtPrice: (im as any).compareAt ? (Math.max(0, Math.round(Number(d[(im as any).compareAt]) || 0)) || null) : null,
       sku: (im as any).sku ? (String(d[(im as any).sku] || '') || null) : null,
+      stock,
       categoryId,
       imageUrl: d[im.image] || null,
       options,
@@ -404,21 +405,33 @@ async function backfillOutlets(supabase: SupabaseClient, tenantId: string, userI
 export interface CatalogDish {
   name: string; description?: string; priceInr?: number; coins?: number
   veg?: boolean; soldOut?: boolean; rewardEligible?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
+  // D2C product fields (written only when the vertical's map defines the role).
+  compareAtPrice?: number | null; sku?: string | null; stock?: number | null; status?: string
 }
+// Maps an editor payload onto a row, writing ONLY the roles this vertical's map
+// defines — so the same form/save path serves a HoReCa dish and a D2C product.
 function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string, string> {
-  const im = config.map.item
-  return {
-    [im.name]: String(dish.name || ''),
-    [im.description]: String(dish.description || ''),
-    [im.price]: String(Math.max(0, Math.round(Number(dish.priceInr) || 0))),
-    [im.coins]: String(Math.max(0, Math.round(Number(dish.coins) || 0))),
-    [im.veg]: String(!!dish.veg),
-    [im.soldOut]: String(!!dish.soldOut),
-    [im.rewardEligible]: String(dish.rewardEligible !== false),
-    [im.image]: String(dish.imageUrl || ''),
-    [im.category]: String(dish.categoryId || ''), // stable category ROW ID (the relationship)
-    [im.addons]: JSON.stringify(Array.isArray(dish.options) ? dish.options : []),
-  }
+  const im = config.map.item as any
+  const d: Record<string, string> = {}
+  const set = (key: string | undefined, val: string) => { if (key) d[key] = val }
+  const opts = JSON.stringify(Array.isArray(dish.options) ? dish.options : [])
+  set(im.name, String(dish.name || ''))
+  set(im.description, String(dish.description || ''))
+  set(im.price, String(Math.max(0, Math.round(Number(dish.priceInr) || 0))))
+  set(im.coins, String(Math.max(0, Math.round(Number(dish.coins) || 0))))
+  set(im.veg, String(!!dish.veg))
+  set(im.soldOut, String(!!dish.soldOut))
+  set(im.rewardEligible, String(dish.rewardEligible !== false))
+  set(im.image, String(dish.imageUrl || ''))
+  set(im.category, String(dish.categoryId || '')) // stable category ROW ID (the relationship)
+  set(im.addons, opts)        // HoReCa: add-on groups
+  set(im.variants, opts)      // D2C: variant groups (same option-group shape)
+  // D2C-only roles:
+  set(im.compareAt, dish.compareAtPrice == null ? '' : String(Math.max(0, Math.round(Number(dish.compareAtPrice)) || 0) || ''))
+  set(im.sku, String(dish.sku || ''))
+  set(im.stock, dish.stock == null ? '' : String(Math.max(0, Math.round(Number(dish.stock)))))
+  set(im.status, String(dish.status || 'active'))
+  return d
 }
 async function categoryNameById(supabase: SupabaseClient, tenantId: string, config: CatalogConfig, categoryId?: string): Promise<string> {
   if (!categoryId) return ''

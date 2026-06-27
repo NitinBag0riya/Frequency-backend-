@@ -216,6 +216,9 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
         catalogSource: config ? 'tables' : 'file',
         categoriesTableId: config?.categoriesTableId || null,
         itemsTableId: config?.itemsTableId || null,
+        // Vertical drives the dashboard editor (product fields vs dish fields).
+        // Derived from the map: a `stock` role means this is a D2C product catalog.
+        vertical: (config?.map?.item as any)?.stock ? 'd2c' : 'horeca',
       })
     } catch (e: any) { res.status(502).json({ error: e?.message || 'Storefront service is unreachable.' }) }
   })
