@@ -274,6 +274,14 @@ export async function catalogDeleteCategory(supabase: SupabaseClient, tenantId: 
 }
 
 // ── provision: create the tables, backfill from the current menu, wire config ────
+// Find an existing catalog table for this tenant by name (oldest first). Used to
+// ADOPT tables a prior (failed/raced) attempt created instead of duplicating them.
+async function findCatalogTable(supabase: SupabaseClient, tenantId: string, name: string): Promise<string | null> {
+  const { data } = await supabase.from('lead_tables').select('id')
+    .eq('tenant_id', tenantId).eq('source', CATALOG_SOURCE).eq('name', name)
+    .order('created_at', { ascending: true }).limit(1)
+  return data && data[0] ? (data[0] as any).id : null
+}
 async function createTable(supabase: SupabaseClient, tenantId: string, userId: string, name: string, cols: any[]): Promise<string> {
   const { data: table, error } = await supabase.from('lead_tables')
     .insert({ name, description: 'Storefront catalog (managed)', source: CATALOG_SOURCE, tenant_id: tenantId, user_id: userId })
@@ -304,6 +312,20 @@ export async function provisionCatalog(supabase: SupabaseClient, tenantId: strin
     const counts = await materializeCatalog(supabase, tenantId, slug)
     return { created: false, config, counts: counts || { categories: 0, items: 0 } }
   }
+  // Self-heal: a prior attempt may have created tables but failed before writing
+  // config (orphans), or raced. Adopt the existing set (oldest of each) instead of
+  // creating duplicates — and skip backfill since those tables already hold data.
+  const adoptCat = await findCatalogTable(supabase, tenantId, 'Menu Categories')
+  const adoptItem = await findCatalogTable(supabase, tenantId, 'Menu Items')
+  if (adoptCat && adoptItem) {
+    const adoptOrders = await findCatalogTable(supabase, tenantId, 'Orders')
+      || await createTable(supabase, tenantId, userId, 'Orders', ORDER_COLS)
+    const config: CatalogConfig = { version: 1, categoriesTableId: adoptCat, itemsTableId: adoptItem, ordersTableId: adoptOrders, map: HORECA_MAP }
+    await sf('PATCH', '/admin/config', slug, { catalogConfig: config, catalogSource: 'tables' })
+    const counts = await materializeCatalog(supabase, tenantId, slug)
+    return { created: false, config, counts: counts || { categories: 0, items: 0 } }
+  }
+
   // Snapshot the current (file-store) menu to seed the tables.
   const menu = await sf('GET', '/admin/menu', slug) as { categories: any[]; items: any[] }
   const categoriesTableId = await createTable(supabase, tenantId, userId, 'Menu Categories', CATEGORY_COLS)
