@@ -48,6 +48,7 @@ const ITEM_COLS = [
   { name: 'Coins', key: 'coins', type: 'number' },
   { name: 'Veg', key: 'veg', type: 'boolean' },
   { name: 'Sold out', key: 'sold_out', type: 'boolean' },
+  { name: 'Earns loyalty (off = offer item)', key: 'reward_eligible', type: 'boolean' },
   { name: 'Image URL', key: 'image_url', type: 'url' },
   { name: 'Category', key: 'category', type: 'lookup' }, // → Categories table (options set at provision)
   { name: 'Add-ons (JSON)', key: 'addons', type: 'textarea' },
@@ -116,7 +117,7 @@ const HORECA_MAP: CatalogConfig['map'] = {
   category: { name: 'name' },
   item: {
     name: 'name', description: 'description', price: 'price', coins: 'coins',
-    veg: 'veg', soldOut: 'sold_out', image: 'image_url', category: 'category', addons: 'addons',
+    veg: 'veg', soldOut: 'sold_out', rewardEligible: 'reward_eligible', image: 'image_url', category: 'category', addons: 'addons',
   },
 }
 
@@ -168,6 +169,8 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
       coins: Math.max(0, Math.round(Number(d[im.coins]) || 0)),
       veg: truthy(d[im.veg]),
       soldOut: truthy(d[im.soldOut]),
+      // Default TRUE: only an explicit "false" (offer item) opts out of earning.
+      rewardEligible: String(d[im.rewardEligible] ?? '') !== 'false',
       categoryId,
       imageUrl: d[im.image] || null,
       options,
@@ -352,7 +355,7 @@ async function backfillOutlets(supabase: SupabaseClient, tenantId: string, userI
 // re-materializes synchronously, so the editor sees fresh data immediately.
 export interface CatalogDish {
   name: string; description?: string; priceInr?: number; coins?: number
-  veg?: boolean; soldOut?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
+  veg?: boolean; soldOut?: boolean; rewardEligible?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
 }
 function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string, string> {
   const im = config.map.item
@@ -363,6 +366,7 @@ function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string,
     [im.coins]: String(Math.max(0, Math.round(Number(dish.coins) || 0))),
     [im.veg]: String(!!dish.veg),
     [im.soldOut]: String(!!dish.soldOut),
+    [im.rewardEligible]: String(dish.rewardEligible !== false),
     [im.image]: String(dish.imageUrl || ''),
     [im.category]: String(dish.categoryId || ''), // stable category ROW ID (the relationship)
     [im.addons]: JSON.stringify(Array.isArray(dish.options) ? dish.options : []),
@@ -485,7 +489,8 @@ export async function provisionCatalog(supabase: SupabaseClient, tenantId: strin
         data: {
           name: String(it.name || ''), description: String(it.description || ''),
           price: String(it.priceInr ?? 0), coins: String(it.coins ?? 0),
-          veg: String(!!it.veg), sold_out: String(!!it.soldOut), image_url: String(it.imageUrl || ''),
+          veg: String(!!it.veg), sold_out: String(!!it.soldOut), reward_eligible: String(it.rewardEligible !== false),
+          image_url: String(it.imageUrl || ''),
           category: catRowIdByFileId.get(it.categoryId) || '', // stable category ROW id
           addons: JSON.stringify(it.options || []),
         },
