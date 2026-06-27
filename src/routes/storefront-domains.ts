@@ -15,7 +15,7 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
-import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, syncOrderRow } from '../lib/catalog.js'
+import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, syncOrderRow, syncCartRow } from '../lib/catalog.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -82,6 +82,21 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       const tenantId = (t as any)?.id
       if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
       await syncOrderRow(supabase, tenantId, String(slug), order)
+      res.json({ ok: true })
+    } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
+  })
+
+  // Server-to-server: storefront-api mirrors an in-progress/abandoned cart into the
+  // tenant's Carts table (status open | converted). Shared admin secret; best-effort.
+  r.post('/api/storefront/cart-sync', async (req, res) => {
+    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    const { slug, cart } = (req.body || {}) as { slug?: string; cart?: any }
+    if (!slug || !cart?.guestKey) return res.status(400).json({ ok: false, error: 'slug and cart.guestKey required' })
+    try {
+      const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+      const tenantId = (t as any)?.id
+      if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
+      await syncCartRow(supabase, tenantId, String(slug), cart)
       res.json({ ok: true })
     } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
   })
