@@ -468,6 +468,32 @@ export async function catalogDeleteCategory(supabase: SupabaseClient, tenantId: 
   await materializeCatalog(supabase, tenantId, slug)
 }
 
+// Decrement product stock when an order is placed (D2C inventory). itemId is the
+// Products lead_row id (= the materialized item id). No-op for verticals whose map
+// has no `stock` role (e.g. HoReCa). Re-materializes once so sold-out flips at 0.
+export async function catalogDecrementStock(supabase: SupabaseClient, tenantId: string, slug: string, lines: Array<{ itemId?: string; qty?: number }>) {
+  const config = await getCatalogConfig(slug)
+  if (!config) return
+  const stockKey = (config.map.item as any).stock
+  if (!stockKey) return // this vertical doesn't track inventory
+  let changed = false
+  for (const ln of (lines || [])) {
+    const id = String(ln?.itemId || ''); const qty = Math.max(0, Math.floor(Number(ln?.qty) || 0))
+    if (!id || !qty) continue
+    const { data: row } = await supabase.from('lead_rows').select('id,data')
+      .eq('id', id).eq('tenant_id', tenantId).eq('table_id', config.itemsTableId).maybeSingle()
+    if (!row) continue
+    const cur = Number(((row as any).data || {})[stockKey])
+    if (!Number.isFinite(cur)) continue // untracked item
+    const next = Math.max(0, cur - qty)
+    if (next === cur) continue
+    await supabase.from('lead_rows').update({ data: { ...(row as any).data, [stockKey]: String(next) } })
+      .eq('id', id).eq('tenant_id', tenantId)
+    changed = true
+  }
+  if (changed) await materializeCatalog(supabase, tenantId, slug)
+}
+
 // ── provision: create the tables, backfill from the current menu, wire config ────
 // Find an existing catalog table for this tenant by name (oldest first). Used to
 // ADOPT tables a prior (failed/raced) attempt created instead of duplicating them.

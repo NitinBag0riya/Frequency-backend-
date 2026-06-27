@@ -15,7 +15,7 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
-import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
+import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -84,6 +84,21 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       await syncOrderRow(supabase, tenantId, String(slug), order)
       res.json({ ok: true })
     } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
+  })
+
+  // Server-to-server: storefront-api decrements D2C product inventory on a new order.
+  // No-op for verticals without a stock column. Shared admin secret; best-effort.
+  r.post('/api/storefront/inventory-decrement', async (req, res) => {
+    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    const { slug, lines } = (req.body || {}) as { slug?: string; lines?: Array<{ itemId?: string; qty?: number }> }
+    if (!slug || !Array.isArray(lines)) return res.status(400).json({ ok: false, error: 'slug and lines[] required' })
+    try {
+      const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+      const tenantId = (t as any)?.id
+      if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
+      await catalogDecrementStock(supabase, tenantId, String(slug), lines)
+      res.json({ ok: true })
+    } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'decrement failed' }) }
   })
 
   // Server-to-server: storefront-api mirrors an in-progress/abandoned cart into the
