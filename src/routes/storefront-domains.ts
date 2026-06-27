@@ -15,7 +15,7 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
-import { provisionCatalog, materializeCatalog, getCatalogConfig } from '../lib/catalog.js'
+import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory } from '../lib/catalog.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -168,6 +168,42 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       if (!counts) return res.status(400).json({ error: 'This menu is not backed by Tables yet — provision it first.' })
       res.json({ ok: true, ...counts })
     } catch (e: any) { res.status(502).json({ error: e?.message || 'Sync failed' }) }
+  })
+
+  // Catalog item/category edits (UI→Table) — the dashboard's rich dish editor
+  // writes through here when the menu is Tables-backed, so add-ons get the proper
+  // group editor and each save re-materializes the storefront snapshot.
+  r.post('/api/storefront/catalog/item', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId, userId = (req as any).user?.id
+    const slug = await slugOf(req, res); if (!slug) return
+    try { await catalogUpsertItem(supabase, tenantId, userId, slug, (req.body || {}) as any); res.json({ ok: true }) }
+    catch (e: any) { res.status(400).json({ error: e?.message || 'Could not save dish' }) }
+  })
+  r.patch('/api/storefront/catalog/item/:rowId', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId, userId = (req as any).user?.id
+    const slug = await slugOf(req, res); if (!slug) return
+    try { await catalogUpsertItem(supabase, tenantId, userId, slug, (req.body || {}) as any, String(req.params.rowId)); res.json({ ok: true }) }
+    catch (e: any) { res.status(400).json({ error: e?.message || 'Could not save dish' }) }
+  })
+  r.delete('/api/storefront/catalog/item/:rowId', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const slug = await slugOf(req, res); if (!slug) return
+    try { await catalogDeleteItem(supabase, tenantId, slug, String(req.params.rowId)); res.json({ ok: true }) }
+    catch (e: any) { res.status(400).json({ error: e?.message || 'Could not delete dish' }) }
+  })
+  r.post('/api/storefront/catalog/category', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId, userId = (req as any).user?.id
+    const slug = await slugOf(req, res); if (!slug) return
+    const name = String((req.body || {}).name || '').trim()
+    if (!name) { res.status(400).json({ error: 'Category name required' }); return }
+    try { await catalogAddCategory(supabase, tenantId, userId, slug, name); res.json({ ok: true }) }
+    catch (e: any) { res.status(400).json({ error: e?.message || 'Could not add category' }) }
+  })
+  r.delete('/api/storefront/catalog/category/:rowId', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const slug = await slugOf(req, res); if (!slug) return
+    try { await catalogDeleteCategory(supabase, tenantId, slug, String(req.params.rowId)); res.json({ ok: true }) }
+    catch (e: any) { res.status(400).json({ error: e?.message || 'Could not delete category' }) }
   })
 
   // ── menu / orders admin proxy ────────────────────────────────────────────────

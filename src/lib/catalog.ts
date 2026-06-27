@@ -142,6 +142,74 @@ export async function maybeSyncCatalog(supabase: SupabaseClient, tenantId: strin
   }
 }
 
+// ── operator edits via the rich menu editor (UI→Table), in tables-mode ──────────
+// The dashboard's dish form writes through here so add-ons get the proper group
+// editor (not raw JSON). Each write maps the dish onto the items-table row and
+// re-materializes synchronously, so the editor sees fresh data immediately.
+export interface CatalogDish {
+  name: string; description?: string; priceInr?: number; coins?: number
+  veg?: boolean; soldOut?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
+}
+function dishToRowData(config: CatalogConfig, dish: CatalogDish, categoryName: string): Record<string, string> {
+  const im = config.map.item
+  return {
+    [im.name]: String(dish.name || ''),
+    [im.description]: String(dish.description || ''),
+    [im.price]: String(Math.max(0, Math.round(Number(dish.priceInr) || 0))),
+    [im.coins]: String(Math.max(0, Math.round(Number(dish.coins) || 0))),
+    [im.veg]: String(!!dish.veg),
+    [im.soldOut]: String(!!dish.soldOut),
+    [im.image]: String(dish.imageUrl || ''),
+    [im.category]: categoryName || '',
+    [im.addons]: JSON.stringify(Array.isArray(dish.options) ? dish.options : []),
+  }
+}
+async function categoryNameById(supabase: SupabaseClient, tenantId: string, config: CatalogConfig, categoryId?: string): Promise<string> {
+  if (!categoryId) return ''
+  const { data } = await supabase.from('lead_rows').select('data')
+    .eq('tenant_id', tenantId).eq('table_id', config.categoriesTableId).eq('id', categoryId).maybeSingle()
+  return data ? String((data as any).data?.[config.map.category.name] || '') : ''
+}
+async function configOrThrow(slug: string): Promise<CatalogConfig> {
+  const c = await getCatalogConfig(slug)
+  if (!c) throw new Error('This menu is not backed by Tables yet — provision it first.')
+  return c
+}
+
+export async function catalogUpsertItem(supabase: SupabaseClient, tenantId: string, userId: string | null, slug: string, dish: CatalogDish, rowId?: string) {
+  const config = await configOrThrow(slug)
+  const catName = await categoryNameById(supabase, tenantId, config, dish.categoryId)
+  const data = dishToRowData(config, dish, catName)
+  if (rowId) {
+    const { error } = await supabase.from('lead_rows').update({ data }).eq('id', rowId).eq('tenant_id', tenantId).eq('table_id', config.itemsTableId)
+    if (error) throw new Error(error.message)
+  } else {
+    const { error } = await supabase.from('lead_rows').insert({ table_id: config.itemsTableId, tenant_id: tenantId, user_id: userId, data, status: 'active' })
+    if (error) throw new Error(error.message)
+  }
+  await materializeCatalog(supabase, tenantId, slug)
+}
+export async function catalogDeleteItem(supabase: SupabaseClient, tenantId: string, slug: string, rowId: string) {
+  const config = await configOrThrow(slug)
+  const { error } = await supabase.from('lead_rows').delete().eq('id', rowId).eq('tenant_id', tenantId).eq('table_id', config.itemsTableId)
+  if (error) throw new Error(error.message)
+  await materializeCatalog(supabase, tenantId, slug)
+}
+export async function catalogAddCategory(supabase: SupabaseClient, tenantId: string, userId: string | null, slug: string, name: string) {
+  const config = await configOrThrow(slug)
+  const { error } = await supabase.from('lead_rows').insert({ table_id: config.categoriesTableId, tenant_id: tenantId, user_id: userId, data: { [config.map.category.name]: String(name || '') }, status: 'active' })
+  if (error) throw new Error(error.message)
+  await materializeCatalog(supabase, tenantId, slug)
+}
+export async function catalogDeleteCategory(supabase: SupabaseClient, tenantId: string, slug: string, rowId: string) {
+  const config = await configOrThrow(slug)
+  // Find the category's name, delete it, then delete items that referenced it.
+  const name = await categoryNameById(supabase, tenantId, config, rowId)
+  await supabase.from('lead_rows').delete().eq('id', rowId).eq('tenant_id', tenantId).eq('table_id', config.categoriesTableId)
+  if (name) await supabase.from('lead_rows').delete().eq('tenant_id', tenantId).eq('table_id', config.itemsTableId).eq(`data->>${config.map.item.category}`, name)
+  await materializeCatalog(supabase, tenantId, slug)
+}
+
 // ── provision: create the tables, backfill from the current menu, wire config ────
 async function createTable(supabase: SupabaseClient, tenantId: string, userId: string, name: string, cols: any[]): Promise<string> {
   const { data: table, error } = await supabase.from('lead_tables')
