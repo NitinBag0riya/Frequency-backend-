@@ -58,6 +58,7 @@ const ORDER_COLS = [
   { name: 'Mode', key: 'mode', type: 'text' },
   { name: 'Table', key: 'table', type: 'number' },
   { name: 'Items', key: 'items', type: 'textarea' },
+  { name: 'Line items (JSON)', key: 'items_json', type: 'textarea' },
   { name: 'Total', key: 'total', type: 'number' },
   { name: 'Coins', key: 'coins', type: 'number' },
   { name: 'Guest', key: 'guest_name', type: 'text' },
@@ -177,6 +178,9 @@ function orderToRow(o: any): Record<string, string> {
     mode: String(o.mode || (o.table != null ? 'dinein' : 'pickup')),
     table: o.table != null && o.table !== '' ? String(o.table) : '',
     items: String(o.items != null ? o.items : summarizeLines(o.lines)),
+    // Full structured cart/order lines (name, qty, price, options) — complete
+    // capture, not just the human summary above.
+    items_json: Array.isArray(o.lines) ? JSON.stringify(o.lines).slice(0, 6000) : '',
     total: String(Math.max(0, Math.round(Number(o.grand) || 0))),
     coins: String(Math.max(0, Math.round(Number(o.coinsEarned) || 0))),
     guest_name: String(o.guestName || ''),
