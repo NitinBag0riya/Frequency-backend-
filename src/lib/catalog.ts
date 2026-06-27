@@ -492,7 +492,7 @@ export async function catalogDeleteCategory(supabase: SupabaseClient, tenantId: 
 // Decrement product stock when an order is placed (D2C inventory). itemId is the
 // Products lead_row id (= the materialized item id). No-op for verticals whose map
 // has no `stock` role (e.g. HoReCa). Re-materializes once so sold-out flips at 0.
-export async function catalogDecrementStock(supabase: SupabaseClient, tenantId: string, slug: string, lines: Array<{ itemId?: string; qty?: number }>) {
+export async function catalogDecrementStock(supabase: SupabaseClient, tenantId: string, slug: string, lines: Array<{ itemId?: string; qty?: number }>, restock = false) {
   const config = await getCatalogConfig(slug)
   if (!config) return
   const stockKey = (config.map.item as any).stock
@@ -506,7 +506,7 @@ export async function catalogDecrementStock(supabase: SupabaseClient, tenantId: 
     if (!row) continue
     const cur = Number(((row as any).data || {})[stockKey])
     if (!Number.isFinite(cur)) continue // untracked item
-    const next = Math.max(0, cur - qty)
+    const next = restock ? cur + qty : Math.max(0, cur - qty) // return/cancel puts units back
     if (next === cur) continue
     await supabase.from('lead_rows').update({ data: { ...(row as any).data, [stockKey]: String(next) } })
       .eq('id', id).eq('tenant_id', tenantId)

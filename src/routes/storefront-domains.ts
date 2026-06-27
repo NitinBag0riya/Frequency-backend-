@@ -90,13 +90,13 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   // No-op for verticals without a stock column. Shared admin secret; best-effort.
   r.post('/api/storefront/inventory-decrement', async (req, res) => {
     if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
-    const { slug, lines } = (req.body || {}) as { slug?: string; lines?: Array<{ itemId?: string; qty?: number }> }
+    const { slug, lines, restock } = (req.body || {}) as { slug?: string; lines?: Array<{ itemId?: string; qty?: number }>; restock?: boolean }
     if (!slug || !Array.isArray(lines)) return res.status(400).json({ ok: false, error: 'slug and lines[] required' })
     try {
       const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
       const tenantId = (t as any)?.id
       if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
-      await catalogDecrementStock(supabase, tenantId, String(slug), lines)
+      await catalogDecrementStock(supabase, tenantId, String(slug), lines, !!restock)
       res.json({ ok: true })
     } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'decrement failed' }) }
   })
