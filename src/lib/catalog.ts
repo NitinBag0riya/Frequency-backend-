@@ -26,6 +26,7 @@ export interface CatalogConfig {
   version: number
   categoriesTableId: string
   itemsTableId: string
+  ordersTableId?: string
   map: {
     category: { name: string }
     item: Record<string, string> // role → column key
@@ -47,6 +48,22 @@ const ITEM_COLS = [
   { name: 'Image URL', key: 'image_url', type: 'url' },
   { name: 'Category', key: 'category', type: 'text' },
   { name: 'Add-ons (JSON)', key: 'addons', type: 'textarea' },
+]
+// Orders table — a mirror of the live orders (storefront-api stays authoritative
+// for the customer flow; this gives the operator a queryable/automatable copy and
+// lets order rows drive workflows). Fixed column keys (both sides controlled).
+const ORDER_COLS = [
+  { name: 'Order', key: 'order_id', type: 'text', is_primary: true, is_required: true },
+  { name: 'Status', key: 'status', type: 'select', options: ['placed', 'accepted', 'preparing', 'ready', 'served', 'cancelled'] },
+  { name: 'Mode', key: 'mode', type: 'text' },
+  { name: 'Table', key: 'table', type: 'number' },
+  { name: 'Items', key: 'items', type: 'textarea' },
+  { name: 'Total', key: 'total', type: 'number' },
+  { name: 'Coins', key: 'coins', type: 'number' },
+  { name: 'Guest', key: 'guest_name', type: 'text' },
+  { name: 'Phone', key: 'guest_phone', type: 'phone' },
+  { name: 'Paid', key: 'paid', type: 'boolean' },
+  { name: 'Placed at', key: 'placed_at', type: 'text' },
 ]
 const HORECA_MAP: CatalogConfig['map'] = {
   category: { name: 'name' },
@@ -142,6 +159,52 @@ export async function maybeSyncCatalog(supabase: SupabaseClient, tenantId: strin
   }
 }
 
+// ── orders mirror (storefront-api → Tables) ─────────────────────────────────────
+// storefront-api stays the authoritative live-order store (fast customer flow);
+// we mirror each order into the Orders table on create/pay/status-change so the
+// operator gets a queryable/automatable copy. One-way; upserted by order_id.
+function summarizeLines(lines: any): string {
+  if (!Array.isArray(lines)) return ''
+  return lines.map((l: any) => `${l.qty || 1}× ${l.name || 'item'}`).join(', ').slice(0, 300)
+}
+function orderToRow(o: any): Record<string, string> {
+  const placedAt = o.createdAt
+    ? (typeof o.createdAt === 'number' ? new Date(o.createdAt).toISOString() : String(o.createdAt))
+    : ''
+  return {
+    order_id: String(o.id || ''),
+    status: String(o.status || 'placed'),
+    mode: String(o.mode || (o.table != null ? 'dinein' : 'pickup')),
+    table: o.table != null && o.table !== '' ? String(o.table) : '',
+    items: String(o.items != null ? o.items : summarizeLines(o.lines)),
+    total: String(Math.max(0, Math.round(Number(o.grand) || 0))),
+    coins: String(Math.max(0, Math.round(Number(o.coinsEarned) || 0))),
+    guest_name: String(o.guestName || ''),
+    guest_phone: String(o.guestPhone || ''),
+    paid: String(!!o.paid),
+    placed_at: placedAt,
+  }
+}
+export async function syncOrderRow(supabase: SupabaseClient, tenantId: string, slug: string, order: any): Promise<void> {
+  const config = await getCatalogConfig(slug)
+  if (!config?.ordersTableId || !order?.id) return
+  const data = orderToRow(order)
+  const { data: existing } = await supabase.from('lead_rows').select('id')
+    .eq('tenant_id', tenantId).eq('table_id', config.ordersTableId).eq('data->>order_id', String(order.id)).maybeSingle()
+  if (existing) await supabase.from('lead_rows').update({ data }).eq('id', (existing as any).id)
+  else await supabase.from('lead_rows').insert({ table_id: config.ordersTableId, tenant_id: tenantId, user_id: null, data, status: 'active' })
+}
+async function backfillOrders(supabase: SupabaseClient, tenantId: string, userId: string | null, slug: string, ordersTableId: string): Promise<void> {
+  let orders: any[] = []
+  try { orders = await sf('GET', '/admin/orders', slug) } catch { return }
+  if (!Array.isArray(orders) || !orders.length) return
+  const rows = orders.slice(0, 2000).map(o => ({
+    table_id: ordersTableId, tenant_id: tenantId, user_id: userId, status: 'active',
+    data: orderToRow(o),
+  }))
+  await supabase.from('lead_rows').insert(rows)
+}
+
 // ── operator edits via the rich menu editor (UI→Table), in tables-mode ──────────
 // The dashboard's dish form writes through here so add-ons get the proper group
 // editor (not raw JSON). Each write maps the dish onto the items-table row and
@@ -227,16 +290,25 @@ async function createTable(supabase: SupabaseClient, tenantId: string, userId: s
 }
 
 export async function provisionCatalog(supabase: SupabaseClient, tenantId: string, userId: string, slug: string): Promise<{ created: boolean; config: CatalogConfig; counts: { categories: number; items: number } }> {
-  // Idempotent: if already provisioned, just re-materialize.
+  // Idempotent + self-upgrading: if already provisioned, ensure the Orders table
+  // exists (added after some tenants were provisioned), then re-materialize.
   const existing = await getCatalogConfig(slug)
   if (existing) {
+    let config = existing
+    if (!config.ordersTableId) {
+      const ordersTableId = await createTable(supabase, tenantId, userId, 'Orders', ORDER_COLS)
+      config = { ...config, ordersTableId }
+      await sf('PATCH', '/admin/config', slug, { catalogConfig: config })
+      await backfillOrders(supabase, tenantId, userId, slug, ordersTableId)
+    }
     const counts = await materializeCatalog(supabase, tenantId, slug)
-    return { created: false, config: existing, counts: counts || { categories: 0, items: 0 } }
+    return { created: false, config, counts: counts || { categories: 0, items: 0 } }
   }
   // Snapshot the current (file-store) menu to seed the tables.
   const menu = await sf('GET', '/admin/menu', slug) as { categories: any[]; items: any[] }
   const categoriesTableId = await createTable(supabase, tenantId, userId, 'Menu Categories', CATEGORY_COLS)
   const itemsTableId = await createTable(supabase, tenantId, userId, 'Menu Items', ITEM_COLS)
+  const ordersTableId = await createTable(supabase, tenantId, userId, 'Orders', ORDER_COLS)
 
   // Backfill categories (preserve order via insert order).
   const catNameById = new Map<string, string>()
@@ -266,9 +338,10 @@ export async function provisionCatalog(supabase: SupabaseClient, tenantId: strin
     if (error) throw new Error(`backfill items failed: ${error.message}`)
   }
 
-  const config: CatalogConfig = { version: 1, categoriesTableId, itemsTableId, map: HORECA_MAP }
+  const config: CatalogConfig = { version: 1, categoriesTableId, itemsTableId, ordersTableId, map: HORECA_MAP }
   // Persist the mapping + flip the serving flag, then materialize the snapshot.
   await sf('PATCH', '/admin/config', slug, { catalogConfig: config, catalogSource: 'tables' })
+  await backfillOrders(supabase, tenantId, userId, slug, ordersTableId)
   const counts = await materializeCatalog(supabase, tenantId, slug)
   return { created: true, config, counts: counts || { categories: 0, items: 0 } }
 }

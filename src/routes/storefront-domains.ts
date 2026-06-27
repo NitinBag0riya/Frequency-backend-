@@ -15,7 +15,7 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
-import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory } from '../lib/catalog.js'
+import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, syncOrderRow } from '../lib/catalog.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -68,6 +68,22 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     } catch (e: any) {
       res.status(502).json({ ok: false, error: e?.message || 'send failed' })
     }
+  })
+
+  // Server-to-server: storefront-api mirrors an order into the tenant's Orders
+  // table on create/pay/status-change. Authenticated by the shared admin secret
+  // (not a user session); slug comes from the body. Best-effort.
+  r.post('/api/storefront/order-sync', async (req, res) => {
+    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    const { slug, order } = (req.body || {}) as { slug?: string; order?: any }
+    if (!slug || !order?.id) return res.status(400).json({ ok: false, error: 'slug and order.id required' })
+    try {
+      const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+      const tenantId = (t as any)?.id
+      if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
+      await syncOrderRow(supabase, tenantId, String(slug), order)
+      res.json({ ok: true })
+    } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
   })
 
   r.post('/api/storefront/domains', requireAuth, identifyTenant, async (req, res) => {
