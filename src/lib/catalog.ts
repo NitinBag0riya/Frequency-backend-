@@ -216,6 +216,9 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
       veg: (im as any).veg ? truthy(d[(im as any).veg]) : false,
       soldOut,
       rewardEligible: (im as any).rewardEligible ? String(d[(im as any).rewardEligible] ?? '') !== 'false' : true,
+      // D2C extras (null for HoReCa): strike-through compare-at price + SKU.
+      compareAtPrice: (im as any).compareAt ? (Math.max(0, Math.round(Number(d[(im as any).compareAt]) || 0)) || null) : null,
+      sku: (im as any).sku ? (String(d[(im as any).sku] || '') || null) : null,
       categoryId,
       imageUrl: d[im.image] || null,
       options,
