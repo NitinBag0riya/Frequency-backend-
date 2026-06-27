@@ -123,12 +123,15 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
     .map(r => ({ id: r.id, name: String(r.data?.[m.category.name] ?? '').trim() }))
     .filter(c => c.name)
   const byName = new Map(categories.map(c => [c.name.toLowerCase(), c.id]))
+  const byId = new Set(categories.map(c => c.id))
   const fallback = categories[0]?.id
   const im = m.item
   const items = (itemRows || []).map(r => {
     const d = r.data || {}
-    const catName = String(d[im.category] ?? '').trim().toLowerCase()
-    const categoryId = byName.get(catName) || fallback
+    // Resolve the category link by stable ROW ID first (the standard reference;
+    // rename-proof), falling back to name (grid lookup-picker value / legacy rows).
+    const ref = String(d[im.category] ?? '').trim()
+    const categoryId = byId.has(ref) ? ref : (byName.get(ref.toLowerCase()) || fallback)
     let options: any[] = []
     if (d[im.addons]) { try { const p = JSON.parse(d[im.addons]); if (Array.isArray(p)) options = p } catch { /* leave empty */ } }
     return {
@@ -261,7 +264,7 @@ export interface CatalogDish {
   name: string; description?: string; priceInr?: number; coins?: number
   veg?: boolean; soldOut?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
 }
-function dishToRowData(config: CatalogConfig, dish: CatalogDish, categoryName: string): Record<string, string> {
+function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string, string> {
   const im = config.map.item
   return {
     [im.name]: String(dish.name || ''),
@@ -271,7 +274,7 @@ function dishToRowData(config: CatalogConfig, dish: CatalogDish, categoryName: s
     [im.veg]: String(!!dish.veg),
     [im.soldOut]: String(!!dish.soldOut),
     [im.image]: String(dish.imageUrl || ''),
-    [im.category]: categoryName || '',
+    [im.category]: String(dish.categoryId || ''), // stable category ROW ID (the relationship)
     [im.addons]: JSON.stringify(Array.isArray(dish.options) ? dish.options : []),
   }
 }
@@ -289,8 +292,7 @@ async function configOrThrow(slug: string): Promise<CatalogConfig> {
 
 export async function catalogUpsertItem(supabase: SupabaseClient, tenantId: string, userId: string | null, slug: string, dish: CatalogDish, rowId?: string) {
   const config = await configOrThrow(slug)
-  const catName = await categoryNameById(supabase, tenantId, config, dish.categoryId)
-  const data = dishToRowData(config, dish, catName)
+  const data = dishToRowData(config, dish)
   if (rowId) {
     const { error } = await supabase.from('lead_rows').update({ data }).eq('id', rowId).eq('tenant_id', tenantId).eq('table_id', config.itemsTableId)
     if (error) throw new Error(error.message)
@@ -314,10 +316,13 @@ export async function catalogAddCategory(supabase: SupabaseClient, tenantId: str
 }
 export async function catalogDeleteCategory(supabase: SupabaseClient, tenantId: string, slug: string, rowId: string) {
   const config = await configOrThrow(slug)
-  // Find the category's name, delete it, then delete items that referenced it.
+  // Find the category's name, delete it, then delete items that referenced it —
+  // by stable id (current) OR by name (legacy rows / grid picker value).
   const name = await categoryNameById(supabase, tenantId, config, rowId)
+  const catCol = config.map.item.category
   await supabase.from('lead_rows').delete().eq('id', rowId).eq('tenant_id', tenantId).eq('table_id', config.categoriesTableId)
-  if (name) await supabase.from('lead_rows').delete().eq('tenant_id', tenantId).eq('table_id', config.itemsTableId).eq(`data->>${config.map.item.category}`, name)
+  await supabase.from('lead_rows').delete().eq('tenant_id', tenantId).eq('table_id', config.itemsTableId).eq(`data->>${catCol}`, rowId)
+  if (name) await supabase.from('lead_rows').delete().eq('tenant_id', tenantId).eq('table_id', config.itemsTableId).eq(`data->>${catCol}`, name)
   await materializeCatalog(supabase, tenantId, slug)
 }
 
