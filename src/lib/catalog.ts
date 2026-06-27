@@ -47,9 +47,16 @@ const ITEM_COLS = [
   { name: 'Veg', key: 'veg', type: 'boolean' },
   { name: 'Sold out', key: 'sold_out', type: 'boolean' },
   { name: 'Image URL', key: 'image_url', type: 'url' },
-  { name: 'Category', key: 'category', type: 'text' },
+  { name: 'Category', key: 'category', type: 'lookup' }, // → Categories table (options set at provision)
   { name: 'Add-ons (JSON)', key: 'addons', type: 'textarea' },
 ]
+// The Category column is a LOOKUP into the Categories table — a validated picker
+// (the Tables feature's relationship primitive), not freetext. options = [tableId,
+// columnKey] per the lead_columns lookup contract. Stores the category name value,
+// so composeMenu's name-grouping is unchanged + back-compatible.
+function buildItemCols(categoriesTableId: string) {
+  return ITEM_COLS.map(c => c.key === 'category' ? { ...c, type: 'lookup', options: [categoriesTableId, 'name'] } : c)
+}
 // Orders table — a mirror of the live orders (storefront-api stays authoritative
 // for the customer flow; this gives the operator a queryable/automatable copy and
 // lets order rows drive workflows). Fixed column keys (both sides controlled).
@@ -377,7 +384,8 @@ export async function provisionCatalog(supabase: SupabaseClient, tenantId: strin
   // Snapshot the current (file-store) menu to seed the tables.
   const menu = await sf('GET', '/admin/menu', slug) as { categories: any[]; items: any[] }
   const categoriesTableId = await createTable(supabase, tenantId, userId, 'Menu Categories', CATEGORY_COLS)
-  const itemsTableId = await createTable(supabase, tenantId, userId, 'Menu Items', ITEM_COLS)
+  // Items.category is a lookup INTO the just-created Categories table (validated picker).
+  const itemsTableId = await createTable(supabase, tenantId, userId, 'Menu Items', buildItemCols(categoriesTableId))
   const ordersTableId = await createTable(supabase, tenantId, userId, 'Orders', ORDER_COLS)
   const cartsTableId = await createTable(supabase, tenantId, userId, 'Carts', CART_COLS)
 
