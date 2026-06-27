@@ -132,6 +132,7 @@ const D2C_ITEM_COLS = [
   { name: 'SKU', key: 'sku', type: 'text' },
   { name: 'Stock', key: 'stock', type: 'number' },
   { name: 'Image URL', key: 'image_url', type: 'url' },
+  { name: 'Gallery (extra image URLs)', key: 'gallery', type: 'textarea' }, // newline/comma-separated
   { name: 'Collection', key: 'category', type: 'lookup' }, // → Collections table
   { name: 'Variants (JSON)', key: 'variants', type: 'textarea' },
   { name: 'Status', key: 'status', type: 'select', options: ['active', 'draft', 'archived'] },
@@ -143,7 +144,7 @@ const D2C_MAP: CatalogConfig['map'] = {
   category: { name: 'name' },
   item: {
     name: 'name', description: 'description', price: 'price', compareAt: 'compare_at', sku: 'sku',
-    stock: 'stock', image: 'image_url', category: 'category', variants: 'variants', status: 'status',
+    stock: 'stock', image: 'image_url', gallery: 'gallery', category: 'category', variants: 'variants', status: 'status',
   },
 }
 
@@ -222,6 +223,12 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
       stock,
       categoryId,
       imageUrl: d[im.image] || null,
+      // Full image list (primary first, then gallery), deduped — drives the PDP carousel.
+      imageUrls: (() => {
+        const primary = String(d[im.image] || '').trim()
+        const extra = (im as any).gallery ? String(d[(im as any).gallery] || '').split(/[\n,]+/).map(s => s.trim()).filter(Boolean) : []
+        return [primary, ...extra].filter((u, i, a) => u && a.indexOf(u) === i)
+      })(),
       options,
     }
   }).filter((it): it is NonNullable<typeof it> => !!it && !!it.name && !!it.categoryId)
@@ -406,7 +413,7 @@ export interface CatalogDish {
   name: string; description?: string; priceInr?: number; coins?: number
   veg?: boolean; soldOut?: boolean; rewardEligible?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
   // D2C product fields (written only when the vertical's map defines the role).
-  compareAtPrice?: number | null; sku?: string | null; stock?: number | null; status?: string
+  compareAtPrice?: number | null; sku?: string | null; stock?: number | null; status?: string; gallery?: string[]
 }
 // Maps an editor payload onto a row, writing ONLY the roles this vertical's map
 // defines — so the same form/save path serves a HoReCa dish and a D2C product.
@@ -423,6 +430,7 @@ function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string,
   set(im.soldOut, String(!!dish.soldOut))
   set(im.rewardEligible, String(dish.rewardEligible !== false))
   set(im.image, String(dish.imageUrl || ''))
+  set(im.gallery, Array.isArray(dish.gallery) ? dish.gallery.filter(Boolean).join('\n') : '') // D2C: extra images
   set(im.category, String(dish.categoryId || '')) // stable category ROW ID (the relationship)
   set(im.addons, opts)        // HoReCa: add-on groups
   set(im.variants, opts)      // D2C: variant groups (same option-group shape)
