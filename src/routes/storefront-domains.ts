@@ -30,6 +30,22 @@ const vercelConfigured = !!(VTOKEN && VTEAM)
 // and we attach the secret + the active tenant's slug server-side.
 const SF_API = process.env.STOREFRONT_API_URL || 'http://localhost:5181'
 const SF_SECRET = process.env.STOREFRONT_ADMIN_SECRET || 'dev-admin'
+// Fail closed: never run in prod with the dev-default shared secret.
+if (process.env.NODE_ENV === 'production' && (!process.env.STOREFRONT_ADMIN_SECRET || SF_SECRET === 'dev-admin')) {
+  throw new Error('[security] STOREFRONT_ADMIN_SECRET must be set to a strong value in production')
+}
+
+// Sliding-window guard on OUTBOUND OTP delivery, independent of the upstream
+// caller — a leaked secret or a retry loop can't drive unbounded paid WhatsApp
+// sends. Caps: 3 per phone / 10 min, and 200 per tenant / day.
+const otpHits = new Map<string, number[]>()
+function otpRateOk(key: string, max: number, windowMs: number): boolean {
+  const now = Date.now()
+  const arr = (otpHits.get(key) || []).filter(t => now - t < windowMs)
+  if (arr.length >= max) { otpHits.set(key, arr); return false }
+  arr.push(now); otpHits.set(key, arr)
+  return true
+}
 
 async function vercel(method: string, path: string, body?: unknown): Promise<{ ok: boolean; status: number; json: any }> {
   const sep = path.includes('?') ? '&' : '?'
@@ -62,6 +78,10 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, phone, code } = (req.body || {}) as { slug?: string; phone?: string; code?: string }
     if (!slug || !phone || !code) return res.status(400).json({ ok: false, error: 'slug, phone, code required' })
+    const ph = String(phone).replace(/\D/g, '').slice(-10)
+    if (!otpRateOk(`otp-ph:${ph}`, 3, 10 * 60_000) || !otpRateOk(`otp-tenant:${String(slug)}`, 200, 24 * 60 * 60_000)) {
+      return res.status(429).json({ ok: false, error: 'rate_limited' })
+    }
     try {
       const out = await sendStorefrontOtp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
       res.json({ ok: true, via: out.via })
