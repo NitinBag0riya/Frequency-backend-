@@ -15,6 +15,7 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
+import { sendMsg91Otp, sendMsg91Sms } from '../lib/storefront-msg91.js'
 import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -82,9 +83,40 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     if (!otpRateOk(`otp-ph:${ph}`, 3, 10 * 60_000) || !otpRateOk(`otp-tenant:${String(slug)}`, 200, 24 * 60 * 60_000)) {
       return res.status(429).json({ ok: false, error: 'rate_limited' })
     }
+    // Channel order: MSG91 SMS is the primary OTP gateway (tenant's own key →
+    // Frequency platform key). If it's not configured or fails, fall back to the
+    // WhatsApp authentication template; if BOTH fail, storefront-api shows the
+    // on-screen demo code so login never breaks.
     try {
-      const out = await sendStorefrontOtp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
-      res.json({ ok: true, via: out.via })
+      const m = await sendMsg91Otp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
+      return res.json({ ok: true, channel: 'sms', via: m.via })
+    } catch (smsErr: any) {
+      try {
+        const out = await sendStorefrontOtp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
+        return res.json({ ok: true, channel: 'whatsapp', via: out.via })
+      } catch (waErr: any) {
+        console.warn(`[send-otp] sms+wa both failed: sms="${smsErr?.message}" wa="${waErr?.message}"`)
+        return res.status(502).json({ ok: false, error: smsErr?.message || waErr?.message || 'send failed' })
+      }
+    }
+  })
+
+  // Server-to-server: storefront-api asks us to deliver a transactional order-update
+  // SMS over MSG91 (tenant key → Frequency platform key). storefront-api only calls
+  // this when the customer has NOT opted into web/native push — SMS is the fallback
+  // channel. `vars` are the DLT template's variables (e.g. var1=order#, var2=status).
+  r.post('/api/storefront/send-sms', async (req, res) => {
+    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    const { slug, phone, vars, templateId } = (req.body || {}) as { slug?: string; phone?: string; vars?: Record<string, string>; templateId?: string }
+    if (!slug || !phone) return res.status(400).json({ ok: false, error: 'slug and phone required' })
+    const ph = String(phone).replace(/\D/g, '').slice(-10)
+    // Coarser cap than OTP — transactional, but still guard against loops/abuse.
+    if (!otpRateOk(`sms-ph:${ph}`, 6, 10 * 60_000) || !otpRateOk(`sms-tenant:${String(slug)}`, 500, 24 * 60 * 60_000)) {
+      return res.status(429).json({ ok: false, error: 'rate_limited' })
+    }
+    try {
+      const m = await sendMsg91Sms(supabase, { slug: String(slug), phone: String(phone), vars: vars || {}, templateId })
+      res.json({ ok: true, via: m.via })
     } catch (e: any) {
       res.status(502).json({ ok: false, error: e?.message || 'send failed' })
     }
