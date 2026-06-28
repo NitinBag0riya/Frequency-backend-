@@ -156,6 +156,9 @@ const VERTICALS: Record<string, VerticalTemplate> = {
 }
 function templateFor(businessType?: string): VerticalTemplate {
   const k = String(businessType || '').toLowerCase()
+  // Salon/spa/services are catalog businesses — a "service" is an item with a price,
+  // so reuse the D2C product-style tables for Tables-backed editing.
+  if (k === 'salon' || k === 'spa' || k === 'services' || k === 'wellness') return VERTICALS.d2c
   return (k === 'd2c' || k === 'ecommerce' || k === 'retail') ? VERTICALS.d2c : VERTICALS.horeca
 }
 
