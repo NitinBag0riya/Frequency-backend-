@@ -239,9 +239,24 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
 }
 
 // ── status: is this tenant's menu backed by Tables yet? ─────────────────────────
+// Short-TTL cache: getCatalogConfig is hit on EVERY storefront sync (order/cart/
+// customer/outlet/stock-decrement/materialize) and each call was a cross-service HTTP
+// GET to storefront-api — so one order fanned out 3-4 redundant round-trips. The config
+// (the categories/items table ids) only changes at provision/reconfigure, which
+// invalidates the entry explicitly, so a 30s TTL is safe.
+const _cfgCache = new Map<string, { exp: number; v: CatalogConfig }>()
+const CFG_TTL_MS = 30_000
+export function invalidateCatalogConfig(slug: string): void { _cfgCache.delete(slug) }
 export async function getCatalogConfig(slug: string): Promise<CatalogConfig | null> {
+  const hit = _cfgCache.get(slug)
+  if (hit && hit.exp > Date.now()) return hit.v
   const cfg = await sf('GET', '/admin/config', slug)
-  return (cfg && cfg.catalogConfig) || null
+  const v: CatalogConfig | null = (cfg && cfg.catalogConfig) || null
+  // Only cache a positive result — a null (not-yet-provisioned) mustn't be pinned, or a
+  // sync firing right after provision would keep seeing "no catalog" for the TTL.
+  if (v) _cfgCache.set(slug, { exp: Date.now() + CFG_TTL_MS, v })
+  else _cfgCache.delete(slug)
+  return v
 }
 
 // ── materialize: compose from rows and push the snapshot to storefront-api ───────
@@ -615,6 +630,7 @@ export async function provisionCatalog(supabase: SupabaseClient, tenantId: strin
     ordersTableId, cartsTableId, customersTableId, outletsTableId, map: tpl.map,
   }
   await sf('PATCH', '/admin/config', slug, { catalogConfig: config, catalogSource: 'tables' })
+  invalidateCatalogConfig(slug) // table ids just (re)written — don't let materialize read a stale/empty cache
   const counts = await materializeCatalog(supabase, tenantId, slug)
   return { created, config, counts: counts || { categories: 0, items: 0 } }
 }

@@ -21,7 +21,7 @@
 
 import '../env'
 import { Worker, Job } from 'bullmq'
-import { createClient } from '@supabase/supabase-js'
+import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { sheetsReadRange } from '../google'
 import { listAllRecords } from '../lib/airtable'
@@ -230,6 +230,10 @@ async function syncGoogleSheet(sub: any): Promise<{ imported: number; updated: n
   }
 
   let imported = 0, updated = 0
+  // Collect inserts/updates and flush them in batches instead of one query per row —
+  // a 1000-row sheet was 1000 sequential round-trips every sync tick.
+  const toInsert: Record<string, unknown>[] = []
+  const toUpdate: { id: string; data: Record<string, string> }[] = []
   for (const row of dataRows) {
     // Build the raw header-keyed object first. This is the shape the pinned
     // mapping operates on — same shape the user sees in the FE preview when
@@ -255,21 +259,37 @@ async function syncGoogleSheet(sub: any): Promise<{ imported: number; updated: n
       const prev = existing.data as Record<string, any>
       let changed = false
       for (const k of keys) if (String(prev?.[k] ?? '') !== data[k]) { changed = true; break }
-      if (changed) {
-        await supabase.from('lead_rows')
-          .update({ data, updated_at: new Date().toISOString() })
-          .eq('id', existing.id)
-        updated++
-      }
+      if (changed) toUpdate.push({ id: existing.id, data })
     } else {
-      await supabase.from('lead_rows').insert({
-        tenant_id: sub.tenant_id,
-        user_id:   tenant.user_id,
-        table_id:  sub.lead_table_id,
-        data, status: 'new', tags: [],
-      })
-      imported++
+      toInsert.push({ tenant_id: sub.tenant_id, user_id: tenant.user_id, table_id: sub.lead_table_id, data, status: 'new', tags: [] })
     }
+  }
+  const counts = await flushRowWrites(supabase, toInsert, toUpdate)
+  imported += counts.imported; updated += counts.updated
+  return { imported, updated }
+}
+
+// Bulk-insert new rows + run updates concurrently in bounded batches (distinct ids
+// can't be one statement, but N sequential awaits → ~ceil(N/20) round-trips). Preserves
+// exact insert/update semantics of the per-row loops it replaced. Never throws.
+async function flushRowWrites(
+  supabase: SupabaseClient,
+  toInsert: Record<string, unknown>[],
+  toUpdate: { id: string; data: Record<string, unknown> }[],
+): Promise<{ imported: number; updated: number }> {
+  let imported = 0, updated = 0
+  for (let i = 0; i < toInsert.length; i += 500) {
+    const chunk = toInsert.slice(i, i + 500)
+    const { error } = await supabase.from('lead_rows').insert(chunk)
+    if (error) console.warn('[data-source-sync] bulk insert failed:', error.message)
+    else imported += chunk.length
+  }
+  const nowIso = new Date().toISOString()
+  for (let i = 0; i < toUpdate.length; i += 20) {
+    const batch = toUpdate.slice(i, i + 20)
+    const results = await Promise.all(batch.map(u =>
+      supabase.from('lead_rows').update({ data: u.data, updated_at: nowIso }).eq('id', u.id)))
+    updated += results.filter((r: { error: unknown }) => !r.error).length
   }
   return { imported, updated }
 }
@@ -330,7 +350,8 @@ async function syncAirtable(sub: any): Promise<{ imported: number; updated: numb
     if (rid) byRecordId.set(String(rid), r)
   }
 
-  let imported = 0, updated = 0
+  const toInsert: Record<string, unknown>[] = []
+  const toUpdate: { id: string; data: Record<string, string> }[] = []
   for (const rec of records) {
     // Step 1: apply the static rename map (Airtable field name → our key).
     const renamed: Record<string, string> = {}
@@ -352,23 +373,12 @@ async function syncAirtable(sub: any): Promise<{ imported: number; updated: numb
       const prev = existing.data as Record<string, any>
       let changed = false
       for (const k of Object.keys(data)) if (String(prev?.[k] ?? '') !== data[k]) { changed = true; break }
-      if (changed) {
-        await supabase.from('lead_rows')
-          .update({ data, updated_at: new Date().toISOString() })
-          .eq('id', existing.id)
-        updated++
-      }
+      if (changed) toUpdate.push({ id: existing.id, data })
     } else {
-      await supabase.from('lead_rows').insert({
-        tenant_id: sub.tenant_id,
-        user_id:   tenant.user_id,
-        table_id:  sub.lead_table_id,
-        data, status: 'new', tags: [],
-        ingest_source: 'sync',
-      })
-      imported++
+      toInsert.push({ tenant_id: sub.tenant_id, user_id: tenant.user_id, table_id: sub.lead_table_id, data, status: 'new', tags: [], ingest_source: 'sync' })
     }
   }
+  const { imported, updated } = await flushRowWrites(supabase, toInsert, toUpdate)
   return {
     imported, updated,
     warning: hitCap ? 'Sync truncated at 5000 records — only the first 5000 are mirrored each tick. Use Airtable views to filter or contact support to raise the cap.' : undefined,
@@ -400,7 +410,8 @@ async function syncLeadTable(sub: any): Promise<{ imported: number; updated: num
     if (sid) bySrc.set(String(sid), r)
   }
 
-  let imported = 0, updated = 0
+  const toInsert: Record<string, unknown>[] = []
+  const toUpdate: { id: string; data: Record<string, unknown> }[] = []
   for (const row of srcRows) {
     const raw = (row.data ?? {}) as Record<string, unknown>
     const data: Record<string, any> = pinnedMapping
@@ -411,18 +422,12 @@ async function syncLeadTable(sub: any): Promise<{ imported: number; updated: num
       const prev = existing.data as Record<string, any>
       let changed = false
       for (const k of Object.keys(data)) if (String(prev?.[k] ?? '') !== String(data[k] ?? '')) { changed = true; break }
-      if (changed) {
-        await supabase.from('lead_rows').update({ data, updated_at: new Date().toISOString() }).eq('id', existing.id)
-        updated++
-      }
+      if (changed) toUpdate.push({ id: existing.id, data })
     } else {
-      await supabase.from('lead_rows').insert({
-        tenant_id: sub.tenant_id, user_id: tenant.user_id, table_id: sub.lead_table_id,
-        data, status: 'new', tags: [], ingest_source: 'sync',
-      })
-      imported++
+      toInsert.push({ tenant_id: sub.tenant_id, user_id: tenant.user_id, table_id: sub.lead_table_id, data, status: 'new', tags: [], ingest_source: 'sync' })
     }
   }
+  const { imported, updated } = await flushRowWrites(supabase, toInsert, toUpdate)
   return { imported, updated, warning: srcRows.length >= 10000 ? 'Sync truncated at 10000 rows.' : undefined }
 }
 
