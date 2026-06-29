@@ -233,6 +233,8 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
         return [primary, ...extra].filter((u, i, a) => u && a.indexOf(u) === i)
       })(),
       options,
+      // Per-location availability (empty = every outlet) — read from the data blob.
+      availableOutlets: parseOutletIds(d[AVAILABLE_OUTLETS_KEY]),
     }
   }).filter((it): it is NonNullable<typeof it> => !!it && !!it.name && !!it.categoryId)
   return { categories, items }
@@ -432,6 +434,18 @@ export interface CatalogDish {
   veg?: boolean; soldOut?: boolean; rewardEligible?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
   // D2C product fields (written only when the vertical's map defines the role).
   compareAtPrice?: number | null; sku?: string | null; stock?: number | null; status?: string; gallery?: string[]
+  // Per-location availability: outlet ids this item is served at (empty = everywhere).
+  availableOutlets?: string[]
+}
+// Reserved data key for per-outlet availability. It's not a mapped grid column —
+// the catalog tables are jsonb-backed, so this rides along in the row's data blob
+// (set by the dish editor's "Available at" picker, read back in composeMenu) with
+// no schema migration. The grid simply ignores keys it has no column for.
+const AVAILABLE_OUTLETS_KEY = '_availableOutlets'
+const parseOutletIds = (v: unknown): string[] => {
+  if (Array.isArray(v)) return v.map(String)
+  if (typeof v === 'string' && v.trim()) { try { const p = JSON.parse(v); return Array.isArray(p) ? p.map(String) : [] } catch { return [] } }
+  return []
 }
 // Maps an editor payload onto a row, writing ONLY the roles this vertical's map
 // defines — so the same form/save path serves a HoReCa dish and a D2C product.
@@ -457,6 +471,10 @@ function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string,
   set(im.sku, String(dish.sku || ''))
   set(im.stock, dish.stock == null ? '' : String(Math.max(0, Math.round(Number(dish.stock)))))
   set(im.status, String(dish.status || 'active'))
+  // Per-location availability rides in the data blob (no mapped column). Written
+  // only when restricted, so unrestricted rows stay clean.
+  const outletIds = parseOutletIds(dish.availableOutlets)
+  if (outletIds.length) d[AVAILABLE_OUTLETS_KEY] = JSON.stringify(outletIds)
   return d
 }
 async function categoryNameById(supabase: SupabaseClient, tenantId: string, config: CatalogConfig, categoryId?: string): Promise<string> {
