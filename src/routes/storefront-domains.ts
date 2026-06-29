@@ -13,6 +13,7 @@
  *   VERCEL_STOREFRONT_PROJECT — project name (default "frequency-storefront")
  */
 import express from 'express'
+import crypto from 'node:crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
 import { sendMsg91Otp, sendMsg91Sms } from '../lib/storefront-msg91.js'
@@ -34,6 +35,14 @@ const SF_SECRET = process.env.STOREFRONT_ADMIN_SECRET || 'dev-admin'
 // Fail closed: never run in prod with the dev-default shared secret.
 if (process.env.NODE_ENV === 'production' && (!process.env.STOREFRONT_ADMIN_SECRET || SF_SECRET === 'dev-admin')) {
   throw new Error('[security] STOREFRONT_ADMIN_SECRET must be set to a strong value in production')
+}
+// Constant-time compare of the shared admin secret — avoids a remote timing side-channel
+// on the static STOREFRONT_ADMIN_SECRET, matching the timingSafeEqual checks used by the
+// rest of the codebase's webhook/secret verifications.
+function adminOk(req: express.Request): boolean {
+  const a = Buffer.from(req.header('X-Admin-Secret') || '', 'utf8')
+  const b = Buffer.from(SF_SECRET, 'utf8')
+  return a.length === b.length && crypto.timingSafeEqual(a, b)
 }
 
 // Sliding-window guard on OUTBOUND OTP delivery, independent of the upstream
@@ -76,7 +85,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   // (storefront-api already knows which tenant). Returns 502 on delivery failure
   // so storefront-api can fall back to its on-screen demo code.
   r.post('/api/storefront/send-otp', async (req, res) => {
-    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, phone, code } = (req.body || {}) as { slug?: string; phone?: string; code?: string }
     if (!slug || !phone || !code) return res.status(400).json({ ok: false, error: 'slug, phone, code required' })
     const ph = String(phone).replace(/\D/g, '').slice(-10)
@@ -106,7 +115,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   // this when the customer has NOT opted into web/native push — SMS is the fallback
   // channel. `vars` are the DLT template's variables (e.g. var1=order#, var2=status).
   r.post('/api/storefront/send-sms', async (req, res) => {
-    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, phone, vars, templateId } = (req.body || {}) as { slug?: string; phone?: string; vars?: Record<string, string>; templateId?: string }
     if (!slug || !phone) return res.status(400).json({ ok: false, error: 'slug and phone required' })
     const ph = String(phone).replace(/\D/g, '').slice(-10)
@@ -126,7 +135,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   // table on create/pay/status-change. Authenticated by the shared admin secret
   // (not a user session); slug comes from the body. Best-effort.
   r.post('/api/storefront/order-sync', async (req, res) => {
-    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, order } = (req.body || {}) as { slug?: string; order?: any }
     if (!slug || !order?.id) return res.status(400).json({ ok: false, error: 'slug and order.id required' })
     try {
@@ -141,7 +150,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   // Server-to-server: storefront-api decrements D2C product inventory on a new order.
   // No-op for verticals without a stock column. Shared admin secret; best-effort.
   r.post('/api/storefront/inventory-decrement', async (req, res) => {
-    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, lines, restock } = (req.body || {}) as { slug?: string; lines?: Array<{ itemId?: string; qty?: number }>; restock?: boolean }
     if (!slug || !Array.isArray(lines)) return res.status(400).json({ ok: false, error: 'slug and lines[] required' })
     try {
@@ -156,7 +165,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   // Server-to-server: storefront-api mirrors an in-progress/abandoned cart into the
   // tenant's Carts table (status open | converted). Shared admin secret; best-effort.
   r.post('/api/storefront/cart-sync', async (req, res) => {
-    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, cart } = (req.body || {}) as { slug?: string; cart?: any }
     if (!slug || !cart?.guestKey) return res.status(400).json({ ok: false, error: 'slug and cart.guestKey required' })
     try {
@@ -170,7 +179,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
 
   // Server-to-server: storefront-api mirrors a signed-in guest → Customers table.
   r.post('/api/storefront/customer-sync', async (req, res) => {
-    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, customer } = (req.body || {}) as { slug?: string; customer?: any }
     if (!slug || !(customer?.key)) return res.status(400).json({ ok: false, error: 'slug and customer.key required' })
     try {
@@ -184,7 +193,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
 
   // Server-to-server: storefront-api mirrors an outlet → Outlets table.
   r.post('/api/storefront/outlet-sync', async (req, res) => {
-    if ((req.header('X-Admin-Secret') || '') !== SF_SECRET) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, outlet } = (req.body || {}) as { slug?: string; outlet?: any }
     if (!slug || !(outlet?.id)) return res.status(400).json({ ok: false, error: 'slug and outlet.id required' })
     try {

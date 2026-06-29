@@ -2242,20 +2242,32 @@ app.get('/api/tenants/:id/members', requireAuth, identifyTenant, async (req, res
 
 app.post('/api/onboarding', requireAuth, async (req, res) => {
   const user = (req as any).user
-  const { business_name, full_name, phone } = req.body ?? {}
+  const { business_name: _bn, full_name: _fn, phone: _ph } = req.body ?? {}
 
   // Defensive validation — caller must supply business_name + full_name.
   // Previously this handler would crash deep in the slugify / upsert path
   // when called with an empty body (smoke harness exposed it as a 500
   // panic on POST /api/onboarding with body=`{}`).
-  if (typeof business_name !== 'string' || business_name.trim().length === 0) {
+  if (typeof _bn !== 'string' || _bn.trim().length === 0) {
     res.status(400).json({ error: 'business_name is required' })
     return
   }
-  if (typeof full_name !== 'string' || full_name.trim().length === 0) {
+  if (typeof _fn !== 'string' || _fn.trim().length === 0) {
     res.status(400).json({ error: 'full_name is required' })
     return
   }
+  // Bound + sanitize before persisting: these are user-controlled and flow into the
+  // tenant row, the generated slug, and profiles, and are rendered raw across team /
+  // audit UIs. Phone is normalised to digits (10–15) or null, so wa_number never stores
+  // unvalidated junk (it was previously written through verbatim).
+  const CTRL = new RegExp('[\\u0000-\\u001F\\u007F]', 'g')
+  const clean = (s: string, max: number) => s.replace(CTRL, '').trim().slice(0, max)
+  const business_name = clean(_bn, 120)
+  const full_name = clean(_fn, 80)
+  const _digits = typeof _ph === 'string' ? _ph.replace(/[^\d+]/g, '').slice(0, 16) : ''
+  const phone = /^\+?\d{10,15}$/.test(_digits) ? _digits : null
+  if (!business_name) { res.status(400).json({ error: 'business_name is required' }); return }
+  if (!full_name) { res.status(400).json({ error: 'full_name is required' }); return }
 
   // Update Profile
   await supabase.from('profiles').update({
