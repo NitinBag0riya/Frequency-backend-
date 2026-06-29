@@ -297,7 +297,7 @@ export function createShopifyOAuthRouter(deps: Deps): express.Router {
     res.status(200).type('html').send(`<!doctype html><html><body><script>
       try {
         if (window.opener) {
-          window.opener.postMessage({ type: 'shopify_oauth_result', ok: true, label: ${JSON.stringify(shopName ?? shop)} }, '*');
+          window.opener.postMessage({ type: 'shopify_oauth_result', ok: true, label: ${JSON.stringify(shopName ?? shop).replace(/</g, '\\u003c')} }, '*');
         }
       } catch (e) {}
       document.title = 'Shopify connected';

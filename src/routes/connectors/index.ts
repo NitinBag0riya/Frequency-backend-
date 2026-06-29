@@ -1562,7 +1562,7 @@ export function createConnectorsRouter(deps: Deps): express.Router {
             <h2>⚠ Google OAuth not configured</h2>
             <p style="opacity:.6">This window will close…</p>
             <script>
-              try { window.opener?.postMessage({ ok: false, message: ${JSON.stringify(message)} }, ${JSON.stringify(FRONTEND_ORIGIN)}) } catch(e){}
+              try { window.opener?.postMessage({ ok: false, message: ${JSON.stringify(message).replace(/</g, '\\u003c')} }, ${JSON.stringify(FRONTEND_ORIGIN)}) } catch(e){}
               setTimeout(() => { try { window.close(); } catch(e){} }, 1500);
             </script></body></html>`)
           return

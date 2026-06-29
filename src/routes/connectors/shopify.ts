@@ -330,11 +330,11 @@ function closePopupHtml(payload: { ok: boolean; connector?: string; error?: stri
 <style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;padding:32px;max-width:420px;margin:48px auto;text-align:center;color:#1a1a1a}h2{font-size:18px;margin:8px 0}.icon{font-size:42px;margin-bottom:8px}.muted{color:#6b7280;font-size:13px;margin-top:16px}</style>
 </head><body>
 <div class="icon">${payload.ok ? '✅' : '⚠️'}</div>
-<h2>${payload.ok ? `Connected to ${payload.connector ?? 'app'}` : 'Couldn\'t connect'}</h2>
-<p>${payload.ok ? (payload.label ?? '') : escapeHtml(payload.error ?? 'Unknown error')}</p>
+<h2>${payload.ok ? `Connected to ${escapeHtml(payload.connector ?? 'app')}` : 'Couldn\'t connect'}</h2>
+<p>${payload.ok ? escapeHtml(payload.label ?? '') : escapeHtml(payload.error ?? 'Unknown error')}</p>
 <p class="muted">${payload.ok ? 'You can close this window.' : 'You can close this window and try again.'}</p>
 <script>
-  try { window.opener?.postMessage(${JSON.stringify(payload)}, ${JSON.stringify(FRONTEND_ORIGIN)}); } catch(e){}
+  try { window.opener?.postMessage(${JSON.stringify(payload).replace(/</g, '\\u003c')}, ${JSON.stringify(FRONTEND_ORIGIN)}); } catch(e){}
   setTimeout(() => { try { window.close(); } catch(e){} }, 1200);
 </script>
 </body></html>`

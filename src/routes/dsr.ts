@@ -344,7 +344,7 @@ export function createDsrRouter(deps: Deps): express.Router {
         const [{ data: contact }, { data: msgs }, { data: cons }] = await Promise.all([
           supabase.from('contacts').select('*').eq('id', dsr.contact_id).eq('tenant_id', tenantId).maybeSingle(),
           supabase.from('messages').select('id, channel, direction, contact_phone, content, status, created_at')
-            .eq('tenant_id', tenantId).eq('contact_phone', '').or(`contact_phone.eq.${(await supabase.from('contacts').select('phone').eq('id', dsr.contact_id).maybeSingle()).data?.phone ?? ''}`),
+            .eq('tenant_id', tenantId).eq('contact_phone', '').or(`contact_phone.eq.${String((await supabase.from('contacts').select('phone').eq('id', dsr.contact_id).maybeSingle()).data?.phone ?? '').replace(/[,()*]/g, '')}`),
           supabase.from('consent_events').select('*').eq('contact_id', dsr.contact_id),
         ])
         const exportBlob = { contact, messages: msgs ?? [], consent_events: cons ?? [] }

@@ -227,7 +227,7 @@ function closePopupHtml(payload: { ok: boolean; connector?: string; label?: stri
 <p>${payload.ok ? escapeHtml(payload.label ?? '') : escapeHtml(payload.error ?? 'Unknown error')}</p>
 <p class="muted">${payload.ok ? 'You can close this window.' : 'You can close this window and try again.'}</p>
 <script>
-  try { window.opener?.postMessage(${JSON.stringify(payload)}, ${JSON.stringify(FRONTEND_ORIGIN)}); } catch(e){}
+  try { window.opener?.postMessage(${JSON.stringify(payload).replace(/</g, '\\u003c')}, ${JSON.stringify(FRONTEND_ORIGIN)}); } catch(e){}
   setTimeout(() => { try { window.close(); } catch(e){} }, 1200);
 </script>
 </body></html>`

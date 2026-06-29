@@ -599,7 +599,9 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
         // this contact and pass it as alternating user/assistant turns. The
         // current inbound is already the latest row (the webhook inserts it
         // before routing), so it's the final user turn.
-        const cp = String(ctx.session.contact_phone)
+        // Strip PostgREST `.or()` metacharacters — contact_phone can carry a value
+        // that originated from an unverified channel webhook (see inbound-router).
+        const cp = String(ctx.session.contact_phone).replace(/[,()*]/g, '')
         const { data: hist } = await supabase.from('messages')
           .select('direction, content, created_at')
           .eq('tenant_id', ctx.tenant.id)

@@ -37,6 +37,14 @@ import { enqueueWorkflowExecution } from '../queue'
 
 export type InboundChannel = 'whatsapp' | 'instagram' | 'telegram'
 
+// PostgREST `.or()` takes a RAW filter string that supabase-js does NOT encode, so a
+// channel identifier containing `,` `(` `)` `*` would inject extra OR predicates
+// (e.g. a Telegram `fromId` of `1,bot_paused.eq.true`). Channel ids are phone numbers
+// / numeric platform ids, so strip only those filter metacharacters before
+// interpolating — `:`/`.`/`+` are kept so synthetic `order:channel:id` ids and phone
+// `+` prefixes still match. See lib/safe-key.ts which documents this class.
+const orSafe = (v: string): string => String(v).replace(/[,()*]/g, '').slice(0, 80)
+
 export async function routeInboundToWorkflow(
   supabase: SupabaseClient,
   tenant: any,
@@ -62,7 +70,7 @@ export async function routeInboundToWorkflow(
   const { data: pausedContact } = await supabase.from('contacts')
     .select('bot_paused')
     .eq('tenant_id', tenant.id)
-    .or(`phone.eq.+${contactId},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
+    .or(`phone.eq.+${orSafe(contactId)},phone.eq.${orSafe(contactId)},telegram_id.eq.${orSafe(contactId)},instagram_id.eq.${orSafe(contactId)}`)
     .limit(1)
     .maybeSingle()
   if (pausedContact?.bot_paused) return
@@ -115,7 +123,7 @@ export async function routeFlowSubmission(
   const { data: pausedContact } = await supabase.from('contacts')
     .select('bot_paused')
     .eq('tenant_id', tenant.id)
-    .or(`phone.eq.+${contactId},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
+    .or(`phone.eq.+${orSafe(contactId)},phone.eq.${orSafe(contactId)},telegram_id.eq.${orSafe(contactId)},instagram_id.eq.${orSafe(contactId)}`)
     .limit(1).maybeSingle()
   if (pausedContact?.bot_paused) return { resumed: false, triggered: false }
 
@@ -127,7 +135,7 @@ export async function routeFlowSubmission(
   const { data: session } = await supabase.from('workflow_sessions')
     .select('id, current_node_id')
     .eq('tenant_id', tenant.id).eq('channel', channel)
-    .or(`contact_phone.eq.+${contactId},contact_phone.eq.${contactId}`)
+    .or(`contact_phone.eq.+${orSafe(contactId)},contact_phone.eq.${orSafe(contactId)}`)
     .eq('status', 'active')
     .order('started_at', { ascending: false }).limit(1).maybeSingle()
   if (session) {
@@ -213,7 +221,7 @@ async function notifyMobileAgents(
     const { data: contactRow } = await supabase.from('contacts')
       .select('name, phone')
       .eq('tenant_id', tenant.id)
-      .or(`phone.eq.+${contactId},phone.eq.${contactId},telegram_id.eq.${contactId},instagram_id.eq.${contactId}`)
+      .or(`phone.eq.+${orSafe(contactId)},phone.eq.${orSafe(contactId)},telegram_id.eq.${orSafe(contactId)},instagram_id.eq.${orSafe(contactId)}`)
       .limit(1)
       .maybeSingle()
     if (contactRow?.name) displayName = contactRow.name
