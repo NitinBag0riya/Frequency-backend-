@@ -477,11 +477,18 @@ export function createTelegramRouter(deps: Deps): express.Router {
           res.status(401).json({ error: 'invalid_secret' }); return
         }
       } else {
-        console.warn(`[telegram-webhook] no webhook_secret stored tenant=${tenantId} — accepting unverified (run /api/telegram/bot/webhook to enable)`)
+        // Fail closed: the bot row exists but has no secret, so this delivery
+        // can't be proven to come from Telegram (the webhook URL + tenant_id are
+        // guessable, so an attacker could POST forged updates to drive workflows
+        // or impersonate a contact). Reject and tell the operator to re-register
+        // the webhook (POST /api/telegram/bot/webhook), which sets the secret.
+        console.warn(`[telegram-webhook] no webhook_secret stored tenant=${tenantId} — rejecting (re-register via /api/telegram/bot/webhook to enable)`)
+        res.status(401).json({ error: 'webhook_not_secured' }); return
       }
     } catch (e: any) {
-      // Column missing on tg_bots — accept this delivery but warn so the
-      // operator knows to apply the migration.
+      // Could not READ the secret (e.g. tg_bots.webhook_secret column not yet
+      // migrated). This is an all-tenants infra state, not a per-bot one, so we
+      // accept-with-warn rather than break every bot at once — apply the migration.
       console.warn(`[telegram-webhook] could not read webhook_secret (tenant=${tenantId}): ${e?.message}`)
     }
 
