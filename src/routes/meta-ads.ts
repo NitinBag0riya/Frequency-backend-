@@ -926,12 +926,15 @@ function closePopupHtml(message: string, ok = false): string {
   // and serialize it for <script> context with `<` neutralized so a literal
   // </script> in the value can't break out of the inline script.
   const h = (s: string) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
-  const j = (v: unknown) => JSON.stringify(v).replace(/</g, '\\u003c')
+  // Robust-by-construction: the attacker-controllable message is NEVER placed in the
+  // inline <script> source (so a literal </script> can't break out). It lives only in
+  // an HTML attribute (entity-escaped by h()), and the script reads it back as a plain
+  // string via the DOM. FRONTEND_ORIGIN is a trusted env value.
   return `<!doctype html><html><head><meta charset="utf-8"><title>${ok ? 'Connected' : 'Error'}</title></head><body style="font-family:DM Sans,system-ui;background:#0d1117;color:#fff;padding:24px;text-align:center;">
-    <h2>${ok ? '✓ Connected' : '⚠ '}${h(message)}</h2>
+    <h2 id="__t" data-m="${h(message)}">${ok ? '✓ Connected' : '⚠ '}${h(message)}</h2>
     <p style="opacity:.6">This window will close…</p>
     <script>
-      try { window.opener?.postMessage({ ok: ${ok}, message: ${j(message)} }, ${j(FRONTEND_ORIGIN)}) } catch(e){}
+      try { window.opener?.postMessage({ ok: ${ok}, message: document.getElementById('__t').getAttribute('data-m') || '' }, '${h(FRONTEND_ORIGIN)}') } catch(e){}
       setTimeout(() => { try { window.close(); } catch(e){} }, 1500);
     </script></body></html>`
 }
