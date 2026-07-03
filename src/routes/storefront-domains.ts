@@ -79,6 +79,17 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   const r = express.Router()
   const { supabase, requireAuth, identifyTenant } = deps
 
+  // Boot-time self-test: confirm the Vercel creds can actually see the storefront
+  // project. If this logs a failure, custom-domain adds will 502 — the token/team
+  // is wrong. Runs once, best-effort, never blocks startup.
+  if (vercelConfigured) {
+    vercel('GET', `/v9/projects/${VPROJECT}`)
+      .then(res => console.log(`[storefront-domains] vercel self-test: project "${VPROJECT}" → ${res.status} ${res.ok ? 'OK ✓' : 'FAIL ✗ (' + (res.json?.error?.message || 'creds/team wrong') + ')'}`))
+      .catch(e => console.warn('[storefront-domains] vercel self-test threw:', e?.message))
+  } else {
+    console.warn('[storefront-domains] VERCEL_API_TOKEN / VERCEL_TEAM_ID not set — custom domains will record only, no Vercel registration.')
+  }
+
   // Server-to-server: storefront-api asks us to deliver a login OTP over
   // WhatsApp (tenant's WABA, else Frequency fallback). Authenticated by the
   // shared admin secret — NOT a user session — and the slug comes from the body
@@ -209,37 +220,44 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     const tenantId = (req as any).tenantId
     const hostname = normalizeHostname((req.body as any)?.hostname)
     if (!isValidHostname(hostname)) { res.status(400).json({ error: 'Enter a valid domain, e.g. order.yourbrand.com' }); return }
-
-    // 1. Register on Vercel so it serves the storefront + issues TLS. 409 = the
-    //    domain is already on the project → fine (idempotent).
-    if (vercelConfigured) {
-      const add = await vercel('POST', `/v10/projects/${VPROJECT}/domains`, { name: hostname })
-      if (!add.ok && add.status !== 409) {
-        const msg = add.json?.error?.message || `Couldn't register the domain (${add.status}).`
-        // 403/forbidden often means the domain belongs to another Vercel account.
-        res.status(502).json({ error: msg }); return
+    try {
+      // 1. Register on Vercel so it serves the storefront + issues TLS. 409 = the
+      //    domain is already on the project → fine (idempotent).
+      if (vercelConfigured) {
+        const add = await vercel('POST', `/v10/projects/${VPROJECT}/domains`, { name: hostname })
+        if (!add.ok && add.status !== 409) {
+          const msg = add.json?.error?.message || `Couldn't register the domain (${add.status}).`
+          console.warn(`[storefront-domains] vercel add "${hostname}" → ${add.status}: ${msg}`)
+          // 403/forbidden often means the domain belongs to another Vercel account.
+          res.status(502).json({ error: msg }); return
+        }
       }
-    }
 
-    // 2. Record against the tenant. Unique on hostname → a domain can belong to
-    //    exactly one storefront.
-    const verification_token = `freq-verify-${Math.random().toString(36).slice(2, 10)}`
-    const { data, error } = await supabase.from('tenant_domains')
-      .insert({ tenant_id: tenantId, hostname, kind: 'custom', verification_token })
-      .select('*').single()
-    if (error) {
-      const dup = (error as any).code === '23505'
-      res.status(dup ? 409 : 500).json({ error: dup ? 'That domain is already connected.' : error.message })
-      return
-    }
+      // 2. Record against the tenant. Unique on hostname → a domain can belong to
+      //    exactly one storefront.
+      const verification_token = `freq-verify-${Math.random().toString(36).slice(2, 10)}`
+      const { data, error } = await supabase.from('tenant_domains')
+        .insert({ tenant_id: tenantId, hostname, kind: 'custom', verification_token })
+        .select('*').single()
+      if (error) {
+        const dup = (error as any).code === '23505'
+        console.warn(`[storefront-domains] insert "${hostname}" tenant=${tenantId} → ${(error as any).code}: ${error.message}`)
+        res.status(dup ? 409 : 500).json({ error: dup ? 'That domain is already connected.' : error.message })
+        return
+      }
 
-    // 3. Ask Vercel what DNS records are required (so the UI can show the exact ones).
-    let dns: any = null
-    if (vercelConfigured) {
-      const cfg = await vercel('GET', `/v9/projects/${VPROJECT}/domains/${encodeURIComponent(hostname)}/config`)
-      if (cfg.ok) dns = cfg.json
+      // 3. Ask Vercel what DNS records are required (so the UI can show the exact ones).
+      let dns: any = null
+      if (vercelConfigured) {
+        const cfg = await vercel('GET', `/v9/projects/${VPROJECT}/domains/${encodeURIComponent(hostname)}/config`)
+        if (cfg.ok) dns = cfg.json
+      }
+      console.log(`[storefront-domains] connected "${hostname}" → tenant ${tenantId}`)
+      res.json({ domain: data, dns })
+    } catch (e: any) {
+      console.error(`[storefront-domains] add "${hostname}" threw:`, e?.message, e?.stack?.split('\n')[1]?.trim())
+      res.status(500).json({ error: e?.message || 'Could not connect the domain. Please try again.' })
     }
-    res.json({ domain: data, dns })
   })
 
   r.delete('/api/storefront/domains/:id', requireAuth, identifyTenant, async (req, res) => {
