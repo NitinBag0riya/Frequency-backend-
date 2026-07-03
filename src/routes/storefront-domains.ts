@@ -291,7 +291,9 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       const ownershipOk = dom.ok && dom.json?.verified === true
       const dnsOk = cfg.ok && cfg.json?.misconfigured === false
       const verified = ownershipOk && dnsOk
-      const ssl_status = verified ? 'active' : 'pending'
+      // ssl_status is CHECK-constrained to 'pending' | 'issued' (+ error states) —
+      // NOT 'active'. Vercel auto-issues the cert once DNS verifies.
+      const ssl_status = verified ? 'issued' : 'pending'
 
       const { data: updated, error } = await supabase.from('tenant_domains')
         .update({ verified, ssl_status }).eq('id', row.id).eq('tenant_id', tenantId).select('*').single()
