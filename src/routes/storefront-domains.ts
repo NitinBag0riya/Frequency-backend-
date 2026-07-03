@@ -272,6 +272,38 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     res.json({ ok: true })
   })
 
+  // Re-poll Vercel for a pending domain's DNS/verification state and persist it.
+  // The UI calls this from a "Recheck status" button — there is no background poller.
+  r.post('/api/storefront/domains/:id/recheck', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    try {
+      const { data: row } = await supabase.from('tenant_domains')
+        .select('*').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+      if (!row) { res.status(404).json({ error: 'Domain not found' }); return }
+      if (!vercelConfigured) { res.json({ domain: row, dns: null, misconfigured: null }); return }
+
+      const hostname = row.hostname as string
+      // verified = Vercel confirms ownership AND the DNS records are correctly set.
+      const [dom, cfg] = await Promise.all([
+        vercel('GET', `/v9/projects/${VPROJECT}/domains/${encodeURIComponent(hostname)}`),
+        vercel('GET', `/v6/domains/${encodeURIComponent(hostname)}/config`),
+      ])
+      const ownershipOk = dom.ok && dom.json?.verified === true
+      const dnsOk = cfg.ok && cfg.json?.misconfigured === false
+      const verified = ownershipOk && dnsOk
+      const ssl_status = verified ? 'active' : 'pending'
+
+      const { data: updated, error } = await supabase.from('tenant_domains')
+        .update({ verified, ssl_status }).eq('id', row.id).eq('tenant_id', tenantId).select('*').single()
+      if (error) { res.status(500).json({ error: error.message }); return }
+      console.log(`[storefront-domains] recheck "${hostname}" → verified=${verified} dnsOk=${dnsOk} ownershipOk=${ownershipOk}`)
+      res.json({ domain: updated, dns: cfg.ok ? cfg.json : null, misconfigured: cfg.json?.misconfigured ?? null })
+    } catch (e: any) {
+      console.error(`[storefront-domains] recheck threw:`, e?.message)
+      res.status(500).json({ error: e?.message || 'Could not check the domain status.' })
+    }
+  })
+
   // ── catalog: back the menu with the Database→Tables feature ──────────────────
   // Resolve the active workspace's slug, then provision/sync the tenant's catalog
   // tables. The dashboard never holds the admin secret — same trust model as the
