@@ -26,6 +26,8 @@ import { createTestConnectionRouter } from './routes/connectors/test-connection'
 import { createBillingRouter }     from './routes/billing'
 import { createCtwaAnalyticsRouter } from './routes/ctwa-analytics'
 import { createWaitlistRouter }    from './routes/waitlist'
+import { createInvitationsRouter, buildInviteEmail } from './routes/invitations'
+import { sendEmail } from './lib/email'
 import { createPublicStatusRouter } from './routes/public-status'
 import { createWaFeaturesRouter }  from './routes/wa-features'
 import { createWaTemplatesRouter } from './routes/wa-templates'
@@ -36,6 +38,7 @@ import { createSuperAdminRouter }  from './routes/super-admin'
 import { createTeamsRouter }       from './routes/teams'
 import { createTenantAuditRouter } from './routes/tenant-audit'
 import { createNotificationsRouter } from './routes/notifications'
+import { createAssetsRouter } from './routes/assets'
 import { createFormsRouter } from './routes/forms'
 import { createSitesRouter } from './routes/sites'
 import { createDevicesRouter }       from './routes/devices'
@@ -793,6 +796,38 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
       next()
       return
     }
+    // 4. Agency access — the caller may be a member of an agency that MANAGES
+    //    this tenant as a sub-account. Agency owners/admins/operators are not
+    //    necessarily direct team members of the sub-account, so without this
+    //    the "switch into sub-account" flow 403s on every tenant-scoped
+    //    endpoint (audit: critical). Only grant for an ACCEPTED membership and
+    //    a LIVE (not removed) sub-account link. checkPermission then decides the
+    //    action level from the agency role (operators are read-only).
+    const { data: memberships } = await supabase
+      .from('agency_members')
+      .select('agency_id, role')
+      .eq('user_id', user.id)
+      .not('accepted_at', 'is', null)
+    const agencyIds = (memberships ?? []).map((m: any) => m.agency_id)
+    if (agencyIds.length) {
+      const { data: subLink } = await supabase
+        .from('agency_sub_accounts')
+        .select('agency_id')
+        .eq('tenant_id', headerTenantId)
+        .is('removed_at', null)
+        .in('agency_id', agencyIds)
+        .maybeSingle()
+      if (subLink) {
+        const agencyRole = (memberships as any[]).find(m => m.agency_id === (subLink as any).agency_id)?.role || 'agency_operator'
+        logger.debug(`[identifyTenant] resolved via agency membership: tenant=${headerTenantId}, agencyRole=${agencyRole}`)
+        ;(req as any).tenantId = headerTenantId
+        ;(req as any).userRole = agencyRole
+        ;(req as any).agencyAccess = { role: agencyRole, agencyId: (subLink as any).agency_id }
+        next()
+        return
+      }
+    }
+
     // SECURITY: caller sent an X-Tenant-ID header they have NO access to.
     // The previous behavior was to silently fall through and resolve to the
     // caller's own tenant — which (a) lies to clients about which tenant
@@ -968,6 +1003,21 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete' | s
       // (Quota check for metered features happens at write-points where the
       // metric is known — handled by the workers, not this generic middleware.)
       ;(req as any).userPlan = sub.plan_id
+    }
+
+    // 5b. Agency-context access. The caller reached this sub-account tenant via
+    //     agency membership (identifyTenant set agencyAccess), NOT a direct
+    //     team-member role — so the role-matrix / legacy paths below would
+    //     wrongly 403 them. Agency owners/admins manage the sub-account (all
+    //     actions); operators are read-only. The tenant lifecycle + entitlement
+    //     + plan gates above already applied to this sub-account.
+    const agencyAccess = (req as any).agencyAccess
+    if (agencyAccess) {
+      ;(req as any).userRoleKey = agencyAccess.role
+      const canManage = agencyAccess.role === 'agency_owner' || agencyAccess.role === 'agency_admin'
+      if (action === 'view' || canManage) { next(); return }
+      apiError(res, 403, 'agency_read_only', 'Agency operators have read-only access to this sub-account.')
+      return
     }
 
     // 6. Role permission matrix — new RBAC path
@@ -2242,7 +2292,7 @@ app.get('/api/tenants/:id/members', requireAuth, identifyTenant, async (req, res
 
 app.post('/api/onboarding', requireAuth, async (req, res) => {
   const user = (req as any).user
-  const { business_name: _bn, full_name: _fn, phone: _ph } = req.body ?? {}
+  const { business_name: _bn, full_name: _fn, phone: _ph, business_type: _bt } = req.body ?? {}
 
   // Defensive validation — caller must supply business_name + full_name.
   // Previously this handler would crash deep in the slugify / upsert path
@@ -2269,28 +2319,75 @@ app.post('/api/onboarding', requireAuth, async (req, res) => {
   if (!business_name) { res.status(400).json({ error: 'business_name is required' }); return }
   if (!full_name) { res.status(400).json({ error: 'full_name is required' }); return }
 
-  // Update Profile
-  await supabase.from('profiles').update({
-    full_name,
-    wa_number: phone
-  }).eq('id', user.id)
+  // Reliably BURN the invite code server-side. The client also calls
+  // consume_invitation_code after signUp, but that call is best-effort and its
+  // failure is swallowed (AuthPage) — so a dropped client consume leaves the code
+  // reusable (audit: high). Here (authenticated, service-role) we consume it again
+  // at workspace creation; the RPC is atomic + idempotent (returns null if already
+  // used), so double-consume is safe and the code is guaranteed retired once a
+  // workspace exists. No hard reject — Google-OAuth / grandfathered users have no
+  // code in metadata and must still be able to onboard.
+  const inviteCode = (user?.user_metadata?.invite_code || '').toString().trim()
+  if (inviteCode && user?.email) {
+    try {
+      await supabase.rpc('consume_invitation_code', {
+        p_code: inviteCode.toUpperCase(),
+        p_email: String(user.email).toLowerCase(),
+        p_user_id: user.id,
+      })
+    } catch (e: any) {
+      console.warn('[onboarding] invite consume (server, non-fatal) failed:', e?.message)
+    }
+  }
 
-  // Generate the workspace slug from business_name BEFORE the tenant insert.
-  // The DB has a UNIQUE constraint + reserved-word CHECK on slug; this util
-  // (lib/slug.ts) handles slugify + collision suffix + reserved-word fallback
-  // so the insert always succeeds with a clean slug. The user_id is used as
-  // the fallback seed for the unlikely case where business_name slugifies to
-  // empty (all non-Latin characters).
-  const { ensureUniqueSlug } = await import('./lib/slug')
-  const slug = await ensureUniqueSlug(supabase, business_name ?? '', user.id)
+  // Business type drives the WHOLE vertical experience (storefront pack, loyalty,
+  // catalog copy, feature gating). It used to be set by a SEPARATE, best-effort
+  // client call AFTER onboarding (setBusinessType) — so a dropped/blocked request
+  // left the workspace with business_type=null and every downstream gate reading
+  // the wrong vertical. Fold it in here so it's persisted atomically with the
+  // tenant. Validate against the known verticals; anything unrecognised is
+  // ignored (leaves the column default) rather than writing junk.
+  const VALID_BTYPES = new Set([
+    'horeca', 'real_estate', 'd2c', 'ecommerce', 'salon', 'spa', 'wellness',
+    'restaurant', 'cafe', 'hotel', 'retail', 'services', 'other',
+  ])
+  const business_type = typeof _bt === 'string' && VALID_BTYPES.has(_bt) ? _bt : null
 
-  // Create/Update Tenant
-  const { data: tenant, error } = await supabase.from('tenants').upsert({
-    user_id: user.id,
-    business_name,
-    slug,
-    status: 'active'
-  }).select().single()
+  // Idempotent get-or-create. Onboarding is the FIRST-workspace step and is prone
+  // to double-submission (React strict-mode double effects, network retries, two
+  // tabs). The old code did `tenants.upsert({...})` with NO onConflict target →
+  // upsert-on-primary-key with no id supplied → a brand-new INSERT on every call
+  // → duplicate workspaces under one user on any retry/race. We now look up the
+  // user's existing active tenant and UPDATE it in place; only a genuinely new
+  // user reaches the INSERT path. The profile write is independent of the tenant
+  // read, so the two run concurrently.
+  const [ , existingRes ] = await Promise.all([
+    supabase.from('profiles').update({ full_name, wa_number: phone }).eq('id', user.id),
+    supabase.from('tenants')
+      .select('id')
+      .eq('user_id', user.id)
+      .eq('status', 'active')
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle(),
+  ])
+
+  let tenant: any, error: any
+  if (existingRes.data?.id) {
+    // Reuse the existing workspace — keep its slug stable, refresh name + type.
+    ;({ data: tenant, error } = await supabase.from('tenants')
+      .update({ business_name, ...(business_type ? { business_type } : {}) })
+      .eq('id', existingRes.data.id)
+      .select().single())
+  } else {
+    // First workspace: mint a unique slug (lib/slug.ts handles slugify +
+    // collision suffix + reserved-word fallback) then insert.
+    const { ensureUniqueSlug } = await import('./lib/slug')
+    const slug = await ensureUniqueSlug(supabase, business_name ?? '', user.id)
+    ;({ data: tenant, error } = await supabase.from('tenants')
+      .insert({ user_id: user.id, business_name, slug, status: 'active', ...(business_type ? { business_type } : {}) })
+      .select().single())
+  }
 
   if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
 
@@ -4421,8 +4518,30 @@ app.get('/api/campaigns', requireAuth, identifyTenant, checkPermission('whatsapp
 
   const { data, count, error } = await q
   if (error) { res.status(500).json({ error: error.message }); return }
+  const rows = (data ?? []) as any[]
+
+  // Real stats rollup. campaigns.stats is a static column that nothing ever
+  // updates (audit: every non-seed campaign showed all-zero KPIs forever), so
+  // compute enrolled/active/converted live from campaign_enrollments for just
+  // this page's campaigns — one batched query, aggregated in memory. `converted`
+  // maps to a completed sequence; `revenue` has NO source in the current engine
+  // (no attribution model) so it is left at 0 rather than faked.
+  if (rows.length) {
+    const ids = rows.map(c => c.id)
+    const { data: enr } = await supabase.from('campaign_enrollments')
+      .select('campaign_id, status').eq('tenant_id', tenantId).in('campaign_id', ids)
+    const agg: Record<string, { enrolled: number; active: number; converted: number; revenue: number }> = {}
+    for (const e of (enr ?? []) as any[]) {
+      const a = (agg[e.campaign_id] ||= { enrolled: 0, active: 0, converted: 0, revenue: 0 })
+      a.enrolled++
+      if (e.status === 'active') a.active++
+      else if (e.status === 'completed') a.converted++
+    }
+    for (const c of rows) c.stats = agg[c.id] ?? { enrolled: 0, active: 0, converted: 0, revenue: 0 }
+  }
+
   const total = count ?? 0
-  res.json({ data: data ?? [], total, page, pageSize, totalPages: Math.ceil(total / pageSize) })
+  res.json({ data: rows, total, page, pageSize, totalPages: Math.ceil(total / pageSize) })
 })
 
 app.post('/api/campaigns', requireAuth, identifyTenant, checkPermission('whatsapp_automation', 'edit'), validateBody(CampaignCreateSchema), async (req, res) => {
@@ -5307,6 +5426,68 @@ app.use(createPaymentWebhookRouter({ supabase, requireAuth, identifyTenant, chec
 // ── Public waitlist (apex landing page signups, no auth) ────────────────────
 // Mounted at /api/waitlist. Per-IP rate limit lives inside the router.
 app.use('/api/waitlist', createWaitlistRouter({ supabase }))
+app.use('/api/invitations', createInvitationsRouter({ supabase }))
+
+// Super-admin: (re)send an invitation code's email via Resend.
+//
+// Powers the admin Invitations page — minting a code auto-fires this once, and
+// the per-row "Resend" button re-fires it. It lives here (not in the public
+// invitations router) because it must be gated to platform users: the browser
+// can't hold the Resend key, and we don't want anyone triggering sends for
+// arbitrary code ids. The email body is the SAME builder the self-serve path
+// uses (buildInviteEmail), so admin and self-serve invites are identical.
+app.post('/api/invitations/:id/send', requireAuth, async (req, res) => {
+  const user = (req as any).user
+  if (!(await isPlatformUser(user.id))) {
+    return apiError(res, 403, 'forbidden', 'Platform Console access required.')
+  }
+
+  const { id } = req.params
+  // A manual "Resend" must always deliver; an auto-send-on-mint should dedupe a
+  // double fire (React strict-mode / double-click). The flag switches the
+  // Resend idempotency-key strategy below.
+  const isResend = req.body?.resend === true || req.query.resend === 'true'
+
+  const { data: code, error } = await supabase
+    .from('invitation_codes')
+    .select('id, code, email, status, expires_at')
+    .eq('id', id)
+    .maybeSingle()
+  if (error) {
+    console.error('[invitations:send] load failed:', error.message)
+    return apiError(res, 503, 'db_error', 'Could not load the code right now.')
+  }
+  if (!code) return apiError(res, 404, 'not_found', 'Invitation code not found.')
+  if (code.status !== 'unused') {
+    return apiError(res, 409, 'not_sendable', `This code is ${code.status} — only unused codes can be emailed.`)
+  }
+
+  const appUrl = process.env.FRONTEND_URL ?? 'https://getfrequency.app'
+  // expires_at is null for admin-minted codes → email copy omits any expiry claim.
+  const expiresDays = code.expires_at
+    ? Math.max(1, Math.ceil((new Date(code.expires_at).getTime() - Date.now()) / 86_400_000))
+    : null
+  const { subject, html, text } = buildInviteEmail(code.code, appUrl, { expiresDays })
+
+  try {
+    await sendEmail({
+      to: code.email,
+      subject,
+      html,
+      text,
+      // Auto-send dedupes on the code id (Resend dedupes 24h on this key), so a
+      // strict-mode double render doesn't double-email. A manual resend appends
+      // a timestamp so it always goes through.
+      idempotency_key: isResend ? `invite-${code.id}-${Date.now()}` : `invite-${code.id}`,
+    })
+  } catch (e: any) {
+    console.error('[invitations:send] email failed:', e?.message)
+    return apiError(res, 502, 'email_failed', e?.message ?? 'Email delivery failed. Check RESEND_API_KEY / RESEND_FROM_EMAIL.')
+  }
+
+  await supabase.from('invitation_codes').update({ sent_at: new Date().toISOString() }).eq('id', code.id)
+  return res.json({ ok: true, emailed: true })
+})
 
 // ── Public status (no auth) ──────────────────────────────────────────────────
 // Powers the public /status page. Three endpoints under /api/public/:
@@ -5407,6 +5588,7 @@ app.use(createTenantAuditRouter({ supabase, requireAuth, identifyTenant, checkPe
 
 // ── Notifications (in-app bell + preferences) ────────────────────────────────
 app.use(createNotificationsRouter({ supabase, requireAuth, identifyTenant }))
+app.use(createAssetsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createFormsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createSitesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 

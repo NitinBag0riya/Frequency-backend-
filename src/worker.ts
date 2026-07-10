@@ -42,6 +42,7 @@ import { startAgencyPayoutAggregatorWorker } from './workers/agency-payout-aggre
 // Phase 3 — SLA monitor (migration 095). Every 30s scans open
 // conversations + emits sla_breaches rows on threshold crossings.
 import { startSlaMonitorWorker } from './workers/sla-monitor'
+import { startOrderSlaWorker } from './workers/order-sla'
 // P1 #18 — Bulk contact import processor (migration 084)
 import { startContactImportProcessorWorker } from './workers/contact-import-processor'
 // P2 #20 — Voice note transcription (migration 086)
@@ -103,6 +104,10 @@ async function main() {
   // every open conversation in every tenant with sla_configs rows.
   const slam = await startSlaMonitorWorker()
 
+  // Aggregator order-SLA escalation. Every 60s, emits order.late for orders
+  // still `new` past ORDER_SLA_LATE_SECONDS (default 180s), once per order.
+  const osla = await startOrderSlaWorker()
+
   // P1 #18 — Bulk contact import processor. BullMQ-driven; one job per
   // contact_import_jobs row. Two phases: dry-run (parse + validate +
   // preview) and execute (UPSERT contacts + INSERT per-contact consent_events).
@@ -162,6 +167,8 @@ async function main() {
       vnt.close(),
       // Signed-form PDF render (Block D)
       sfp.close(),
+      // Aggregator order-SLA escalation
+      osla.close(),
     ])
     await closeQueues()
     process.exit(0)
