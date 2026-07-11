@@ -44,21 +44,9 @@
  */
 
 import '../env'
-import { Worker, Job, QueueEvents, UnrecoverableError } from 'bullmq'
+import { Worker, Job, UnrecoverableError } from 'bullmq'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
-import {
-  Q,
-  connection,
-  webhookRetryBackoff,
-  WEBHOOK_RETRY_ATTEMPTS,
-  webhookInboundQueue,
-  webhookOutboundQueue,
-  webhookInboundDeadQueue,
-  webhookOutboundDeadQueue,
-  WebhookInboundJob,
-  WebhookOutboundJob,
-  enqueueVoiceNoteTranscribe,
-} from '../queue'
+import { Q, connection, webhookRetryBackoff, WEBHOOK_RETRY_ATTEMPTS, webhookInboundDeadQueue, webhookOutboundDeadQueue, WebhookInboundJob, WebhookOutboundJob, enqueueVoiceNoteTranscribe } from '../queue'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)

@@ -5,7 +5,7 @@
 
 import { Layout } from '../components/Layout'
 import { CTAButton, Paragraph, Panel, Title } from '../components/ui'
-import { color, font, space, type as t } from '../theme'
+import { color, font, type as t } from '../theme'
 
 export interface AgencyMemberInviteProps {
   agencyName: string

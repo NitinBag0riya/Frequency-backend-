@@ -26,7 +26,7 @@ import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import crypto from 'crypto'
 import { validateBody } from '../../validation'
-import { resolveAdapter, resolveSource, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
+import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
 import { emitNotification } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>

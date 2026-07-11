@@ -9,11 +9,7 @@ import helmet from 'helmet'
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import { createClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
-import {
-  sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets,
-  calendarCreateEvent, calendarCheckAvailability, gmailSendEmail,
-  getValidGoogleToken,
-} from './google'
+import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets, calendarCreateEvent, gmailSendEmail, getValidGoogleToken } from './google'
 import { createLeadsRouter } from './leads'
 import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
@@ -44,7 +40,7 @@ import { createSitesRouter } from './routes/sites'
 import { createDevicesRouter }       from './routes/devices'
 import { createUsageRouter }         from './routes/usage'
 import { createWedgeSurfaceRouter }  from './routes/wedge-surface'
-import { createApprovalsRouter, requireApproval } from './routes/approvals'
+import { createApprovalsRouter } from './routes/approvals'
 import { createWorkflowRecosRouter } from './routes/workflow-recos'
 import { createWorkflowTemplatesRouter } from './routes/workflow-templates'
 import { createWorkflowVersionsRouter } from './routes/workflow-versions'
@@ -99,13 +95,7 @@ import {
 import { composeNodeCatalogPromptSection } from './engine/node-types'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import { syncTenant as syncTenantTemplates } from './workers/template-sync'
-import {
-  enqueueWorkflowExecution,
-  workflowQueue, messageQueue, broadcastQueue, cronQueue,
-  callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue,
-  attachDebugListeners,
-  connection as redisConnection,
-} from './queue'
+import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, attachDebugListeners, connection as redisConnection } from './queue'
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
 import { ExpressAdapter } from '@bull-board/express'

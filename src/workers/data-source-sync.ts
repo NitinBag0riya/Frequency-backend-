@@ -25,7 +25,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { Q, connection, cronQueue } from '../queue'
 import { sheetsReadRange } from '../google'
 import { listAllRecords } from '../lib/airtable'
-import { loadMapping, applyMappingToPayload, type DecodedField } from '../lib/apply-mapping'
+import { loadMapping, applyMappingToPayload } from '../lib/apply-mapping'
 import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'

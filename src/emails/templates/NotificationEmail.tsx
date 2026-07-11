@@ -4,10 +4,10 @@
  * includes 'email'. Title + optional body + optional CTA.
  */
 
-import { Section, Text } from '@react-email/components'
+import { Text } from '@react-email/components'
 import { Layout } from '../components/Layout'
 import { CTAButton, Paragraph, Title } from '../components/ui'
-import { APP_URL, color, font, space, type as t } from '../theme'
+import { APP_URL, color, font, type as t } from '../theme'
 import { absoluteUrl } from '../url'
 
 export interface NotificationEmailProps {
