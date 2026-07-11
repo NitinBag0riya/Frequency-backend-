@@ -84,8 +84,9 @@ export function createAssetsRouter(deps: Deps): express.Router {
         })
         if (upErr) { apiError(res, 500, 'storage_upload_failed', upErr.message); return }
 
-        const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(path)
-        const url = pub?.publicUrl ?? ''
+        // Branded CDN URL (assets.getfrequency.app proxies to the Supabase
+        // public object) — matches uploadFile()/uploadBrandImage() on the FE.
+        const url = `https://assets.getfrequency.app/${BUCKET}/${path}`
 
         const { data: row, error: insErr } = await supabase.from('assets').insert({
           tenant_id: tenantId, name: rawName, url, storage_path: path,
