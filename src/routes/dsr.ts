@@ -274,6 +274,20 @@ export function createDsrRouter(deps: Deps): express.Router {
           receipt.counts.messages_deleted += (del1 ?? []).length
         }
 
+        // Also delete by contact_id FK. The comment above promised this path but
+        // only the phone path was coded — so a phone-less contact (email /
+        // Instagram / Telegram-only) or any message stored without contact_phone
+        // was NEVER erased (silent incomplete erasure, DPDPA violation). Guard
+        // for schemas where messages has no contact_id column.
+        {
+          const { data: delId, error: idErr } = await supabase.from('messages')
+            .delete().eq('tenant_id', tenantId).eq('contact_id', dsr.contact_id).select('id')
+          if (idErr && !/column .* does not exist/i.test(idErr.message)) {
+            receipt.errors.push(`messages by contact_id: ${idErr.message}`)
+          }
+          receipt.counts.messages_deleted += (delId ?? []).length
+        }
+
         // (c) Delete attachments — schema may or may not exist; try and swallow.
         try {
           const { data: del2, error: aErr } = await supabase.from('attachments')
@@ -341,13 +355,31 @@ export function createDsrRouter(deps: Deps): express.Router {
         if (!dsr.contact_id) {
           res.status(400).json({ error: `${dsr.request_type} requires a contact_id on the DSR` }); return
         }
-        const [{ data: contact }, { data: msgs }, { data: cons }] = await Promise.all([
-          supabase.from('contacts').select('*').eq('id', dsr.contact_id).eq('tenant_id', tenantId).maybeSingle(),
-          supabase.from('messages').select('id, channel, direction, contact_phone, content, status, created_at')
-            .eq('tenant_id', tenantId).eq('contact_phone', '').or(`contact_phone.eq.${String((await supabase.from('contacts').select('phone').eq('id', dsr.contact_id).maybeSingle()).data?.phone ?? '').replace(/[,()*]/g, '')}`),
-          supabase.from('consent_events').select('*').eq('contact_id', dsr.contact_id),
-        ])
-        const exportBlob = { contact, messages: msgs ?? [], consent_events: cons ?? [] }
+        // Fetch THIS subject's data only. The previous query used
+        // `.eq('contact_phone','').or(contact_phone.eq.<phone>)` which was both
+        // malformed AND pulled EVERY blank-contact_phone message — other
+        // principals' unlinked messages — into this export: a cross-subject PII
+        // leak. Scope strictly by contact_id FK and/or the subject's exact phone
+        // variants; never by blank phone.
+        const { data: contact } = await supabase.from('contacts')
+          .select('*').eq('id', dsr.contact_id).eq('tenant_id', tenantId).maybeSingle()
+        const cphone = contact?.phone ? String(contact.phone) : ''
+        const cNoPlus = cphone.replace(/^\+/, '')
+        const cVariants = cphone ? [cphone, cNoPlus, `+${cNoPlus}`] : []
+        const msgCols = 'id, channel, direction, contact_phone, content, status, created_at'
+        const msgMap = new Map<string, any>()
+        {
+          const byId = await supabase.from('messages').select(msgCols)
+            .eq('tenant_id', tenantId).eq('contact_id', dsr.contact_id)
+          if (!byId.error) for (const m of (byId.data ?? [])) msgMap.set(m.id, m)
+          if (cVariants.length) {
+            const byPhone = await supabase.from('messages').select(msgCols)
+              .eq('tenant_id', tenantId).in('contact_phone', cVariants)
+            if (!byPhone.error) for (const m of (byPhone.data ?? [])) msgMap.set(m.id, m)
+          }
+        }
+        const cons = (await supabase.from('consent_events').select('*').eq('contact_id', dsr.contact_id)).data
+        const exportBlob = { contact, messages: Array.from(msgMap.values()), consent_events: cons ?? [] }
         receipt.export = exportBlob
         receipt.counts.messages_deleted = 0  // access is non-destructive
 
