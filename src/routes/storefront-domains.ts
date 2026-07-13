@@ -416,7 +416,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     try {
       const up = await fetch(`${SF_API}${upstreamPath}`, {
         method,
-        headers: { 'Content-Type': 'application/json', 'X-Tenant': slug, 'X-Admin-Secret': SF_SECRET },
+        headers: { 'Content-Type': 'application/json', 'X-Tenant': slug, 'X-Admin-Secret': SF_SECRET, 'X-Operator-Email': String((req as any).user?.email || '') },
         body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
       })
       const text = await up.text()

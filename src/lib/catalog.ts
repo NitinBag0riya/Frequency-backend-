@@ -71,6 +71,11 @@ const ORDER_COLS = [
   { name: 'Items', key: 'items', type: 'textarea' },
   { name: 'Line items (JSON)', key: 'items_json', type: 'textarea' },
   { name: 'Total', key: 'total', type: 'number' },
+  { name: 'Comp?', key: 'is_comp', type: 'boolean' },
+  { name: 'Comp reason', key: 'comp_reason', type: 'text' },
+  { name: 'Discount', key: 'discount', type: 'number' },
+  { name: 'Discount/comp for', key: 'adjust_for', type: 'text' },
+  { name: 'Ref id', key: 'adjust_for_id', type: 'text' },
   { name: 'Coins', key: 'coins', type: 'number' },
   { name: 'Customer', key: 'guest_id', type: 'text' },     // stable customer ref (guestKey)
   { name: 'Outlet', key: 'outlet_id', type: 'text' },      // stable outlet ref
@@ -310,6 +315,11 @@ function orderToRow(o: any): Record<string, string> {
     // capture, not just the human summary above.
     items_json: Array.isArray(o.lines) ? JSON.stringify(o.lines).slice(0, 6000) : '',
     total: String(Math.max(0, Math.round(Number(o.grand) || 0))),
+    is_comp: String(!!o.nc),
+    comp_reason: String(o.ncReason || ''),
+    discount: String(Math.max(0, Math.round(Number(o.discount) || Number(o.manualDiscount) || 0))),
+    adjust_for: String((o.adjustRef && o.adjustRef.name) || ''),
+    adjust_for_id: String((o.adjustRef && o.adjustRef.id) || ''),
     coins: String(Math.max(0, Math.round(Number(o.coinsEarned) || 0))),
     guest_id: String(o.guestKey || ''),
     outlet_id: String(o.outletId || ''),
