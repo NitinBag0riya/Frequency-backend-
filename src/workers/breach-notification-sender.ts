@@ -9,13 +9,13 @@
  *
  * Per-recipient durability lives in breach_notification_recipients:
  *   - Insert with send_status='queued' (upsert; ON CONFLICT DO NOTHING).
- *   - Send each via Resend (lib/email.ts).
+ *   - Send each via Brevo (lib/email.ts).
  *   - Update to 'sent' (+ resend_message_id) or 'failed' (+ error).
  *
  * Resilience:
  *   - Per-recipient try/catch — one bad address never aborts the run.
- *   - Resend rate limit honored via BullMQ limiter (10/sec).
- *   - If RESEND_API_KEY is unset, every row lands 'failed' with the exact
+ *   - Send rate limit honored via BullMQ limiter (10/sec).
+ *   - If BREVO_API_KEY is unset, every row lands 'failed' with the exact
  *     reason; the worker never crashes (devs can run locally without email).
  *   - Worker concurrency = 1 so a single breach is processed end-to-end
  *     before another picks up — keeps the per-breach state-machine simple.

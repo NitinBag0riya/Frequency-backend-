@@ -16,7 +16,7 @@ import express from 'express'
 import crypto from 'node:crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
-import { sendMsg91Otp, sendMsg91Sms } from '../lib/storefront-msg91.js'
+import { sendSmsOtp, sendSmsOrderUpdate } from '../lib/storefront-sms.js'
 import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -103,12 +103,12 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     if (!otpRateOk(`otp-ph:${ph}`, 3, 10 * 60_000) || !otpRateOk(`otp-tenant:${String(slug)}`, 200, 24 * 60 * 60_000)) {
       return res.status(429).json({ ok: false, error: 'rate_limited' })
     }
-    // Channel order: MSG91 SMS is the primary OTP gateway (tenant's own key →
-    // Frequency platform key). If it's not configured or fails, fall back to the
-    // WhatsApp authentication template; if BOTH fail, storefront-api shows the
-    // on-screen demo code so login never breaks.
+    // Channel order: Brevo SMS is the primary OTP gateway (Frequency's platform
+    // Brevo account). If it's not configured or fails, fall back to the WhatsApp
+    // authentication template; if BOTH fail, storefront-api shows the on-screen
+    // demo code so login never breaks.
     try {
-      const m = await sendMsg91Otp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
+      const m = await sendSmsOtp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
       return res.json({ ok: true, channel: 'sms', via: m.via })
     } catch (smsErr: any) {
       try {
@@ -122,9 +122,9 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   })
 
   // Server-to-server: storefront-api asks us to deliver a transactional order-update
-  // SMS over MSG91 (tenant key → Frequency platform key). storefront-api only calls
-  // this when the customer has NOT opted into web/native push — SMS is the fallback
-  // channel. `vars` are the DLT template's variables (e.g. var1=order#, var2=status).
+  // SMS over Brevo (Frequency's platform account). storefront-api only calls this
+  // when the customer has NOT opted into web/native push — SMS is the fallback
+  // channel. `vars` carry the message fields (e.g. var1=order#, var2=status).
   r.post('/api/storefront/send-sms', async (req, res) => {
     if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, phone, vars, templateId } = (req.body || {}) as { slug?: string; phone?: string; vars?: Record<string, string>; templateId?: string }
@@ -135,7 +135,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       return res.status(429).json({ ok: false, error: 'rate_limited' })
     }
     try {
-      const m = await sendMsg91Sms(supabase, { slug: String(slug), phone: String(phone), vars: vars || {}, templateId })
+      const m = await sendSmsOrderUpdate(supabase, { slug: String(slug), phone: String(phone), vars: vars || {}, templateId })
       res.json({ ok: true, via: m.via })
     } catch (e: any) {
       res.status(502).json({ ok: false, error: e?.message || 'send failed' })

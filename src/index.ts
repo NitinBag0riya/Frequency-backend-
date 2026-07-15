@@ -23,7 +23,7 @@ import { createBillingRouter }     from './routes/billing'
 import { createCtwaAnalyticsRouter } from './routes/ctwa-analytics'
 import { createWaitlistRouter }    from './routes/waitlist'
 import { createInvitationsRouter, buildInviteEmail } from './routes/invitations'
-import { sendEmail } from './lib/email'
+import { sendEmail, emailConfigured } from './lib/email'
 import { createPublicStatusRouter } from './routes/public-status'
 import { createWaFeaturesRouter }  from './routes/wa-features'
 import { createWaTemplatesRouter } from './routes/wa-templates'
@@ -210,13 +210,8 @@ if (process.env.NODE_ENV === 'production' && process.env.ALLOW_SMOKE_TEST === '1
 // Same for email — notifications still deliver in-app without these, but
 // any default_channels = ['in_app','email'] event will silently skip its
 // email leg. Loud boot warning so the misconfiguration shows up in logs.
-{
-  const missing: string[] = []
-  if (!process.env.RESEND_API_KEY)    missing.push('RESEND_API_KEY')
-  if (!process.env.RESEND_FROM_EMAIL) missing.push('RESEND_FROM_EMAIL')
-  if (missing.length > 0) {
-    console.warn(`[boot] Email delivery not configured — missing: ${missing.join(', ')}. In-app notifications still work; email leg will be skipped + logged.`)
-  }
+if (!emailConfigured()) {
+  console.warn('[boot] Email delivery not configured — set BREVO_API_KEY (xkeysib-…) and BREVO_FROM_EMAIL. In-app notifications still work; email leg will be skipped + logged.')
 }
 
 // Defence-in-depth against runtime prototype pollution.
@@ -5472,7 +5467,7 @@ app.post('/api/invitations/:id/send', requireAuth, async (req, res) => {
     })
   } catch (e: any) {
     console.error('[invitations:send] email failed:', e?.message)
-    return apiError(res, 502, 'email_failed', e?.message ?? 'Email delivery failed. Check RESEND_API_KEY / RESEND_FROM_EMAIL.')
+    return apiError(res, 502, 'email_failed', e?.message ?? 'Email delivery failed. Check BREVO_API_KEY / BREVO_FROM_EMAIL.')
   }
 
   await supabase.from('invitation_codes').update({ sent_at: new Date().toISOString() }).eq('id', code.id)

@@ -23,7 +23,7 @@ import express from 'express'
 import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { apiError } from '../lib/api-error'
-import { sendEmail } from '../lib/email'
+import { sendEmail, emailConfigured } from '../lib/email'
 import { renderEmail } from '../emails/render'
 import IntegrationRequestAlert from '../emails/templates/IntegrationRequestAlert'
 
@@ -105,8 +105,8 @@ async function notifyDeveloperTeam(args: {
   context?:  Record<string, unknown> | null
 }): Promise<void> {
   try {
-    if (!process.env.RESEND_API_KEY || !process.env.RESEND_FROM_EMAIL) {
-      console.warn('[integration-requests] Resend not configured — row created but no email sent', args.row.id)
+    if (!emailConfigured()) {
+      console.warn('[integration-requests] Brevo not configured — row created but no email sent', args.row.id)
       return
     }
 

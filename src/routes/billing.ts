@@ -26,6 +26,7 @@ import {
 import { emitNotification } from './notifications'
 import { withIdempotency } from '../lib/idempotency'
 import { renderInvoiceEmail } from '../emails/invoice'
+import { emailConfigured } from '../lib/email'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -946,7 +947,7 @@ async function generateAndEmailGstInvoice(
 
     if (!recipient) {
       emailFailReason = 'no_recipient_email_on_file'
-    } else if (!process.env.RESEND_API_KEY || !process.env.RESEND_FROM_EMAIL) {
+    } else if (!emailConfigured()) {
       emailFailReason = 'email_provider_not_configured'
     } else {
       try {
@@ -1139,7 +1140,7 @@ async function handleAgencyWebhookEvent(
             }, { onConflict: 'razorpay_inv_id' })
           }
 
-          if (recipient && process.env.RESEND_API_KEY && process.env.RESEND_FROM_EMAIL) {
+          if (recipient && emailConfigured()) {
             const { sendEmail } = await import('../lib/email')
             const emailHtml = await renderInvoiceEmail({
               heading:       'Agency invoice',

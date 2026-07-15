@@ -1,29 +1,32 @@
 /**
- * Email delivery — Resend HTTP wrapper.
+ * Email delivery — Brevo (formerly Sendinblue) HTTP wrapper.
  *
- * No npm dependency on the `resend` SDK to keep the surface tiny + auditable.
- * Resend's REST API is straightforward (Bearer auth + JSON), and rolling our
- * own gives us control over retries, error shapes, and timeouts without
- * tracking another package's update cadence.
+ * No npm dependency on the `@getbrevo/brevo` SDK to keep the surface tiny +
+ * auditable. Brevo's REST API is straightforward (api-key header + JSON), and
+ * rolling our own gives us control over retries, error shapes, and timeouts
+ * without tracking another package's update cadence.
  *
- * Used by the notifications helper (routes/notifications.ts) when an event
- * type's `default_channels` includes 'email'. The user's prefs can override
- * to disable email per-event-type.
+ * The public `sendEmail()` signature is unchanged from the old Resend wrapper,
+ * so every call site keeps working untouched.
  *
  * Env:
- *   RESEND_API_KEY     — re_… (test or live)
- *   RESEND_FROM_EMAIL  — e.g. "Frequency <hello@frequency.in>"
- *   RESEND_REPLY_TO    — optional; defaults to no Reply-To
+ *   BREVO_API_KEY     — xkeysib-… (the single key Brevo uses for email + SMS)
+ *   BREVO_FROM_EMAIL  — e.g. "Frequency <hello@frequency.in>" or "hello@frequency.in"
+ *   BREVO_REPLY_TO    — optional; defaults to no Reply-To
  *
- * Picked Resend because:
- *   - Free tier covers MVP (3k emails/month)
+ * Back-compat: if BREVO_* are unset we fall back to the old RESEND_FROM_EMAIL /
+ * RESEND_REPLY_TO for the sender/reply addresses (same string format) so the
+ * from-address config doesn't have to be re-entered — only the API key must be
+ * swapped to BREVO_API_KEY. The Resend API key itself is never reused (Brevo
+ * won't accept it).
+ *
+ * Picked Brevo because:
+ *   - Free tier covers MVP (300 emails/day)
+ *   - One provider + one key for BOTH transactional email and India SMS
  *   - Simple REST API (no SDK juggling)
- *   - Reasonable India deliverability (rented IPs include Asia-Pacific)
- *   - Stripe-billed so we get one Razorpay-isolated invoice instead of
- *     spreading SaaS spend across multiple providers
  */
 
-const BASE = 'https://api.resend.com'
+const BASE = 'https://api.brevo.com/v3'
 
 export interface SendEmailArgs {
   to:       string | string[]
@@ -31,8 +34,9 @@ export interface SendEmailArgs {
   html:     string
   text?:    string
   reply_to?: string
-  /** Idempotency key — Resend dedupes within 24h on this. We use it for
-   *  notification deliveries so a worker retry doesn't double-send. */
+  /** Kept for call-site compatibility. Brevo has no idempotency header, so this
+   *  is a no-op — a worker retry can double-send. If exactly-once matters,
+   *  dedupe upstream on this key before calling. */
   idempotency_key?: string
 }
 
@@ -41,40 +45,72 @@ export interface SendEmailResult {
 }
 
 /**
- * Send a single email via Resend. Throws if the API key isn't configured
- * or if Resend returns a non-2xx — caller should catch + log to
+ * The Brevo REST API wants the raw `xkeysib-…` string in the `api-key` header.
+ * Some Brevo connector / "MCP" keys are handed out base64-wrapped as
+ * `{"api_key":"xkeysib-…"}` — accept either shape so the Fly secret can be set
+ * to whichever the dashboard gave you. Returns undefined if unset.
+ * Exported for tests.
+ */
+export function brevoApiKey(): string | undefined {
+  const raw = process.env.BREVO_API_KEY
+  if (!raw) return undefined
+  if (raw.startsWith('xkeysib-')) return raw
+  try {
+    const key = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'))?.api_key
+    if (typeof key === 'string' && key.startsWith('xkeysib-')) return key
+  } catch { /* not a wrapped key — fall through to raw */ }
+  return raw
+}
+
+/** True when email is configured (API key + a from address). Callers use this
+ *  to gate email-dependent features instead of poking at RESEND_* directly. */
+export function emailConfigured(): boolean {
+  return !!(brevoApiKey() && (process.env.BREVO_FROM_EMAIL || process.env.RESEND_FROM_EMAIL))
+}
+
+/** Parse "Name <email@host>" or "email@host" → {email, name?}. Exported for tests. */
+export function parseSender(raw: string): { email: string; name?: string } {
+  const m = raw.match(/^\s*(.*?)\s*<([^>]+)>\s*$/)
+  if (m) return { email: m[2].trim(), name: m[1].trim() || undefined }
+  return { email: raw.trim() }
+}
+
+/**
+ * Send a single email via Brevo. Throws if the API key isn't configured or if
+ * Brevo returns a non-2xx — caller should catch + log to
  * notification_delivery_log so we have a record of why it failed.
  *
- * Returns the Resend message id so we can reference it in delivery logs.
+ * Returns the Brevo messageId so we can reference it in delivery logs.
  */
 export async function sendEmail(args: SendEmailArgs): Promise<SendEmailResult> {
-  const apiKey = process.env.RESEND_API_KEY
-  const from = process.env.RESEND_FROM_EMAIL
-  if (!apiKey || !from) {
-    throw new Error('Email not configured: set RESEND_API_KEY (re_…) and RESEND_FROM_EMAIL (e.g. "Frequency <hello@frequency.in>" or just "hello@frequency.in")')
+  const apiKey = brevoApiKey()
+  const fromRaw = process.env.BREVO_FROM_EMAIL || process.env.RESEND_FROM_EMAIL
+  if (!apiKey || !fromRaw) {
+    throw new Error('Email not configured: set BREVO_API_KEY (xkeysib-…) and BREVO_FROM_EMAIL (e.g. "Frequency <hello@frequency.in>" or just "hello@frequency.in")')
   }
 
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${apiKey}`,
-    'Content-Type':  'application/json',
-  }
-  if (args.idempotency_key) headers['Idempotency-Key'] = args.idempotency_key
+  const toList = (Array.isArray(args.to) ? args.to : [args.to]).map(email => ({ email }))
+  const replyRaw = args.reply_to ?? process.env.BREVO_REPLY_TO ?? process.env.RESEND_REPLY_TO
 
-  const res = await fetch(`${BASE}/emails`, {
+  const res = await fetch(`${BASE}/smtp/email`, {
     method: 'POST',
-    headers,
+    headers: {
+      'api-key':      apiKey,
+      'Content-Type': 'application/json',
+      'Accept':       'application/json',
+    },
     body: JSON.stringify({
-      from,
-      to:        Array.isArray(args.to) ? args.to : [args.to],
-      subject:   args.subject,
-      html:      args.html,
-      text:      args.text,
-      reply_to:  args.reply_to ?? process.env.RESEND_REPLY_TO ?? undefined,
+      sender:      parseSender(fromRaw),
+      to:          toList,
+      subject:     args.subject,
+      htmlContent: args.html,
+      textContent: args.text,
+      replyTo:     replyRaw ? parseSender(replyRaw) : undefined,
     }),
   })
   const body = await res.json().catch(() => ({} as any))
   if (!res.ok) {
-    throw new Error(`Resend send failed (${res.status}): ${(body as any)?.message ?? (body as any)?.error ?? 'unknown'}`)
+    throw new Error(`Brevo email send failed (${res.status}): ${(body as any)?.message ?? (body as any)?.code ?? 'unknown'}`)
   }
-  return { id: (body as any)?.id ?? '' }
+  return { id: (body as any)?.messageId ?? '' }
 }
