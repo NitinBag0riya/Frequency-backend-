@@ -311,6 +311,10 @@ const STATIC_ALLOWED = new Set([FRONTEND_PRIMARY, ...FRONTEND_ALIASES])
 // the team can curl staging links without re-deploying. Adjust the slug
 // when you rename the Vercel project.
 const VERCEL_PREVIEW_RE = /^https:\/\/[a-z0-9-]+(-[a-z0-9]+)?\.vercel\.app$/
+// White-label operator dashboards on tenant custom domains (tenant_domains kind='dashboard')
+// call this API cross-origin with a Bearer JWT. Their origins can't be known statically, so
+// they're allowed dynamically from this Set — populated + refreshed from the DB below.
+const dashboardOrigins = new Set<string>()
 
 const restrictiveCors = cors({
   origin: (origin, cb) => {
@@ -318,6 +322,7 @@ const restrictiveCors = cors({
     // — let them through, the route auth still applies.
     if (!origin) return cb(null, true)
     if (STATIC_ALLOWED.has(origin)) return cb(null, true)
+    if (dashboardOrigins.has(origin)) return cb(null, true)
     if (VERCEL_PREVIEW_RE.test(origin)) return cb(null, true)
     if (process.env.NODE_ENV !== 'production' && /^https?:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) {
       return cb(null, true)
@@ -652,6 +657,22 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+
+// Keep the white-label dashboard CORS allowlist fresh — a connected 'dashboard' custom
+// domain calls this API cross-origin (Bearer auth, no cookies). Refreshed every 5 min;
+// a newly-connected domain is allowed within one cycle (aligns with DNS propagation).
+async function refreshDashboardOrigins() {
+  try {
+    const { data } = await supabase.from('tenant_domains').select('hostname').eq('kind', 'dashboard')
+    if (!data) return
+    dashboardOrigins.clear()
+    for (const d of data as { hostname: string }[]) {
+      if (d.hostname) { dashboardOrigins.add(`https://${d.hostname}`); dashboardOrigins.add(`https://www.${d.hostname}`) }
+    }
+  } catch { /* keep the last-known allowlist on a transient DB failure */ }
+}
+void refreshDashboardOrigins()
+setInterval(refreshDashboardOrigins, 5 * 60_000).unref()
 
 const META_APP_ID     = process.env.META_APP_ID!
 const META_APP_SECRET = process.env.META_APP_SECRET!
