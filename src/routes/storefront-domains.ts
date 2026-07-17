@@ -352,13 +352,25 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
         supabase.from('tenant_branding').select('*').eq('tenant_id', dom.tenant_id).maybeSingle(),
       ])
       const br = (b || {}) as any
-      res.json({ whitelabel: {
-        slug: (t as any)?.slug || null,
-        name: br.name || (t as any)?.name || null,
-        logoUrl: br.logo_url || br.logoUrl || null,
-        accent: br.accent || br.primary_color || br.primaryColor || null,
-        verified: !!(dom as any).verified,
-      } })
+      const slug = (t as any)?.slug || null
+      let name = br.name || (t as any)?.name || null
+      let logoUrl = br.logo_url || br.logoUrl || null
+      let accent = br.accent || br.primary_color || br.primaryColor || null
+      // tenant_branding is often empty — the real storefront brand lives in the
+      // storefront-api's public config (resolved by slug). Fall back to it so a
+      // white-label dashboard shows the tenant's actual logo/name/accent.
+      if (slug && (!name || !logoUrl)) {
+        try {
+          const cfg = await fetch(`${SF_API}/v1/config`, { headers: { 'X-Tenant': slug } })
+          if (cfg.ok) {
+            const j: any = await cfg.json()
+            name = name || j?.name || null
+            logoUrl = logoUrl || j?.logoUrl || null
+            accent = accent || j?.tokens?.accent || j?.tokens?.primary || null
+          }
+        } catch (e: any) { console.warn('[whitelabel] storefront config fallback failed:', e?.message) }
+      }
+      res.json({ whitelabel: { slug, name, logoUrl, accent, verified: !!(dom as any).verified } })
     } catch (e: any) {
       console.error('[whitelabel] resolve threw:', e?.message)
       res.json({ whitelabel: null })
