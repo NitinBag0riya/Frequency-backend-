@@ -25,7 +25,12 @@ interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
 const VTOKEN = process.env.VERCEL_API_TOKEN
 const VTEAM = process.env.VERCEL_TEAM_ID
 const VPROJECT = process.env.VERCEL_STOREFRONT_PROJECT || 'frequency-storefront'
+// White-label operator dashboard lives on a DIFFERENT Vercel project than the storefront,
+// so a `dashboard`-purpose custom domain registers there instead.
+const VDASH_PROJECT = process.env.VERCEL_DASHBOARD_PROJECT || 'frequency-fe'
 const vercelConfigured = !!(VTOKEN && VTEAM)
+// tenant_domains.kind: 'custom'/'subdomain' → storefront; 'dashboard' → white-label admin.
+const projectFor = (kind?: string) => (kind === 'dashboard' ? VDASH_PROJECT : VPROJECT)
 
 // The customer storefront's admin API (db-backed) + its shared secret. The
 // dashboard never holds this secret — it calls our authenticated proxy below,
@@ -220,24 +225,27 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     const tenantId = (req as any).tenantId
     const hostname = normalizeHostname((req.body as any)?.hostname)
     if (!isValidHostname(hostname)) { res.status(400).json({ error: 'Enter a valid domain, e.g. order.yourbrand.com' }); return }
+    // 'dashboard' → white-label the operator app (frequency-fe project); else the storefront.
+    const kind = (req.body as any)?.purpose === 'dashboard' ? 'dashboard' : 'custom'
+    const project = projectFor(kind)
     try {
-      // 1. Register on Vercel so it serves the storefront + issues TLS. 409 = the
-      //    domain is already on the project → fine (idempotent).
+      // 1. Register on Vercel so it serves the app + issues TLS. 409 = already on the
+      //    project → fine (idempotent).
       if (vercelConfigured) {
-        const add = await vercel('POST', `/v10/projects/${VPROJECT}/domains`, { name: hostname })
+        const add = await vercel('POST', `/v10/projects/${project}/domains`, { name: hostname })
         if (!add.ok && add.status !== 409) {
           const msg = add.json?.error?.message || `Couldn't register the domain (${add.status}).`
-          console.warn(`[storefront-domains] vercel add "${hostname}" → ${add.status}: ${msg}`)
+          console.warn(`[storefront-domains] vercel add "${hostname}" (${kind}) → ${add.status}: ${msg}`)
           // 403/forbidden often means the domain belongs to another Vercel account.
           res.status(502).json({ error: msg }); return
         }
       }
 
-      // 2. Record against the tenant. Unique on hostname → a domain can belong to
-      //    exactly one storefront.
+      // 2. Record against the tenant. Unique on hostname → a domain belongs to exactly
+      //    one tenant, and its `kind` decides storefront vs white-label dashboard.
       const verification_token = `freq-verify-${Math.random().toString(36).slice(2, 10)}`
       const { data, error } = await supabase.from('tenant_domains')
-        .insert({ tenant_id: tenantId, hostname, kind: 'custom', verification_token })
+        .insert({ tenant_id: tenantId, hostname, kind, verification_token })
         .select('*').single()
       if (error) {
         const dup = (error as any).code === '23505'
@@ -249,10 +257,10 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       // 3. Ask Vercel what DNS records are required (so the UI can show the exact ones).
       let dns: any = null
       if (vercelConfigured) {
-        const cfg = await vercel('GET', `/v9/projects/${VPROJECT}/domains/${encodeURIComponent(hostname)}/config`)
+        const cfg = await vercel('GET', `/v9/projects/${project}/domains/${encodeURIComponent(hostname)}/config`)
         if (cfg.ok) dns = cfg.json
       }
-      console.log(`[storefront-domains] connected "${hostname}" → tenant ${tenantId}`)
+      console.log(`[storefront-domains] connected "${hostname}" (${kind}) → tenant ${tenantId}`)
       res.json({ domain: data, dns })
     } catch (e: any) {
       console.error(`[storefront-domains] add "${hostname}" threw:`, e?.message, e?.stack?.split('\n')[1]?.trim())
@@ -263,9 +271,9 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   r.delete('/api/storefront/domains/:id', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId
     const { data: row } = await supabase.from('tenant_domains')
-      .select('hostname').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
+      .select('hostname, kind').eq('id', req.params.id).eq('tenant_id', tenantId).maybeSingle()
     if (row?.hostname && vercelConfigured) {
-      await vercel('DELETE', `/v9/projects/${VPROJECT}/domains/${encodeURIComponent(row.hostname)}`) // best-effort
+      await vercel('DELETE', `/v9/projects/${projectFor(row.kind as string)}/domains/${encodeURIComponent(row.hostname)}`) // best-effort
     }
     const { error } = await supabase.from('tenant_domains').delete().eq('id', req.params.id).eq('tenant_id', tenantId)
     if (error) { res.status(500).json({ error: error.message }); return }
@@ -285,7 +293,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       const hostname = row.hostname as string
       // verified = Vercel confirms ownership AND the DNS records are correctly set.
       const [dom, cfg] = await Promise.all([
-        vercel('GET', `/v9/projects/${VPROJECT}/domains/${encodeURIComponent(hostname)}`),
+        vercel('GET', `/v9/projects/${projectFor(row.kind as string)}/domains/${encodeURIComponent(hostname)}`),
         vercel('GET', `/v6/domains/${encodeURIComponent(hostname)}/config`),
       ])
       const ownershipOk = dom.ok && dom.json?.verified === true
@@ -303,6 +311,37 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     } catch (e: any) {
       console.error(`[storefront-domains] recheck threw:`, e?.message)
       res.status(500).json({ error: e?.message || 'Could not check the domain status.' })
+    }
+  })
+
+  // Public white-label resolver — NO auth (the dashboard needs it BEFORE login) and
+  // CORS-open (it's non-sensitive public branding, and the caller is an unknown custom
+  // domain). Maps a 'dashboard'-kind custom domain → the tenant it white-labels, with
+  // just enough branding for the pre-login screen. Storefront domains never resolve here.
+  r.get('/api/whitelabel', async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*')
+    res.set('Cache-Control', 'public, max-age=60')
+    const host = normalizeHostname(String(req.query.host || ''))
+    if (!host) { res.json({ whitelabel: null }); return }
+    try {
+      const { data: dom } = await supabase.from('tenant_domains')
+        .select('tenant_id, verified').eq('hostname', host).eq('kind', 'dashboard').maybeSingle()
+      if (!dom?.tenant_id) { res.json({ whitelabel: null }); return }
+      const [{ data: t }, { data: b }] = await Promise.all([
+        supabase.from('tenants').select('*').eq('id', dom.tenant_id).maybeSingle(),
+        supabase.from('tenant_branding').select('*').eq('tenant_id', dom.tenant_id).maybeSingle(),
+      ])
+      const br = (b || {}) as any
+      res.json({ whitelabel: {
+        slug: (t as any)?.slug || null,
+        name: br.name || (t as any)?.name || null,
+        logoUrl: br.logo_url || br.logoUrl || null,
+        accent: br.accent || br.primary_color || br.primaryColor || null,
+        verified: !!(dom as any).verified,
+      } })
+    } catch (e: any) {
+      console.error('[whitelabel] resolve threw:', e?.message)
+      res.json({ whitelabel: null })
     }
   })
 
