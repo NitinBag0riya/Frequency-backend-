@@ -84,6 +84,19 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   const r = express.Router()
   const { supabase, requireAuth, identifyTenant } = deps
 
+  // Platform-scope check (a role assignment with tenant_id IS NULL = /naruto console
+  // user). Used to gate white-label dashboard-domain connects. Mirrors the platform
+  // branch of the FE useRole resolver; kept local to avoid re-wiring Deps.
+  const isPlatformUser = async (userId?: string): Promise<boolean> => {
+    if (!userId) return false
+    const { data: assign } = await supabase.from('user_role_assignments')
+      .select('id').eq('user_id', userId).is('tenant_id', null).maybeSingle()
+    if ((assign as any)?.id) return true
+    const { data: legacy } = await supabase.from('user_roles')
+      .select('role').eq('user_id', userId).is('tenant_id', null).eq('role', 'super_admin').limit(1)
+    return !!legacy?.[0]
+  }
+
   // Boot-time self-test: confirm the Vercel creds can actually see the storefront
   // project. If this logs a failure, custom-domain adds will 502 — the token/team
   // is wrong. Runs once, best-effort, never blocks startup.
@@ -227,6 +240,13 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     if (!isValidHostname(hostname)) { res.status(400).json({ error: 'Enter a valid domain, e.g. order.yourbrand.com' }); return }
     // 'dashboard' → white-label the operator app (frequency-fe project); else the storefront.
     const kind = (req.body as any)?.purpose === 'dashboard' ? 'dashboard' : 'custom'
+    // White-labeling the operator dashboard is a PLATFORM capability (the /naruto
+    // console), not tenant self-serve. Hiding the UI isn't access control — enforce
+    // it here too: only a platform-scoped user (role assignment with tenant_id IS NULL)
+    // may connect a dashboard domain. Mirrors the FE `isSuper` gate + useRole.
+    if (kind === 'dashboard' && !(await isPlatformUser((req as any).user?.id))) {
+      res.status(403).json({ error: 'Platform Console access required to connect an admin-dashboard domain.' }); return
+    }
     const project = projectFor(kind)
     try {
       // 1. Register on Vercel so it serves the app + issues TLS. 409 = already on the
