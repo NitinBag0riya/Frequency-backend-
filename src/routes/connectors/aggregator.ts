@@ -493,57 +493,78 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // notify + fire workflows (essential: the client re-pushes the same orders
   // every ~40s).
   r.post('/api/connectors/aggregator/dyno/:token/orders', async (req, res) => {
-    const tenantId = await resolveToken(String(req.params.token))
-    if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
-    void bumpHeartbeat(tenantId)
-    const orders = Array.isArray(req.body?.orders) ? req.body.orders : []
+    // Money path — a live order must NEVER be silently dropped. Guarantees:
+    //  1. Idempotent upsert on (tenant, channel, external_order_id) — re-pushes
+    //     never dup, and the client re-pushes every ~40s (at-least-once backstop).
+    //  2. One inline retry per order so a transient DB hiccup doesn't wait 40s.
+    //  3. If ANY order still fails to persist, we 503 → the client retries sooner
+    //     (already-persisted rows just re-upsert harmlessly). Rows that DID persist
+    //     are on the board regardless.
+    //  4. Whole handler wrapped — an early throw returns 500 (retry), never an
+    //     unhandled rejection that black-holes the batch.
+    try {
+      const tenantId = await resolveToken(String(req.params.token))
+      if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
+      void bumpHeartbeat(tenantId)
+      const orders = Array.isArray(req.body?.orders) ? req.body.orders : []
 
-    // Prior statuses for this batch (one query) to detect new vs changed.
-    const ids = orders.map((o: any) => String(o.orderId ?? '')).filter(Boolean)
-    const priorByKey = new Map<string, string>()
-    if (ids.length) {
-      const { data: prior } = await supabase.from('aggregator_orders')
-        .select('channel, external_order_id, status')
-        .eq('tenant_id', tenantId).in('external_order_id', ids)
-      for (const p of prior ?? []) priorByKey.set(`${(p as any).channel}:${(p as any).external_order_id}`, (p as any).status)
+      // Prior statuses for this batch (one query) to detect new vs changed. If it
+      // fails, treat all as new (a false re-ring is acceptable; a dropped order is not).
+      const ids = orders.map((o: any) => String(o.orderId ?? '')).filter(Boolean)
+      const priorByKey = new Map<string, string>()
+      if (ids.length) {
+        try {
+          const { data: prior } = await supabase.from('aggregator_orders')
+            .select('channel, external_order_id, status')
+            .eq('tenant_id', tenantId).in('external_order_id', ids)
+          for (const p of prior ?? []) priorByKey.set(`${(p as any).channel}:${(p as any).external_order_id}`, (p as any).status)
+        } catch (e: any) { console.warn(`[aggregator/dyno] prior-status query failed (all treated as new): ${e?.message}`) }
+      }
+
+      let notified = 0, failed = 0
+      for (const el of orders) {
+        try {
+          const channel = chan(el.vendor)
+          const status = normalizeStatus(el.status)
+          const s = extractSummary(el.data)
+          const externalOrderId = String(el.orderId ?? '')
+          if (!externalOrderId) continue
+          const prior = priorByKey.get(`${channel}:${externalOrderId}`)
+          const isNewRow = prior === undefined
+          const changed = isNewRow || prior !== status
+
+          const row = {
+            tenant_id: tenantId, source: 'dynoapis', channel, external_order_id: externalOrderId,
+            outlet_ref: el.resId != null ? String(el.resId) : null,
+            status, status_identifier: el.statusIdentifier ?? String(el.status ?? ''),
+            customer_name: s.name, customer_phone_masked: s.phone,
+            item_count: s.items, gross_amount: s.gross,
+            placed_at: el.data?.placed_at ?? el.data?.order?.created_at ?? null,
+            payload: el.data ?? {}, updated_at: new Date().toISOString(),
+          }
+          // Persist with one inline retry — a transient hiccup shouldn't cost us a live order.
+          let upErr = (await supabase.from('aggregator_orders').upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })).error
+          if (upErr) upErr = (await supabase.from('aggregator_orders').upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })).error
+          if (upErr) { console.error(`[aggregator/dyno] upsert failed after retry (order ${externalOrderId}): ${upErr.message}`); failed++; continue }
+
+          if (!changed) continue   // unchanged re-push — no bell, no trigger
+          notified++
+          const isNew = isNewRow && status === 'new'
+          void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross) })
+          void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
+            fireOrderTrigger(supabase, tenantId, {
+              kind: isNew ? 'new_order' : 'order_status', channel, status,
+              contactPhone: s.phone, orderId: externalOrderId, order: el.data ?? {},
+            })
+          ).catch(e => console.warn(`[aggregator/dyno] trigger (non-fatal): ${e?.message}`))
+        } catch (e: any) { console.error(`[aggregator/dyno] order error: ${e?.message}`); failed++ }
+      }
+      if (failed > 0) { res.status(503).json({ received: false, count: orders.length, changed: notified, failed, note: 'partial failure — please retry' }); return }
+      res.status(200).json({ received: true, count: orders.length, changed: notified })
+    } catch (e: any) {
+      console.error(`[aggregator/dyno] orders handler threw: ${e?.message}`)
+      res.status(500).json({ error: 'ingest failed — retry' })   // client re-pushes next poll
     }
-
-    let notified = 0
-    for (const el of orders) {
-      try {
-        const channel = chan(el.vendor)
-        const status = normalizeStatus(el.status)
-        const s = extractSummary(el.data)
-        const externalOrderId = String(el.orderId ?? '')
-        if (!externalOrderId) continue
-        const prior = priorByKey.get(`${channel}:${externalOrderId}`)
-        const isNewRow = prior === undefined
-        const changed = isNewRow || prior !== status
-
-        const { error } = await supabase.from('aggregator_orders').upsert({
-          tenant_id: tenantId, source: 'dynoapis', channel, external_order_id: externalOrderId,
-          outlet_ref: el.resId != null ? String(el.resId) : null,
-          status, status_identifier: el.statusIdentifier ?? String(el.status ?? ''),
-          customer_name: s.name, customer_phone_masked: s.phone,
-          item_count: s.items, gross_amount: s.gross,
-          placed_at: el.data?.placed_at ?? el.data?.order?.created_at ?? null,
-          payload: el.data ?? {}, updated_at: new Date().toISOString(),
-        }, { onConflict: 'tenant_id,channel,external_order_id' })
-        if (error) { console.error(`[aggregator/dyno] upsert failed: ${error.message}`); continue }
-
-        if (!changed) continue   // unchanged re-push — no bell, no trigger
-        notified++
-        const isNew = isNewRow && status === 'new'
-        void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross) })
-        void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
-          fireOrderTrigger(supabase, tenantId, {
-            kind: isNew ? 'new_order' : 'order_status', channel, status,
-            contactPhone: s.phone, orderId: externalOrderId, order: el.data ?? {},
-          })
-        ).catch(e => console.warn(`[aggregator/dyno] trigger (non-fatal): ${e?.message}`))
-      } catch (e: any) { console.error(`[aggregator/dyno] order error: ${e?.message}`) }
-    }
-    res.status(200).json({ received: true, count: orders.length, changed: notified })
   })
 
   // GET /:resId/orders/status — DynoAPIs polls for decisions we queued.
