@@ -43,8 +43,14 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_API_URL ?? 'http://localhost:3001').
 const PULL_CODE  = { accept: 1, ready: 3, reject: -1 } as const   // we tell it what to do
 const RESULT_MAP: Record<number, string> = { 2: 'preparing', 4: 'ready', [-2]: 'rejected' } // it tells us the outcome
 
-function chan(vendor: unknown): AggregatorChannel {
-  return String(vendor ?? '').toLowerCase() === 'swiggy' ? 'swiggy' : 'zomato'
+// Robust channel detection. DynoAPIs *should* send vendor='swiggy'|'zomato', but
+// the field/casing varies by payload shape — substring-match so 'Swiggy',
+// 'SWIGGY_DELIVERY', a nested 'swiggy_instamart' etc. all resolve correctly, and
+// only fall back to zomato when there's genuinely no swiggy signal anywhere.
+function chan(...vals: unknown[]): AggregatorChannel {
+  const s = vals.map(v => String(v ?? '')).join(' ').toLowerCase()
+  if (s.includes('swiggy')) return 'swiggy'
+  return 'zomato'
 }
 const CHANNEL_LABEL: Record<AggregatorChannel, string> = { zomato: 'Zomato', swiggy: 'Swiggy' }
 const STATUS_LABEL: Record<string, string> = {
@@ -129,15 +135,27 @@ function parseOrderHistory(body: any): ParsedHistOrder[] {
   return out
 }
 
-/** Best-effort customer/amount extraction — full raw order is always kept in payload. */
+/** Best-effort customer/amount extraction across Zomato + Swiggy payload shapes —
+ *  the full raw order is ALWAYS kept in payload, so a missed field is cosmetic
+ *  (blank summary), never lost data. Field names span both aggregators' conventions. */
 function extractSummary(data: any): { name: string | null; phone: string | null; items: number; gross: number | null } {
-  const o = data?.order ?? data ?? {}
-  const items = Array.isArray(o.items) ? o.items : Array.isArray(o.order_items) ? o.order_items : []
+  const o = data?.order ?? data?.orderDetails ?? data?.order_details ?? data ?? {}
+  const cust = o.customer ?? o.customer_details ?? o.customerDetails ?? o.user ?? {}
+  const items = Array.isArray(o.items) ? o.items
+    : Array.isArray(o.order_items) ? o.order_items
+    : Array.isArray(o.cart_items) ? o.cart_items
+    : Array.isArray(o.line_items) ? o.line_items
+    : Array.isArray(o.orderItems) ? o.orderItems : []
+  const firstLast = [cust.first_name, cust.last_name].filter(Boolean).join(' ').trim() || null
+  const n = (v: any) => (v == null || v === '' ? null : Number(v))
   return {
-    name:  o.customer?.name ?? o.customer_name ?? null,
-    phone: o.customer?.phone ?? o.customer_phone ?? null,   // aggregators mask this
-    items: items.reduce((n: number, it: any) => n + (Number(it.quantity ?? it.qty ?? 1) || 1), 0),
-    gross: o.total_cost ?? o.net_amount ?? o.order_total ?? o.grand_total ?? null,
+    name:  cust.name ?? o.customer_name ?? o.customerName ?? firstLast ?? null,
+    phone: cust.phone ?? cust.mobile ?? cust.contact_number ?? o.customer_phone ?? o.customerPhone ?? null,   // aggregators mask this
+    items: (items.length
+      ? items.reduce((s: number, it: any) => s + (Number(it.quantity ?? it.qty ?? it.count ?? 1) || 1), 0)
+      : Number(o.item_count ?? o.items_count ?? o.itemCount ?? 0)) || 0,
+    gross: n(o.total_cost) ?? n(o.net_amount) ?? n(o.order_total) ?? n(o.grand_total) ?? n(o.bill_amount)
+        ?? n(o.final_amount) ?? n(o.net_total) ?? n(o.order_value) ?? n(o.total) ?? n(o.invoice?.total) ?? null,
   }
 }
 
@@ -524,7 +542,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       let notified = 0, failed = 0
       for (const el of orders) {
         try {
-          const channel = chan(el.vendor)
+          const channel = chan(el.vendor, el.platform, el.source, el.channel, el.data?.vendor, el.data?.platform)
           const status = normalizeStatus(el.status)
           const s = extractSummary(el.data)
           const externalOrderId = String(el.orderId ?? '')
