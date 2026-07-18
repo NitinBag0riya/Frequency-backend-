@@ -184,7 +184,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         tenant_id: tenantId,
         event_key: ev.isNew ? 'order.new' : 'order.status',
         recipient_user_ids: recipients,
-        link: '/orders',
+        link: '/settings/orders',   // the real orders-board route (org slug is added client-side)
         data: {
           channel: ev.channel, channel_label: CHANNEL_LABEL[ev.channel],
           order_id: ev.orderId, status: ev.status, status_label: STATUS_LABEL[ev.status] ?? ev.status,
