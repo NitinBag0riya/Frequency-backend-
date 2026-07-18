@@ -104,7 +104,10 @@ export interface AggregatorAdapter {
 export function normalizeStatus(raw: string | null | undefined): OrderStatus {
   const s = String(raw ?? '').toUpperCase()
   if (!s) return 'new'
-  if (s.includes('NEW')) return 'new'
+  // New/awaiting-acceptance — Zomato says NEW; Swiggy variants say PLACED/PENDING/
+  // RECEIVED/CREATED. Catch them all so a fresh order surfaces (accept prompt + ring)
+  // instead of silently falling through to 'preparing'.
+  if (s.includes('NEW') || s.includes('PLACE') || s.includes('PEND') || s.includes('RECEIV') || s.includes('CREAT')) return 'new'
   if (s.includes('READY')) return 'ready'
   if (s.includes('PICK')) return 'picked_up'
   if (s.includes('DELIVER')) return 'delivered'
