@@ -6,21 +6,24 @@
  * of which there can be several — swapping one for another is a one-line change
  * in `resolveAdapter()` and never touches the routes or the FE:
  *
- *   dynoapis      — interim. The DynoAPIs desktop client runs on the merchant's
- *                   own machine, rides the merchant's own Zomato/Swiggy dashboard
- *                   login, and pulls the decisions we queue. Our servers never
- *                   call the aggregators.  ← first implementation
+ *   frequency_desktop — our own Frequency Desktop app runs on the merchant's
+ *                   machine WITH the merchant logged into Frequency. It rides the
+ *                   merchant's own Zomato/Swiggy dashboard login, relays captured
+ *                   orders using that authenticated Frequency session, and pulls
+ *                   the decisions we queue. Our servers never call the
+ *                   aggregators.  ← first implementation
  *   urbanpiper    — a licensed middleware partner's API                 (future)
  *   zomato_direct / swiggy_direct — the official partner APIs, once approved
  *                   past the store-count / volume gate                  (future)
  *
- * Capability-gated: each adapter declares what it can actually do. DynoAPIs can
- * take orders and toggle stock but cannot edit a menu, so `menuEdit` is false —
- * the FE greys out menu editing until the tenant is on a source that supports it.
+ * Capability-gated: each adapter declares what it can actually do. The desktop
+ * source can take orders and toggle stock but cannot edit a menu, so `menuEdit`
+ * is false — the FE greys out menu editing until the tenant is on a source that
+ * supports it.
  */
 
 export type AggregatorSource =
-  | 'dynoapis'
+  | 'frequency_desktop'
   | 'urbanpiper'
   | 'zomato_direct'
   | 'swiggy_direct'
@@ -76,9 +79,9 @@ export interface AdapterContext {
 }
 
 /**
- * The contract every source implements. `dynoapis` fulfils order/stock via a
- * PULL model (queue rows the merchant's machine polls); a future `urbanpiper`
- * or `*_direct` adapter fulfils the same methods with an outbound HTTP call.
+ * The contract every source implements. `frequency_desktop` fulfils order/stock
+ * via a PULL model (queue rows the merchant's machine polls); a future
+ * `urbanpiper` or `*_direct` adapter fulfils the same methods with an outbound HTTP call.
  * Either way the routes and FE are identical.
  */
 export interface AggregatorAdapter {

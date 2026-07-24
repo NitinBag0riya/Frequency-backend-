@@ -7,24 +7,24 @@
  *     The dashboard order board + stock toggles call these. They never know or
  *     care which source is active — an adapter handles that.
  *
- *  B) DynoAPIs webhook contract (public, per-tenant token)
- *       /api/connectors/aggregator/dyno/:token/*
- *     The DynoAPIs desktop client on the MERCHANT's machine drives these. It
- *     pushes new orders to us and PULLS the decisions we queued, executes them
- *     against Zomato/Swiggy itself, and posts results back. Our servers never
- *     talk to the aggregators — the exact contract is reverse-engineered from
- *     the client (POST /orders, GET /:resId/orders/status, POST
- *     /orders/:orderId/status, GET /:resId/items, POST /:resId/items/status …).
+ *  B) Frequency Desktop bridge (AUTHENTICATED — tenant from the logged-in
+ *     session, no token, no public URL)   /api/connectors/aggregator/*
+ *     The Frequency Desktop app on the MERCHANT's machine runs the Frequency web
+ *     app with the merchant logged in. Captured orders are relayed here through
+ *     that web view using the SAME session as every other FE call; queued
+ *     operator decisions are polled back the same authenticated way. It executes
+ *     them against Zomato/Swiggy itself — our servers never talk to the
+ *     aggregators (POST /orders/ingest, GET /pending-actions, POST
+ *     /actions/result, POST /menu/ingest, POST /history/ingest).
  *
  * Adding UrbanPiper / official-direct later means a new adapter (surface A keeps
- * working unchanged) + its own inbound webhook if it has one — surface B is
- * DynoAPIs-specific and drops away when DynoAPIs does.
+ * working unchanged) + its own inbound path if it has one — surface B is
+ * Frequency-Desktop-specific.
  */
 
 import express from 'express'
 import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
-import crypto from 'crypto'
 import { validateBody } from '../../validation'
 import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
 import { emitNotification } from '../notifications'
@@ -37,14 +37,12 @@ interface Deps {
   checkPermission: (feature: string, action: 'view' | 'edit' | 'delete') => Middleware
 }
 
-const PUBLIC_BASE_URL = (process.env.PUBLIC_API_URL ?? 'http://localhost:3001').replace(/\/+$/, '')
-
-// DynoAPIs order-status codes it expects in our poll responses / result posts.
+// Order-status codes the desktop app uses in poll responses / result posts.
 const PULL_CODE  = { accept: 1, ready: 3, reject: -1 } as const   // we tell it what to do
 const RESULT_MAP: Record<number, string> = { 2: 'preparing', 4: 'ready', [-2]: 'rejected' } // it tells us the outcome
 
-// Robust channel detection. DynoAPIs *should* send vendor='swiggy'|'zomato', but
-// the field/casing varies by payload shape — substring-match so 'Swiggy',
+// Robust channel detection. The desktop app *should* send vendor='swiggy'|'zomato',
+// but the field/casing varies by payload shape — substring-match so 'Swiggy',
 // 'SWIGGY_DELIVERY', a nested 'swiggy_instamart' etc. all resolve correctly, and
 // only fall back to zomato when there's genuinely no swiggy signal anywhere.
 function chan(...vals: unknown[]): AggregatorChannel {
@@ -66,7 +64,7 @@ function orderSummary(items: number, gross: number | null, currency = 'INR'): st
 interface ParsedEntity { entity_type: 'item' | 'category'; entity_id: string; name: string | null; in_stock: boolean; price: number | null; category_ref: string | null; raw: any }
 
 /**
- * Parse a DynoAPIs menu snapshot into normalised item/category rows.
+ * Parse a Frequency Desktop menu snapshot into normalised item/category rows.
  * The aggregators' menu JSON is undocumented + varies, so this is best-effort
  * across common shapes and ALWAYS keeps the raw entity in `raw`.
  * TODO(menu-spec): tighten field names once a real snapshot is captured.
@@ -104,7 +102,7 @@ function parseMenuSnapshot(body: any): ParsedEntity[] {
 interface ParsedHistOrder { external_order_id: string; status: string | null; customer_name: string | null; item_count: number; gross_amount: number | null; placed_at: string | null; raw: any }
 
 /**
- * Parse a DynoAPIs order-history snapshot into normalised past-order rows.
+ * Parse a Frequency Desktop order-history snapshot into normalised past-order rows.
  * Zomato pushes an array of order-details; Swiggy pushes its history payload;
  * some shapes page under `pages[].orders`. Best-effort across all, raw retained.
  * TODO(history-spec): tighten once a real snapshot is captured.
@@ -195,11 +193,11 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (e: any) { console.warn(`[aggregator] notify failed (non-fatal): ${e?.message}`) }
   }
 
-  // Bump the DynoAPIs liveness heartbeat (called from the regular poll).
+  // Bump the desktop-app liveness heartbeat (called from the regular poll).
   const bumpHeartbeat = async (tenantId: string) => {
     try {
       await supabase.from('aggregator_heartbeats').upsert(
-        { tenant_id: tenantId, source: 'dynoapis', last_seen_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+        { tenant_id: tenantId, source: 'frequency_desktop', last_seen_at: new Date().toISOString(), updated_at: new Date().toISOString() },
         { onConflict: 'tenant_id' },
       )
     } catch { /* non-fatal */ }
@@ -220,7 +218,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     const now = new Date().toISOString()
     if (entities.length) {
       const rows = entities.map(e => ({
-        tenant_id: tenantId, source: 'dynoapis', channel, outlet_ref: outletRef,
+        tenant_id: tenantId, source: 'frequency_desktop', channel, outlet_ref: outletRef,
         entity_type: e.entity_type, entity_id: e.entity_id, name: e.name,
         in_stock: e.in_stock, price: e.price, category_ref: e.category_ref,
         raw: e.raw, last_synced_at: now, updated_at: now,
@@ -236,7 +234,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     console.log(`[aggregator/menu] ingested ${entities.length} entities for outlet ${outletRef}`)
   }
 
-  // Whether the next DynoAPIs items-poll should request a full menu pull.
+  // Whether the next items-poll should request a full menu pull.
   const needsFullSync = async (tenantId: string, outletRef: string): Promise<boolean> => {
     const { data } = await supabase.from('aggregator_menu_sync')
       .select('pending_full_sync').eq('tenant_id', tenantId).eq('outlet_ref', outletRef).maybeSingle()
@@ -260,7 +258,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     const now = new Date().toISOString()
     if (parsed.length) {
       const rows = parsed.map(o => ({
-        tenant_id: tenantId, source: 'dynoapis', channel, outlet_ref: outletRef,
+        tenant_id: tenantId, source: 'frequency_desktop', channel, outlet_ref: outletRef,
         external_order_id: o.external_order_id, status: o.status,
         customer_name: o.customer_name, item_count: o.item_count, gross_amount: o.gross_amount,
         placed_at: o.placed_at, raw: o.raw, updated_at: now,
@@ -387,7 +385,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       const adapter = await resolveAdapter(supabase, tenantId)
       if (!adapter.capabilities().stock) { res.status(422).json({ error: `${adapter.source} cannot toggle stock` }); return }
       const b = req.body as z.infer<typeof StockBody>
-      // DynoAPIs routes stock actions by outlet_ref, so channel is informational
+      // Stock actions route by outlet_ref, so channel is informational
       // — resolve a best-effort value (body → orders → default) for the record.
       const channel = (b.channel ?? await channelForOutlet(tenantId, b.outletRef) ?? 'zomato') as AggregatorChannel
       const out = await adapter.submitStockToggle({ tenantId, source: adapter.source }, { ...b, channel })
@@ -459,7 +457,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
-  // Connection health — is the merchant's DynoAPIs client polling us?
+  // Connection health — is the merchant's Frequency Desktop app polling us?
   r.get('/api/connectors/aggregator/health', ...guardView, async (req, res) => {
     try {
       const { data } = await supabase.from('aggregator_heartbeats')
@@ -470,59 +468,45 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
-  // Connect DynoAPIs: mint the per-tenant webhook token + return the URL the
-  // operator pastes into DynoAPIs' Cloud URL config on their machine.
-  r.post('/api/connectors/aggregator/dynoapis/connect', ...guardEdit, async (req, res) => {
+  // Connect Frequency Desktop: just mark the integration active. There is no
+  // token and no URL to paste — the desktop app authenticates every relay with
+  // the merchant's own logged-in Frequency session (same as any FE→BE call).
+  r.post('/api/connectors/aggregator/frequency-desktop/connect', ...guardEdit, async (req, res) => {
     try {
       const tenantId = (req as any).tenantId
       const userId = (req as any).user?.id as string | undefined
       if (!userId) { res.status(401).json({ error: 'auth missing user.id' }); return }
-      const { data: existing } = await supabase.from('tenant_integrations')
-        .select('metadata').eq('tenant_id', tenantId).eq('key', 'aggregator_dynoapis').maybeSingle()
-      const ingestToken = (existing?.metadata as any)?.ingest_token ?? crypto.randomBytes(24).toString('hex')
       const { error } = await supabase.from('tenant_integrations').upsert({
-        tenant_id: tenantId, user_id: userId, key: 'aggregator_dynoapis', status: 'active',
-        scope: 'order_management', brand_label: 'Zomato/Swiggy · DynoAPIs',
-        metadata: { source: 'dynoapis', ingest_token: ingestToken },
+        tenant_id: tenantId, user_id: userId, key: 'aggregator_frequency_desktop', status: 'active',
+        scope: 'order_management', brand_label: 'Zomato/Swiggy · Frequency Desktop',
+        metadata: { source: 'frequency_desktop' },
       }, { onConflict: 'tenant_id,key' })
       if (error) { res.status(500).json({ error: 'Failed to persist connection: ' + error.message }); return }
-      const cloudUrl = `${PUBLIC_BASE_URL}/api/connectors/aggregator/dyno/${ingestToken}`
       res.json({
-        success: true, source: 'dynoapis', cloudUrl,
-        note: "Paste this as the Cloud URL in DynoAPIs on the merchant's machine. Orders will flow into your order board; accept/ready/reject and stock toggles are pulled back automatically.",
+        success: true, source: 'frequency_desktop',
+        note: 'Connected. Open Frequency Desktop and log in, then Connect Swiggy/Zomato — orders relay in automatically under this account; accept/ready/reject and stock toggles are pulled back.',
       })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
   // ══════════════════════════════════════════════════════════════════════════
-  // B) DynoAPIs webhook contract (public; tenant resolved by URL token)
+  // B) Frequency Desktop bridge (AUTHENTICATED — tenant from the logged-in
+  //    session; no token, no public URL). The desktop app relays through its
+  //    logged-in Frequency web view, so every call here is a normal guarded
+  //    FE→BE request and the tenant comes from identifyTenant like everywhere.
   // ══════════════════════════════════════════════════════════════════════════
 
-  const resolveToken = async (token: string): Promise<string | null> => {
-    const { data } = await supabase.from('tenant_integrations')
-      .select('tenant_id').eq('key', 'aggregator_dynoapis')
-      .eq('metadata->>ingest_token', token).maybeSingle()
-    return (data as any)?.tenant_id ?? null
-  }
-
-  // POST /orders — DynoAPIs pushes a batch of new/updated orders.
-  // We diff against the stored status so a re-push of an unchanged order does
-  // NOT re-ring the bell — only genuinely new orders and real status changes
-  // notify + fire workflows (essential: the client re-pushes the same orders
-  // every ~40s).
-  r.post('/api/connectors/aggregator/dyno/:token/orders', async (req, res) => {
-    // Money path — a live order must NEVER be silently dropped. Guarantees:
-    //  1. Idempotent upsert on (tenant, channel, external_order_id) — re-pushes
-    //     never dup, and the client re-pushes every ~40s (at-least-once backstop).
-    //  2. One inline retry per order so a transient DB hiccup doesn't wait 40s.
-    //  3. If ANY order still fails to persist, we 503 → the client retries sooner
-    //     (already-persisted rows just re-upsert harmlessly). Rows that DID persist
-    //     are on the board regardless.
-    //  4. Whole handler wrapped — an early throw returns 500 (retry), never an
-    //     unhandled rejection that black-holes the batch.
+  // POST /orders/ingest — the desktop relays a batch of captured orders.
+  // Money path — a live order must NEVER be silently dropped. Guarantees:
+  //  1. Idempotent upsert on (tenant, channel, external_order_id) — re-pushes
+  //     never dup, and the app re-pushes every ~40s (at-least-once backstop).
+  //  2. One inline retry per order so a transient DB hiccup doesn't wait 40s.
+  //  3. If ANY order still fails, we 503 → the app retries sooner.
+  //  4. Whole handler wrapped — an early throw returns 500 (retry).
+  // Unchanged re-pushes never re-ring the bell (diff against stored status).
+  r.post('/api/connectors/aggregator/orders/ingest', ...guardEdit, async (req, res) => {
     try {
-      const tenantId = await resolveToken(String(req.params.token))
-      if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
+      const tenantId = (req as any).tenantId
       void bumpHeartbeat(tenantId)
       const orders = Array.isArray(req.body?.orders) ? req.body.orders : []
 
@@ -536,7 +520,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
             .select('channel, external_order_id, status')
             .eq('tenant_id', tenantId).in('external_order_id', ids)
           for (const p of prior ?? []) priorByKey.set(`${(p as any).channel}:${(p as any).external_order_id}`, (p as any).status)
-        } catch (e: any) { console.warn(`[aggregator/dyno] prior-status query failed (all treated as new): ${e?.message}`) }
+        } catch (e: any) { console.warn(`[aggregator/ingest] prior-status query failed (all treated as new): ${e?.message}`) }
       }
 
       let notified = 0, failed = 0
@@ -552,7 +536,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           const changed = isNewRow || prior !== status
 
           const row = {
-            tenant_id: tenantId, source: 'dynoapis', channel, external_order_id: externalOrderId,
+            tenant_id: tenantId, source: 'frequency_desktop', channel, external_order_id: externalOrderId,
             outlet_ref: el.resId != null ? String(el.resId) : null,
             status, status_identifier: el.statusIdentifier ?? String(el.status ?? ''),
             customer_name: s.name, customer_phone_masked: s.phone,
@@ -563,7 +547,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           // Persist with one inline retry — a transient hiccup shouldn't cost us a live order.
           let upErr = (await supabase.from('aggregator_orders').upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })).error
           if (upErr) upErr = (await supabase.from('aggregator_orders').upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })).error
-          if (upErr) { console.error(`[aggregator/dyno] upsert failed after retry (order ${externalOrderId}): ${upErr.message}`); failed++; continue }
+          if (upErr) { console.error(`[aggregator/ingest] upsert failed after retry (order ${externalOrderId}): ${upErr.message}`); failed++; continue }
 
           if (!changed) continue   // unchanged re-push — no bell, no trigger
           notified++
@@ -574,103 +558,93 @@ export function createAggregatorConnector(deps: Deps): express.Router {
               kind: isNew ? 'new_order' : 'order_status', channel, status,
               contactPhone: s.phone, orderId: externalOrderId, order: el.data ?? {},
             })
-          ).catch(e => console.warn(`[aggregator/dyno] trigger (non-fatal): ${e?.message}`))
-        } catch (e: any) { console.error(`[aggregator/dyno] order error: ${e?.message}`); failed++ }
+          ).catch(e => console.warn(`[aggregator/ingest] trigger (non-fatal): ${e?.message}`))
+        } catch (e: any) { console.error(`[aggregator/ingest] order error: ${e?.message}`); failed++ }
       }
       if (failed > 0) { res.status(503).json({ received: false, count: orders.length, changed: notified, failed, note: 'partial failure — please retry' }); return }
       res.status(200).json({ received: true, count: orders.length, changed: notified })
     } catch (e: any) {
-      console.error(`[aggregator/dyno] orders handler threw: ${e?.message}`)
-      res.status(500).json({ error: 'ingest failed — retry' })   // client re-pushes next poll
+      console.error(`[aggregator/ingest] handler threw: ${e?.message}`)
+      res.status(500).json({ error: 'ingest failed — retry' })   // app re-pushes next poll
     }
   })
 
-  // GET /:resId/orders/status — DynoAPIs polls for decisions we queued.
-  // Returns { orders: [{ orderId, status, prepTime? }] } using DynoAPIs' codes.
-  r.get('/api/connectors/aggregator/dyno/:token/:resId/orders/status', async (req, res) => {
-    const tenantId = await resolveToken(String(req.params.token))
-    if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
-    void bumpHeartbeat(tenantId)   // regular poll = liveness signal
-    const { data } = await supabase.from('aggregator_orders')
-      .select('external_order_id, pending_action, pending_prep_time')
-      .eq('tenant_id', tenantId).eq('outlet_ref', String(req.params.resId))
-      .not('pending_action', 'is', null)
-    const orders = (data ?? []).map((o: any) => ({
-      orderId: o.external_order_id,
-      status: PULL_CODE[o.pending_action as keyof typeof PULL_CODE] ?? 0,
-      prepTime: o.pending_prep_time ?? 30,
-    }))
-    // Request a one-shot history backfill the first time we see this outlet.
-    const orderHistory = await needsHistorySync(tenantId, String(req.params.resId))
-    res.json({ orders, orderHistory })
+  // GET /pending-actions — the desktop polls the operator decisions + stock
+  // toggles we queued (tenant-wide, all outlets), executes them on the merchant's
+  // own dashboard, and reports back via /actions/result. Poll = liveness signal.
+  r.get('/api/connectors/aggregator/pending-actions', ...guardView, async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      void bumpHeartbeat(tenantId)
+      const { data: od } = await supabase.from('aggregator_orders')
+        .select('external_order_id, outlet_ref, channel, pending_action, pending_prep_time, pending_reason')
+        .eq('tenant_id', tenantId).not('pending_action', 'is', null)
+      const orders = (od ?? []).map((o: any) => ({
+        orderId: o.external_order_id, resId: o.outlet_ref, channel: o.channel,
+        action: o.pending_action, code: PULL_CODE[o.pending_action as keyof typeof PULL_CODE] ?? 0,
+        prepTime: o.pending_prep_time ?? 30, reason: o.pending_reason ?? null,
+      }))
+      const { data: stk } = await supabase.from('aggregator_stock_actions')
+        .select('id, outlet_ref, channel, entity_type, entity_id, in_stock')
+        .eq('tenant_id', tenantId).eq('status', 'pending')
+      const stock = (stk ?? []).map((a: any) => ({
+        id: a.id, resId: a.outlet_ref, channel: a.channel,
+        entityType: a.entity_type, entityId: a.entity_id, inStock: a.in_stock,
+      }))
+      // Outlets still needing a one-shot full menu / history pull (day-one catalog).
+      const { data: ms } = await supabase.from('aggregator_menu_sync')
+        .select('outlet_ref').eq('tenant_id', tenantId).eq('pending_full_sync', true)
+      const { data: hs } = await supabase.from('aggregator_history_sync')
+        .select('outlet_ref').eq('tenant_id', tenantId).eq('pending_full_sync', true)
+      res.json({
+        orders, stock,
+        menuResync: (ms ?? []).map((r: any) => r.outlet_ref),
+        historyResync: (hs ?? []).map((r: any) => r.outlet_ref),
+      })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
-  // POST /orders/:orderId/status — DynoAPIs reports a decision's outcome.
-  // Body { statusCode, statusResponse }. We MUST echo { status: statusCode } so
-  // the client considers it applied. Clears the queued decision.
-  r.post('/api/connectors/aggregator/dyno/:token/orders/:orderId/status', async (req, res) => {
-    const tenantId = await resolveToken(String(req.params.token))
-    if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
-    const statusCode = Number(req.body?.statusCode)
-    const mapped = RESULT_MAP[statusCode]
-    await supabase.from('aggregator_orders').update({
-      pending_action: null, pending_prep_time: null, pending_reason: null, pending_queued_at: null,
-      ...(mapped ? { status: mapped } : {}),
-      last_action_result: req.body?.statusResponse ?? null, updated_at: new Date().toISOString(),
-    }).eq('tenant_id', tenantId).eq('external_order_id', String(req.params.orderId))
-    res.json({ status: statusCode })   // echo so the client marks it done
+  // POST /actions/result — the desktop reports the outcome of a queued action,
+  // clearing it. kind:'order' (statusCode via RESULT_MAP) | 'stock' (by id).
+  r.post('/api/connectors/aggregator/actions/result', ...guardEdit, async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const b = (req.body ?? {}) as any
+      if (b.kind === 'order' && b.orderId) {
+        const mapped = RESULT_MAP[Number(b.statusCode)]
+        await supabase.from('aggregator_orders').update({
+          pending_action: null, pending_prep_time: null, pending_reason: null, pending_queued_at: null,
+          ...(mapped ? { status: mapped } : {}),
+          last_action_result: b.result ?? null, updated_at: new Date().toISOString(),
+        }).eq('tenant_id', tenantId).eq('external_order_id', String(b.orderId))
+      } else if (b.kind === 'stock' && b.id != null) {
+        await supabase.from('aggregator_stock_actions').update({
+          status: 'done', result: b.result ?? null, updated_at: new Date().toISOString(),
+        }).eq('tenant_id', tenantId).eq('id', b.id)
+      } else {
+        res.status(400).json({ error: "body needs { kind:'order', orderId, statusCode } or { kind:'stock', id }" }); return
+      }
+      res.json({ ok: true })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
-  // GET /:resId/items — DynoAPIs polls for stock toggles we queued.
-  // Returns { items:[{id,stockStatus}], categories:[{id,stockStatus}], getAllItems:false }.
-  r.get('/api/connectors/aggregator/dyno/:token/:resId/items', async (req, res) => {
-    const tenantId = await resolveToken(String(req.params.token))
-    if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
-    const { data } = await supabase.from('aggregator_stock_actions')
-      .select('entity_type, entity_id, in_stock')
-      .eq('tenant_id', tenantId).eq('outlet_ref', String(req.params.resId)).eq('status', 'pending')
-    const items: any[] = [], categories: any[] = []
-    for (const a of data ?? []) {
-      const row = { id: (a as any).entity_id, stockStatus: (a as any).in_stock }
-      ;((a as any).entity_type === 'category' ? categories : items).push(row)
-    }
-    // Ask the client to fetch + push the full menu when we don't have it yet
-    // (or a resync was requested) — this is how an onboarded restaurant's
-    // existing catalog lands in our POS on day one.
-    const getAllItems = await needsFullSync(tenantId, String(req.params.resId))
-    res.json({ items, categories, getAllItems })
-  })
-
-  // POST /:resId/items/status & /:resId/categories/status — toggle results.
-  // Body { entityId, statusResponse, aggregator, stockStatus, ... }. Echo {status:200}.
-  const stockResult = (entityType: 'item' | 'category') => async (req: express.Request, res: express.Response) => {
-    const tenantId = await resolveToken(String(req.params.token))
-    if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
-    await supabase.from('aggregator_stock_actions').update({
-      status: 'done', result: req.body?.statusResponse ?? req.body ?? null, updated_at: new Date().toISOString(),
-    }).eq('tenant_id', tenantId).eq('outlet_ref', String(req.params.resId))
-      .eq('entity_type', entityType).eq('entity_id', String(req.body?.entityId ?? '')).eq('status', 'pending')
-    res.json({ status: 200 })
-  }
-  r.post('/api/connectors/aggregator/dyno/:token/:resId/items/status',      stockResult('item'))
-  r.post('/api/connectors/aggregator/dyno/:token/:resId/categories/status', stockResult('category'))
-
-  // Full menu snapshot → parse + upsert into aggregator_menu (day-one catalog).
-  r.post('/api/connectors/aggregator/dyno/:token/:resId/items', async (req, res) => {
-    const tenantId = await resolveToken(String(req.params.token))
-    if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
-    try { await ingestMenu(tenantId, String(req.params.resId), req.body) }
+  // POST /menu/ingest & /history/ingest — day-one catalog + past-order backfill,
+  // relayed authenticated by the web app. Body { outletRef, ... }.
+  r.post('/api/connectors/aggregator/menu/ingest', ...guardEdit, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const outletRef = String(req.body?.outletRef ?? '')
+    if (!outletRef) { res.status(400).json({ error: 'outletRef required' }); return }
+    try { await ingestMenu(tenantId, outletRef, req.body) }
     catch (e: any) { console.error(`[aggregator/menu] ingest error: ${e?.message}`) }
-    res.json({ status: 200 })
+    res.json({ ok: true })
   })
-
-  // Order-history snapshot → parse + upsert into aggregator_order_history (day-one backfill).
-  r.post('/api/connectors/aggregator/dyno/:token/:resId/orders/history', async (req, res) => {
-    const tenantId = await resolveToken(String(req.params.token))
-    if (!tenantId) { res.status(404).json({ error: 'Unknown token' }); return }
-    try { await ingestHistory(tenantId, String(req.params.resId), req.body) }
+  r.post('/api/connectors/aggregator/history/ingest', ...guardEdit, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const outletRef = String(req.body?.outletRef ?? '')
+    if (!outletRef) { res.status(400).json({ error: 'outletRef required' }); return }
+    try { await ingestHistory(tenantId, outletRef, req.body) }
     catch (e: any) { console.error(`[aggregator/history] ingest error: ${e?.message}`) }
-    res.json({ status: 200 })
+    res.json({ ok: true })
   })
 
   return r

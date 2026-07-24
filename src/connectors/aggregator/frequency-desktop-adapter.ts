@@ -1,18 +1,18 @@
 /**
- * DynoAPIs adapter — the interim source.
+ * Frequency Desktop adapter — the interim source.
  *
- * DynoAPIs is a desktop client the *merchant* installs on their own Windows
- * machine. It logs into the merchant's own Zomato/Swiggy dashboard and does all
- * the aggregator talking there — our servers never call Zomato/Swiggy. The
- * integration with us is a PULL model over the webhook the merchant's machine
- * points at (see routes/connectors/aggregator.ts):
+ * Frequency Desktop is our own app the *merchant* installs on their machine, and
+ * it runs the Frequency web app with the merchant logged in. It logs into the
+ * merchant's own Zomato/Swiggy dashboard and does all the aggregator talking
+ * there — our servers never call Zomato/Swiggy. The integration with us is a
+ * PULL model, but authenticated by the logged-in Frequency session (NO token):
+ * the app relays through its own web view (see routes/connectors/aggregator.ts):
  *
- *   • New/updated orders  → DynoAPIs POSTs them to us      → we upsert
- *   • Operator decisions  → we QUEUE them on the order row → DynoAPIs polls
- *       GET {base}/{resId}/orders/status, executes on the aggregator, then
- *       POSTs the result back to {base}/orders/{orderId}/status
- *   • Stock toggles       → we QUEUE a row                 → DynoAPIs polls
- *       GET {base}/{resId}/items, executes, POSTs {resId}/items/status back
+ *   • New/updated orders  → relayed to POST /orders/ingest → we upsert
+ *   • Operator decisions  → we QUEUE them on the order row → the app polls
+ *       GET /pending-actions, executes on the aggregator, then POSTs the result
+ *       back to /actions/result
+ *   • Stock toggles       → we QUEUE a row                 → same pull/result path
  *
  * So both write methods here just enqueue — nothing leaves our infra. That is
  * the whole point: the aggregator access stays on the merchant's machine.
@@ -23,15 +23,15 @@ import {
   AggregatorAdapter, AdapterCapabilities, AdapterContext, OrderDecision, StockToggle, AggregatorChannel,
 } from './types'
 
-export class DynoApisAdapter implements AggregatorAdapter {
-  readonly source = 'dynoapis' as const
+export class FrequencyDesktopAdapter implements AggregatorAdapter {
+  readonly source = 'frequency_desktop' as const
   constructor(private supabase: SupabaseClient) {}
 
   capabilities(): AdapterCapabilities {
-    // DynoAPIs rides the merchant dashboard's *order-ops* surface only. It can
-    // take orders and flip items on/off, but it cannot build or edit a menu —
-    // those live behind a heavier surface it doesn't cover. The FE greys out
-    // menu editing accordingly until the tenant moves to a direct/middleware
+    // The desktop source rides the merchant dashboard's *order-ops* surface only.
+    // It can take orders and flip items on/off, but it cannot build or edit a
+    // menu — those live behind a heavier surface it doesn't cover. The FE greys
+    // out menu editing accordingly until the tenant moves to a direct/middleware
     // source that reports these true.
     return {
       orders:      true,
@@ -50,7 +50,7 @@ export class DynoApisAdapter implements AggregatorAdapter {
     order: { externalOrderId: string; channel: AggregatorChannel; outletRef: string | null },
     decision: OrderDecision,
   ): Promise<{ queued: boolean; executed: boolean }> {
-    // Queue the decision on the order row; DynoAPIs pulls it on its next poll.
+    // Queue the decision on the order row; the desktop app pulls it on its next poll.
     const { error } = await this.supabase.from('aggregator_orders')
       .update({
         pending_action:    decision.kind,
