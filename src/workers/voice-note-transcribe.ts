@@ -40,6 +40,7 @@ import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { recordFlatAiCostCents } from '../lib/ai-usage'
 import { Q, VoiceNoteTranscribeJob, connection } from '../queue'
+import { readSecretValue } from '../lib/wa-creds'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -196,7 +197,7 @@ async function resolveAudio(message: any, tenant: any): Promise<{ bytes: Buffer;
 
     const mediaId = audio.id
     if (!mediaId) return null
-    const token = tenant?.access_token
+    const token = readSecretValue(tenant?.access_token)
     if (!token) throw new Error('wa_token_missing')
 
     // Resolve media-id → signed CDN URL via Graph.

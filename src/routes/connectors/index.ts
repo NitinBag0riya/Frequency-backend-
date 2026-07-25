@@ -43,6 +43,7 @@ import { createLeadWebhookConnectors } from './lead-webhooks'
 import { createZomatoConnector } from './zomato'
 import { createAggregatorConnector } from './aggregator'
 import { signOauthState } from '../../lib/oauth-state'
+import { readSecretValue, writeSecretValue } from '../../lib/wa-creds'
 
 // Meta Graph API base — kept inline to avoid pulling in unrelated config modules.
 const GRAPH = 'https://graph.facebook.com/v18.0'
@@ -1228,7 +1229,10 @@ export function createConnectorsRouter(deps: Deps): express.Router {
       const { error } = await supabase.from('tenants').update({
         waba_id,
         phone_number_id,
-        access_token,
+        // Encrypted at rest, same as the embedded-signup path. Reads go
+        // through readSecretValue(), which passes legacy plaintext rows
+        // through unchanged.
+        access_token: writeSecretValue(access_token),
         display_phone: displayPhoneNumber,
         status: 'active',
         ...(verifiedName ? { business_name: verifiedName } : {}),
@@ -1396,7 +1400,7 @@ export function createConnectorsRouter(deps: Deps): express.Router {
 
         const r2 = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+          headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             messaging_product: 'whatsapp',
             to: phone,
@@ -1436,7 +1440,7 @@ export function createConnectorsRouter(deps: Deps): express.Router {
         if (!tenant || tenant.status !== 'active' || !tenant.access_token || !tenant.phone_number_id) {
           res.json({ ok: false, error: 'WhatsApp is not connected for this workspace.' }); return
         }
-        const tok = tenant.access_token as string
+        const tok = readSecretValue(tenant.access_token) ?? ''
         // 1) Phone — proves the token + phone-number id are live.
         const pr = await fetch(`${GRAPH}/${encodeURIComponent(tenant.phone_number_id)}?fields=display_phone_number,verified_name,quality_rating&access_token=${encodeURIComponent(tok)}`)
         const pj = await pr.json() as any

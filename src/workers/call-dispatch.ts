@@ -27,6 +27,7 @@ import '../env'
 import { Worker, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, CallDispatchJob, connection } from '../queue'
+import { readSecretValue } from '../lib/wa-creds'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -93,7 +94,7 @@ export function startCallDispatchWorker() {
         metaResp = await fetch(`${GRAPH_BASE()}/${tenant.phone_number_id}/calls`, {
           method: 'POST',
           headers: {
-            Authorization:  `Bearer ${tenant.access_token}`,
+            Authorization:  `Bearer ${readSecretValue(tenant.access_token)}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(payload),

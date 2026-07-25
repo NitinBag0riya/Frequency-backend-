@@ -23,6 +23,7 @@ import { Q, connection, cronQueue } from '../queue'
 import { emitNotification } from '../routes/notifications'
 import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 import { parseComponents } from '../lib/wa-components'
+import { readSecretValue } from '../lib/wa-creds'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -130,7 +131,7 @@ export async function syncTenant(tenant: { id: string; waba_id: string; access_t
   if (!tenant.waba_id || !tenant.access_token) {
     return { fetched: 0, updated: 0, deleted: 0 }
   }
-  const templates = await fetchTemplates(tenant.waba_id, tenant.access_token)
+  const templates = await fetchTemplates(tenant.waba_id, readSecretValue(tenant.access_token) ?? '')
 
   // Pre-fetch existing rows for this tenant so we can DIFF status &
   // category in one pass instead of N round-trips. One row per

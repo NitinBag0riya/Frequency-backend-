@@ -70,6 +70,37 @@ interface ParsedEntity { entity_type: 'item' | 'category'; entity_id: string; na
  * TODO(menu-spec): tighten field names once a real snapshot is captured.
  */
 function parseMenuSnapshot(body: any): ParsedEntity[] {
+  // Swiggy Frequency-Desktop snapshot (real shape, mapped live 2026-07-25):
+  // restaurant-menu-wrapper → data.menu.items_vo[], each row flattening a
+  // category + one item. Handle it explicitly; fall through to the generic
+  // best-effort parser for other/unknown shapes.
+  const itemsVo = body?.data?.menu?.items_vo ?? body?.menu?.items_vo
+  if (Array.isArray(itemsVo) && itemsVo.length) {
+    const rows: ParsedEntity[] = []
+    const seenCat = new Set<string>()
+    for (const row of itemsVo) {
+      const catId = row?.main_category_id != null ? String(row.main_category_id) : null
+      if (catId && !seenCat.has(catId)) {
+        seenCat.add(catId)
+        rows.push({
+          entity_type: 'category', entity_id: catId, name: row.main_category_name ?? null,
+          in_stock: true, price: null, category_ref: null,
+          raw: { main_category_id: catId, main_category_name: row.main_category_name, main_category_order: row.main_category_order },
+        })
+      }
+      const it = row?.item
+      if (it && it.id != null) {
+        rows.push({
+          entity_type: 'item', entity_id: String(it.id), name: it.name ?? null,
+          in_stock: it.in_stock === 1 || it.in_stock === true,
+          price: typeof it.price === 'number' ? it.price : (it.price != null ? Number(it.price) : null),
+          category_ref: catId, raw: it,
+        })
+      }
+    }
+    if (rows.length) return rows
+  }
+
   const sr = body?.statusResponse ?? body?.data ?? body ?? {}
   const itemArr: any[] = Array.isArray(sr) ? sr : (sr.items ?? sr.data?.items ?? sr.menu?.items ?? [])
   const catArr: any[] = sr.categories ?? sr.data?.categories ?? sr.menu?.categories ?? []

@@ -13,6 +13,7 @@
  * (storefront-api) falls back to its on-screen demo code, so login never breaks.
  */
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { readSecretValue } from './wa-creds'
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
 const OTP_TEMPLATE = process.env.WA_OTP_TEMPLATE_NAME || 'frequency_login_code'
@@ -36,7 +37,7 @@ export async function sendStorefrontOtp(
 
   let creds: { phoneNumberId: string; accessToken: string; via: 'tenant' | 'frequency' } | null = null
   if (tenant?.phone_number_id && tenant?.access_token && (tenant as any).status !== 'disconnected') {
-    creds = { phoneNumberId: tenant.phone_number_id, accessToken: tenant.access_token, via: 'tenant' }
+    creds = { phoneNumberId: tenant.phone_number_id, accessToken: readSecretValue(tenant.access_token) ?? '', via: 'tenant' }
   } else if (process.env.FREQ_WA_PHONE_NUMBER_ID && process.env.FREQ_WA_ACCESS_TOKEN) {
     creds = { phoneNumberId: process.env.FREQ_WA_PHONE_NUMBER_ID, accessToken: process.env.FREQ_WA_ACCESS_TOKEN, via: 'frequency' }
   }

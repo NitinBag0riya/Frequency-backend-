@@ -27,6 +27,8 @@ import { sendEmail, emailConfigured } from './lib/email'
 import { createPublicStatusRouter } from './routes/public-status'
 import { createWaFeaturesRouter }  from './routes/wa-features'
 import { createWaTemplatesRouter } from './routes/wa-templates'
+import { createWaConnectionRouter, createDataDeletionRouter } from './routes/wa-connection'
+import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue } from './lib/wa-creds'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
@@ -2613,7 +2615,11 @@ app.post('/api/auth/facebook/connect-waba', requireAuth, async (req, res) => {
       user_id: user.id,
       waba_id,
       phone_number_id,
-      access_token: longToken,
+      // Encrypted at rest (AES-256-GCM via lib/app-secrets). Reads go through
+      // readSecretValue(), which passes legacy plaintext rows straight through
+      // — so existing tenants keep working and re-encrypt on their next
+      // reconnect, with no big-bang backfill.
+      access_token: writeSecretValue(longToken),
       business_name: existingNullWaba?.business_name ?? businessName,
       slug: slugToWrite,
       display_phone: phoneData.display_phone_number,
@@ -2920,7 +2926,7 @@ app.post('/api/wa-templates', requireAuth, identifyTenant, checkPermission('what
   try {
     const r = await fetch(`${GRAPH}/${tenant.waba_id}/message_templates`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, language, category, components })
     })
     const data = await r.json() as any
@@ -2969,7 +2975,7 @@ app.delete('/api/wa-templates/:name', requireAuth, identifyTenant, checkPermissi
   try {
     const r = await fetch(
       `${GRAPH}/${tenant.waba_id}/message_templates?name=${encodeURIComponent(String(req.params.name ?? ''))}`,
-      { method: 'DELETE', headers: { Authorization: `Bearer ${tenant.access_token}` } }
+      { method: 'DELETE', headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}` } }
     )
     const text = await r.text().catch(() => '')
     let data: any = null
@@ -3607,7 +3613,7 @@ app.post('/api/inbox/react', requireAuth, identifyTenant, checkPermission('inbox
   try {
     const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
     const data = await r.json() as any
@@ -3734,7 +3740,7 @@ async function sendWAMedia(tenant: any, to: string, kind: 'image'|'video'|'audio
 
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
   const data = await r.json() as any
@@ -3868,6 +3874,30 @@ app.get('/webhook/whatsapp', (req, res) => {
   }
 })
 
+// GET verify for a BYO tenant's private webhook URL.
+//
+// The merchant pastes this exact URL into THEIR Meta app's WhatsApp webhook
+// config, and uses the same token as the Verify Token — one string to copy
+// instead of two, and it's already a per-tenant secret. We compare against the
+// path segment (which the lookup already proved exists) rather than the global
+// WH_VERIFY_TOKEN, so one tenant can never verify another's endpoint.
+app.get('/webhook/whatsapp/:token', async (req, res) => {
+  const mode      = req.query['hub.mode']
+  const verify    = req.query['hub.verify_token']
+  const challenge = req.query['hub.challenge']
+  const pathToken = String(req.params.token ?? '')
+
+  const { data: tenant } = await supabase.from('tenants')
+    .select('id').eq('wa_webhook_token', pathToken).maybeSingle()
+
+  if (mode === 'subscribe' && tenant && verify === pathToken) {
+    console.log(`[wa-webhook] BYO webhook verified tenant=${tenant.id}`)
+    res.status(200).send(challenge)
+  } else {
+    res.sendStatus(403)
+  }
+})
+
 // POST: Inbound messages
 //
 // B2: HMAC verification of x-hub-signature-256. Without this, anyone who
@@ -3875,27 +3905,28 @@ app.get('/webhook/whatsapp', (req, res) => {
 // updates, and pollute every tenant's inbox / fire workflows under any
 // WABA we host. The raw body parser is mounted above (before express.json)
 // so req.body is a Buffer at this point — exactly the bytes Meta signed.
-app.post('/webhook/whatsapp', async (req, res) => {
+/**
+ * Shared inbound handler for both webhook URLs.
+ *
+ *   appSecret     — which secret verifies this delivery's HMAC. Platform mode
+ *                   uses ours; a BYO tenant's own Meta app signs with theirs.
+ *   scopeTenantId — set only for BYO deliveries. Constrains every entry in the
+ *                   payload to that one tenant, so a merchant who controls
+ *                   their own signing key can't reach across into another
+ *                   tenant's inbox by naming a foreign WABA id.
+ */
+async function handleWaWebhook(
+  req: express.Request,
+  res: express.Response,
+  appSecret: string,
+  scopeTenantId?: string,
+) {
   const sigHeader = req.header('x-hub-signature-256') || req.header('X-Hub-Signature-256')
   const rawBody = req.body as Buffer
-  const appSecret = process.env.META_APP_SECRET || ''
   if (!Buffer.isBuffer(rawBody)) {
     // Should never happen given the express.raw mount, but fail closed.
     console.warn('[wa-webhook] body is not a Buffer — raw parser not mounted? Refusing.')
     res.status(401).json({ error: 'invalid_signature' }); return
-  }
-  // Local helper kept inline to avoid an extra import cycle. Same constant-
-  // time compare pattern as routes/wa-calling.ts:verifyMetaSignature.
-  const verifyMetaSignature = (body: Buffer, header: string | undefined, secret: string): boolean => {
-    if (!header || !secret) return false
-    const prefix = 'sha256='
-    if (!header.startsWith(prefix)) return false
-    const provided = header.slice(prefix.length)
-    const expected = crypto.createHmac('sha256', secret).update(body).digest('hex')
-    if (provided.length !== expected.length) return false
-    try {
-      return crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(expected, 'utf8'))
-    } catch { return false }
   }
   if (!verifyMetaSignature(rawBody, sigHeader, appSecret)) {
     console.warn('[wa-webhook] HMAC verification failed — rejecting')
@@ -3907,7 +3938,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
   // and ACKs immediately. The worker (workers/webhook-retry.ts) does the
   // DB writes with 5-attempt exponential backoff + DLQ. Default OFF so
   // existing behaviour is preserved until we flip the switch in prod.
-  if (process.env.WEBHOOK_QUEUE_ENABLED === '1') {
+  // ponytail: BYO deliveries always run inline — the queue payload carries no
+  // tenant scope, so a queued BYO entry would be re-resolved by waba_id alone
+  // and lose the scopeTenantId guard above. Ceiling: BYO tenants don't get the
+  // retry/DLQ safety net. Upgrade path when BYO volume warrants it — add
+  // tenantId to the enqueueWebhookInbound payload and honour it in
+  // workers/webhook-retry.ts, then drop this condition.
+  if (process.env.WEBHOOK_QUEUE_ENABLED === '1' && !scopeTenantId) {
     try {
       const { enqueueWebhookInbound } = await import('./queue')
       await enqueueWebhookInbound({
@@ -3959,10 +3996,19 @@ app.post('/webhook/whatsapp', async (req, res) => {
         if (change.field !== 'messages') continue
         const value = change.value
 
-        // Find tenant by WABA ID
-        const { data: tenant } = await supabase.from('tenants')
-          .select('*').eq('waba_id', wabaId).eq('status', 'active').single()
-        if (!tenant) continue
+        // Find tenant by WABA ID. On a BYO endpoint the tenant is already
+        // known from the URL token — pin the query to it so a payload naming
+        // someone else's WABA resolves to nothing instead of to them.
+        let tenantQuery = supabase.from('tenants')
+          .select('*').eq('waba_id', wabaId).eq('status', 'active')
+        if (scopeTenantId) tenantQuery = tenantQuery.eq('id', scopeTenantId)
+        const { data: tenant } = await tenantQuery.maybeSingle()
+        if (!tenant) {
+          if (scopeTenantId) {
+            console.warn(`[wa-webhook] BYO payload for waba=${wabaId} did not match tenant=${scopeTenantId} — dropped`)
+          }
+          continue
+        }
 
         // Handle inbound messages
         for (const msg of value.messages ?? []) {
@@ -4046,6 +4092,36 @@ app.post('/webhook/whatsapp', async (req, res) => {
   } catch (err) {
     console.error('Webhook error:', err)
   }
+}
+
+// Platform mode — every tenant onboarded through OUR Meta app shares this URL.
+app.post('/webhook/whatsapp', async (req, res) => {
+  await handleWaWebhook(req, res, process.env.META_APP_SECRET || '')
+})
+
+// BYO mode — one private URL per tenant. Resolving the tenant from the path
+// BEFORE touching the body is the whole point: it tells us which app secret to
+// verify against without having to parse unverified JSON first.
+app.post('/webhook/whatsapp/:token', async (req, res) => {
+  const { data: tenant } = await supabase.from('tenants')
+    .select('id, wa_mode, wa_app_id, wa_app_secret_enc, wa_webhook_token, waba_id, phone_number_id, access_token, status')
+    .eq('wa_webhook_token', String(req.params.token ?? ''))
+    .maybeSingle()
+
+  if (!tenant || tenant.status !== 'active') {
+    // 404 rather than 403 — an unknown token shouldn't confirm the URL shape.
+    res.sendStatus(404); return
+  }
+
+  const creds = await resolveWaCreds(supabase, tenant.id, tenant)
+  if (!creds?.appSecret) {
+    // Secret present but undecryptable (key rotated). 503 makes Meta retry
+    // rather than treat the delivery as permanently rejected.
+    console.error(`[wa-webhook] BYO tenant=${tenant.id} has no usable app secret`)
+    res.sendStatus(503); return
+  }
+
+  await handleWaWebhook(req, res, creds.appSecret, tenant.id)
 })
 
 async function handleInboundMessage(tenant: any, msg: any, contact: any) {
@@ -4287,7 +4363,7 @@ async function sendTextMessage(tenant: any, to: string, text: string, replyToPla
 
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
   const data = await r.json() as any
@@ -4325,7 +4401,7 @@ async function sendTemplateMessage(tenant: any, to: string, templateName: string
 
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
   const data = await r.json() as any
@@ -4371,7 +4447,7 @@ async function sendInteractiveMessage(tenant: any, to: string, config: any) {
 
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   })
   const data = await r.json() as any
@@ -5549,6 +5625,9 @@ app.use(createWaFeaturesRouter({ supabase, requireAuth, identifyTenant, checkPer
 // :name/explain-rejection, /api/wa-templates/:name/resubmit-draft alongside
 // the inline GET/POST/DELETE /api/wa-templates routes above.
 app.use(createWaTemplatesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+app.use(createWaConnectionRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+// Unauthenticated — Meta calls this one, not a logged-in user.
+app.use(createDataDeletionRouter({ supabase }))
 app.use(createTelegramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createInstagramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createMetaAdsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))

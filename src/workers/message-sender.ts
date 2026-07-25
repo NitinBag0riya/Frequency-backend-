@@ -20,6 +20,7 @@ import { Worker, UnrecoverableError, Job } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { Q, MessageSendJob, connection } from '../queue'
 import { checkAndConsumeQuota, RateLimitExceededError } from '../lib/quota'
+import { readSecretValue } from '../lib/wa-creds'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -251,7 +252,7 @@ async function sendWhatsApp(data: MessageSendJob) {
 
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
   const body = await r.json() as any

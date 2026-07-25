@@ -25,6 +25,7 @@ import {
 } from '../lib/wa-flow-schema'
 import { checkAndConsumeQuota } from '../lib/quota'
 import { recordAiUsage } from '../lib/ai-usage'
+import { readSecretValue } from '../lib/wa-creds'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -236,7 +237,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       try {
         const r = await fetch(`${GRAPH}/${tenant.waba_id}/flows`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+          headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ name, categories: category ? [category] : ['OTHER'] }),
         })
         const j = await r.json() as any
@@ -272,7 +273,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
     if (flow.meta_flow_id && tenant?.access_token) {
       try {
         await fetch(`${GRAPH}/${flow.meta_flow_id}/publish`, {
-          method: 'POST', headers: { Authorization: `Bearer ${tenant.access_token}` },
+          method: 'POST', headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}` },
         })
       } catch (e) { /* fall-through; we still mark local PUBLISHED */ }
     }
@@ -504,7 +505,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       if (!metaFlowId) {
         const createRes = await fetch(`${GRAPH}/${tenant.waba_id}/flows`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+          headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             name: flow.name,
             categories: flow.category ? [flow.category] : ['OTHER'],
@@ -526,7 +527,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       form.append('asset_type', 'FLOW_JSON')
       const assetRes = await fetch(`${GRAPH}/${metaFlowId}/assets`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${tenant.access_token}` },
+        headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}` },
         body: form as any,
       })
       const assetJson = await assetRes.json() as any
@@ -537,7 +538,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       // 2c. Publish — irreversible at Meta.
       const pubRes = await fetch(`${GRAPH}/${metaFlowId}/publish`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${tenant.access_token}` },
+        headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}` },
       })
       const pubJson = await pubRes.json() as any
       if (!pubRes.ok) {
@@ -634,7 +635,7 @@ export function createWaFeaturesRouter(deps: Deps): express.Router {
       try {
         await fetch(`${GRAPH}/${tenant.phone_number_id}/whatsapp_business_profile`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${tenant.access_token}`, 'Content-Type': 'application/json' },
+          headers: { Authorization: `Bearer ${readSecretValue(tenant.access_token)}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             messaging_product: 'whatsapp',
             about: row.about, description: row.description, email: row.email,

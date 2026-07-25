@@ -39,6 +39,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { readSecretValue } from './wa-creds'
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
 
@@ -155,7 +156,7 @@ export async function sendWaNotification(
   const r = await fetch(`${GRAPH}/${tenant.phone_number_id}/messages`, {
     method: 'POST',
     headers: {
-      Authorization:  `Bearer ${tenant.access_token}`,
+      Authorization:  `Bearer ${readSecretValue(tenant.access_token)}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
