@@ -22,6 +22,7 @@ export function createAppointmentsRouter(supabase: SupabaseClient, requireAuth: 
     if (req.query.from) q = q.gte('starts_at', String(req.query.from))
     if (req.query.to) q = q.lte('starts_at', String(req.query.to))
     if (req.query.status) q = q.eq('status', String(req.query.status))
+    if (req.query.assignedTo) q = q.eq('assigned_to', String(req.query.assignedTo))
     const { data, error } = await q
     if (error) return res.status(500).json({ error: error.message })
     res.json({ appointments: data ?? [] })
@@ -53,6 +54,7 @@ export function createAppointmentsRouter(supabase: SupabaseClient, requireAuth: 
       service: b.service ?? null, stylist: b.stylist ?? null,
       starts_at: b.startsAt, duration_min: b.durationMin != null ? Number(b.durationMin) : 30,
       status, price: b.price != null && b.price !== '' ? Number(b.price) : null, note: b.note ?? null,
+      assigned_to: b.assignedTo ?? null,
       by_email: (req as any).user?.email ?? null,
     }).select().single()
     if (error) return res.status(500).json({ error: error.message })
@@ -67,6 +69,7 @@ export function createAppointmentsRouter(supabase: SupabaseClient, requireAuth: 
     if (b.status !== undefined) { if (!STATUSES.includes(b.status)) return res.status(400).json({ error: 'bad status' }); patch.status = b.status }
     for (const [k, col] of [['customerName', 'customer_name'], ['customerPhone', 'customer_phone'], ['service', 'service'], ['stylist', 'stylist'], ['note', 'note']] as const)
       if (b[k] !== undefined) patch[col] = b[k]
+    if (b.assignedTo !== undefined) patch.assigned_to = b.assignedTo || null
     if (b.startsAt !== undefined) patch.starts_at = b.startsAt
     if (b.durationMin !== undefined) patch.duration_min = Number(b.durationMin)
     if (b.price !== undefined) patch.price = b.price === '' ? null : Number(b.price)
