@@ -13,6 +13,7 @@ import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata,
 import { createLeadsRouter } from './leads'
 import { createKhataRouter } from './routes/khata'
 import { createListingsRouter } from './routes/listings'
+import { createAppointmentsRouter } from './routes/appointments'
 import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
@@ -5486,6 +5487,7 @@ if (process.env.NODE_ENV !== 'production') {
 app.use('/api', createLeadsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createKhataRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createListingsRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use('/api', createAppointmentsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api/admin', createAdminRouter(supabase, requireAuth, isPlatformUser))
 
 // ── Phase 3: campaigns, analytics, execution logs, activity ──────────────────
