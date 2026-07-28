@@ -19,6 +19,10 @@ export function createAppointmentsRouter(supabase: SupabaseClient, requireAuth: 
   router.get('/appointments', ...view, async (req, res) => {
     const tenantId = (req as any).tenantId
     let q = supabase.from('appointments').select('*').eq('tenant_id', tenantId).order('starts_at', { ascending: true })
+    // Staff (role data_scope='own') are hard-scoped to their OWN bookings — a
+    // server-side boundary, not just a UI filter. Managers/owners ('team'/'all')
+    // see the whole calendar. This is what makes the admin-vs-staff split real.
+    if ((req as any).userDataScope === 'own') q = q.eq('assigned_to', (req as any).user?.id)
     if (req.query.from) q = q.gte('starts_at', String(req.query.from))
     if (req.query.to) q = q.lte('starts_at', String(req.query.to))
     if (req.query.status) q = q.eq('status', String(req.query.status))
@@ -33,8 +37,11 @@ export function createAppointmentsRouter(supabase: SupabaseClient, requireAuth: 
     const tenantId = (req as any).tenantId
     const start = new Date(); start.setHours(0, 0, 0, 0)
     const end = new Date(start); end.setDate(end.getDate() + 1)
-    const { data, error } = await supabase.from('appointments').select('status')
+    let sq = supabase.from('appointments').select('status')
       .eq('tenant_id', tenantId).gte('starts_at', start.toISOString()).lt('starts_at', end.toISOString())
+    // Same row-scope as the list: staff counts reflect only their own bookings.
+    if ((req as any).userDataScope === 'own') sq = sq.eq('assigned_to', (req as any).user?.id)
+    const { data, error } = await sq
     if (error) return res.status(500).json({ error: error.message })
     const rows = data ?? []
     const by = (s: string) => rows.filter(r => r.status === s).length
