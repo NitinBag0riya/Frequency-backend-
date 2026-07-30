@@ -498,6 +498,70 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
+  // ── Cross-channel menu reconcile (foundation for absolute menu sync) ──────────
+  // Collapse the per-channel menus (our mini-app/POS catalog + captured Zomato +
+  // Swiggy) into ONE master keyed by normalised name, so "3 items on Zomato / 4 on
+  // Swiggy" become one master list with per-channel presence/price + an explicit
+  // our_item ↔ zomato_catalogueId ↔ swiggy_itemId map (menu_channel_map). This is
+  // read-only bookkeeping — no aggregator write — and the base every sync hangs off.
+  const normKey = (s: unknown) => String(s ?? '').toLowerCase().normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ')
+
+  // POST body (all optional): { master: [{id,name,price,available}] } — our own
+  // mini-app/POS catalog items to fold in alongside the captured aggregator menus.
+  r.post('/api/connectors/aggregator/menu/reconcile', ...guardEdit, async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const rows: any[] = []
+      const push = (channel: string, item: { id?: any; name?: any; price?: any; available?: any; outletRef?: any }) => {
+        const name = String(item.name ?? '').trim()
+        if (!name) return
+        rows.push({
+          tenant_id: tenantId, master_key: normKey(name), master_name: name,
+          channel, outlet_ref: item.outletRef != null ? String(item.outletRef) : null,
+          channel_item_id: String(item.id ?? `${channel}:${normKey(name)}`),
+          channel_name: name, channel_price: item.price != null ? Number(item.price) : null,
+          available: item.available !== false, match_type: 'auto', updated_at: new Date().toISOString(),
+        })
+      }
+      // Captured aggregator items (Zomato/Swiggy) already in aggregator_menu.
+      const { data: agg } = await supabase.from('aggregator_menu')
+        .select('channel, outlet_ref, entity_id, name, price, in_stock')
+        .eq('tenant_id', tenantId).eq('entity_type', 'item').limit(5000)
+      for (const m of agg ?? []) push(m.channel, { id: m.entity_id, name: m.name, price: m.price, available: m.in_stock, outletRef: m.outlet_ref })
+      // Our own catalog items passed from the FE (mini-app + POS share one menu).
+      for (const m of Array.isArray(req.body?.master) ? req.body.master : []) {
+        push('miniapp', { id: m.id, name: m.name, price: m.price, available: m.available })
+      }
+      if (rows.length) {
+        await supabase.from('menu_channel_map').upsert(rows, { onConflict: 'tenant_id,channel,channel_item_id' })
+      }
+      const masters = new Set(rows.map(r => r.master_key))
+      const byChannel: Record<string, number> = {}
+      for (const r of rows) byChannel[r.channel] = (byChannel[r.channel] ?? 0) + 1
+      res.json({ ok: true, mapped: rows.length, masterItems: masters.size, byChannel })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
+  // The unified master menu: one row per master_key with which channels carry it +
+  // per-channel price/availability. This is the "same items in my menu" view.
+  r.get('/api/connectors/aggregator/menu/unified', ...guardView, async (req, res) => {
+    try {
+      const { data } = await supabase.from('menu_channel_map')
+        .select('master_key, master_name, channel, channel_item_id, channel_price, available')
+        .eq('tenant_id', (req as any).tenantId).limit(10000)
+      const masters = new Map<string, any>()
+      for (const r of data ?? []) {
+        let m = masters.get(r.master_key)
+        if (!m) { m = { key: r.master_key, name: r.master_name, channels: {} }; masters.set(r.master_key, m) }
+        m.channels[r.channel] = { itemId: r.channel_item_id, price: r.channel_price, available: r.available }
+      }
+      const items = [...masters.values()].map(m => ({ ...m, presentOn: Object.keys(m.channels) }))
+        .sort((a, b) => a.name.localeCompare(b.name))
+      res.json({ items, count: items.length })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
   // Count of orders still awaiting acceptance — drives the sidebar badge.
   r.get('/api/connectors/aggregator/orders/pending-count', ...guardView, async (req, res) => {
     try {
