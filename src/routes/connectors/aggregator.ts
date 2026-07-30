@@ -101,6 +101,34 @@ function parseMenuSnapshot(body: any): ParsedEntity[] {
     if (rows.length) return rows
   }
 
+  // Zomato Frequency-Desktop snapshot (get_content_menu, mapped live 2026-07-30):
+  // menuResponse.categoryWrappers[].category + catalogueWrappers[].catalogue
+  // (name, inStock, nested category ref). Price lives in a variant map — kept in
+  // raw; in_stock is what stock-toggle needs.
+  const mr = body?.menuResponse ?? body?.response?.menuResponse ?? body?.data?.menuResponse
+  if (mr && Array.isArray(mr.catalogueWrappers)) {
+    const rows: ParsedEntity[] = []
+    for (const cw of mr.categoryWrappers ?? []) {
+      const c = cw?.category
+      if (c?.categoryId != null) rows.push({
+        entity_type: 'category', entity_id: String(c.categoryId), name: c.name ?? null,
+        in_stock: true, price: null, category_ref: null, raw: c,
+      })
+    }
+    for (const w of mr.catalogueWrappers) {
+      const cat = w?.catalogue
+      if (cat?.catalogueId == null) continue
+      rows.push({
+        entity_type: 'item', entity_id: String(cat.catalogueId), name: cat.name ?? null,
+        in_stock: cat.inStock !== false,
+        price: typeof cat.price === 'number' ? cat.price : (cat.price != null ? Number(cat.price) : null),
+        category_ref: cat.category?.categoryId != null ? String(cat.category.categoryId) : null,
+        raw: cat,
+      })
+    }
+    if (rows.length) return rows
+  }
+
   const sr = body?.statusResponse ?? body?.data ?? body ?? {}
   const itemArr: any[] = Array.isArray(sr) ? sr : (sr.items ?? sr.data?.items ?? sr.menu?.items ?? [])
   const catArr: any[] = sr.categories ?? sr.data?.categories ?? sr.menu?.categories ?? []
@@ -169,14 +197,22 @@ function parseOrderHistory(body: any): ParsedHistOrder[] {
  *  (blank summary), never lost data. Field names span both aggregators' conventions. */
 function extractSummary(data: any): { name: string | null; phone: string | null; items: number; gross: number | null } {
   const o = data?.order ?? data?.orderDetails ?? data?.order_details ?? data ?? {}
-  const cust = o.customer ?? o.customer_details ?? o.customerDetails ?? o.user ?? {}
-  const items = Array.isArray(o.items) ? o.items
+  // Zomato: customer is `creator`, line items nest at cartDetails.items.dishes,
+  // and there is NO order-level total (sum the dishes). Decoded live 2026-07-30
+  // against La Fiamma / res 22804912 — without these paths every Zomato order
+  // ingested blank (null customer / 0 items / null amount).
+  const cust = o.customer ?? o.customer_details ?? o.customerDetails ?? o.user ?? o.creator ?? {}
+  const items = Array.isArray(o.cartDetails?.items?.dishes) ? o.cartDetails.items.dishes
+    : Array.isArray(o.items) ? o.items
     : Array.isArray(o.order_items) ? o.order_items
     : Array.isArray(o.cart_items) ? o.cart_items
     : Array.isArray(o.line_items) ? o.line_items
     : Array.isArray(o.orderItems) ? o.orderItems : []
   const firstLast = [cust.first_name, cust.last_name].filter(Boolean).join(' ').trim() || null
   const n = (v: any) => (v == null || v === '' ? null : Number(v))
+  // Zomato dishes carry totalCost/unitCost; sum them when no order-level total exists.
+  const lineSum = items.reduce((s: number, it: any) =>
+    s + (Number(it.totalCost ?? it.total ?? it.price ?? it.amount ?? it.unitCost ?? 0) || 0), 0) || null
   return {
     name:  cust.name ?? o.customer_name ?? o.customerName ?? firstLast ?? null,
     phone: cust.phone ?? cust.mobile ?? cust.contact_number ?? o.customer_phone ?? o.customerPhone ?? null,   // aggregators mask this
@@ -184,7 +220,7 @@ function extractSummary(data: any): { name: string | null; phone: string | null;
       ? items.reduce((s: number, it: any) => s + (Number(it.quantity ?? it.qty ?? it.count ?? 1) || 1), 0)
       : Number(o.item_count ?? o.items_count ?? o.itemCount ?? 0)) || 0,
     gross: n(o.total_cost) ?? n(o.net_amount) ?? n(o.order_total) ?? n(o.grand_total) ?? n(o.bill_amount)
-        ?? n(o.final_amount) ?? n(o.net_total) ?? n(o.order_value) ?? n(o.total) ?? n(o.invoice?.total) ?? null,
+        ?? n(o.final_amount) ?? n(o.net_total) ?? n(o.order_value) ?? n(o.total) ?? n(o.invoice?.total) ?? lineSum ?? null,
   }
 }
 
