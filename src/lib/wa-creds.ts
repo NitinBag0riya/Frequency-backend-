@@ -103,14 +103,26 @@ export async function resolveWaCreds(
   // the wrong signature and leak our secret's trust boundary across tenants).
   if (!appSecret) return null
 
+  // Platform default sender. When a tenant has no WhatsApp number of their own,
+  // fall back to the Frequency platform number (FREQ_WA_* env) so outbound still
+  // sends — the same fallback storefront-otp.ts already uses, now applied to ALL
+  // outbound (notifications, workflows, campaigns), not just OTP. The pair is
+  // ATOMIC: never mix a tenant's token with the platform phone (or vice-versa),
+  // since the access_token must belong to the phone number's WABA. Dormant until
+  // FREQ_WA_PHONE_NUMBER_ID + FREQ_WA_ACCESS_TOKEN are set.
+  const tenantPn = row.phone_number_id ?? null
+  const tenantTok = readSecretValue(row.access_token)
+  const hasTenantWa = !!(tenantPn && tenantTok)
+  const usePlatform = !hasTenantWa && !!(process.env.FREQ_WA_PHONE_NUMBER_ID && process.env.FREQ_WA_ACCESS_TOKEN)
+
   return {
     tenantId: row.id,
     mode,
     appId: mode === 'byo' ? (row.wa_app_id || '') : (process.env.META_APP_ID || ''),
     appSecret,
-    wabaId: row.waba_id ?? null,
-    phoneNumberId: row.phone_number_id ?? null,
-    accessToken: readSecretValue(row.access_token),
+    wabaId: usePlatform ? (process.env.FREQ_WA_WABA_ID ?? null) : (row.waba_id ?? null),
+    phoneNumberId: usePlatform ? process.env.FREQ_WA_PHONE_NUMBER_ID! : tenantPn,
+    accessToken: usePlatform ? process.env.FREQ_WA_ACCESS_TOKEN! : tenantTok,
     webhookToken: row.wa_webhook_token ?? null,
   }
 }
