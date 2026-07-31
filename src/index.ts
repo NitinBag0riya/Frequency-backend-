@@ -19,6 +19,7 @@ import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
 import { createStorefrontDomainsRouter } from './routes/storefront-domains'
 import { createStorefrontAppRouter } from './routes/storefront-app'
+import { createAuthEmailHookRouter } from './routes/auth-email-hook'
 import { createConnectorsRouter }  from './routes/connectors'
 import { createPaymentWebhookRouter } from './routes/payment-webhook'
 import { createTestConnectionRouter } from './routes/connectors/test-connection'
@@ -5497,6 +5498,7 @@ app.use(createPhase3Router({ supabase, requireAuth, identifyTenant, checkPermiss
 app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createStorefrontDomainsRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createStorefrontAppRouter({ supabase, requireAuth, identifyTenant }))
+app.use(createAuthEmailHookRouter())  // Supabase Send-Email hook → Brevo (auth emails)
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
 app.use(createConnectorsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
