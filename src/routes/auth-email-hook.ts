@@ -80,11 +80,16 @@ export function createAuthEmailHookRouter(): express.Router {
       const action = ACTIONS[ed.email_action_type]
       if (!action) { log.warn(`unknown email_action_type: ${ed.email_action_type}`); res.status(200).json({ skipped: true }); return }
 
-      // Build the Supabase verify link (same shape Supabase's own emails use).
-      const supaUrl = (process.env.SUPABASE_URL || ed.site_url || '').replace(/\/$/, '')
+      // Link to OUR branded domain (getfrequency.app/auth/confirm), never the raw
+      // supabase.co/auth/v1/verify URL — that reads as phishing + hurts trust.
+      // The FE route verifies token_hash via verifyOtp on our domain, then routes
+      // the user on (recovery → set password; else → `next`).
+      // Prefer Supabase's configured Site URL (the auth domain, currently
+      // beta.getfrequency.app) since that's where /auth/confirm is deployed.
+      const feBase = (ed.site_url || process.env.FRONTEND_URL || 'https://beta.getfrequency.app').replace(/\/$/, '')
       const tokenHash = ed.email_action_type.startsWith('email_change') && ed.token_hash_new ? ed.token_hash_new : ed.token_hash
       const type = ed.email_action_type === 'email_change_new' ? 'email_change' : ed.email_action_type
-      const confirmationUrl = `${supaUrl}/auth/v1/verify?token=${encodeURIComponent(tokenHash)}&type=${encodeURIComponent(type)}&redirect_to=${encodeURIComponent(ed.redirect_to || '')}`
+      const confirmationUrl = `${feBase}/auth/confirm?token_hash=${encodeURIComponent(tokenHash)}&type=${encodeURIComponent(type)}&next=${encodeURIComponent(ed.redirect_to || '/')}`
 
       const html = template(action.file)
         .split('{{ .ConfirmationURL }}').join(confirmationUrl)
