@@ -391,6 +391,13 @@ app.use('/api/storefront/app/eas-webhook', express.json({
   verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
 }))
 
+// Supabase Send-Email hook — Standard-Webhooks HMAC over the exact bytes.
+// Capture rawBody before the global parser so auth-email-hook.ts can verify it.
+app.use('/api/hooks/auth-email', express.json({
+  limit: '1mb',
+  verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
+}))
+
 // F2: tight global body limit. Default to 1 MB for every JSON endpoint —
 // far more than any normal API call needs, but small enough to stop a
 // malicious client from exhausting memory with a 50 MB payload. The routes

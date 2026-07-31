@@ -60,18 +60,19 @@ function verify(secretRaw: string, id: string, ts: string, body: string, sigHead
 export function createAuthEmailHookRouter(): express.Router {
   const r = express.Router()
 
-  // Raw body is required for HMAC — mount express.raw() only on this route.
-  r.post('/api/hooks/auth-email', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+  // rawBody is captured by the express.json verify hook mounted for this path in
+  // index.ts (before the global parser), so HMAC runs over the exact signed bytes.
+  r.post('/api/hooks/auth-email', async (req, res) => {
     try {
       const secret = process.env.SUPABASE_EMAIL_HOOK_SECRET
       if (!secret) { log.error('SUPABASE_EMAIL_HOOK_SECRET unset — refusing'); res.status(503).json({ error: 'hook not configured' }); return }
-      const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : String(req.body ?? '')
+      const raw = ((req as any).rawBody as Buffer | undefined)?.toString('utf8') ?? JSON.stringify(req.body ?? {})
       const id = String(req.header('webhook-id') ?? '')
       const ts = String(req.header('webhook-timestamp') ?? '')
       const sig = String(req.header('webhook-signature') ?? '')
-      if (!verify(secret, id, ts, raw, sig)) { res.status(401).json({ error: 'bad signature' }); return }
+      if (!verify(secret, id, ts, raw, sig)) { log.warn('bad signature'); res.status(401).json({ error: 'bad signature' }); return }
 
-      const payload = JSON.parse(raw) as {
+      const payload = req.body as {
         user: { email: string }
         email_data: { token: string; token_hash: string; redirect_to: string; email_action_type: string; site_url?: string; token_hash_new?: string }
       }
