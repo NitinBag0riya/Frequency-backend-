@@ -84,9 +84,10 @@ export function createAuthEmailHookRouter(): express.Router {
       // supabase.co/auth/v1/verify URL — that reads as phishing + hurts trust.
       // The FE route verifies token_hash via verifyOtp on our domain, then routes
       // the user on (recovery → set password; else → `next`).
-      // Prefer Supabase's configured Site URL (the auth domain, currently
-      // beta.getfrequency.app) since that's where /auth/confirm is deployed.
-      const feBase = (ed.site_url || process.env.FRONTEND_URL || 'https://beta.getfrequency.app').replace(/\/$/, '')
+      // NEVER use ed.site_url: Supabase sends the project API base there
+      // (…supabase.co/auth/v1), producing exactly the phishing-looking link we're
+      // replacing. Hard-brand to the apex (serves /auth/confirm); AUTH_LINK_BASE overrides.
+      const feBase = (process.env.AUTH_LINK_BASE || 'https://getfrequency.app').replace(/\/$/, '')
       const tokenHash = ed.email_action_type.startsWith('email_change') && ed.token_hash_new ? ed.token_hash_new : ed.token_hash
       const type = ed.email_action_type === 'email_change_new' ? 'email_change' : ed.email_action_type
       const confirmationUrl = `${feBase}/auth/confirm?token_hash=${encodeURIComponent(tokenHash)}&type=${encodeURIComponent(type)}&next=${encodeURIComponent(ed.redirect_to || '/')}`
@@ -96,7 +97,7 @@ export function createAuthEmailHookRouter(): express.Router {
         .split('{{ .Token }}').join(ed.token || '')
 
       await sendEmail({ to: payload.user.email, subject: action.subject, html })
-      log.info(`sent ${ed.email_action_type} → ${payload.user.email} via Brevo`)
+      log.info(`sent ${ed.email_action_type} → ${payload.user.email} via Brevo [link ${feBase}]`)
       res.status(200).json({ ok: true })
     } catch (err: any) {
       log.error('auth-email hook failed:', err?.message ?? err)
