@@ -562,6 +562,24 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
+  // Queue a menu create/edit/delete to push OUT to an aggregator. The desktop
+  // pulls it on /pending-actions and runs aggregatorClient.editItem on the
+  // merchant's session (Swiggy = async QC review; caller passes a built item_vo).
+  // Body: { channel, outletRef, action?, entityId?, itemVo }. Swiggy only for now.
+  r.post('/api/connectors/aggregator/menu/edit', ...guardEdit, async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const { channel, outletRef, action, entityId, itemVo } = req.body ?? {}
+      if (!channel || !itemVo) { res.status(400).json({ error: 'channel + itemVo are required' }); return }
+      const { data, error } = await supabase.from('aggregator_menu_actions').insert({
+        tenant_id: tenantId, channel: String(channel), outlet_ref: outletRef != null ? String(outletRef) : null,
+        action: action ?? 'edit', entity_id: entityId != null ? String(entityId) : null, item_vo: itemVo, status: 'pending',
+      }).select('id').single()
+      if (error) { res.status(500).json({ error: error.message }); return }
+      res.json({ ok: true, id: data?.id, note: 'Queued — the merchant client submits it to the aggregator (Swiggy = QC review) on its next poll (~30s).' })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
   // Count of orders still awaiting acceptance — drives the sidebar badge.
   r.get('/api/connectors/aggregator/orders/pending-count', ...guardView, async (req, res) => {
     try {
@@ -727,10 +745,18 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         .select('outlet_ref').eq('tenant_id', tenantId).eq('pending_full_sync', true)
       const { data: hs } = await supabase.from('aggregator_history_sync')
         .select('outlet_ref').eq('tenant_id', tenantId).eq('pending_full_sync', true)
+      // Queued menu create/edit/delete — the desktop submits each to the aggregator
+      // (Swiggy = QC review) via aggregatorClient.editItem, then posts the outcome.
+      const { data: me } = await supabase.from('aggregator_menu_actions')
+        .select('id, outlet_ref, channel, action, entity_id, item_vo')
+        .eq('tenant_id', tenantId).eq('status', 'pending')
       res.json({
         orders, stock,
         menuResync: (ms ?? []).map((r: any) => r.outlet_ref),
         historyResync: (hs ?? []).map((r: any) => r.outlet_ref),
+        menuEdits: (me ?? []).map((a: any) => ({
+          id: a.id, resId: a.outlet_ref, channel: a.channel, action: a.action, entityId: a.entity_id, itemVo: a.item_vo,
+        })),
       })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
@@ -752,8 +778,14 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         await supabase.from('aggregator_stock_actions').update({
           status: 'done', result: b.result ?? null, updated_at: new Date().toISOString(),
         }).eq('tenant_id', tenantId).eq('id', b.id)
+      } else if (b.kind === 'menuEdit' && b.id != null) {
+        // Swiggy menu edit is async QC — 'done' = accepted into QC, 'failed' = errored/rejected.
+        const failed = !!(b.result?.error || b.result?.rejection)
+        await supabase.from('aggregator_menu_actions').update({
+          status: failed ? 'failed' : 'done', result: b.result ?? null, updated_at: new Date().toISOString(),
+        }).eq('tenant_id', tenantId).eq('id', b.id)
       } else {
-        res.status(400).json({ error: "body needs { kind:'order', orderId, statusCode } or { kind:'stock', id }" }); return
+        res.status(400).json({ error: "body needs { kind:'order', orderId, statusCode }, { kind:'stock', id } or { kind:'menuEdit', id }" }); return
       }
       res.json({ ok: true })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
