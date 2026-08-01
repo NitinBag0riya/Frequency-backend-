@@ -121,10 +121,10 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     if (!otpRateOk(`otp-ph:${ph}`, 3, 10 * 60_000) || !otpRateOk(`otp-tenant:${String(slug)}`, 200, 24 * 60 * 60_000)) {
       return res.status(429).json({ ok: false, error: 'rate_limited' })
     }
-    // Channel order: Brevo SMS is the primary OTP gateway (Frequency's platform
-    // Brevo account). If it's not configured or fails, fall back to the WhatsApp
-    // authentication template; if BOTH fail, storefront-api shows the on-screen
-    // demo code so login never breaks.
+    // Channel order: MSG91 SMS is the primary OTP gateway (Frequency's platform
+    // MSG91 account + DLT header). If it's not configured or fails, fall back to
+    // the WhatsApp authentication template; if BOTH fail, storefront-api shows
+    // the on-screen demo code so login never breaks.
     try {
       const m = await sendSmsOtp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
       return res.json({ ok: true, channel: 'sms', via: m.via })
@@ -140,9 +140,10 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   })
 
   // Server-to-server: storefront-api asks us to deliver a transactional order-update
-  // SMS over Brevo (Frequency's platform account). storefront-api only calls this
-  // when the customer has NOT opted into web/native push — SMS is the fallback
-  // channel. `vars` carry the message fields (e.g. var1=order#, var2=status).
+  // SMS over MSG91 (Frequency's platform account + DLT order flow). storefront-api
+  // only calls this when the customer has NOT opted into web/native push — SMS is
+  // the fallback channel. `vars` carry the message fields (var1=order#, var2=status,
+  // var3=name), passed straight through as MSG91 flow variables.
   r.post('/api/storefront/send-sms', async (req, res) => {
     if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
     const { slug, phone, vars, templateId } = (req.body || {}) as { slug?: string; phone?: string; vars?: Record<string, string>; templateId?: string }
