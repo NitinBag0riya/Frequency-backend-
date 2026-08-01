@@ -28,7 +28,7 @@
  */
 
 const SELLER_GSTIN_DEFAULT  = process.env.SELLER_GSTIN          ?? 'UNREGISTERED'
-const SELLER_LEGAL_NAME     = process.env.SELLER_LEGAL_NAME     ?? 'Frequency Technologies Pvt Ltd'
+const SELLER_LEGAL_NAME     = process.env.SELLER_LEGAL_NAME     ?? 'NITIN BHAIYA AI STUDIO'
 const SELLER_ADDRESS        = process.env.SELLER_ADDRESS        ?? 'Mumbai, Maharashtra, India'
 const SELLER_STATE_CODE     = process.env.SELLER_STATE_CODE     ?? '27'  // Maharashtra
 const SELLER_STATE_NAME     = process.env.SELLER_STATE_NAME     ?? 'Maharashtra'

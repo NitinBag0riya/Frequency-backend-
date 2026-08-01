@@ -73,7 +73,7 @@ function inviteEmailHtml(code: string, appUrl: string, expiresDays: number | nul
           <p style="margin:0;color:#7C8493;font-size:12px;line-height:1.5;">${expiryNote(expiresDays)} If you didn't request it, you can safely ignore this email.</p>
         </td></tr>
       </table>
-      <div style="color:#7C8493;font-size:11px;margin-top:16px;">&copy; Frequency Technologies Pvt Ltd &middot; Made in India</div>
+      <div style="color:#7C8493;font-size:11px;margin-top:16px;">&copy; NITIN BHAIYA AI STUDIO &middot; Made in India</div>
     </td></tr>
   </table></body></html>`
 }
