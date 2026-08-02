@@ -464,6 +464,45 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
+  // Publish / make-visible an item or category on a channel. This is the
+  // menu-visibility surface: "publish to Swiggy" is a REAL stock-visibility
+  // write (setStock on the merchant's session); "publish to Zomato" is
+  // partner/PetPooja-gated, so it is queued and the desktop reports it back as
+  // gated (dashboard shows "pending partner") — never a fake success. Reuses the
+  // SAME aggregator_stock_actions queue + pull/result path as stock toggles,
+  // because publish == a visibility write.
+  const PublishBody = z.object({
+    channel:    z.enum(['zomato', 'swiggy']),
+    outletRef:  z.string().min(1),
+    entityType: z.enum(['item', 'category']),
+    entityId:   z.string().min(1),
+    visible:    z.boolean().default(true),   // publish=true (make visible/live) | false=hide
+  })
+  r.post('/api/connectors/aggregator/menu/publish', ...guardEdit, validateBody(PublishBody), async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const adapter = await resolveAdapter(supabase, tenantId)
+      const b = req.body as z.infer<typeof PublishBody>
+      const cap = adapter.capabilities().publish?.[b.channel]
+      if (!cap) { res.status(422).json({ error: `${adapter.source} cannot publish to ${b.channel}` }); return }
+      // Enqueue for BOTH channels: Swiggy applies it live; Zomato is picked up and
+      // reported gated so the queue row terminates in 'gated', not a fake 'done'.
+      const out = await adapter.submitStockToggle(
+        { tenantId, source: adapter.source },
+        { channel: b.channel, outletRef: b.outletRef, entityType: b.entityType, entityId: b.entityId, inStock: b.visible },
+      )
+      // Optimistically reflect the desired visibility on the menu row (same as /stock).
+      await supabase.from('aggregator_menu').update({ in_stock: b.visible, updated_at: new Date().toISOString() })
+        .eq('tenant_id', tenantId).eq('outlet_ref', b.outletRef).eq('entity_type', b.entityType).eq('entity_id', b.entityId)
+      res.json({
+        ok: true, ...out, channel: b.channel, gated: cap === 'gated',
+        note: cap === 'gated'
+          ? 'Queued — Zomato menu/visibility publishing is partner/PetPooja-gated; it will report back as pending partner.'
+          : 'Queued — the merchant client applies it on Swiggy on its next poll (~30s).',
+      })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
   // Menu for the stock-toggle UI (items + categories for the tenant / outlet).
   r.get('/api/connectors/aggregator/menu', ...guardView, async (req, res) => {
     try {
@@ -775,8 +814,11 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           last_action_result: b.result ?? null, updated_at: new Date().toISOString(),
         }).eq('tenant_id', tenantId).eq('external_order_id', String(b.orderId))
       } else if (b.kind === 'stock' && b.id != null) {
+        // Honest terminal state — gated (partner-blocked, e.g. Zomato visibility)
+        // ≠ failed (errored) ≠ done (applied). status is free text, no migration.
+        const st = b.result?.gated ? 'gated' : (b.result?.error ? 'failed' : 'done')
         await supabase.from('aggregator_stock_actions').update({
-          status: 'done', result: b.result ?? null, updated_at: new Date().toISOString(),
+          status: st, result: b.result ?? null, updated_at: new Date().toISOString(),
         }).eq('tenant_id', tenantId).eq('id', b.id)
       } else if (b.kind === 'menuEdit' && b.id != null) {
         // Swiggy menu edit is async QC — 'done' = accepted into QC, 'failed' = errored/rejected.

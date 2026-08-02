@@ -42,6 +42,11 @@ export class FrequencyDesktopAdapter implements AggregatorAdapter {
       categories:  false,
       variants:    false,
       offers:      false,
+      // Publishing = flipping an item/category visible. Swiggy has a real,
+      // calibrated stock-status write (setStock), so it's live. Zomato's
+      // menu/visibility write is partner/PetPooja-gated with no mapped endpoint,
+      // so it's queued and reported back as gated — never faked.
+      publish:     { swiggy: 'live', zomato: 'gated' },
     }
   }
 

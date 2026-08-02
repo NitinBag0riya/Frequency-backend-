@@ -70,6 +70,11 @@ export interface AdapterCapabilities {
   categories: boolean      // create/edit category structure
   variants: boolean        // add-ons / modifiers / variants
   offers: boolean          // promotions / ads
+  // Per-channel "make item/category live/visible" — a stock-visibility write.
+  // 'live' = we can apply it now (Swiggy setStock); 'gated' = blocked on
+  // partner/PetPooja (Zomato). The FE reads this to render "publish" vs
+  // "pending partner" per channel instead of hardcoding it.
+  publish: Record<AggregatorChannel, 'live' | 'gated'>
 }
 
 /** Everything an adapter needs to act for one tenant. */
