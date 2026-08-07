@@ -187,6 +187,15 @@ export function createPiiRouter(deps: Deps): express.Router {
    */
   r.patch('/api/pii/config', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId as string
+    // Admin-only: masking policy protects Aadhaar/PAN/phone/email. Previously any
+    // authenticated member could disable masking, self-grant unmask, or plant a
+    // ReDoS regex (confirmed live: a sales_rep PATCHed enabled_types:[] → 200).
+    // Gate on the same admin roles dsr.ts/privacy-center.ts use. userRole is set by
+    // identifyTenant (assignment key / user_roles / 'owner' via ownership / platform).
+    const role = (req as any).userRole as string | undefined
+    if (!role || !['owner', 'workspace_admin', 'platform_owner', 'super_admin'].includes(role)) {
+      res.status(403).json({ error: 'Only an owner or workspace admin can change PII masking policy' }); return
+    }
     const parsed = PatchConfigBody.safeParse(req.body)
     if (!parsed.success) { res.status(400).json({ error: 'Invalid body', issues: parsed.error.issues }); return }
     // Upsert: if no row, create it.

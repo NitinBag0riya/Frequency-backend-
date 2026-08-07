@@ -68,6 +68,7 @@ interface Deps {
   supabase:       SupabaseClient
   requireAuth:    Middleware
   identifyTenant: Middleware
+  checkPermission: (feature: string, action: string) => Middleware
 }
 
 // Default stages we seed for a tenant on first access. Mirrors what an Indian
@@ -123,8 +124,16 @@ function leadStatusFromStage(target: { name: string; is_won: boolean; is_lost: b
 
 export function createCrmRouter(deps: Deps): express.Router {
   const r = express.Router()
-  const { supabase, requireAuth, identifyTenant } = deps
-  const guard = [requireAuth, identifyTenant]
+  const { supabase, requireAuth, identifyTenant, checkPermission } = deps
+  // This router previously ran with NO permission check (mounted without
+  // checkPermission), so ANY authenticated member — incl. disabled/fired,
+  // out-of-plan, or read-only roles — could read every deal + contact PII and
+  // write/delete the pipeline (confirmed live: an analyst GET /api/crm/deals → 200).
+  // checkPermission also enforces the disabled-user / suspended-tenant / entitlement
+  // / plan gates. Reads require leads:view, writes leads:edit, deletes leads:delete.
+  const guard = [requireAuth, identifyTenant, checkPermission('leads', 'view')]
+  const editGuard = [requireAuth, identifyTenant, checkPermission('leads', 'edit')]
+  const delGuard = [requireAuth, identifyTenant, checkPermission('leads', 'delete')]
 
   // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -360,7 +369,7 @@ export function createCrmRouter(deps: Deps): express.Router {
   })
 
   // ── POST /api/crm/stages ───────────────────────────────────────────────────
-  r.post('/api/crm/stages', ...guard, async (req, res) => {
+  r.post('/api/crm/stages', ...editGuard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }
     const body = req.body ?? {}
@@ -389,7 +398,7 @@ export function createCrmRouter(deps: Deps): express.Router {
   })
 
   // ── PATCH /api/crm/stages/:id ──────────────────────────────────────────────
-  r.patch('/api/crm/stages/:id', ...guard, async (req, res) => {
+  r.patch('/api/crm/stages/:id', ...editGuard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }
     const id = String(req.params.id ?? '')
@@ -444,7 +453,7 @@ export function createCrmRouter(deps: Deps): express.Router {
   // (would silently nuke deal history); we can't ON DELETE SET NULL either
   // (stage_id is NOT NULL by design). Archiving lets the user remove the
   // stage from the board while keeping deal history intact.
-  r.delete('/api/crm/stages/:id', ...guard, async (req, res) => {
+  r.delete('/api/crm/stages/:id', ...delGuard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }
     const id = String(req.params.id ?? '')
@@ -633,7 +642,7 @@ export function createCrmRouter(deps: Deps): express.Router {
   })
 
   // ── POST /api/crm/deals ────────────────────────────────────────────────────
-  r.post('/api/crm/deals', ...guard, async (req, res) => {
+  r.post('/api/crm/deals', ...editGuard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     const userId   = (req as any).user?.id as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }
@@ -749,7 +758,7 @@ export function createCrmRouter(deps: Deps): express.Router {
   // semantics. We re-fetch the deal first so we know the previous values
   // (events need from_stage_id, and won/lost detection needs the OLD stage's
   // terminal flags).
-  r.patch('/api/crm/deals/:id', ...guard, async (req, res) => {
+  r.patch('/api/crm/deals/:id', ...editGuard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     const userId   = (req as any).user?.id as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }
@@ -874,7 +883,7 @@ export function createCrmRouter(deps: Deps): express.Router {
   })
 
   // ── DELETE /api/crm/deals/:id ──────────────────────────────────────────────
-  r.delete('/api/crm/deals/:id', ...guard, async (req, res) => {
+  r.delete('/api/crm/deals/:id', ...delGuard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }
     const id = String(req.params.id ?? '')
@@ -902,7 +911,7 @@ export function createCrmRouter(deps: Deps): express.Router {
   // is_won/is_lost/name to a canonical lead.status string and write it back
   // to the lead row's status column. Leads don't have an audit table, so
   // status moves are best-effort and not recorded — flagged as a follow-up.
-  r.post('/api/crm/cards/:id/move', ...guard, async (req, res) => {
+  r.post('/api/crm/cards/:id/move', ...editGuard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     const userId   = (req as any).user?.id as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }
@@ -1023,7 +1032,7 @@ export function createCrmRouter(deps: Deps): express.Router {
   // is the whole point of CRM Lite. The original lead row is preserved
   // (audit) but stamped with `converted_to_deal_id` + `converted_at` in its
   // data jsonb so the FE can grey it out + label "Converted".
-  r.post('/api/crm/leads/:lead_id/promote-to-deal', ...guard, async (req, res) => {
+  r.post('/api/crm/leads/:lead_id/promote-to-deal', ...editGuard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     const userId   = (req as any).user?.id as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }

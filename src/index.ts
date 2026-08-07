@@ -2425,18 +2425,26 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
     .eq('user_id', user.id)
   if (e1) { res.status(500).json({ error: e1.message }); return }
 
-  // 2. Tenants the user has access to via user_roles (team members)
-  const { data: roleRows } = await supabase.from('user_roles')
-    .select('tenant_id')
-    .eq('user_id', user.id)
-    .not('tenant_id', 'is', null)
-  const roleTenantIds = (roleRows ?? []).map(r => r.tenant_id).filter(id => !(ownedTenants ?? []).find(t => t.id === id))
+  // 2. Tenants the user has access to as a team member. There are TWO membership
+  //    tables: legacy `user_roles` AND the RBAC `user_role_assignments` (where every
+  //    member invited via /api/team/* lands — invite/accept write ONLY this table).
+  //    Reading just user_roles stranded RBAC-invited members with an empty tenant
+  //    list (measured: 11/15 member assignments had no user_roles row), locking them
+  //    out of the app even though identifyTenant would authorize them. Merge both.
+  const [{ data: roleRows }, { data: assignRows }] = await Promise.all([
+    supabase.from('user_roles').select('tenant_id').eq('user_id', user.id).not('tenant_id', 'is', null),
+    supabase.from('user_role_assignments').select('tenant_id').eq('user_id', user.id).not('tenant_id', 'is', null).is('disabled_at', null),
+  ])
+  const memberTenantIds = [...new Set([
+    ...(roleRows ?? []).map(r => r.tenant_id),
+    ...(assignRows ?? []).map(r => r.tenant_id),
+  ])].filter(id => !(ownedTenants ?? []).find(t => t.id === id))
 
   let teamTenants: any[] = []
-  if (roleTenantIds.length > 0) {
+  if (memberTenantIds.length > 0) {
     const { data: extra } = await supabase.from('tenants')
       .select('id,slug,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
-      .in('id', roleTenantIds)
+      .in('id', memberTenantIds)
     teamTenants = extra ?? []
   }
 
@@ -5609,7 +5617,7 @@ app.use(createBroadcastLinkAnalyticsRouter({ supabase, requireAuth, identifyTena
 // ── P2 #22 — Sales CRM Lite (tenant-scoped, auth required) ──────────────────
 // Pipeline view tied to conversations. Stages + deals + append-only events.
 // Migration 087_sales_crm_lite.sql.
-app.use(createCrmRouter({ supabase, requireAuth, identifyTenant }))
+app.use(createCrmRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 // Quick Replies + Internal Notes (Phase 1A — migration 093). Stage-aware
 // composer suggestions reuse the CRM tables crm_deals + crm_stages, so
 // this mount must come AFTER createCrmRouter to keep dependency order

@@ -42,6 +42,12 @@ function requireTenantPerm(supabase: SupabaseClient, feature: string, action: 'v
     // also bypass this via identifyTenant marking isSuperAdmin)
     if ((req as any).isSuperAdmin) { next(); return }
 
+    // The FOUNDING owner is resolved by identifyTenant via tenants.user_id and
+    // tagged userRole='owner'. Onboarding never creates an owner
+    // user_role_assignments row, so without this fallback the owner 403s on every
+    // team route (measured: 112/116 active tenants' owners had no assignment row).
+    if ((req as any).userRole === 'owner') { next(); return }
+
     const { data: assignment } = await supabase.from('user_role_assignments')
       .select('role_id, disabled_at')
       .eq('user_id', userId).eq('tenant_id', tenantId)
@@ -122,6 +128,9 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const inviterId = (req as any).user.id
       const { email, role_key, department_id, message } = req.body
       if (!email || !role_key) { res.status(400).json({ error: 'email + role_key required' }); return }
+      if (role_key === 'owner' && (req as any).userRole !== 'owner') {
+        res.status(403).json({ error: 'Only the owner can grant the owner role' }); return
+      }
 
       // Plan gate: enforce team_size_max
       const plan = await getTenantPlan(supabase, tenantId)
@@ -181,6 +190,9 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const inviterId = (req as any).user.id
       const { user_id, email, role_key, department_id } = req.body
       if (!role_key || (!user_id && !email)) { res.status(400).json({ error: 'role_key + (user_id or email) required' }); return }
+      if (role_key === 'owner' && (req as any).userRole !== 'owner') {
+        res.status(403).json({ error: 'Only the owner can grant the owner role' }); return
+      }
 
       // Resolve user
       let resolvedUserId = user_id
@@ -347,9 +359,24 @@ export function createTeamsRouter(deps: Deps): express.Router {
     requireAuth, identifyTenant, requireTenantPerm(supabase, 'team', 'edit'),
     async (req, res) => {
       const tenantId = (req as any).tenantId
+      const callerIsOwner = (req as any).userRole === 'owner'
       const { role_key, department_id, disabled } = req.body
       const patch: Record<string, any> = {}
       if (role_key) {
+        // Privilege-escalation guards (confirmed exploit: a workspace_admin PATCHed
+        // its own row to role_key:'owner' and took over the tenant — reproduced live
+        // on prod before this fix). Only an owner may grant the owner role, and no
+        // non-owner may change their OWN role.
+        if (role_key === 'owner' && !callerIsOwner) {
+          res.status(403).json({ error: 'Only the owner can grant the owner role' }); return
+        }
+        if (!callerIsOwner) {
+          const { data: target } = await supabase.from('user_role_assignments')
+            .select('user_id').eq('id', String(req.params.assignmentId)).eq('tenant_id', tenantId).maybeSingle()
+          if (target && target.user_id === (req as any).user.id) {
+            res.status(403).json({ error: 'You cannot change your own role' }); return
+          }
+        }
         const { data: role } = await supabase.from('role_definitions')
           .select('id').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
         if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
