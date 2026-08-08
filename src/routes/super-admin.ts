@@ -255,6 +255,34 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       res.json({ success: true, scheduled_for_hard_delete_after_days: 30 })
     })
 
+  // Data export bundle — the "export" half of export-then-delete. Returns the
+  // tenant's migration-tracked config (branding/subscription/entitlements/team)
+  // as one JSON so an operator can archive before offboarding. Audited.
+  r.get('/api/super-admin/tenants/:id/export',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (req, res) => {
+      const id = String(req.params.id)
+      const { data: tenant } = await supabase.from('tenants').select('*').eq('id', id).maybeSingle()
+      if (!tenant) { res.status(404).json({ error: 'Tenant not found' }); return }
+      const [branding, sub, ents, users] = await Promise.all([
+        supabase.from('tenant_branding').select('*').eq('tenant_id', id).maybeSingle(),
+        supabase.from('tenant_subscriptions').select('*').eq('tenant_id', id).maybeSingle(),
+        supabase.from('tenant_entitlements').select('*').eq('tenant_id', id),
+        supabase.from('user_role_assignments').select('user_id, role_id, department_id, disabled_at').eq('tenant_id', id),
+      ])
+      const bundle = {
+        exported_at: new Date().toISOString(),
+        tenant,
+        branding: branding.data ?? null,
+        subscription: sub.data ?? null,
+        entitlements: ents.data ?? [],
+        team: users.data ?? [],
+      }
+      await audit(supabase, req, { action: 'tenant.export', target_tenant_id: id })
+      res.setHeader('Content-Disposition', `attachment; filename="tenant-${id}.json"`)
+      res.json(bundle)
+    })
+
   // ─── Plans ────────────────────────────────────────────────────────────────
   // GET /plans is also exposed publicly for FE; super-admin gates POST/PATCH/DELETE.
   r.get('/api/super-admin/plans', requireAuth, requirePlatformPerm(supabase, 'plans', 'view'),
