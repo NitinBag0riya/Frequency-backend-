@@ -103,7 +103,7 @@ import {
 import { composeNodeCatalogPromptSection } from './engine/node-types'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import { syncTenant as syncTenantTemplates } from './workers/template-sync'
-import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, attachDebugListeners, connection as redisConnection } from './queue'
+import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, voiceNoteTranscribeQueue, webhookInboundQueue, webhookOutboundQueue, webhookInboundDeadQueue, webhookOutboundDeadQueue, breachNotificationQueue, signedFormPdfQueue, attachDebugListeners, connection as redisConnection } from './queue'
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
 import { ExpressAdapter } from '@bull-board/express'
@@ -5848,6 +5848,17 @@ createBullBoard({
     new BullMQAdapter(callEventIngestQueue),
     new BullMQAdapter(callRecordingArchiveQueue),
     new BullMQAdapter(callTranscribeQueue),
+    // Previously unregistered — these are why "the entire flow" wasn't visible.
+    // Webhook inbound/outbound + their dead-letter queues (the DLQ replay UI
+    // reads these), plus voice-note transcription, breach fan-out, signed-form
+    // PDFs. Registering them makes Bull Board show the whole pipeline.
+    new BullMQAdapter(voiceNoteTranscribeQueue),
+    new BullMQAdapter(webhookInboundQueue),
+    new BullMQAdapter(webhookOutboundQueue),
+    new BullMQAdapter(webhookInboundDeadQueue),
+    new BullMQAdapter(webhookOutboundDeadQueue),
+    new BullMQAdapter(breachNotificationQueue),
+    new BullMQAdapter(signedFormPdfQueue),
   ],
   serverAdapter: bullBoardAdapter,
 })
@@ -5858,7 +5869,14 @@ async function requireSuperAdminOrLocal(req: express.Request, res: express.Respo
   // shared dev VMs / port-forwarded staging where "localhost" can mean an
   // attacker-controlled origin. Local dev now logs in as a platform user
   // exactly like prod does (the dev seed creates a super-admin user).
-  const token = req.headers.authorization?.replace('Bearer ', '') || (req.query.token as string)
+  // The dashboard opens this in a fresh tab with the JWT in the query string
+  // (a new browsing context carries no Authorization header). It sends
+  // `?access_token=` (the Supabase/Bull-Board convention); accept `?token=`
+  // too for back-compat. Reading the wrong param name here was the root cause
+  // of the blank/401 board — every asset + poll XHR was rejected.
+  const token = req.headers.authorization?.replace('Bearer ', '')
+    || (req.query.access_token as string)
+    || (req.query.token as string)
   if (!token) { res.status(401).send('auth required'); return }
   const { data: { user } } = await supabase.auth.getUser(token)
   if (!user) { res.status(401).send('invalid token'); return }
