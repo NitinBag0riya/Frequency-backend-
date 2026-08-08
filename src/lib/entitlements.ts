@@ -191,6 +191,122 @@ export async function resolveEntitlements(
 }
 
 /**
+ * Detailed per-feature resolution for the naruto tenant cockpit matrix.
+ *
+ * Same three-layer merge + hard vertical gate as resolveEntitlements/hasFeature
+ * (single source of truth), but returns the *source* of each decision so the
+ * super-admin can see plan-default vs override vs vertical-gated at a glance and
+ * know which rows are safe to toggle. One features read + one plan_features read
+ * + one overrides read + one plan.limits read — the whole matrix in one call.
+ */
+export interface FeatureMatrixRow {
+  key: string
+  name: string
+  category: string
+  sort_order: number
+  verticals: string[]
+  gate_style: string
+  default_enabled: boolean
+  plan_granted: boolean
+  /** Raw override value if an active override row exists (null = quota-only or none). */
+  override_enabled: boolean | null
+  expires_at: string | null
+  quota_override: Record<string, number> | null
+  /** Effective on/off after the full merge. */
+  resolved: boolean
+  /** What decided `resolved`: which layer won (or the hard gate). */
+  source: 'override' | 'plan' | 'default' | 'vertical'
+  /** Feature is not allowed for this tenant's vertical — locked, not toggleable. */
+  vertical_locked: boolean
+}
+
+/**
+ * Pure per-feature decision — the exact layer precedence hasFeature enforces,
+ * factored out so the cockpit matrix and a DB-free self-check share it.
+ * Precedence: hard vertical gate → active override → plan grant → global default.
+ */
+export function decideFeature(input: {
+  vertical_locked: boolean
+  override_enabled: boolean | null   // null = no active on/off override
+  plan_granted: boolean
+  default_enabled: boolean
+}): { resolved: boolean; source: FeatureMatrixRow['source'] } {
+  if (input.vertical_locked) return { resolved: false, source: 'vertical' }
+  if (input.override_enabled !== null) return { resolved: input.override_enabled, source: 'override' }
+  if (input.plan_granted) return { resolved: true, source: 'plan' }
+  return { resolved: input.default_enabled, source: 'default' }
+}
+
+export async function resolveEntitlementsDetailed(
+  sb: SupabaseClient, tenantId: string,
+): Promise<{
+  business_group: BusinessGroup
+  plan_id: string | null
+  status: string | null
+  plan_limits: Record<string, number>
+  quota_override: Record<string, number>
+  features: FeatureMatrixRow[]
+}> {
+  // Full feature rows (incl. name/category/sort_order) — not the cached slim map.
+  const [{ data: featureRows }, tenant] = await Promise.all([
+    sb.from('features').select('key, name, category, sort_order, verticals, default_enabled, gate_style').order('sort_order'),
+    loadTenant(sb, tenantId),
+  ])
+  const bg = businessGroup(tenant?.business_type)
+
+  const [{ data: grants }, { data: overrides }, { data: planRow }] = await Promise.all([
+    tenant?.plan_id
+      ? sb.from('plan_features').select('feature_key').eq('plan_id', tenant.plan_id)
+      : Promise.resolve({ data: [] as any[] }),
+    sb.from('tenant_entitlements').select('feature, is_enabled, expires_at, quota_override').eq('tenant_id', tenantId),
+    tenant?.plan_id
+      ? sb.from('plans').select('limits').eq('id', tenant.plan_id).maybeSingle()
+      : Promise.resolve({ data: null as any }),
+  ])
+
+  const granted = new Set((grants ?? []).map((g: any) => g.feature_key))
+  const now = Date.now()
+  const ovMap = new Map<string, OverrideRow>()
+  const quotaMerged: Record<string, number> = {}
+  for (const o of (overrides ?? []) as any[]) {
+    if (o.expires_at && new Date(o.expires_at).getTime() <= now) continue  // expired → ignore
+    ovMap.set(o.feature, o)
+    if (o.quota_override && typeof o.quota_override === 'object') Object.assign(quotaMerged, o.quota_override)
+  }
+  const access = grantsAccess(tenant?.status ?? null)
+
+  const features: FeatureMatrixRow[] = (featureRows ?? []).map((f: any) => {
+    const verticals: string[] = f.verticals ?? ['*']
+    const vertical_locked = !(verticals.includes('*') || verticals.includes(bg))
+    const ov = ovMap.get(f.key) ?? null
+    const plan_granted = access && granted.has(f.key)
+    const override_enabled = ov ? ov.is_enabled : null
+    const { resolved, source } = decideFeature({
+      vertical_locked, override_enabled, plan_granted, default_enabled: !!f.default_enabled,
+    })
+
+    return {
+      key: f.key, name: f.name, category: f.category ?? 'platform',
+      sort_order: f.sort_order ?? 0, verticals, gate_style: f.gate_style ?? 'hidden',
+      default_enabled: !!f.default_enabled, plan_granted,
+      override_enabled,
+      expires_at: ov?.expires_at ?? null,
+      quota_override: (ov?.quota_override as Record<string, number>) ?? null,
+      resolved, source, vertical_locked,
+    }
+  })
+
+  return {
+    business_group: bg,
+    plan_id: tenant?.plan_id ?? null,
+    status: tenant?.status ?? null,
+    plan_limits: ((planRow as any)?.limits as Record<string, number>) ?? {},
+    quota_override: quotaMerged,
+    features,
+  }
+}
+
+/**
  * Quota resolution: a per-tenant override beats the plan limit. Used by
  * checkLimit so an admin quota bump takes effect without a plan change.
  */

@@ -341,6 +341,21 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       res.json(data ?? [])
     })
 
+  // Full resolved feature matrix for ONE tenant — powers the naruto tenant
+  // cockpit. Each row carries resolved on/off + the source that decided it
+  // (override / plan / default / vertical-gate) so the operator sees plan vs
+  // override at a glance and knows which rows are locked by the vertical gate.
+  r.get('/api/super-admin/tenants/:id/entitlement-matrix',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (req, res) => {
+      try {
+        const { resolveEntitlementsDetailed } = await import('../lib/entitlements')
+        res.json(await resolveEntitlementsDetailed(supabase, String(req.params.id)))
+      } catch (e: any) {
+        res.status(500).json({ error: e?.message ?? 'matrix resolve failed' })
+      }
+    })
+
   r.patch('/api/super-admin/features/:key', requireAuth, requirePlatformPerm(supabase, 'plans', 'edit'),
     async (req, res) => {
       const allowed = ['name', 'description', 'category', 'verticals', 'default_enabled', 'gate_style', 'config_schema', 'sort_order']
