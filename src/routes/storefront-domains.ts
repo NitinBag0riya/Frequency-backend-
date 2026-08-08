@@ -58,37 +58,42 @@ async function resolveStoreName(slug: string): Promise<string> {
   return name
 }
 
-// Emit a realtime order.new notification for a storefront/POS/app order the FIRST
-// time we see it, so the operator's dashboard chimes instantly (OrderAlertProvider
-// subscribes to notifications realtime). Deduped by order_id → a status re-sync of
-// the same order never re-rings. Recipients = active members of the tenant, same
-// as the aggregator path. Best-effort: any failure is logged, never thrown.
-async function notifyNewStorefrontOrder(supabase: SupabaseClient, tenantId: string, slug: string, order: any): Promise<void> {
+// Emit a realtime order notification so the operator's boards update instantly:
+//   • FIRST sight of an order → order.new  (OrderAlertProvider rings + banners)
+//   • a later STATUS change   → order.status (no ring — the FE relays it to refetch
+//     the KDS / Orders boards, so an accepted order appears on a SEPARATE KDS screen
+//     live, not on its next poll).
+// Deduped by the LAST notification's status for this order → a re-sync of the same
+// status is a no-op, so we never double-fire. Recipients = owner ∪ members (solo
+// owners aren't in user_role_assignments). Best-effort: logged, never thrown.
+async function notifyStorefrontOrder(supabase: SupabaseClient, tenantId: string, slug: string, order: any): Promise<void> {
   try {
     const orderId = String(order?.id ?? '')
     if (!orderId) return
-    // Already rang for this order? (placement rings once; later status syncs skip.)
-    const { data: seen } = await supabase.from('notifications')
-      .select('id').eq('tenant_id', tenantId).eq('event_key', 'order.new')
-      .eq('data->>order_id', orderId).limit(1).maybeSingle()
-    if (seen) return
-    const recipients = await tenantNotifyRecipients(supabase, tenantId)   // owner ∪ members (solo owners aren't in user_role_assignments)
+    const status = String(order?.status ?? 'placed')
+    // What did we last tell operators about this order? (newest order.* for it)
+    const { data: last } = await supabase.from('notifications')
+      .select('data').eq('tenant_id', tenantId).eq('data->>order_id', orderId)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle()
+    if (last && (last as any)?.data?.status === status) return   // status unchanged → don't re-fire
+    const isNew = !last
+    const recipients = await tenantNotifyRecipients(supabase, tenantId)
     if (!recipients.length) return
     const where = order?.table ? `Table ${order.table}` : (order?.mode === 'dinein' ? 'Dine-in' : 'Pickup')
     const items = Array.isArray(order?.lines) ? order.lines.reduce((n: number, l: any) => n + (Number(l?.qty) || 1), 0) : 0
     await emitNotification(supabase, {
       tenant_id: tenantId,
-      event_key: 'order.new',
+      event_key: isNew ? 'order.new' : 'order.status',
       recipient_user_ids: recipients,
       link: '/settings/orders',   // canonical orders board (matches aggregator + OrderAlertProvider silence-on-view)
       data: {
         channel: 'storefront', channel_label: 'Storefront',
-        order_id: orderId, status: String(order?.status ?? 'placed'),
-        summary: `New order · ${where} · ${items} item${items === 1 ? '' : 's'} — accept now`,
-        priority: 'high',
+        order_id: orderId, status, status_label: status,
+        summary: isNew ? `New order · ${where} · ${items} item${items === 1 ? '' : 's'} — accept now` : `${where} · ${status}`,
+        priority: isNew ? 'high' : 'normal',
       },
     })
-  } catch (e: any) { console.warn(`[storefront] order.new notify failed (non-fatal): ${e?.message}`) }
+  } catch (e: any) { console.warn(`[storefront] order notify failed (non-fatal): ${e?.message}`) }
 }
 // Fail closed: never run in prod with the dev-default shared secret.
 if (process.env.NODE_ENV === 'production' && (!process.env.STOREFRONT_ADMIN_SECRET || SF_SECRET === 'dev-admin')) {
@@ -236,7 +241,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       // poll — this emits the same order.new notification the aggregator path does,
       // so OrderAlertProvider chimes instantly. Idempotent (deduped by order_id) so
       // later status re-syncs never re-ring. Fire-and-forget; never blocks the sync.
-      void notifyNewStorefrontOrder(supabase, tenantId, String(slug), order)
+      void notifyStorefrontOrder(supabase, tenantId, String(slug), order)
       res.json({ ok: true })
     } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
   })
