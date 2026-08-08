@@ -163,6 +163,24 @@ export function createNotificationsRouter(deps: Deps): express.Router {
  * (NotificationBell.tsx subscribes by recipient_user_id), so the bell badge
  * updates instantly.
  */
+/**
+ * Recipients for a tenant's order/operational notifications: the tenant OWNER
+ * (tenants.user_id) UNION active team members (user_role_assignments). Deduped.
+ *
+ * CRITICAL: resolving members alone misses the common case — a solo SMB owner
+ * has NO user_role_assignments row (they're tracked via tenants.user_id), so a
+ * members-only query returns [] and the owner never gets the ring. Always union
+ * the owner. Shared by the storefront and aggregator order-notification paths.
+ */
+export async function tenantNotifyRecipients(supabase: SupabaseClient, tenantId: string): Promise<string[]> {
+  const [ownerRes, memberRes] = await Promise.all([
+    supabase.from('tenants').select('user_id').eq('id', tenantId).maybeSingle(),
+    supabase.from('user_role_assignments').select('user_id').eq('tenant_id', tenantId).is('disabled_at', null),
+  ])
+  const ids = [(ownerRes.data as any)?.user_id, ...((memberRes.data ?? []).map((r: any) => r.user_id))]
+  return Array.from(new Set(ids.filter(Boolean)))
+}
+
 export async function emitNotification(
   supabase: SupabaseClient,
   args: {

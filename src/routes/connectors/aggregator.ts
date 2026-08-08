@@ -27,7 +27,7 @@ import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { validateBody } from '../../validation'
 import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
-import { emitNotification } from '../notifications'
+import { emitNotification, tenantNotifyRecipients } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps {
@@ -230,12 +230,9 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   const guardEdit = [requireAuth, identifyTenant, checkPermission('integrations', 'edit')]
   const guardView = [requireAuth, identifyTenant, checkPermission('integrations', 'view')]
 
-  // Active members of a tenant — the recipients for order notifications.
-  const tenantRecipients = async (tenantId: string): Promise<string[]> => {
-    const { data } = await supabase.from('user_role_assignments')
-      .select('user_id').eq('tenant_id', tenantId).is('disabled_at', null)
-    return Array.from(new Set((data ?? []).map((r: any) => r.user_id).filter(Boolean)))
-  }
+  // Recipients for order notifications: OWNER ∪ active members. Delegates to the
+  // shared resolver so solo-owner tenants (no user_role_assignments row) still ring.
+  const tenantRecipients = (tenantId: string): Promise<string[]> => tenantNotifyRecipients(supabase, tenantId)
 
   // Ring the bell: emit an in-app notification for an order event. Fire-and-forget.
   const notifyOrder = async (

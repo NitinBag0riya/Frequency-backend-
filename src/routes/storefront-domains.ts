@@ -18,7 +18,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
 import { sendSmsOtp, sendSmsOrderUpdate } from '../lib/storefront-sms.js'
 import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
-import { emitNotification } from './notifications.js'
+import { emitNotification, tenantNotifyRecipients } from './notifications.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -72,9 +72,7 @@ async function notifyNewStorefrontOrder(supabase: SupabaseClient, tenantId: stri
       .select('id').eq('tenant_id', tenantId).eq('event_key', 'order.new')
       .eq('data->>order_id', orderId).limit(1).maybeSingle()
     if (seen) return
-    const { data: members } = await supabase.from('user_role_assignments')
-      .select('user_id').eq('tenant_id', tenantId).is('disabled_at', null)
-    const recipients = Array.from(new Set((members ?? []).map((r: any) => r.user_id).filter(Boolean)))
+    const recipients = await tenantNotifyRecipients(supabase, tenantId)   // owner ∪ members (solo owners aren't in user_role_assignments)
     if (!recipients.length) return
     const where = order?.table ? `Table ${order.table}` : (order?.mode === 'dinein' ? 'Dine-in' : 'Pickup')
     const items = Array.isArray(order?.lines) ? order.lines.reduce((n: number, l: any) => n + (Number(l?.qty) || 1), 0) : 0
