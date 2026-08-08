@@ -266,7 +266,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
 
   r.post('/api/super-admin/plans', requireAuth, requirePlatformPerm(supabase, 'plans', 'edit'),
     async (req, res) => {
-      const { id, name, monthly_price_inr, trial_days, features, limits, freemium_caps } = req.body
+      const { id, name, monthly_price_inr, trial_days, features, limits, freemium_caps, vertical } = req.body
       if (!id || !name) { res.status(400).json({ error: 'id + name required' }); return }
       const { data, error } = await supabase.from('plans').insert({
         id, name,
@@ -275,6 +275,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
         features: features ?? [],
         limits: limits ?? {},
         freemium_caps: freemium_caps ?? {},
+        vertical: vertical ?? '*',
       }).select().single()
       if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: 'plan.create', payload: data })
@@ -283,7 +284,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
 
   r.patch('/api/super-admin/plans/:id', requireAuth, requirePlatformPerm(supabase, 'plans', 'edit'),
     async (req, res) => {
-      const allowed = ['name', 'monthly_price_inr', 'trial_days', 'features', 'limits', 'freemium_caps', 'is_active']
+      const allowed = ['name', 'monthly_price_inr', 'trial_days', 'features', 'limits', 'freemium_caps', 'is_active', 'vertical']
       const patch: Record<string, any> = { updated_at: new Date().toISOString() }
       for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
       const { data, error } = await supabase.from('plans').update(patch).eq('id', String(req.params.id)).select().single()
@@ -301,6 +302,90 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       const { error } = await supabase.from('plans').delete().eq('id', String(req.params.id))
       if (error) { res.status(500).json({ error: error.message }); return }
       await audit(supabase, req, { action: 'plan.delete', payload: { id: String(req.params.id) } })
+      res.json({ success: true })
+    })
+
+  // ─── Feature registry (the canonical gateable-capability list) ──────────────
+  r.get('/api/super-admin/features', requireAuth, requirePlatformPerm(supabase, 'plans', 'view'),
+    async (_req, res) => {
+      const { data, error } = await supabase.from('features').select('*').order('sort_order')
+      if (error) { res.status(500).json({ error: error.message }); return }
+      res.json(data ?? [])
+    })
+
+  r.patch('/api/super-admin/features/:key', requireAuth, requirePlatformPerm(supabase, 'plans', 'edit'),
+    async (req, res) => {
+      const allowed = ['name', 'description', 'category', 'verticals', 'default_enabled', 'gate_style', 'config_schema', 'sort_order']
+      const patch: Record<string, any> = { updated_at: new Date().toISOString() }
+      for (const k of allowed) if (k in req.body) patch[k] = req.body[k]
+      const { data, error } = await supabase.from('features').update(patch).eq('key', String(req.params.key)).select().single()
+      if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
+      await audit(supabase, req, { action: 'feature.update', payload: { key: String(req.params.key), changes: patch } })
+      res.json(data)
+    })
+
+  // ─── Plan ⇄ feature grant matrix ────────────────────────────────────────────
+  r.get('/api/super-admin/plan-features', requireAuth, requirePlatformPerm(supabase, 'plans', 'view'),
+    async (_req, res) => {
+      const { data, error } = await supabase.from('plan_features').select('plan_id, feature_key')
+      if (error) { res.status(500).json({ error: error.message }); return }
+      res.json(data ?? [])
+    })
+
+  // Replace the full feature grant set for ONE plan (idempotent set-semantics).
+  r.put('/api/super-admin/plans/:id/features', requireAuth, requirePlatformPerm(supabase, 'plans', 'edit'),
+    async (req, res) => {
+      const planId = String(req.params.id)
+      const keys = req.body?.feature_keys
+      if (!Array.isArray(keys)) { res.status(400).json({ error: 'feature_keys must be an array' }); return }
+      const FEATURE_KEY = /^[a-z0-9_.]{1,64}$/
+      for (const k of keys) if (typeof k !== 'string' || !FEATURE_KEY.test(k)) { res.status(400).json({ error: `invalid feature key: ${String(k)}` }); return }
+      const { data: plan } = await supabase.from('plans').select('id').eq('id', planId).maybeSingle()
+      if (!plan) { res.status(404).json({ error: 'plan not found' }); return }
+      // Clear then re-insert. Small tables, single plan → cheap + simple.
+      const { error: delErr } = await supabase.from('plan_features').delete().eq('plan_id', planId)
+      if (delErr) { res.status(500).json({ error: delErr.message }); return }
+      if (keys.length > 0) {
+        const rows = keys.map((feature_key: string) => ({ plan_id: planId, feature_key }))
+        const { error: insErr } = await supabase.from('plan_features').upsert(rows, { onConflict: 'plan_id,feature_key' })
+        if (insErr) { res.status(500).json({ error: insErr.message }); return }
+      }
+      await audit(supabase, req, { action: 'plan_features.set', target_tenant_id: null, payload: { plan_id: planId, feature_keys: keys } })
+      res.json({ success: true, plan_id: planId, count: keys.length })
+    })
+
+  // ─── Per-tenant entitlement editor (allow / deny / reset + reason/expiry/quota) ─
+  // is_enabled: true=force-on, false=force-off, null=reset (delete row → back to plan default).
+  r.post('/api/super-admin/tenants/:id/entitlement', requireAuth, requirePlatformPerm(supabase, 'tenants', 'edit'),
+    async (req, res) => {
+      const tenantId = String(req.params.id)
+      const { feature, is_enabled, reason, expires_at, quota_override } = req.body ?? {}
+      const FEATURE_KEY = /^[a-z0-9_.]{1,64}$/
+      if (typeof feature !== 'string' || !FEATURE_KEY.test(feature)) { res.status(400).json({ error: `invalid feature key: ${String(feature)}` }); return }
+      if (is_enabled !== null && typeof is_enabled !== 'boolean') { res.status(400).json({ error: 'is_enabled must be boolean or null (reset)' }); return }
+      if (expires_at != null && Number.isNaN(new Date(expires_at).getTime())) { res.status(400).json({ error: 'expires_at must be an ISO timestamp' }); return }
+      if (quota_override != null && (typeof quota_override !== 'object' || Array.isArray(quota_override))) { res.status(400).json({ error: 'quota_override must be an object' }); return }
+
+      if (is_enabled === null && quota_override == null) {
+        // Reset — remove the override row entirely.
+        const { error } = await supabase.from('tenant_entitlements').delete().eq('tenant_id', tenantId).eq('feature', feature)
+        if (error) { res.status(500).json({ error: error.message }); return }
+        await audit(supabase, req, { action: 'entitlement.reset', target_tenant_id: tenantId, payload: { feature }, reason })
+        res.json({ success: true, reset: true }); return
+      }
+      const user = (req as any).user
+      const row: Record<string, any> = {
+        tenant_id: tenantId, feature,
+        is_enabled: is_enabled ?? true,
+        override_reason: reason ?? null,
+        expires_at: expires_at ?? null,
+        quota_override: quota_override ?? null,
+        granted_by: user?.id ?? null,
+        granted_at: new Date().toISOString(),
+      }
+      const { error } = await supabase.from('tenant_entitlements').upsert(row, { onConflict: 'tenant_id,feature' })
+      if (error) { res.status(500).json({ error: error.message }); return }
+      await audit(supabase, req, { action: 'entitlement.set', target_tenant_id: tenantId, payload: { feature, is_enabled, expires_at, quota_override }, reason })
       res.json({ success: true })
     })
 
