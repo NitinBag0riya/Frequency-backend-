@@ -498,6 +498,9 @@ export function createCrmRouter(deps: Deps): express.Router {
   r.get('/api/crm/deals', ...guard, async (req, res) => {
     const tenantId = (req as any).tenantId as string | undefined
     const userId   = (req as any).user?.id as string | undefined
+    // data_scope from the caller's role (checkPermission sets it). 'own' → the
+    // caller only sees records assigned to them; owners/'all'/'team' unaffected.
+    const scope    = (req as any).userDataScope as string | undefined
     if (!tenantId) { res.status(401).json({ error: 'tenant required' }); return }
 
     const stageId      = req.query.stage_id     ? String(req.query.stage_id)     : null
@@ -516,6 +519,7 @@ export function createCrmRouter(deps: Deps): express.Router {
       .limit(MAX_DEALS_LIST)
     if (stageId)   query = query.eq('stage_id', stageId)
     if (owner)     query = query.eq('owner_user_id', owner)
+    if (scope === 'own' && userId) query = query.eq('owner_user_id', userId)
     if (contactId) query = query.eq('contact_id', contactId)
     if (q && q.length > 0) query = query.ilike('title', `%${q.replace(/[%_]/g, m => '\\' + m)}%`)
 
@@ -602,6 +606,7 @@ export function createCrmRouter(deps: Deps): express.Router {
         .order('updated_at', { ascending: false })
         .limit(MAX_LEAD_CARDS)
       if (owner) leadQuery = leadQuery.eq('assigned_to', owner)
+      if (scope === 'own' && userId) leadQuery = leadQuery.eq('assigned_to', userId)
       const { data: leadRows } = await leadQuery
 
       for (const row of (leadRows ?? []) as any[]) {
