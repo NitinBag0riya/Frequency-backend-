@@ -18,6 +18,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
 import { sendSmsOtp, sendSmsOrderUpdate } from '../lib/storefront-sms.js'
 import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
+import { emitNotification } from './notifications.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -55,6 +56,41 @@ async function resolveStoreName(slug: string): Promise<string> {
   } catch { /* keep slug — never block SMS on the config lookup */ }
   storeNameCache.set(slug, { name, at: Date.now() })
   return name
+}
+
+// Emit a realtime order.new notification for a storefront/POS/app order the FIRST
+// time we see it, so the operator's dashboard chimes instantly (OrderAlertProvider
+// subscribes to notifications realtime). Deduped by order_id → a status re-sync of
+// the same order never re-rings. Recipients = active members of the tenant, same
+// as the aggregator path. Best-effort: any failure is logged, never thrown.
+async function notifyNewStorefrontOrder(supabase: SupabaseClient, tenantId: string, slug: string, order: any): Promise<void> {
+  try {
+    const orderId = String(order?.id ?? '')
+    if (!orderId) return
+    // Already rang for this order? (placement rings once; later status syncs skip.)
+    const { data: seen } = await supabase.from('notifications')
+      .select('id').eq('tenant_id', tenantId).eq('event_key', 'order.new')
+      .eq('data->>order_id', orderId).limit(1).maybeSingle()
+    if (seen) return
+    const { data: members } = await supabase.from('user_role_assignments')
+      .select('user_id').eq('tenant_id', tenantId).is('disabled_at', null)
+    const recipients = Array.from(new Set((members ?? []).map((r: any) => r.user_id).filter(Boolean)))
+    if (!recipients.length) return
+    const where = order?.table ? `Table ${order.table}` : (order?.mode === 'dinein' ? 'Dine-in' : 'Pickup')
+    const items = Array.isArray(order?.lines) ? order.lines.reduce((n: number, l: any) => n + (Number(l?.qty) || 1), 0) : 0
+    await emitNotification(supabase, {
+      tenant_id: tenantId,
+      event_key: 'order.new',
+      recipient_user_ids: recipients,
+      link: '/settings/orders',   // canonical orders board (matches aggregator + OrderAlertProvider silence-on-view)
+      data: {
+        channel: 'storefront', channel_label: 'Storefront',
+        order_id: orderId, status: String(order?.status ?? 'placed'),
+        summary: `New order · ${where} · ${items} item${items === 1 ? '' : 's'} — accept now`,
+        priority: 'high',
+      },
+    })
+  } catch (e: any) { console.warn(`[storefront] order.new notify failed (non-fatal): ${e?.message}`) }
 }
 // Fail closed: never run in prod with the dev-default shared secret.
 if (process.env.NODE_ENV === 'production' && (!process.env.STOREFRONT_ADMIN_SECRET || SF_SECRET === 'dev-admin')) {
@@ -197,6 +233,12 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       const tenantId = (t as any)?.id
       if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
       await syncOrderRow(supabase, tenantId, String(slug), order)
+      // Ring the operator's bell in REAL TIME on the first sight of an order.
+      // Storefront/POS/app orders used to only surface via the dashboard's 8s/30s
+      // poll — this emits the same order.new notification the aggregator path does,
+      // so OrderAlertProvider chimes instantly. Idempotent (deduped by order_id) so
+      // later status re-syncs never re-ring. Fire-and-forget; never blocks the sync.
+      void notifyNewStorefrontOrder(supabase, tenantId, String(slug), order)
       res.json({ ok: true })
     } catch (e: any) { res.status(500).json({ ok: false, error: e?.message || 'sync failed' }) }
   })
