@@ -88,6 +88,7 @@ export function createKhataRouter(supabase: SupabaseClient, requireAuth: Mw, ide
   const router = express.Router()
   const view = [requireAuth, identifyTenant, checkPermission('leads', 'view')]
   const edit = [requireAuth, identifyTenant, checkPermission('leads', 'edit')]
+  const del  = [requireAuth, identifyTenant, checkPermission('leads', 'delete')]
 
   // GET /khata/summary — totals for the header (receivable / payable / parties).
   router.get('/khata/summary', ...view, async (req, res) => {
@@ -177,7 +178,7 @@ export function createKhataRouter(supabase: SupabaseClient, requireAuth: Mw, ide
   })
 
   // DELETE /khata/entries/:id
-  router.delete('/khata/entries/:id', ...edit, async (req, res) => {
+  router.delete('/khata/entries/:id', ...del, async (req, res) => {
     const tenantId = (req as any).tenantId
     const { error } = await supabase.from('ledger_entries').delete()
       .eq('tenant_id', tenantId).eq('id', req.params.id)

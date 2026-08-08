@@ -19,6 +19,18 @@ import { apiError } from '../lib/api-error'
 const BUCKET = 'assets'
 const MAX_BYTES = 50 * 1024 * 1024   // 50 MB — matches the bucket's file_size_limit
 
+// Allowlist of content types we accept. The bucket is PUBLIC-read and served
+// from the branded assets.getfrequency.app origin, so an uploaded SVG or HTML
+// file executes attacker JS on that origin when opened directly (stored XSS).
+// Reject anything script-executing; store the SERVER-validated type, never the
+// client-supplied mimetype.
+const ALLOWED_MIME = new Set([
+  'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif',
+  'video/mp4', 'video/quicktime', 'video/webm',
+  'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/ogg',
+  'application/pdf',
+])
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_BYTES, files: 1 } })
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -73,13 +85,20 @@ export function createAssetsRouter(deps: Deps): express.Router {
         const file = (req as any).file as { buffer: Buffer; originalname: string; mimetype: string; size: number } | undefined
         if (!file) { apiError(res, 400, 'no_file', 'No file uploaded (field name must be "file")'); return }
 
+        // Reject script-executing / non-allowlisted types (SVG, HTML, …) — see ALLOWED_MIME.
+        const mime = String(file.mimetype || '').toLowerCase().split(';')[0].trim()
+        if (!ALLOWED_MIME.has(mime)) {
+          apiError(res, 415, 'unsupported_type', `File type "${mime || 'unknown'}" is not allowed. Allowed: images (png/jpeg/webp/gif/avif), video (mp4/mov/webm), audio (mp3/aac/ogg), pdf.`)
+          return
+        }
+
         const rawName = String((req.body?.name as string) || file.originalname || 'asset').slice(0, 200)
         const safe = (file.originalname || 'asset').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120)
         const path = `${tenantId}/${crypto.randomUUID()}-${safe}`
         const type = typeFromMime(file.mimetype, req.body?.type)
 
         const { error: upErr } = await supabase.storage.from(BUCKET).upload(path, file.buffer, {
-          contentType: file.mimetype || 'application/octet-stream',
+          contentType: mime,   // server-validated (allowlisted), never the raw client mimetype
           upsert: false,
         })
         if (upErr) { apiError(res, 500, 'storage_upload_failed', upErr.message); return }

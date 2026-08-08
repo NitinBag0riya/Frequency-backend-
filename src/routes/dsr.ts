@@ -463,6 +463,11 @@ export function createDsrRouter(deps: Deps): express.Router {
     requireAuth, identifyTenant, checkPermission('leads', 'view'),
     async (req, res) => {
       const tenantId = (req as any).tenantId as string
+      // The receipt payload is the full PII dossier (contact + message history +
+      // consent events). Gate it to admins like verify/execute/reject — a read-only
+      // leads:view role must not be able to pull every subject's data.
+      const role = await getTenantRole(supabase, (req as any).user?.id as string, tenantId)
+      if (!role || !ADMIN_ROLES.has(role)) { res.status(403).json({ error: 'admin role required' }); return }
       const id = String(req.params.id)
       const { data, error } = await supabase.from('dsr_requests')
         .select('id, status, completed_at, payload, request_type')

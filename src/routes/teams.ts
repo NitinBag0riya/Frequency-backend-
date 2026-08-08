@@ -472,12 +472,44 @@ export function createTeamsRouter(deps: Deps): express.Router {
       }
       const { key, label, description, permissions, allowed_apps, data_scope } = req.body
       if (!key || !label) { res.status(400).json({ error: 'key + label required' }); return }
+
+      // Privilege-clamp: a non-owner cannot mint a role with permissions, data
+      // scope, or app access broader than their OWN — else a workspace_admin could
+      // create (then assign) a role holding billing.edit / tenant.delete they were
+      // explicitly denied. Owners may grant anything.
+      const DATA_SCOPES = ['own', 'team', 'department', 'all']
+      const SCOPE_RANK: Record<string, number> = { own: 0, team: 1, department: 2, all: 3 }
+      let finalPerms: Record<string, any> = permissions && typeof permissions === 'object' ? permissions : {}
+      let finalScope: string = DATA_SCOPES.includes(data_scope) ? data_scope : 'own'
+      let finalApps: string[] = Array.isArray(allowed_apps) ? allowed_apps : ['*']
+      if ((req as any).userRole !== 'owner') {
+        const { data: myAssign } = await supabase.from('user_role_assignments')
+          .select('role_id').eq('user_id', (req as any).user.id).eq('tenant_id', tenantId).maybeSingle()
+        const { data: myRole } = myAssign
+          ? await supabase.from('role_definitions').select('permissions, data_scope, allowed_apps').eq('id', myAssign.role_id).maybeSingle()
+          : { data: null as any }
+        const myPerms = ((myRole?.permissions as any) || {}) as Record<string, any>
+        const clamped: Record<string, any> = {}
+        for (const feat of Object.keys(finalPerms)) {
+          for (const act of Object.keys(finalPerms[feat] || {})) {
+            if (finalPerms[feat][act] === true && myPerms?.[feat]?.[act] === true) {
+              clamped[feat] = clamped[feat] || {}
+              clamped[feat][act] = true
+            }
+          }
+        }
+        finalPerms = clamped
+        const myScope = (myRole?.data_scope as string) || 'own'
+        if ((SCOPE_RANK[finalScope] ?? 0) > (SCOPE_RANK[myScope] ?? 0)) finalScope = myScope
+        const myApps: string[] = (myRole?.allowed_apps as string[]) || []
+        if (!myApps.includes('*')) finalApps = finalApps.filter(a => a !== '*' && myApps.includes(a))
+      }
       const { data, error } = await supabase.from('role_definitions').insert({
         scope: 'tenant', key, label, description: description ?? null,
         is_built_in: false, tenant_id: tenantId,
-        permissions: permissions ?? {},
-        allowed_apps: allowed_apps ?? ['*'],
-        data_scope: data_scope ?? 'own',
+        permissions: finalPerms,
+        allowed_apps: finalApps,
+        data_scope: finalScope,
       }).select().single()
       if (error) {
         if ((error as any).code === '23505') { res.status(409).json({ error: 'Role with this key already exists in your tenant' }); return }

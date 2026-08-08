@@ -155,6 +155,9 @@ export function createPrivacyCenterRouter(deps: Deps): express.Router {
     requireAuth, identifyTenant, checkPermission('leads', 'view'),
     async (req, res) => {
       const tenantId = (req as unknown as { tenantId: string }).tenantId
+      // Full PII export blob — admins only (matches the receipt route in dsr.ts).
+      const role = await resolveTenantRole(supabase, (req as any).user?.id, tenantId)
+      if (!role || !ADMIN_ROLES.has(role)) { res.status(403).json({ error: 'admin role required' }); return }
       const id = String(req.params.id)
       const { data, error } = await supabase.from('dsr_requests')
         .select('id, status, completed_at, payload, request_type')
