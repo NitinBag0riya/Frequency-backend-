@@ -37,6 +37,8 @@ import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
 import { createSuperAdminRouter }  from './routes/super-admin'
+import { touchLastActive }         from './lib/last-active'
+import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
 import { createTenantAuditRouter } from './routes/tenant-audit'
 import { createNotificationsRouter } from './routes/notifications'
@@ -740,6 +742,15 @@ async function requireAuth(req: express.Request, res: express.Response, next: ex
 async function identifyTenant(req: express.Request, res: express.Response, next: express.NextFunction) {
   const user = (req as any).user
   if (!user) { apiError(res, 401, 'unauthorized', 'Authentication required.'); return }
+
+  // Throttled last-active writer — wrap next() once so every resolution path
+  // (header / ownership / agency / platform) records activity in one place,
+  // at most once per tenant per 10 min. Fire-and-forget; never blocks.
+  const _next = next
+  next = ((...args: unknown[]) => {
+    if (!args[0]) touchLastActive(supabase, (req as any).tenantId)
+    return (_next as (...a: unknown[]) => void)(...args)
+  }) as express.NextFunction
 
   // Tenant ID comes from the X-Tenant-ID header ONLY. We deliberately
   // dropped the `?tenant_id=` query-param fallback: query params end up
@@ -5709,6 +5720,7 @@ app.use(createSuperAdminRouter({ supabase, requireAuth }))
 
 // ── Tenant team management (RBAC) ────────────────────────────────────────────
 app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))
+app.use(createNavConfigRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Tenant audit log (per-tenant immutable log, populated by WA-calling +
 //    other DPDP-compliance writers; read-side for the AuditLogPage FE) ───────

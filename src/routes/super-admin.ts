@@ -957,6 +957,67 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       res.json({ trend })
     })
 
+  // ─── GET /api/super-admin/vertical-stats ───────────────────────────────
+  // Tenants + MRR grouped by canonical business vertical. Powers the Overview
+  // "Tenants by vertical" donut (count + MRR per slice). Additive aggregate —
+  // one tenants read + one active-subs read, merged in memory.
+  r.get('/api/super-admin/vertical-stats',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (_req, res) => {
+      const group = (bt: string | null | undefined): string => {
+        switch (bt) {
+          case 'horeca': case 'restaurant': case 'cafe': case 'hotel': case 'cloud_kitchen': return 'horeca'
+          case 'd2c': case 'ecommerce': case 'retail': return 'd2c'
+          case 'salon': case 'spa': case 'wellness': case 'services': return 'salon'
+          case 'real_estate': return 'real_estate'
+          default: return 'other'
+        }
+      }
+      const [{ data: tenants }, { data: subs }] = await Promise.all([
+        supabase.from('tenants').select('id, business_type').neq('status', 'deleted'),
+        supabase.from('tenant_subscriptions').select('tenant_id, status, plans!inner(monthly_price_inr)').eq('status', 'active'),
+      ])
+      const mrrByTenant: Record<string, number> = {}
+      for (const s of (subs ?? []) as any[]) {
+        const p = Array.isArray(s.plans) ? s.plans[0] : s.plans
+        const price = Number(p?.monthly_price_inr ?? 0)
+        mrrByTenant[s.tenant_id] = Number.isFinite(price) && price >= 0 ? price : 0 // skip -1 sentinel
+      }
+      const agg: Record<string, { vertical: string; tenants: number; mrr_inr: number }> = {}
+      for (const t of (tenants ?? []) as any[]) {
+        const g = group(t.business_type)
+        agg[g] = agg[g] ?? { vertical: g, tenants: 0, mrr_inr: 0 }
+        agg[g].tenants += 1
+        agg[g].mrr_inr += mrrByTenant[t.id] ?? 0
+      }
+      res.json({ verticals: Object.values(agg).sort((a, b) => b.tenants - a.tenants) })
+    })
+
+  // ─── GET /api/super-admin/activation-funnel ────────────────────────────
+  // Count of tenants who have reached each activation step. Reads the
+  // activation_events instrumentation table (unique per tenant+step). Steps
+  // are returned in canonical funnel order with count + pct of signup.
+  r.get('/api/super-admin/activation-funnel',
+    requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
+    async (_req, res) => {
+      const STEPS = ['signup', 'connect_channel', 'first_catalog', 'first_order', 'first_broadcast']
+      const { data } = await supabase.from('activation_events').select('step')
+      const counts: Record<string, number> = {}
+      for (const row of (data ?? []) as any[]) counts[row.step] = (counts[row.step] ?? 0) + 1
+      // Fall back to tenant count for 'signup' if the events table isn't backfilled yet.
+      if (!counts['signup']) {
+        const { count } = await supabase.from('tenants').select('id', { count: 'exact', head: true }).neq('status', 'deleted')
+        counts['signup'] = count ?? 0
+      }
+      const base = counts['signup'] || 0
+      const funnel = STEPS.map(step => ({
+        step,
+        count: counts[step] ?? 0,
+        pct: base > 0 ? Math.round(((counts[step] ?? 0) / base) * 100) : 0,
+      }))
+      res.json({ funnel })
+    })
+
   // ─── Webhook dead-letter (migration 064) ─────────────────────────────────
   // Permanent failures from webhook.inbound + webhook.outbound queues. The
   // worker writes one row here when a job exhausts all 5 retries
