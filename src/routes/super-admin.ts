@@ -635,11 +635,15 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
 
   r.post('/api/super-admin/announcements', requireAuth, requirePlatformPerm(supabase, 'announcements', 'edit'),
     async (req, res) => {
-      const { title, body, severity, audience, starts_at, ends_at } = req.body
+      const { title, body, severity, audience, starts_at, ends_at, target_verticals, target_plans } = req.body
       if (!title) { res.status(400).json({ error: 'title required' }); return }
+      const asStrArr = (v: any, fallback: string[]) =>
+        Array.isArray(v) && v.length > 0 && v.every((x: any) => typeof x === 'string') ? v : fallback
       const { data, error } = await supabase.from('platform_announcements').insert({
         title, body: body ?? null, severity: severity ?? 'info',
         audience: audience ?? 'all', starts_at: starts_at ?? null, ends_at: ends_at ?? null,
+        target_verticals: asStrArr(target_verticals, ['*']),
+        target_plans: asStrArr(target_plans, ['*']),
         created_by: (req as any).user.id,
       }).select().single()
       if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
