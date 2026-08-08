@@ -448,7 +448,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const tenantId = (req as any).tenantId
       // Built-in roles + this tenant's custom roles (if any)
       const { data, error } = await supabase.from('role_definitions')
-        .select('id, key, label, description, plan_min, is_built_in')
+        .select('id, key, label, description, plan_min, is_built_in, allowed_apps')
         .eq('scope', 'tenant')
         .or(`tenant_id.eq.${tenantId},is_built_in.eq.true`)
         .order('label')
