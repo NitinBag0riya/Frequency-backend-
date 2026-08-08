@@ -26,29 +26,41 @@ async function main() {
 
   assert.equal(await smsAvailable(), true)
 
-  // OTP: template_id + sender + var1=code, mobiles with CC.
-  await sendSmsOtp({} as any, { slug: 's', phone: '9694993366', code: '1234' })
+  // OTP v2: var1=code, var2=store display name (falls back to brand), CC prepended.
+  await sendSmsOtp({} as any, { slug: 's', phone: '9694993366', code: '1234', storeName: 'Maple Mortar' })
   assert.equal(last!.url, 'https://control.msg91.com/api/v5/flow/')
   assert.equal(last!.body.template_id, 'otp-flow-id')
   assert.equal(last!.body.sender, 'FREQNC')
-  assert.deepEqual(last!.body.recipients, [{ mobiles: '919694993366', var1: '1234' }])
+  assert.deepEqual(last!.body.recipients, [{ mobiles: '919694993366', var1: '1234', var2: 'Maple Mortar' }])
 
-  // Order: single composed var1, per-call templateId override wins, CC prepended.
+  // OTP without a store name falls back to the brand literal.
+  await sendSmsOtp({} as any, { slug: 's', phone: '9694993366', code: '1234' })
+  assert.equal(last!.body.recipients[0].var2, 'Frequency')
+
+  // Order v2: pass-through var1=order#, var2=status, var3=name; templateId override wins.
   await sendSmsOrderUpdate({} as any, {
     slug: 's', phone: '09876543210',
     vars: { var1: '1088', var2: 'ready', var3: 'Aura' },
     templateId: 'override-flow',
   })
   assert.equal(last!.body.template_id, 'override-flow')
-  assert.deepEqual(last!.body.recipients, [{ mobiles: '919876543210', var1: 'Order 1088 is now ready' }])
+  assert.deepEqual(last!.body.recipients, [{ mobiles: '919876543210', var1: '1088', var2: 'ready', var3: 'Aura' }])
 
-  // Order defaults when vars missing.
+  // Order var1 is NUMBER-tagged: non-digits are stripped ("#1088" → "1088").
+  await sendSmsOrderUpdate({} as any, { slug: 's', phone: '9876543210', vars: { var1: '#1088', var2: 'ready', var3: 'Aura' } })
+  assert.equal(last!.body.recipients[0].var1, '1088')
+
+  // Order var3 backfills from storeName when the caller omits it.
+  await sendSmsOrderUpdate({} as any, { slug: 's', phone: '9876543210', vars: { var1: '1088', var2: 'ready' }, storeName: 'Aura Salon' })
+  assert.equal(last!.body.recipients[0].var3, 'Aura Salon')
+
+  // Order defaults when vars entirely missing (var1='0', status/name fall back).
   await sendSmsOrderUpdate({} as any, { slug: 's', phone: '9876543210', vars: {} })
-  assert.deepEqual(last!.body.recipients[0], { mobiles: '919876543210', var1: 'Your order is now updated' })
+  assert.deepEqual(last!.body.recipients[0], { mobiles: '919876543210', var1: '0', var2: 'updated', var3: 'Frequency' })
 
-  // Long composed line is clamped to the DLT per-variable budget (30 chars).
-  await sendSmsOrderUpdate({} as any, { slug: 's', phone: '9876543210', vars: { var1: '1088', var2: 'out for delivery today' } })
-  assert.ok(last!.body.recipients[0].var1.length <= 30, 'order var1 must be <= 30 chars')
+  // Each var stays inside the DLT per-variable budget (30 chars).
+  await sendSmsOrderUpdate({} as any, { slug: 's', phone: '9876543210', vars: { var1: '1088', var2: 'out for delivery this evening before 9pm', var3: 'A Very Long Restaurant Name That Exceeds' } })
+  assert.ok(last!.body.recipients[0].var2.length <= 30 && last!.body.recipients[0].var3.length <= 30, 'order vars must be <= 30 chars')
 
   // Missing template id throws (→ caller falls back to WhatsApp / on-screen).
   delete process.env.MSG91_OTP_TEMPLATE_ID

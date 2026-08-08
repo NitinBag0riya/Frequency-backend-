@@ -37,6 +37,25 @@ const projectFor = (kind?: string) => (kind === 'dashboard' ? VDASH_PROJECT : VP
 // and we attach the secret + the active tenant's slug server-side.
 const SF_API = process.env.STOREFRONT_API_URL || 'http://localhost:5181'
 const SF_SECRET = process.env.STOREFRONT_ADMIN_SECRET || 'dev-admin'
+
+// Resolve a tenant's STOREFRONT DISPLAY NAME (what the customer sees on the
+// storefront) for the DLT-branded OTP/order SMS templates. storefront-api's
+// /v1/config already computes exactly display_name || business_name || slug, so
+// reuse it as the single source of truth; fall back to the slug if the service
+// is slow/down so SMS never blocks on it. Cached briefly — names change rarely,
+// OTPs are frequent.
+const storeNameCache = new Map<string, { name: string; at: number }>()
+async function resolveStoreName(slug: string): Promise<string> {
+  const hit = storeNameCache.get(slug)
+  if (hit && Date.now() - hit.at < 5 * 60_000) return hit.name
+  let name = slug
+  try {
+    const cfg = await fetch(`${SF_API}/v1/config`, { headers: { 'X-Tenant': slug }, signal: AbortSignal.timeout(2500) })
+    if (cfg.ok) { const j: any = await cfg.json(); if (j?.name) name = String(j.name) }
+  } catch { /* keep slug — never block SMS on the config lookup */ }
+  storeNameCache.set(slug, { name, at: Date.now() })
+  return name
+}
 // Fail closed: never run in prod with the dev-default shared secret.
 if (process.env.NODE_ENV === 'production' && (!process.env.STOREFRONT_ADMIN_SECRET || SF_SECRET === 'dev-admin')) {
   throw new Error('[security] STOREFRONT_ADMIN_SECRET must be set to a strong value in production')
@@ -126,7 +145,8 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     // the WhatsApp authentication template; if BOTH fail, storefront-api shows
     // the on-screen demo code so login never breaks.
     try {
-      const m = await sendSmsOtp(supabase, { slug: String(slug), phone: String(phone), code: String(code) })
+      const storeName = await resolveStoreName(String(slug))
+      const m = await sendSmsOtp(supabase, { slug: String(slug), phone: String(phone), code: String(code), storeName })
       return res.json({ ok: true, channel: 'sms', via: m.via })
     } catch (smsErr: any) {
       try {
@@ -154,7 +174,11 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       return res.status(429).json({ ok: false, error: 'rate_limited' })
     }
     try {
-      const m = await sendSmsOrderUpdate(supabase, { slug: String(slug), phone: String(phone), vars: vars || {}, templateId })
+      // storefront-api usually supplies var3=name; backfill from the resolved
+      // store display name when it doesn't (the DLT template needs all 3 vars).
+      const vv = { ...(vars || {}) }
+      if (!vv.var3) vv.var3 = await resolveStoreName(String(slug))
+      const m = await sendSmsOrderUpdate(supabase, { slug: String(slug), phone: String(phone), vars: vv, templateId })
       res.json({ ok: true, via: m.via })
     } catch (e: any) {
       res.status(502).json({ ok: false, error: e?.message || 'send failed' })

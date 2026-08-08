@@ -23,7 +23,7 @@
  * Env:
  *   MSG91_AUTH_KEY          — platform Auth Key (MSG91 dashboard → Auth Key)
  *   MSG91_SENDER_ID         — DLT-approved 6-char header (e.g. "FREQNC")
- *   MSG91_OTP_TEMPLATE_ID   — MSG91 flow id for the OTP content template  (var1 = code)
+ *   MSG91_OTP_TEMPLATE_ID   — MSG91 flow id for the OTP content template  (var1=code, var2=store name)
  *   MSG91_ORDER_TEMPLATE_ID — MSG91 flow id for the order content template (var1=order#, var2=status, var3=name)
  *   MSG91_COUNTRY_CODE      — default country code for bare local numbers (def "91")
  */
@@ -85,41 +85,43 @@ async function postFlow(templateId: string, mobile: string, vars: Record<string,
 
 /**
  * Send a login OTP over MSG91. We pass our own pre-generated `code` so the
- * storefront keeps owning verification. DLT template: "{#var#} is your
- * verification code…" → var1 = code.
+ * storefront keeps owning verification. DLT template "Frequency Login OTP v2":
+ * "{#var#} is your {#var#} verification code. Do not share it with anyone. -
+ * Frequency" → var1 = code, var2 = tenant store display name. The store name is
+ * resolved by the caller (storefront-domains) and falls back to the brand.
  */
 export async function sendSmsOtp(
   _supabase: SupabaseClient,
-  args: { slug: string; phone: string; code: string },
+  args: { slug: string; phone: string; code: string; storeName?: string },
 ): Promise<SmsResult> {
   const to = normRecipient(args.phone)
   if (!/^\d{10,15}$/.test(to)) throw new Error(`Invalid phone for SMS OTP: '${args.phone}'`)
   const code = String(args.code).trim()
   if (!/^\d{4,8}$/.test(code)) throw new Error('Invalid OTP code')
-  return postFlow(process.env.MSG91_OTP_TEMPLATE_ID || '', to, { var1: code })
+  const store = (args.storeName || 'Frequency').trim().slice(0, 30) || 'Frequency'
+  return postFlow(process.env.MSG91_OTP_TEMPLATE_ID || '', to, { var1: code, var2: store })
 }
 
 /**
  * Send a transactional order-update SMS. `vars` carries the fields the
- * storefront-api builds ({ var1: order#, var2: status, var3: name }). The DLT
- * order template is SINGLE-variable — "{#var#} - Frequency" (brand literal in
- * the template) — so we compose the status line here into var1, kept short to
- * stay inside the DLT per-variable budget (~30 chars). `templateId` lets the
+ * storefront-api builds ({ var1: order#, var2: status, var3: name }). DLT
+ * template "Frequency Order Update v2": "Order #{#var#} is {#var#} at {#var#}. -
+ * Frequency" → var1 = order# (NUMBER tag → digits only), var2 = status,
+ * var3 = store display name. storefront-api already supplies all three; the
+ * caller backfills var3 (and clamps here) when it doesn't. `templateId` lets the
  * caller override the flow id per-tenant.
- * ponytail: dropped the store-name var — the platform brand "Frequency" is
- * already the literal suffix, and one var registers/sends far more reliably than
- * three (the DLT content editor mis-parses multi-var content).
  */
 export async function sendSmsOrderUpdate(
   _supabase: SupabaseClient,
-  args: { slug: string; phone: string; vars: Record<string, string>; templateId?: string },
+  args: { slug: string; phone: string; vars: Record<string, string>; templateId?: string; storeName?: string },
 ): Promise<SmsResult> {
   const to = normRecipient(args.phone)
   if (!/^\d{10,15}$/.test(to)) throw new Error(`Invalid phone for order SMS: '${args.phone}'`)
   const v = args.vars || {}
-  const orderNo = v.var1 ? String(v.var1) : ''
-  const status = v.var2 ? String(v.var2) : 'updated'
-  const line = (orderNo ? `Order ${orderNo} is now ${status}` : `Your order is now ${status}`).slice(0, 30)
+  // var1 is tagged NUMBER on DLT — strip to digits ("#1088"/"ORD-1088" → "1088").
+  const order = (v.var1 ? String(v.var1) : '').replace(/\D/g, '').slice(0, 12) || '0'
+  const status = (v.var2 ? String(v.var2) : 'updated').trim().slice(0, 30) || 'updated'
+  const store = (v.var3 || args.storeName || 'Frequency').trim().slice(0, 30) || 'Frequency'
   const templateId = args.templateId || process.env.MSG91_ORDER_TEMPLATE_ID || ''
-  return postFlow(templateId, to, { var1: line })
+  return postFlow(templateId, to, { var1: order, var2: status, var3: store })
 }
