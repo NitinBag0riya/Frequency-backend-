@@ -14,6 +14,7 @@ import { createLeadsRouter } from './leads'
 import { createKhataRouter } from './routes/khata'
 import { createListingsRouter } from './routes/listings'
 import { createAppointmentsRouter } from './routes/appointments'
+import { createTasksRouter } from './routes/tasks'
 import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
@@ -985,6 +986,9 @@ function featureLabel(key: string) { return FEATURE_LABELS[key] || key.replace(/
 const PERMISSION_KEY_ALIASES: Record<string, string[]> = {
   whatsapp_automation: ['workflows', 'broadcasts'],
   leads: ['contacts'],
+  // Org Tasks piggyback on the leads/CRM permission for the RBAC matrix — a
+  // role that manages leads can manage internal tasks (feature-gated separately).
+  tasks: ['leads', 'contacts'],
 }
 
 function hasRolePermission(perms: any, feature: string, action: string): boolean {
@@ -5535,6 +5539,7 @@ app.use('/api', createLeadsRouter(supabase, requireAuth, identifyTenant, checkPe
 app.use('/api', createKhataRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createListingsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createAppointmentsRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use('/api', createTasksRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api/admin', createAdminRouter(supabase, requireAuth, isPlatformUser))
 
 // ── Phase 3: campaigns, analytics, execution logs, activity ──────────────────
