@@ -170,6 +170,13 @@ export function createKhataRouter(supabase: SupabaseClient, requireAuth: Mw, ide
     }
     if (b.note !== undefined) patch.note = b.note
     if (b.at !== undefined) patch.at = b.at
+    // Party rename/rephone (the dashboard edit form sends these) — recompute the
+    // stable party_key so the entry still merges with the right customer.
+    if (b.partyName !== undefined || b.partyPhone !== undefined) {
+      if (b.partyName !== undefined) patch.party_name = String(b.partyName).trim() || null
+      if (b.partyPhone !== undefined) patch.party_phone = String(b.partyPhone).trim() || null
+      patch.party_key = partyKeyFrom(b.partyPhone, b.partyName)
+    }
     if (!Object.keys(patch).length) return res.status(400).json({ error: 'nothing to update' })
     const { data, error } = await supabase.from('ledger_entries').update(patch)
       .eq('tenant_id', tenantId).eq('id', req.params.id).select().single()
