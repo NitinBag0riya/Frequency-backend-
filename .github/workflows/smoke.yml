@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       base:
-        description: 'API base URL to probe (default: stage)'
+        description: 'API base URL to probe (default: BETA)'
         required: false
-        default: 'https://api.getfrequency.app'
+        default: 'https://api-beta.getfrequency.app'
       only:
         description: 'Optional comma-separated group filter (e.g. sla,pii)'
         required: false
@@ -39,7 +39,7 @@ jobs:
 
       - name: Wait for BE to be reachable
         env:
-          BASE: ${{ github.event.inputs.base || 'https://api.getfrequency.app' }}
+          BASE: ${{ github.event.inputs.base || 'https://api-beta.getfrequency.app' }}
         # Up to 3 minutes for the deploy to land — Fly.io can take a
         # while to propagate. If /health still 502s after that, the
         # smoke step below will fail fast anyway.
@@ -55,11 +55,15 @@ jobs:
           echo "BE never returned 200 from /health within 180s"
           exit 1
 
+      # Smoke runs against BETA (stage deploys there) so it NEVER creates/mutates
+      # data on prod. It was hitting api.getfrequency.app + prod Supabase and
+      # leaving an e2e-* tenant behind on every stage push — that was the source
+      # of ~120 junk tenants on prod. Beta is throwaway, so leaks there are fine.
       - name: Smoke run
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SMOKE_BASE_URL: ${{ github.event.inputs.base || 'https://api.getfrequency.app' }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL_BETA }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY_BETA }}
+          SMOKE_BASE_URL: ${{ github.event.inputs.base || 'https://api-beta.getfrequency.app' }}
         run: |
           if [ -n "${{ github.event.inputs.only }}" ]; then
             npm run smoke -- --only "${{ github.event.inputs.only }}"
