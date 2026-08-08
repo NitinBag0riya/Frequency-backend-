@@ -587,9 +587,17 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
         supabase.from('tenants').select('id', { count: 'exact', head: true }).neq('status', 'deleted'),
         supabase.from('contacts').select('id', { count: 'exact', head: true }),
         supabase.from('messages').select('id', { count: 'exact', head: true }),
-        supabase.from('tenant_subscriptions').select('plan_id, status, plans!inner(monthly_price_inr)').eq('status', 'active'),
+        supabase.from('tenant_subscriptions').select('plan_id, status, billing_period, plans!inner(monthly_price_inr)').eq('status', 'active'),
       ])
-      const mrr = (sub.data ?? []).reduce((s: number, r: any) => s + Number(r.plans?.monthly_price_inr ?? 0), 0)
+      // MRR = Σ monthly-normalized plan price of active subs, EXCLUDING the
+      // Enterprise `-1` custom sentinel (its real MRR comes from invoices, not
+      // the plans row). monthly_price_inr is already a monthly figure, so a
+      // yearly/quarterly sub still contributes its monthly-equivalent price.
+      const mrr = (sub.data ?? []).reduce((s: number, r: any) => {
+        const price = Number(r.plans?.monthly_price_inr ?? 0)
+        if (!Number.isFinite(price) || price < 0) return s   // skip -1 sentinel + junk
+        return s + price
+      }, 0)
       res.json({
         tenants: t.count ?? 0,
         contacts: c.count ?? 0,

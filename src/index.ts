@@ -663,6 +663,21 @@ app.get('/api/plans', async (_req, res) => {
   }
 })
 
+// Resolved entitlements for the current tenant — the FE mirror of the
+// server-side resolver. Returns { features: {key:bool}, limits, gate_styles,
+// business_group }. UX only; the real fence stays checkPermission + checkLimit.
+app.get('/api/entitlements', requireAuth, identifyTenant, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string
+    if (!tenantId) { res.status(400).json({ error: 'no tenant context' }); return }
+    const { resolveEntitlements } = await import('./lib/entitlements')
+    const result = await resolveEntitlements(supabase, tenantId)
+    res.json(result)
+  } catch (err: any) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error('[startup] ANTHROPIC_API_KEY is not set — workflow parsing will fail')
 }
@@ -995,15 +1010,20 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete' | s
       ); return
     }
 
-    // 3. Per-tenant entitlement override
+    // 3. Per-tenant entitlement override (respects expiry). An explicit
+    //    is_enabled=false force-OFFs a plan-allowed feature; an explicit
+    //    is_enabled=true force-ONs a feature the plan lacks (comp/pilot) —
+    //    it beats the plan whitelist below.
     const { data: ent } = await supabase.from('tenant_entitlements')
-      .select('is_enabled').eq('tenant_id', tenantId).eq('feature', feature).maybeSingle()
-    if (ent && ent.is_enabled === false) {
+      .select('is_enabled, expires_at').eq('tenant_id', tenantId).eq('feature', feature).maybeSingle()
+    const entActive = !!ent && (!ent.expires_at || new Date(ent.expires_at).getTime() > Date.now())
+    if (entActive && ent!.is_enabled === false) {
       res.status(403).json({
         error: `${featureLabel(feature)} has been turned off for your workspace by an administrator.`,
         code: 'feature_disabled', feature,
       }); return
     }
+    const entitlementGrant = entActive && ent!.is_enabled === true
 
     // 4. Plan whitelist + 5. Plan quota
     const { data: sub } = await supabase.from('tenant_subscriptions')
@@ -1012,7 +1032,7 @@ function checkPermission(feature: string, action: 'view' | 'edit' | 'delete' | s
     if (sub) {
       const plan: any = (sub as any).plans
       const features: string[] = plan?.features ?? []
-      if (!features.includes('*') && !features.includes(feature)) {
+      if (!entitlementGrant && !features.includes('*') && !features.includes(feature)) {
         // Feature not in plan — suggest upgrade.
         res.status(402).json({
           error: `${featureLabel(feature)} isn't included in your ${sub.plan_id} plan. Upgrade to unlock it.`,

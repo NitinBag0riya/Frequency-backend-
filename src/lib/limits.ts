@@ -85,7 +85,12 @@ export async function checkLimit(
     ? joinedPlanLimits
     : await freeLimits(supabase)
 
-  const max = Number(planLimits[metric] ?? -1)
+  // Per-tenant quota override (tenant_entitlements.quota_override) beats the
+  // plan limit — lets a super-admin bump one tenant's cap without a plan
+  // change. resolveLimit merges override → plan → unlimited(-1).
+  const { loadQuotaOverride, resolveLimit } = await import('./entitlements')
+  const quotaOverride = await loadQuotaOverride(supabase, tenantId)
+  const max = resolveLimit(planLimits, quotaOverride, metric)
   // -1 (or anything <0) = unlimited. Allow without counting.
   if (max < 0) return { allowed: true, current: 0, max: -1 }
   if (max === 0) {
