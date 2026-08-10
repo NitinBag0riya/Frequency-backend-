@@ -2161,6 +2161,73 @@ app.post('/api/internal/storefront-order', async (req, res) => {
     })).catch(() => {})
 })
 
+// ── Frequency Desktop first-login provisioning ───────────────────────────────
+//
+// The desktop app calls this the first time a merchant logs into Swiggy/Zomato
+// and has no Frequency account yet. It IDEMPOTENTLY mints a HoReCa tenant + owner
+// on the Enterprise plan with one storefront outlet per captured restId, then
+// returns a magic action-link the desktop loads to sign its web view in.
+//
+// No Frequency session exists yet → gated by a shared desktop provisioning secret
+// (same trust model as the storefront X-Admin-Secret). Fail-closed when unset.
+//
+// ponytail: a shared secret shipped in a distributed Electron binary is
+// extractable/spoofable. Ceiling: fine as an M1 gate; a real deployment should
+// move to per-install device attestation / signed tokens before GA. It only ever
+// mints horeca + enterprise, so a leaked secret can create tenants but not
+// escalate an existing one.
+app.post('/api/desktop/provision', async (req, res) => {
+  const secret = process.env.DESKTOP_PROVISION_SECRET
+  const provided = String(req.headers['x-desktop-secret'] ?? '')
+  if (!secret || provided.length !== secret.length ||
+      !crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(secret, 'utf8'))) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const { ProvisionPayloadSchema, provisionTenant } = await import('./routes/desktop-provision')
+  const parsed = ProvisionPayloadSchema.safeParse(req.body)
+  if (!parsed.success) {
+    res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() }); return
+  }
+  try {
+    // Default deps: storefront-api admin outlet CRUD + Supabase magic-link.
+    const SF_API = process.env.STOREFRONT_API_URL || 'http://localhost:5181'
+    const SF_SECRET = process.env.STOREFRONT_ADMIN_SECRET || 'dev-admin'
+    const FRONTEND = process.env.FRONTEND_URL ?? 'https://getfrequency.app'
+    const result = await provisionTenant(supabase, parsed.data, {
+      createOutlet: async (slug, outlet, platform) => {
+        const r = await fetch(`${SF_API}/admin/outlets`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Tenant': slug, 'X-Admin-Secret': SF_SECRET },
+          body: JSON.stringify({
+            name: outlet.name,
+            address: outlet.address ?? '',
+            phone: outlet.phone ?? '',
+            // Bind inbound aggregator orders (carry res_id as outlet_ref) to this
+            // outlet — the dashboard already reads these fields.
+            ...(platform === 'swiggy' ? { swiggyResId: outlet.resId } : { zomatoResId: outlet.resId }),
+          }),
+        })
+        if (!r.ok) throw new Error(`storefront-api /admin/outlets → ${r.status}`)
+        const j: any = await r.json()
+        return { id: String(j?.id ?? '') }
+      },
+      generateLoginLink: async (email) => {
+        try {
+          const { data, error } = await supabase.auth.admin.generateLink({
+            type: 'magiclink', email, options: { redirectTo: FRONTEND },
+          } as any)
+          if (error) return null
+          return (data as any)?.properties?.action_link ?? null
+        } catch { return null }
+      },
+    })
+    res.json(result)
+  } catch (e: any) {
+    console.error('[desktop-provision] failed:', e?.message ?? e)
+    res.status(500).json({ error: e?.message ?? 'provision failed' })
+  }
+})
+
 // ── Pre-flight workflow validation ───────────────────────────────────────────
 //
 // Two endpoints, same engine (engine/workflow-validator.ts):
