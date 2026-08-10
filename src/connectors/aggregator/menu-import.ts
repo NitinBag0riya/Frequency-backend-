@@ -93,10 +93,11 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
       rows.push({
         entity_type: 'item', entity_id: String(cat.catalogueId), name: cat.name ?? null,
         in_stock: cat.inStock !== false,
-        // Zomato prices usually live in a variant/price map, not a flat `price`.
-        // Resolve the effective (default-variant) price; null → import flags it
-        // needs-review at ₹0 rather than dropping the item.
-        price: zomatoPrice(cat),
+        // Zomato prices live on the WRAPPER, not the catalogue: get_content_menu
+        // puts them at catalogueWrappers[].variantWrappers[].variantPrices[]
+        // (service="delivery"). Resolve from there first (verified live 2026-08-11);
+        // fall back to legacy catalogue shapes. null → flagged needs-review, never dropped.
+        price: zomatoWrapperPrice(w),
         category_ref: cat.category?.categoryId != null ? String(cat.category.categoryId) : null,
         raw: cat,
       })
@@ -164,6 +165,31 @@ export function vegOf(raw: any): boolean {
  *   4. a `priceMap` / `prices` object of { variantId: price | {price} }
  * Returns null when nothing resolvable — the caller imports it flagged (₹0), never drops.
  */
+/**
+ * Effective ₹ price for a Zomato catalogue WRAPPER (get_content_menu). The real
+ * price lives at `variantWrappers[].variantPrices[]` — each a `{service, price}`
+ * (service "delivery" | "dine_out" | …). We take the DELIVERY prices (what the
+ * storefront/POS mirror), else any service, and return the lowest positive one
+ * (the base/smallest size → "from ₹X"). Falls back to the legacy catalogue-shape
+ * resolver. Verified live 2026-08-11 against La Fiamma (Burrata Pesto ₹890).
+ */
+export function zomatoWrapperPrice(w: any): number | null {
+  const num = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null }
+  const all: number[] = []
+  const delivery: number[] = []
+  for (const vw of (Array.isArray(w?.variantWrappers) ? w.variantWrappers : [])) {
+    for (const vp of (Array.isArray(vw?.variantPrices) ? vw.variantPrices : [])) {
+      const p = num(vp?.price)
+      if (p == null) continue
+      all.push(p)
+      if (String(vp?.service ?? '').toLowerCase() === 'delivery') delivery.push(p)
+    }
+  }
+  const pool = delivery.length ? delivery : all
+  if (pool.length) return Math.min(...pool)
+  return zomatoPrice(w?.catalogue)
+}
+
 export function zomatoPrice(cat: any): number | null {
   const num = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null }
   const direct = num(cat?.price)
