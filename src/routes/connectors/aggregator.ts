@@ -693,7 +693,10 @@ export function createAggregatorConnector(deps: Deps): express.Router {
             status, status_identifier: el.statusIdentifier ?? String(el.status ?? ''),
             customer_name: s.name, customer_phone_masked: s.phone,
             item_count: s.items, gross_amount: s.gross,
-            placed_at: el.data?.placed_at ?? el.data?.order?.created_at ?? null,
+            // Prefer the canonical placedAt the bridge forwards (correct per platform);
+            // fall back to raw, incl. Zomato's real camelCase `order.createdAt` (the old
+            // snake_case `created_at` never existed → every Zomato order sank to null).
+            placed_at: el.placedAt ?? el.data?.placed_at ?? el.data?.order?.createdAt ?? el.data?.order?.created_at ?? null,
             payload: el.data ?? {}, updated_at: new Date().toISOString(),
           }
           // Persist with one inline retry — a transient hiccup shouldn't cost us a live order.
