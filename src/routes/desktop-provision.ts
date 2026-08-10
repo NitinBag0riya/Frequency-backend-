@@ -7,8 +7,10 @@
  * BRAND-NEW merchant there is no Frequency account yet — this module closes that
  * gap: from the business identity + outlet set the aggregator session exposes,
  * it IDEMPOTENTLY provisions a fresh HoReCa tenant + owner on the Enterprise
- * plan with one storefront outlet per restId, then returns a magic action-link
- * the desktop loads to sign its Frequency web view in — no password re-typed.
+ * plan with one storefront outlet per PHYSICAL outlet — a location listed on both
+ * Swiggy and Zomato under different ids is ONE outlet carrying both channel ids —
+ * then returns a magic action-link the desktop loads to sign its Frequency web
+ * view in, no password re-typed.
  *
  * Trust boundary: no Frequency session exists yet, so the HTTP route gates on a
  * shared desktop provisioning secret (same trust model as the storefront
@@ -33,17 +35,23 @@ const OWNER_EMAIL_DOMAIN = 'desktop.getfrequency.app'
 export const PlatformSchema = z.enum(['swiggy', 'zomato'])
 export type Platform = z.infer<typeof PlatformSchema>
 
-const OutletSchema = z.object({
+// A delivery channel = one aggregator listing (platform + its resId). A physical
+// outlet carries one per platform it's live on (typically Swiggy AND Zomato).
+const ChannelSchema = z.object({
   platform: PlatformSchema,
   resId: z.string().trim().min(1).max(64),
+})
+
+// A PHYSICAL outlet: one real location, many delivery channels.
+const OutletSchema = z.object({
   name: z.string().trim().min(1).max(120),
   address: z.string().trim().max(400).optional(),
   gst: z.string().trim().max(32).optional(),
   phone: z.string().trim().max(20).optional(),
+  channels: z.array(ChannelSchema).min(1).max(8),
 })
 
 export const ProvisionPayloadSchema = z.object({
-  platform: PlatformSchema,
   businessName: z.string().trim().min(1).max(120),
   ownerEmail: z.string().trim().email().max(200).optional(),
   ownerPhone: z.string().trim().max(20).optional(),
@@ -54,12 +62,25 @@ export const ProvisionPayloadSchema = z.object({
 })
 export type ProvisionPayload = z.infer<typeof ProvisionPayloadSchema>
 export type OutletInput = z.infer<typeof OutletSchema>
+export type Channel = z.infer<typeof ChannelSchema>
 
 export interface OutletMapping {
-  platform: Platform
-  resId: string
   outletId: string | null // storefront outlet id; null if storefront-api was unreachable
   name: string
+  channels: Channel[] // the delivery channels attached to this one physical outlet
+}
+
+/** Resolve an inbound order's (platform, resId) to the physical outlet it belongs
+ *  to. Mirrors the dashboard, which resolves via the outlet's swiggyResId/zomatoResId. */
+export function outletIdForChannel(
+  mapping: OutletMapping[],
+  platform: Platform,
+  resId: string,
+): string | null {
+  for (const m of mapping) {
+    if (m.channels.some(c => c.platform === platform && c.resId === resId)) return m.outletId
+  }
+  return null
 }
 
 export interface ProvisionResult {
@@ -79,26 +100,35 @@ export interface ProvisionResult {
 }
 
 export interface ProvisionDeps {
-  /** Create a storefront outlet for `slug`, returning its id. In prod this POSTs
-   *  to storefront-api's admin outlet CRUD; the self-check injects a fake. */
-  createOutlet: (slug: string, outlet: OutletInput, platform: Platform) => Promise<{ id: string }>
+  /** Create ONE storefront outlet for `slug` from a physical outlet, returning its
+   *  id. In prod this POSTs to storefront-api's admin outlet CRUD (setting BOTH
+   *  swiggyResId + zomatoResId from the outlet's channels); the self-check injects
+   *  a fake. */
+  createOutlet: (slug: string, outlet: OutletInput) => Promise<{ id: string }>
   /** Mint a passwordless login link for the owner (magic action-link). */
   generateLoginLink: (email: string) => Promise<string | null>
   /** Resolve a unique tenant slug. Defaults to ensureUniqueSlug. */
   makeSlug?: (businessName: string, fallbackId: string) => Promise<string>
 }
 
-/** Stable idempotency key = platform + the smallest resId in the set. A re-login
- *  with the same business identity resolves to the same key → same tenant. */
-export function provisionKeyFor(platform: Platform, outlets: { resId: string }[]): string {
-  const primary = outlets.map(o => o.resId).sort()[0] ?? ''
-  return `${platform}:${primary}`
+/** Every channel across every outlet as sorted `platform:resId` tokens — the
+ *  canonical fingerprint of a merchant regardless of outlet/channel order. */
+function channelTokens(outlets: { channels: Channel[] }[]): string[] {
+  return outlets.flatMap(o => o.channels.map(c => `${c.platform}:${c.resId}`)).sort()
 }
 
-/** Derived placeholder owner email when the session exposed no real email. */
-function derivedOwnerEmail(platform: Platform, outlets: { resId: string }[]): string {
-  const primary = outlets.map(o => o.resId).sort()[0] ?? 'unknown'
-  return `owner+${platform}-${primary}@${OWNER_EMAIL_DOMAIN}`.toLowerCase()
+/** Stable idempotency key = ALL channel resIds (across all outlets), sorted and
+ *  joined. A re-login triggered by ANY platform's order resolves to the same key
+ *  → the same tenant, so re-provisioning creates zero duplicates. */
+export function provisionKeyFor(outlets: { channels: Channel[] }[]): string {
+  return channelTokens(outlets).join('|')
+}
+
+/** Derived placeholder owner email when the session exposed no real email. Keyed
+ *  off the first (sorted) channel token so it's stable for the merchant. */
+function derivedOwnerEmail(outlets: { channels: Channel[] }[]): string {
+  const primary = (channelTokens(outlets)[0] ?? 'unknown').replace(':', '-')
+  return `owner+${primary}@${OWNER_EMAIL_DOMAIN}`.toLowerCase()
 }
 
 /**
@@ -111,13 +141,12 @@ export async function provisionTenant(
   payload: ProvisionPayload,
   deps: ProvisionDeps,
 ): Promise<ProvisionResult> {
-  const platform = payload.platform
   const outlets = payload.outlets
   const businessName = payload.businessName.trim()
-  const key = provisionKeyFor(platform, outlets)
+  const key = provisionKeyFor(outlets)
 
   const emailIsPlaceholder = !payload.ownerEmail
-  const ownerEmail = (payload.ownerEmail?.trim() || derivedOwnerEmail(platform, outlets)).toLowerCase()
+  const ownerEmail = (payload.ownerEmail?.trim() || derivedOwnerEmail(outlets)).toLowerCase()
 
   // ── 1. Idempotency: has this business identity already been provisioned? ────
   // The desktop_provision_key lives on the aggregator integration row we write
@@ -203,19 +232,21 @@ export async function provisionTenant(
   )
   if (subErr) throw new Error(`enterprise subscription failed: ${subErr.message}`)
 
-  // ── 6. One storefront outlet per captured restId + resId↔outletId mapping ───
+  // ── 6. One storefront outlet per PHYSICAL outlet (both channel ids attached)
+  //    + per-outlet channel mapping so inbound (platform,resId) resolves here. ──
   const mapping: OutletMapping[] = []
   let outletsPending = false
   for (const o of outlets) {
     try {
-      const { id } = await deps.createOutlet(slug, o, platform)
-      mapping.push({ platform: o.platform, resId: o.resId, outletId: id, name: o.name })
+      const { id } = await deps.createOutlet(slug, o)
+      mapping.push({ outletId: id, name: o.name, channels: o.channels })
     } catch (e: any) {
-      // Never fail the whole provision on a storefront hiccup — record the resId
+      // Never fail the whole provision on a storefront hiccup — record the outlet
       // unmapped so it can be reconciled; the tenant/enterprise/integration stand.
       outletsPending = true
-      mapping.push({ platform: o.platform, resId: o.resId, outletId: null, name: o.name })
-      console.warn(`[desktop-provision] outlet create failed for resId=${o.resId}: ${e?.message ?? e}`)
+      mapping.push({ outletId: null, name: o.name, channels: o.channels })
+      const ids = o.channels.map(c => `${c.platform}:${c.resId}`).join(',')
+      console.warn(`[desktop-provision] outlet create failed for [${ids}]: ${e?.message ?? e}`)
     }
   }
 

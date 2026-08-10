@@ -4,10 +4,14 @@
  * No framework — plain asserts. Exits non-zero on failure.
  *
  * Drives the real `provisionTenant` orchestration through an in-memory fake
- * Supabase + fake outlet creator, and asserts the exact side effects:
+ * Supabase + fake outlet creator, and asserts the exact side effects for a
+ * merchant with TWO physical outlets — one live on BOTH Swiggy and Zomato, one
+ * on a single channel:
  *   1. A first call creates exactly ONE horeca tenant, owner user + owner role,
- *      an ACTIVE Enterprise subscription, TWO outlets with a resId↔outletId
- *      mapping, and the aggregator integration active, and returns a login link.
+ *      an ACTIVE Enterprise subscription, exactly TWO storefront outlets (the
+ *      dual-channel one carrying BOTH swiggyResId + zomatoResId), a per-outlet
+ *      channel mapping that resolves each (platform,resId) to the right outletId,
+ *      and the aggregator integration active, and returns a login link.
  *   2. A second IDENTICAL call is idempotent — no duplicate tenant/user/outlets/
  *      subscription; it returns the same tenant with created:false.
  *
@@ -16,7 +20,7 @@
  * and the magic-link actually signing the embedded web view in.
  */
 import assert from 'node:assert/strict'
-import { provisionTenant, provisionKeyFor, type ProvisionPayload } from './desktop-provision'
+import { provisionTenant, provisionKeyFor, outletIdForChannel, type ProvisionPayload } from './desktop-provision'
 
 // ── In-memory fake Supabase ─────────────────────────────────────────────────
 // Minimal fluent builder covering only the ops provisionTenant uses.
@@ -93,14 +97,22 @@ function makeFakeSupabase() {
 }
 
 // ── Deps: fake outlet creator + fake login link ─────────────────────────────
+// The fake mirrors prod: it derives swiggyResId/zomatoResId from the physical
+// outlet's channels, so the self-check can assert both ids attach to one outlet.
 function makeDeps() {
-  const created: Array<{ slug: string; name: string; resId: string; id: string }> = []
+  const created: Array<{ slug: string; name: string; swiggyResId?: string; zomatoResId?: string; id: string }> = []
   let n = 0
   return {
     _created: created,
     createOutlet: async (slug: string, outlet: any) => {
       const id = 'o' + (++n).toString(16).padStart(6, '0')
-      created.push({ slug, name: outlet.name, resId: outlet.resId, id })
+      created.push({
+        slug,
+        name: outlet.name,
+        swiggyResId: outlet.channels.find((c: any) => c.platform === 'swiggy')?.resId,
+        zomatoResId: outlet.channels.find((c: any) => c.platform === 'zomato')?.resId,
+        id,
+      })
       return { id }
     },
     generateLoginLink: async (email: string) => `https://getfrequency.app/verify?token=magic-for-${encodeURIComponent(email)}`,
@@ -109,13 +121,24 @@ function makeDeps() {
   }
 }
 
-// ── Payload: a 2-outlet Swiggy merchant (no real email captured) ─────────────
+// ── Payload: a 2-physical-outlet merchant (no real email captured) ───────────
+// Outlet A is listed on BOTH Swiggy and Zomato (different ids); Outlet B on one.
 const payload: ProvisionPayload = {
-  platform: 'swiggy',
   businessName: 'Spice Route Cafe',
   outlets: [
-    { platform: 'swiggy', resId: '778899', name: 'Spice Route — C Scheme', address: 'C Scheme, Jaipur', gst: '08AAAAA0000A1Z5', phone: '9876543210' },
-    { platform: 'swiggy', resId: '112233', name: 'Spice Route — Vaishali', address: 'Vaishali Nagar, Jaipur', phone: '9811111111' },
+    {
+      name: 'Spice Route — C Scheme', address: 'C Scheme, Jaipur', gst: '08AAAAA0000A1Z5', phone: '9876543210',
+      channels: [
+        { platform: 'swiggy', resId: '778899' },
+        { platform: 'zomato', resId: 'ZR-4455' },
+      ],
+    },
+    {
+      name: 'Spice Route — Vaishali', address: 'Vaishali Nagar, Jaipur', phone: '9811111111',
+      channels: [
+        { platform: 'swiggy', resId: '112233' },
+      ],
+    },
   ],
 }
 
@@ -145,22 +168,38 @@ async function main() {
   assert.equal(supabase._tables.tenant_subscriptions[0].plan_id, 'enterprise')
   assert.equal(supabase._tables.tenant_subscriptions[0].status, 'active')
 
-  // Two outlets + resId↔outletId mapping.
-  assert.equal(deps._created.length, 2, 'two storefront outlets created')
+  // Exactly TWO storefront outlets (one per PHYSICAL outlet, NOT per channel).
+  assert.equal(deps._created.length, 2, 'two storefront outlets created (not three, despite three channels)')
   assert.equal(r1.outlets.length, 2, 'two mappings returned')
   assert.equal(r1.outletsPending, false, 'no pending outlets')
-  const map1 = new Map(r1.outlets.map(o => [o.resId, o.outletId]))
-  assert.ok(map1.get('778899'), 'resId 778899 mapped to an outlet id')
-  assert.ok(map1.get('112233'), 'resId 112233 mapped to an outlet id')
-  assert.notEqual(map1.get('778899'), map1.get('112233'), 'distinct outlet ids per resId')
+
+  // The dual-channel outlet carries BOTH swiggyResId and zomatoResId.
+  const dual = deps._created.find(o => o.name === 'Spice Route — C Scheme')!
+  assert.equal(dual.swiggyResId, '778899', 'dual outlet got its swiggyResId')
+  assert.equal(dual.zomatoResId, 'ZR-4455', 'dual outlet got its zomatoResId')
+  const single = deps._created.find(o => o.name === 'Spice Route — Vaishali')!
+  assert.equal(single.swiggyResId, '112233', 'single outlet got its swiggyResId')
+  assert.equal(single.zomatoResId, undefined, 'single outlet has no zomato channel')
+
+  // Mapping resolves each (platform,resId) to the RIGHT physical outlet id.
+  const swiggyA = outletIdForChannel(r1.outlets, 'swiggy', '778899')
+  const zomatoA = outletIdForChannel(r1.outlets, 'zomato', 'ZR-4455')
+  const swiggyB = outletIdForChannel(r1.outlets, 'swiggy', '112233')
+  assert.ok(swiggyA, 'swiggy 778899 resolves to an outlet')
+  assert.equal(swiggyA, zomatoA, 'both channels of the dual outlet resolve to the SAME outlet id')
+  assert.equal(swiggyA, dual.id, 'and it is the dual outlet')
+  assert.equal(swiggyB, single.id, 'single-channel order resolves to the single outlet')
+  assert.notEqual(swiggyA, swiggyB, 'the two physical outlets are distinct')
+  assert.equal(outletIdForChannel(r1.outlets, 'zomato', 'nope'), null, 'unknown channel resolves to null')
 
   // Aggregator integration active + idempotency ledger + mapping persisted.
   const intg = supabase._tables.tenant_integrations
   assert.equal(intg.length, 1, 'one integration row')
   assert.equal(intg[0].key, 'aggregator_frequency_desktop')
   assert.equal(intg[0].status, 'active')
-  assert.equal(intg[0].metadata.desktop_provision_key, provisionKeyFor('swiggy', payload.outlets))
-  assert.equal(intg[0].metadata.outlets.length, 2, 'mapping persisted in integration metadata')
+  assert.equal(intg[0].metadata.desktop_provision_key, provisionKeyFor(payload.outlets))
+  assert.equal(intg[0].metadata.outlets.length, 2, 'per-outlet mapping persisted in integration metadata')
+  assert.equal(intg[0].metadata.outlets[0].channels.length, 2, 'dual outlet persisted with both channels')
   assert.equal(intg[0].metadata.owner_email_placeholder, true, 'derived email flagged as placeholder')
 
   // Login handoff + placeholder email surfaced.
@@ -182,17 +221,19 @@ async function main() {
   assert.ok(r2.loginUrl && r2.loginUrl.includes('magic-for-'), 're-login link minted')
   assert.equal(r2.outlets.length, 2, 'idempotent call returns the persisted mapping')
 
-  // ── Idempotency key stability ───────────────────────────────────────────────
+  // ── Idempotency key stability — over ALL channel resIds, order-independent ──
   assert.equal(
-    provisionKeyFor('swiggy', payload.outlets),
-    provisionKeyFor('swiggy', [...payload.outlets].reverse()),
-    'provision key is order-independent (sorted primary resId)',
+    provisionKeyFor(payload.outlets),
+    provisionKeyFor([...payload.outlets].reverse()),
+    'provision key is order-independent (all channel tokens sorted + joined)',
   )
+  // Includes every channel across every outlet (3 tokens here).
+  assert.equal(provisionKeyFor(payload.outlets).split('|').length, 3, 'key spans all three channels')
 
   console.log('desktop-provision self-check: OK')
   console.log(`  tenant=${r1.slug} (${r1.tenantId})  owner=${r1.ownerEmail}`)
-  console.log(`  outlets: ${r1.outlets.map(o => `${o.resId}→${o.outletId}`).join(', ')}`)
-  console.log(`  key=${provisionKeyFor('swiggy', payload.outlets)}  idempotent 2nd call: created=${r2.created}`)
+  console.log(`  outlets: ${r1.outlets.map(o => `${o.name} [${o.channels.map(c => `${c.platform}:${c.resId}`).join('+')}]→${o.outletId}`).join('  ')}`)
+  console.log(`  key=${provisionKeyFor(payload.outlets)}  idempotent 2nd call: created=${r2.created}`)
 }
 
 main().catch((e) => { console.error('desktop-provision self-check FAILED:', e); process.exit(1) })

@@ -2194,7 +2194,10 @@ app.post('/api/desktop/provision', async (req, res) => {
     const SF_SECRET = process.env.STOREFRONT_ADMIN_SECRET || 'dev-admin'
     const FRONTEND = process.env.FRONTEND_URL ?? 'https://getfrequency.app'
     const result = await provisionTenant(supabase, parsed.data, {
-      createOutlet: async (slug, outlet, platform) => {
+      createOutlet: async (slug, outlet) => {
+        // One physical outlet → one storefront outlet carrying BOTH channel ids.
+        const swiggyResId = outlet.channels.find(c => c.platform === 'swiggy')?.resId
+        const zomatoResId = outlet.channels.find(c => c.platform === 'zomato')?.resId
         const r = await fetch(`${SF_API}/admin/outlets`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Tenant': slug, 'X-Admin-Secret': SF_SECRET },
@@ -2204,7 +2207,8 @@ app.post('/api/desktop/provision', async (req, res) => {
             phone: outlet.phone ?? '',
             // Bind inbound aggregator orders (carry res_id as outlet_ref) to this
             // outlet — the dashboard already reads these fields.
-            ...(platform === 'swiggy' ? { swiggyResId: outlet.resId } : { zomatoResId: outlet.resId }),
+            ...(swiggyResId ? { swiggyResId } : {}),
+            ...(zomatoResId ? { zomatoResId } : {}),
           }),
         })
         if (!r.ok) throw new Error(`storefront-api /admin/outlets → ${r.status}`)
