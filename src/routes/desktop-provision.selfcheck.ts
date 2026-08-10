@@ -31,6 +31,8 @@ function makeFakeSupabase() {
     tenant_integrations: [],
     tenant_subscriptions: [],
     user_role_assignments: [],
+    tenant_branding: [],
+    profiles: [],
     role_definitions: [{ id: 'role-owner-uuid', key: 'owner', scope: 'tenant', is_built_in: true }],
   }
   const authUsers: Row[] = []
@@ -201,6 +203,17 @@ async function main() {
   assert.equal(intg[0].metadata.outlets.length, 2, 'per-outlet mapping persisted in integration metadata')
   assert.equal(intg[0].metadata.outlets[0].channels.length, 2, 'dual outlet persisted with both channels')
   assert.equal(intg[0].metadata.owner_email_placeholder, true, 'derived email flagged as placeholder')
+
+  // Branding + owner profile written so the tenant shows its real name (not the
+  // default cafe name / placeholder) across storefront + dashboard.
+  assert.equal(supabase._tables.tenant_branding.length, 1, 'one tenant_branding row')
+  assert.equal(supabase._tables.tenant_branding[0].tenant_id, r1.tenantId, 'branding bound to the tenant')
+  assert.equal(supabase._tables.tenant_branding[0].display_name, 'Spice Route Cafe', 'display_name == businessName')
+  assert.equal(supabase._tables.tenant_branding[0].address, 'C Scheme, Jaipur', 'branding address from first outlet with one')
+  assert.equal(supabase._tables.tenant_branding[0].support_phone, '9876543210', 'support_phone from first outlet phone (no ownerPhone captured)')
+  assert.equal(supabase._tables.profiles.length, 1, 'one owner profile row')
+  assert.equal(supabase._tables.profiles[0].id, r1.ownerUserId, 'profile is the owner user')
+  assert.equal(supabase._tables.profiles[0].full_name, 'Spice Route Cafe', 'owner profile full_name == businessName')
 
   // Login handoff + placeholder email surfaced.
   assert.ok(r1.loginUrl && r1.loginUrl.includes('magic-for-'), 'login link minted')

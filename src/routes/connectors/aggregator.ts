@@ -772,9 +772,19 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       const b = (req.body ?? {}) as any
       if (b.kind === 'order' && b.orderId) {
         const mapped = RESULT_MAP[Number(b.statusCode)]
+        // Honest terminal handling, mirroring the stock branch. A decision only
+        // DEQUEUES (clears pending_action) + advances status when the desktop
+        // actually executed it on the aggregator (mapping 'done'). Anything else —
+        // Swiggy 'pending-mapping', Zomato 'pending-live-order-mapping', or 'failed'
+        // — leaves the decision QUEUED (so it's retried / stays visible) and only
+        // records last_action_result so the board shows the honest state.
+        const mapping = String(b.result?.mapping ?? '')
+        const pendingOrFailed = mapping === 'pending-mapping' || mapping === 'pending-live-order-mapping' || mapping === 'failed'
+        const executed = !!mapped && !b.result?.error && !pendingOrFailed
         await supabase.from('aggregator_orders').update({
-          pending_action: null, pending_prep_time: null, pending_reason: null, pending_queued_at: null,
-          ...(mapped ? { status: mapped } : {}),
+          ...(executed
+            ? { pending_action: null, pending_prep_time: null, pending_reason: null, pending_queued_at: null, status: mapped }
+            : {}),
           last_action_result: b.result ?? null, updated_at: new Date().toISOString(),
         }).eq('tenant_id', tenantId).eq('external_order_id', String(b.orderId))
       } else if (b.kind === 'stock' && b.id != null) {
