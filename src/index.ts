@@ -13,6 +13,7 @@ import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata,
 import { createLeadsRouter } from './leads'
 import { createKhataRouter } from './routes/khata'
 import { verifyAttestation, enrollInstall, EnrollSchema, makeInMemoryRateLimiter, type InstallRecord } from './routes/desktop-attestation'
+import { resolveDesktopRuntimeConfig } from './routes/desktop-runtime-config'
 import { createListingsRouter } from './routes/listings'
 import { createAppointmentsRouter } from './routes/appointments'
 import { createTasksRouter } from './routes/tasks'
@@ -2193,6 +2194,23 @@ const desktopInstallStore = {
 }
 // Enrol is low-volume + pre-tenant → a small per-ip in-memory cap is enough.
 const desktopEnrollLimiter = makeInMemoryRateLimiter(10, 60_000)
+
+// ── Frequency Desktop runtime routing config ─────────────────────────────────
+// Public, no auth: returns ONLY which backend an install should talk to (URLs,
+// no secrets). Source of truth is the super-admin-set `desktop_environment`
+// feature flag; defaults to prod when unset so a fresh/failed read never points
+// installs at beta. The desktop fetches this at launch (env override still wins).
+app.get('/api/desktop/runtime-config', async (_req, res) => {
+  let flagValue: unknown
+  try {
+    const { data } = await supabase
+      .from('feature_flags').select('value_json').eq('key', 'desktop_environment').maybeSingle()
+    flagValue = (data?.value_json as any)?.value
+  } catch {
+    /* unreachable DB → fall through to prod default */
+  }
+  res.json(resolveDesktopRuntimeConfig(flagValue))
+})
 
 // ── Frequency Desktop enrolment ──────────────────────────────────────────────
 // First launch: the install registers its Ed25519 public key against a self-minted
