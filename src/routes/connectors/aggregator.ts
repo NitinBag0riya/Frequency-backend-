@@ -27,6 +27,7 @@ import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { validateBody } from '../../validation'
 import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
+import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity } from '../../connectors/aggregator/menu-import'
 import { emitNotification, tenantNotifyRecipients } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -59,103 +60,6 @@ const CUR: Record<string, string> = { INR: '₹', USD: '$', EUR: '€', GBP: '£
 function orderSummary(items: number, gross: number | null, currency = 'INR'): string {
   const amt = gross != null ? ` · ${CUR[currency] ?? currency}${Number(gross).toLocaleString('en-IN')}` : ''
   return `${items} item${items === 1 ? '' : 's'}${amt}`
-}
-
-interface ParsedEntity { entity_type: 'item' | 'category'; entity_id: string; name: string | null; in_stock: boolean; price: number | null; category_ref: string | null; raw: any }
-
-/**
- * Parse a Frequency Desktop menu snapshot into normalised item/category rows.
- * The aggregators' menu JSON is undocumented + varies, so this is best-effort
- * across common shapes and ALWAYS keeps the raw entity in `raw`.
- * TODO(menu-spec): tighten field names once a real snapshot is captured.
- */
-function parseMenuSnapshot(body: any): ParsedEntity[] {
-  // Swiggy Frequency-Desktop snapshot (real shape, mapped live 2026-07-25):
-  // restaurant-menu-wrapper → data.menu.items_vo[], each row flattening a
-  // category + one item. Handle it explicitly; fall through to the generic
-  // best-effort parser for other/unknown shapes.
-  const itemsVo = body?.data?.menu?.items_vo ?? body?.menu?.items_vo
-  if (Array.isArray(itemsVo) && itemsVo.length) {
-    const rows: ParsedEntity[] = []
-    const seenCat = new Set<string>()
-    for (const row of itemsVo) {
-      const catId = row?.main_category_id != null ? String(row.main_category_id) : null
-      if (catId && !seenCat.has(catId)) {
-        seenCat.add(catId)
-        rows.push({
-          entity_type: 'category', entity_id: catId, name: row.main_category_name ?? null,
-          in_stock: true, price: null, category_ref: null,
-          raw: { main_category_id: catId, main_category_name: row.main_category_name, main_category_order: row.main_category_order },
-        })
-      }
-      const it = row?.item
-      if (it && it.id != null) {
-        rows.push({
-          entity_type: 'item', entity_id: String(it.id), name: it.name ?? null,
-          in_stock: it.in_stock === 1 || it.in_stock === true,
-          price: typeof it.price === 'number' ? it.price : (it.price != null ? Number(it.price) : null),
-          category_ref: catId, raw: it,
-        })
-      }
-    }
-    if (rows.length) return rows
-  }
-
-  // Zomato Frequency-Desktop snapshot (get_content_menu, mapped live 2026-07-30):
-  // menuResponse.categoryWrappers[].category + catalogueWrappers[].catalogue
-  // (name, inStock, nested category ref). Price lives in a variant map — kept in
-  // raw; in_stock is what stock-toggle needs.
-  const mr = body?.menuResponse ?? body?.response?.menuResponse ?? body?.data?.menuResponse
-  if (mr && Array.isArray(mr.catalogueWrappers)) {
-    const rows: ParsedEntity[] = []
-    for (const cw of mr.categoryWrappers ?? []) {
-      const c = cw?.category
-      if (c?.categoryId != null) rows.push({
-        entity_type: 'category', entity_id: String(c.categoryId), name: c.name ?? null,
-        in_stock: true, price: null, category_ref: null, raw: c,
-      })
-    }
-    for (const w of mr.catalogueWrappers) {
-      const cat = w?.catalogue
-      if (cat?.catalogueId == null) continue
-      rows.push({
-        entity_type: 'item', entity_id: String(cat.catalogueId), name: cat.name ?? null,
-        in_stock: cat.inStock !== false,
-        price: typeof cat.price === 'number' ? cat.price : (cat.price != null ? Number(cat.price) : null),
-        category_ref: cat.category?.categoryId != null ? String(cat.category.categoryId) : null,
-        raw: cat,
-      })
-    }
-    if (rows.length) return rows
-  }
-
-  const sr = body?.statusResponse ?? body?.data ?? body ?? {}
-  const itemArr: any[] = Array.isArray(sr) ? sr : (sr.items ?? sr.data?.items ?? sr.menu?.items ?? [])
-  const catArr: any[] = sr.categories ?? sr.data?.categories ?? sr.menu?.categories ?? []
-  const bool = (v: any, dflt = true) => (v === undefined || v === null ? dflt : !(v === false || v === 0 || v === 'out_of_stock' || v === 'OUT_OF_STOCK'))
-  const out: ParsedEntity[] = []
-  for (const x of Array.isArray(itemArr) ? itemArr : []) {
-    const id = x?.id ?? x?.item_id ?? x?.itemId ?? x?.entity_id
-    if (id == null) continue
-    out.push({
-      entity_type: 'item', entity_id: String(id),
-      name: x.name ?? x.title ?? x.item_name ?? null,
-      in_stock: bool(x.inStock ?? x.in_stock ?? x.stockStatus ?? x.in_stock_status),
-      price: x.price ?? x.cost ?? x.item_price ?? null,
-      category_ref: x.category_id != null ? String(x.category_id) : (x.categoryId != null ? String(x.categoryId) : null),
-      raw: x,
-    })
-  }
-  for (const x of Array.isArray(catArr) ? catArr : []) {
-    const id = x?.id ?? x?.category_id ?? x?.categoryId ?? x?.entity_id
-    if (id == null) continue
-    out.push({
-      entity_type: 'category', entity_id: String(id),
-      name: x.name ?? x.title ?? x.category_name ?? null,
-      in_stock: bool(x.inStock ?? x.in_stock ?? x.stockStatus), price: null, category_ref: null, raw: x,
-    })
-  }
-  return out
 }
 
 interface ParsedHistOrder { external_order_id: string; status: string | null; customer_name: string | null; item_count: number; gross_amount: number | null; placed_at: string | null; raw: any }
@@ -613,6 +517,69 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       }).select('id').single()
       if (error) { res.status(500).json({ error: error.message }); return }
       res.json({ ok: true, id: data?.id, note: 'Queued — the merchant client submits it to the aggregator (Swiggy = QC review) on its next poll (~30s).' })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
+  // Import a captured aggregator menu INTO the tenant's real storefront/POS menu.
+  // This is the step that turns a READ-only captured Swiggy/Zomato menu (in
+  // aggregator_menu) into the sellable mini-app + POS catalog. Idempotent + non-
+  // destructive (see menu-import). Source-agnostic: works for whichever platform's
+  // normalised entities we have.
+  //   Body: { snapshot?, outletRef?, channel?, storefrontOutletId?, dryRun? }
+  //     - snapshot: a raw captured menu body (run through parseMenuSnapshot). If
+  //       absent, we import whatever is already in aggregator_menu for this tenant
+  //       (optionally filtered by outletRef/channel).
+  //     - outletRef: the aggregator restaurant id (used to filter aggregator_menu AND
+  //       to resolve the storefront outlet via its swiggyResId/zomatoResId).
+  //     - storefrontOutletId: explicit target outlet; overrides resId resolution.
+  const ImportBody = z.object({
+    snapshot: z.any().optional(),
+    outletRef: z.string().min(1).optional(),
+    channel: z.enum(['zomato', 'swiggy']).optional(),
+    storefrontOutletId: z.string().min(1).optional(),
+    dryRun: z.boolean().optional(),
+  })
+  r.post('/api/connectors/aggregator/menu/import-to-pos', ...guardEdit, validateBody(ImportBody), async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const b = req.body as z.infer<typeof ImportBody>
+      const { data: t } = await supabase.from('tenants').select('slug, business_type').eq('id', tenantId).maybeSingle()
+      const slug = (t as any)?.slug as string | undefined
+      if (!slug) { res.status(404).json({ error: 'Tenant has no storefront slug' }); return }
+      // HoReCa-gated: an aggregator menu is a restaurant catalog.
+      const bt = String((t as any)?.business_type ?? '').toLowerCase()
+      if (bt && bt !== 'horeca') { res.status(422).json({ error: 'Menu import is available for HoReCa (restaurant) tenants only' }); return }
+
+      const outletRef = b.outletRef ?? null
+      const channel = b.channel ?? null
+
+      // Entities: inline snapshot, else the already-ingested aggregator_menu rows.
+      let entities: ParsedEntity[]
+      if (b.snapshot) {
+        entities = parseMenuSnapshot(b.snapshot)
+      } else {
+        let q = supabase.from('aggregator_menu')
+          .select('entity_type, entity_id, name, in_stock, price, category_ref, raw')
+          .eq('tenant_id', tenantId)
+        if (outletRef) q = q.eq('outlet_ref', outletRef)
+        if (channel) q = q.eq('channel', channel)
+        const { data } = await q.limit(5000)
+        entities = (data ?? []).map((m: any) => ({
+          entity_type: m.entity_type, entity_id: String(m.entity_id), name: m.name,
+          in_stock: m.in_stock !== false, price: m.price, category_ref: m.category_ref, raw: m.raw ?? {},
+        }))
+      }
+      if (!entities.length) {
+        res.status(400).json({ error: 'No menu to import — pass { snapshot } or ingest the aggregator menu first (POST /menu/ingest).' }); return
+      }
+
+      const result = await importMenuToStorefront(slug, entities, {
+        targetOutletId: b.storefrontOutletId ?? null,
+        aggregatorResId: outletRef,
+        channel,
+        dryRun: !!b.dryRun,
+      })
+      res.json(result)
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
