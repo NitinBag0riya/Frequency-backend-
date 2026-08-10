@@ -93,7 +93,10 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
       rows.push({
         entity_type: 'item', entity_id: String(cat.catalogueId), name: cat.name ?? null,
         in_stock: cat.inStock !== false,
-        price: typeof cat.price === 'number' ? cat.price : (cat.price != null ? Number(cat.price) : null),
+        // Zomato prices usually live in a variant/price map, not a flat `price`.
+        // Resolve the effective (default-variant) price; null → import flags it
+        // needs-review at ₹0 rather than dropping the item.
+        price: zomatoPrice(cat),
         category_ref: cat.category?.categoryId != null ? String(cat.category.categoryId) : null,
         raw: cat,
       })
@@ -149,6 +152,90 @@ export function vegOf(raw: any): boolean {
   if (v === 2) return false  // Zomato: 2 = non-veg
   return false
 }
+
+/**
+ * Effective ₹ price for a Zomato catalogue item. Zomato rarely puts a flat `price`
+ * on the item — the real price lives in a variant map (a base/default variant plus
+ * optional sizes). Best-effort across the shapes seen in get_content_menu / menu_edit:
+ *   1. a positive flat `price`
+ *   2. the DEFAULT variant's price (isDefault / matches defaultVariantId), across
+ *      `variants` / `variantGroups[].variants` / `variantsV2` / `itemVariants`
+ *   3. the lowest positive variant price (fallback when no default is flagged)
+ *   4. a `priceMap` / `prices` object of { variantId: price | {price} }
+ * Returns null when nothing resolvable — the caller imports it flagged (₹0), never drops.
+ */
+export function zomatoPrice(cat: any): number | null {
+  const num = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null }
+  const direct = num(cat?.price)
+  if (direct != null) return direct
+
+  const variants: any[] = []
+  const collect = (arr: any) => {
+    if (!Array.isArray(arr)) return
+    for (const v of arr) {
+      if (!v || typeof v !== 'object') continue
+      if (Array.isArray(v.variants)) collect(v.variants)   // variantGroups → nested variants
+      else variants.push(v)
+    }
+  }
+  collect(cat?.variants); collect(cat?.variantGroups); collect(cat?.variantsV2); collect(cat?.itemVariants)
+  if (variants.length) {
+    const defId = cat?.defaultVariantId ?? cat?.defaultVariant ?? null
+    const isDefault = (v: any) => v?.isDefault === true || v?.default === true || v?.is_default === true ||
+      (defId != null && String(v?.id ?? v?.variantId ?? '') === String(defId))
+    const def = num(variants.find(isDefault)?.price)
+    if (def != null) return def
+    const prices = variants.map(v => num(v?.price)).filter((p): p is number => p != null)
+    if (prices.length) return Math.min(...prices)
+  }
+
+  const pm = cat?.priceMap ?? cat?.prices
+  if (pm && typeof pm === 'object') {
+    const vals = Object.values(pm)
+      .map((x: any) => num(x && typeof x === 'object' ? (x.price ?? x.amount) : x))
+      .filter((p): p is number => p != null)
+    if (vals.length) return Math.min(...vals)
+  }
+  return null
+}
+
+// ── per-channel item detail (Swiggy/Zomato) ─────────────────────────────────────
+// The storefront item's `channels` upgraded from {swiggy:bool, zomato:bool} to
+// per-channel detail. `available` = offered on the channel (a bare bool still means
+// this, back-compat). `price` = per-channel override (null → base). `inStock` = last
+// known stock (null → unknown). `srcId`/`outletRef` = the aggregator binding an
+// import records so the dashboard can push a stock toggle back to the right entity.
+export interface ChannelDetail {
+  available: boolean
+  price: number | null
+  inStock: boolean | null
+  srcId: string | null
+  outletRef: string | null
+}
+export type ItemChannels = { zomato: ChannelDetail; swiggy: ChannelDetail }
+
+const emptyDetail = (available = true): ChannelDetail => ({ available, price: null, inStock: null, srcId: null, outletRef: null })
+
+/** Normalise one channel's value (bool | object | missing) → ChannelDetail. */
+export function normChannelDetail(v: any): ChannelDetail {
+  if (v === false) return emptyDetail(false)
+  if (v == null || v === true) return emptyDetail(true)
+  const o = typeof v === 'object' ? v : {}
+  return {
+    available: o.available !== false,
+    price: o.price != null && Number(o.price) > 0 ? Math.round(Number(o.price)) : null,
+    inStock: o.inStock == null ? null : !!o.inStock,
+    srcId: o.srcId != null ? String(o.srcId).slice(0, 64) : null,
+    outletRef: o.outletRef != null ? String(o.outletRef).slice(0, 64) : null,
+  }
+}
+export const normChannels = (raw: any): ItemChannels => ({
+  zomato: normChannelDetail(raw?.zomato),
+  swiggy: normChannelDetail(raw?.swiggy),
+})
+const detailEq = (a: ChannelDetail, b: ChannelDetail) =>
+  a.available === b.available && a.price === b.price && a.inStock === b.inStock &&
+  a.srcId === b.srcId && a.outletRef === b.outletRef
 
 // ── mapped storefront shapes ────────────────────────────────────────────────────
 export interface MappedCategory { sourceId: string; name: string }
@@ -272,6 +359,19 @@ export async function importMenuToStorefront(
   }
   const { categories: aggCats, items: aggItems } = mapEntities(entities)
 
+  // Which channel this import speaks for + the aggregator outlet ref it binds to.
+  // Populated onto the item's per-channel detail so the dashboard shows the real
+  // Swiggy/Zomato price + stock, and can push a stock toggle back to this entity.
+  const channel = (opts.channel === 'zomato' || opts.channel === 'swiggy') ? opts.channel : null
+  const chOutletRef = opts.aggregatorResId != null ? String(opts.aggregatorResId) : null
+  const detailFor = (it: MappedItem): ChannelDetail => ({
+    available: true,
+    price: it.priceInr > 0 ? it.priceInr : null,   // real per-channel ₹ (null = needs-review/base)
+    inStock: !it.soldOut,
+    srcId: it.sourceId,
+    outletRef: chOutletRef,
+  })
+
   const menu = await call('GET', '/admin/menu', slug) as { categories: any[]; items: any[] }
   const existingCats: any[] = Array.isArray(menu?.categories) ? menu.categories : []
   const existingItems: any[] = Array.isArray(menu?.items) ? menu.items : []
@@ -319,6 +419,9 @@ export async function importMenuToStorefront(
         categoryId,
         availableOutlets: outletId ? [outletId] : [],
       }
+      // Seed this channel's per-channel detail (real price + stock + binding); the
+      // other channel defaults to available with no override (server normalises).
+      if (channel) body.channels = { [channel]: detailFor(it) }
       if (it.imageUrl) body.imageUrl = it.imageUrl
       if (!opts.dryRun) {
         const res = await call('POST', '/admin/items', slug, body)
@@ -345,6 +448,18 @@ export async function importMenuToStorefront(
         const next = [...cur, outletId]
         patch.availableOutlets = next
         changes.availableOutlets = { from: cur, to: next }
+      }
+    }
+    // Refresh THIS channel's per-channel detail from the captured menu, preserving
+    // the other channel and the operator's `available` choice. Send the full object
+    // (server replaces wholesale). Idempotent: no diff → no patch.
+    if (channel) {
+      const merged = normChannels(existing.channels)
+      const next = { ...detailFor(it), available: merged[channel].available }
+      if (!detailEq(merged[channel], next)) {
+        merged[channel] = next
+        patch.channels = merged
+        changes.channels = { from: existing.channels ?? null, to: merged }
       }
     }
 
