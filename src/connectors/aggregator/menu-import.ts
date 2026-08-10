@@ -173,6 +173,12 @@ export function vegOf(raw: any): boolean {
  * (the base/smallest size → "from ₹X"). Falls back to the legacy catalogue-shape
  * resolver. Verified live 2026-08-11 against La Fiamma (Burrata Pesto ₹890).
  */
+/** Storefront base price across channels = the higher of what's already stored and
+ *  the channel being imported (Swiggy vs Zomato). 0 when neither has a price. */
+export function higherBase(existing: number | null | undefined, incoming: number | null | undefined): number {
+  return Math.max(Number(existing) || 0, Number(incoming) || 0)
+}
+
 export function zomatoWrapperPrice(w: any): number | null {
   const num = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null }
   const all: number[] = []
@@ -464,7 +470,11 @@ export async function importMenuToStorefront(
     // Leave name/description/veg/coins/options/image as the merchant curated them.
     const patch: any = {}
     const changes: Record<string, { from: any; to: any }> = {}
-    if (Number(existing.priceInr) !== it.priceInr) { patch.priceInr = it.priceInr; changes.priceInr = { from: existing.priceInr, to: it.priceInr } }
+    // Storefront base = the HIGHER of the channels seen (Swiggy vs Zomato), so the
+    // direct price is never below what an aggregator charges. Only ever raises to
+    // match the top channel; a later cheaper channel never lowers it.
+    const desiredBase = higherBase(existing.priceInr, it.priceInr)
+    if (Number(existing.priceInr) !== desiredBase) { patch.priceInr = desiredBase; changes.priceInr = { from: existing.priceInr, to: desiredBase } }
     if (!!existing.soldOut !== it.soldOut) { patch.soldOut = it.soldOut; changes.soldOut = { from: !!existing.soldOut, to: it.soldOut } }
     // UNION the outlet into availableOutlets — never narrow. Empty existing list means
     // "all outlets", so leave it empty (adding would wrongly restrict it).

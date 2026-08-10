@@ -6,7 +6,7 @@
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parseMenuSnapshot, zomatoWrapperPrice } from './menu-import.js'
+import { parseMenuSnapshot, zomatoWrapperPrice, higherBase } from './menu-import.js'
 
 const body = JSON.parse(readFileSync(join(__dirname, '__fixtures__/zomato-menu.json'), 'utf8'))
 const rows = parseMenuSnapshot(body)
@@ -26,6 +26,9 @@ ok(items.every((r) => r.name), 'every item has a name')
 const wrappers = body.data.menuResponse.catalogueWrappers
 const resolved = wrappers.map((w: any) => zomatoWrapperPrice(w)).filter((p: number | null) => p && p > 0)
 ok(resolved.length >= items.length, `resolver priced ${resolved.length} wrappers (>= ${items.length} items) of ${wrappers.length} total`)
+
+// storefront base = higher of the two channels
+ok(higherBase(720, 850) === 850 && higherBase(890, null) === 890 && higherBase(null, 640) === 640 && higherBase(null, null) === 0, 'higherBase picks the max channel price (never lowers)')
 
 console.log(`\n  parsed ${items.length} items, ${priced.length} priced:`)
 for (const r of items.slice(0, 6)) console.log(`    ${r.name} → ₹${r.price}`)
