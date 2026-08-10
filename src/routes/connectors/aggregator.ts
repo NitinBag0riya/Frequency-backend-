@@ -64,13 +64,86 @@ function orderSummary(items: number, gross: number | null, currency = 'INR'): st
 
 interface ParsedHistOrder { external_order_id: string; status: string | null; customer_name: string | null; item_count: number; gross_amount: number | null; placed_at: string | null; raw: any }
 
+/** Strip Zomato snippet markdown: `<semibold-200|{white-500|DELIVERED}>` → `DELIVERED`. */
+export function stripZomatoMarkup(text: unknown): string {
+  return String(text == null ? '' : text)
+    .replace(/<[a-z0-9-]+\|/gi, '').replace(/\{[a-z0-9-]+\|/gi, '').replace(/[>}]/g, '')
+    .replace(/\s+/g, ' ').trim()
+}
+
+/** Zomato get-all-v2 snippets → past-order rows (verified against real La Fiamma capture). */
+export function parseZomatoSnippets(snippets: any[]): ParsedHistOrder[] {
+  const out: ParsedHistOrder[] = []
+  for (const s of snippets) {
+    const id = s?.id
+    if (id == null) continue
+    const info = (Array.isArray(s.infoList) ? s.infoList : []).map((r: any) => ({
+      l: stripZomatoMarkup(r?.leftText?.text), r: stripZomatoMarkup(r?.rightText?.text),
+    }))
+    const idRow = info.find((x: any) => /^id:/i.test(x.l))
+    const itemRows = info.filter((x: any) => /\bx\b/i.test(x.l) && /₹/.test(x.r))
+    const itemCount = itemRows.reduce((n: number, x: any) => {
+      const m = x.l.match(/^(\d+)\s*x/i); return n + (m ? Number(m[1]) : 1)
+    }, 0)
+    const gross = itemRows.reduce((sum: number, x: any) => {
+      const m = String(x.r).match(/([\d,]+(?:\.\d+)?)/); return sum + (m ? Number(m[1].replace(/,/g, '')) : 0)
+    }, 0)
+    out.push({
+      external_order_id: String(id),
+      status: stripZomatoMarkup(s?.primaryTag?.label?.text) || 'HISTORY',
+      customer_name: idRow ? String(idRow.r).replace(/^by\s+/i, '').trim() || null : null,
+      item_count: itemCount,
+      gross_amount: gross > 0 ? gross : null,
+      // "11:23 PM | 10 August" — no year in snippet; kept in raw. Backend leaves null
+      // rather than guess a wrong ISO; the order date is recoverable from raw + query.
+      placed_at: null,
+      raw: s,
+    })
+  }
+  return out
+}
+
+/** Swiggy orders/v1/history groups (`[{restId, data:{objects}}]`) → past-order rows. */
+export function parseSwiggyHistoryGroups(groups: any[]): ParsedHistOrder[] {
+  const out: ParsedHistOrder[] = []
+  for (const g of groups) {
+    const objects = g?.data?.objects
+    if (!Array.isArray(objects)) continue
+    for (const o of objects) {
+      const id = o?.order_id ?? o?.id ?? o?.rng_order_id
+      if (id == null) continue
+      const itemsArr = Array.isArray(o.order_items) ? o.order_items : Array.isArray(o.items) ? o.items : []
+      out.push({
+        external_order_id: String(id),
+        status: o.order_status ?? o.status ?? o.state ?? null,
+        customer_name: o.customer_name ?? o.customer?.name ?? null,
+        item_count: itemsArr.reduce((n: number, it: any) => n + (Number(it.quantity ?? it.qty ?? 1) || 1), 0),
+        gross_amount: o.order_total ?? o.bill_total ?? o.total ?? o.net_total ?? null,
+        placed_at: o.order_time ?? o.ordered_time ?? o.order_placed_time ?? o.created_on ?? null,
+        raw: o,
+      })
+    }
+  }
+  return out
+}
+
 /**
  * Parse a Frequency Desktop order-history snapshot into normalised past-order rows.
- * Zomato pushes an array of order-details; Swiggy pushes its history payload;
- * some shapes page under `pages[].orders`. Best-effort across all, raw retained.
- * TODO(history-spec): tighten once a real snapshot is captured.
+ * Handles the real aggregator shapes: Zomato get-all-v2 `snippets[]`, Swiggy
+ * orders/v1/history `data[].data.objects[]`, plus generic order arrays / paged
+ * shapes. Raw always retained. Verified against live La Fiamma captures 2026-08-11.
  */
-function parseOrderHistory(body: any): ParsedHistOrder[] {
+export function parseOrderHistory(body: any): ParsedHistOrder[] {
+  // Zomato order/history/get-all-v2 → { snippets:[{id, primaryTag, topRightText,
+  // infoList}] } (a UI-snippet list; text is markdown-wrapped `<tag|{color|TEXT}>`).
+  if (Array.isArray(body?.snippets) && body.snippets.some((s: any) => s?.id != null && s?.primaryTag)) {
+    return parseZomatoSnippets(body.snippets)
+  }
+  // Swiggy orders/v1/history → { data:[{restId, data:{objects:[order]}}] }.
+  if (Array.isArray(body?.data) && body.data.some((g: any) => g?.restId != null && Array.isArray(g?.data?.objects))) {
+    return parseSwiggyHistoryGroups(body.data)
+  }
+
   const sr = body?.statusResponse ?? body?.data ?? body ?? {}
   let orders: any[] = []
   if (Array.isArray(sr)) orders = sr
