@@ -13,7 +13,7 @@ import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata,
 import { createLeadsRouter } from './leads'
 import { createKhataRouter } from './routes/khata'
 import { verifyAttestation, enrollInstall, EnrollSchema, makeInMemoryRateLimiter, type InstallRecord } from './routes/desktop-attestation'
-import { resolveDesktopRuntimeConfig } from './routes/desktop-runtime-config'
+import { resolveDesktopRuntimeConfig, resolveDesktopManifest } from './routes/desktop-runtime-config'
 import { createListingsRouter } from './routes/listings'
 import { createAppointmentsRouter } from './routes/appointments'
 import { createTasksRouter } from './routes/tasks'
@@ -2202,14 +2202,40 @@ const desktopEnrollLimiter = makeInMemoryRateLimiter(10, 60_000)
 // installs at beta. The desktop fetches this at launch (env override still wins).
 app.get('/api/desktop/runtime-config', async (_req, res) => {
   let flagValue: unknown
+  let bridge: unknown
   try {
     const { data } = await supabase
-      .from('feature_flags').select('value_json').eq('key', 'desktop_environment').maybeSingle()
-    flagValue = (data?.value_json as any)?.value
+      .from('feature_flags').select('key, value_json')
+      .in('key', ['desktop_environment', 'desktop_bridge_rules'])
+    for (const row of data ?? []) {
+      if (row.key === 'desktop_environment') flagValue = (row.value_json as any)?.value
+      // DATA-DRIVEN bridge-rules override (Layer 1): the WHOLE value_json is the override
+      // block the desktop merges over its baked defaults (portal URLs, isLoggedIn patterns,
+      // response-shape matchers, status maps). No secrets — data only, validated app-side.
+      else if (row.key === 'desktop_bridge_rules') bridge = row.value_json
+    }
   } catch {
-    /* unreachable DB → fall through to prod default */
+    /* unreachable DB → fall through to prod default, no bridge override */
   }
-  res.json(resolveDesktopRuntimeConfig(flagValue))
+  const cfg = resolveDesktopRuntimeConfig(flagValue)
+  res.json(bridge && typeof bridge === 'object' ? { ...cfg, bridge } : cfg)
+})
+
+// ── Frequency Desktop download manifest ──────────────────────────────────────
+// Public, no auth: the latest desktop version + per-OS download URLs the dashboard
+// /download page renders. Source of truth is the super-admin `desktop_release` feature
+// flag (set once after uploading artifacts); all-null until then so the page falls back
+// gracefully. Routing/metadata only — no secrets.
+app.get('/api/desktop/download-manifest', async (_req, res) => {
+  let flagValue: unknown
+  try {
+    const { data } = await supabase
+      .from('feature_flags').select('value_json').eq('key', 'desktop_release').maybeSingle()
+    flagValue = data?.value_json
+  } catch {
+    /* unreachable DB → empty manifest (page uses its fallback) */
+  }
+  res.json(resolveDesktopManifest(flagValue))
 })
 
 // ── Frequency Desktop enrolment ──────────────────────────────────────────────
