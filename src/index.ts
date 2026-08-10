@@ -12,6 +12,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets, calendarCreateEvent, gmailSendEmail, getValidGoogleToken } from './google'
 import { createLeadsRouter } from './leads'
 import { createKhataRouter } from './routes/khata'
+import { verifyAttestation, enrollInstall, EnrollSchema, makeInMemoryRateLimiter, type InstallRecord } from './routes/desktop-attestation'
 import { createListingsRouter } from './routes/listings'
 import { createAppointmentsRouter } from './routes/appointments'
 import { createTasksRouter } from './routes/tasks'
@@ -397,6 +398,14 @@ app.use('/api/storefront/app/eas-webhook', express.json({
 // Supabase Send-Email hook — Standard-Webhooks HMAC over the exact bytes.
 // Capture rawBody before the global parser so auth-email-hook.ts can verify it.
 app.use('/api/hooks/auth-email', express.json({
+  limit: '1mb',
+  verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
+}))
+
+// Frequency Desktop provisioning — the per-install attestation signature is over
+// the EXACT request bytes, so capture rawBody before the global parser (the legacy
+// shared-secret path ignores it). Verified in routes/desktop-attestation.ts.
+app.use('/api/desktop/provision', express.json({
   limit: '1mb',
   verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
 }))
@@ -2161,6 +2170,50 @@ app.post('/api/internal/storefront-order', async (req, res) => {
     })).catch(() => {})
 })
 
+// ── Frequency Desktop per-install attestation store ──────────────────────────
+// Supabase-backed registry of enrolled installs (public keys). Written by /enroll,
+// read by the provision signature check. Service-role only (see the migration RLS).
+const desktopInstallStore = {
+  getInstall: async (id: string): Promise<InstallRecord | null> => {
+    const { data } = await supabase.from('desktop_installs')
+      .select('install_id, public_key, revoked').eq('install_id', id).maybeSingle()
+    return data
+      ? { installId: (data as any).install_id, publicKey: (data as any).public_key, revoked: !!(data as any).revoked }
+      : null
+  },
+  recordInstall: async (rec: InstallRecord): Promise<void> => {
+    const { error } = await supabase.from('desktop_installs')
+      .insert({ install_id: rec.installId, public_key: rec.publicKey })
+    if (error) throw new Error(error.message)
+  },
+  touchInstall: async (id: string): Promise<void> => {
+    await supabase.from('desktop_installs')
+      .update({ last_seen_at: new Date().toISOString() }).eq('install_id', id)
+  },
+}
+// Enrol is low-volume + pre-tenant → a small per-ip in-memory cap is enough.
+const desktopEnrollLimiter = makeInMemoryRateLimiter(10, 60_000)
+
+// ── Frequency Desktop enrolment ──────────────────────────────────────────────
+// First launch: the install registers its Ed25519 public key against a self-minted
+// install id. First-write-wins (a known id can't be rebound to a new key). The
+// private key never leaves the install; subsequent provision calls are signed with
+// it. Rate-limited per ip; all input zod-validated + fail-closed.
+app.post('/api/desktop/enroll', async (req, res) => {
+  const ip = ipKeyGenerator(req.ip ?? 'unknown')
+  if (desktopEnrollLimiter(ip)) { res.status(429).json({ error: 'too many enrol attempts' }); return }
+  const parsed = EnrollSchema.safeParse(req.body)
+  if (!parsed.success) { res.status(400).json({ error: 'invalid enrol payload', details: parsed.error.flatten() }); return }
+  try {
+    const out = await enrollInstall(parsed.data, desktopInstallStore)
+    if (!out.ok) { res.status(out.status).json({ error: out.error }); return }
+    res.json({ ok: true, created: out.created, installId: out.installId })
+  } catch (e: any) {
+    console.error('[desktop-enroll] failed:', e?.message ?? e)
+    res.status(500).json({ error: 'enrol failed' })
+  }
+})
+
 // ── Frequency Desktop first-login provisioning ───────────────────────────────
 //
 // The desktop app calls this the first time a merchant logs into Swiggy/Zomato
@@ -2168,21 +2221,39 @@ app.post('/api/internal/storefront-order', async (req, res) => {
 // on the Enterprise plan with one storefront outlet per captured restId, then
 // returns a magic action-link the desktop loads to sign its web view in.
 //
-// No Frequency session exists yet → gated by a shared desktop provisioning secret
-// (same trust model as the storefront X-Admin-Secret). Fail-closed when unset.
-//
-// ponytail: a shared secret shipped in a distributed Electron binary is
-// extractable/spoofable. Ceiling: fine as an M1 gate; a real deployment should
-// move to per-install device attestation / signed tokens before GA. It only ever
-// mints horeca + enterprise, so a leaked secret can create tenants but not
-// escalate an existing one.
+// AUTH — authorised if EITHER holds (both fail-closed):
+//   • per-install attestation: x-desktop-install-id + x-desktop-timestamp +
+//     x-desktop-signature (Ed25519 over `installId.timestamp.rawBody`), verified
+//     against the enrolled public key within the anti-replay window. PRIMARY path.
+//   • legacy shared secret: x-desktop-secret == DESKTOP_PROVISION_SECRET
+//     (timing-safe). Back-compat for the pilot binary until it updates.
+// It only ever mints horeca + enterprise, and role/plan are never client-controlled,
+// so neither path can escalate an existing tenant.
 app.post('/api/desktop/provision', async (req, res) => {
+  // 1. Legacy shared secret (kept working for the already-shipped pilot).
   const secret = process.env.DESKTOP_PROVISION_SECRET
   const provided = String(req.headers['x-desktop-secret'] ?? '')
-  if (!secret || provided.length !== secret.length ||
-      !crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(secret, 'utf8'))) {
-    res.status(401).json({ error: 'unauthorized' }); return
+  const secretOk = !!secret && provided.length === secret.length &&
+    crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(secret, 'utf8'))
+  // 2. Per-install signature (primary). rawBody is captured by the path-scoped
+  //    express.json verify hook mounted above the global parser.
+  let attestOk = false
+  if (!secretOk) {
+    const rawBody = ((req as any).rawBody as Buffer | undefined)?.toString('utf8')
+      ?? JSON.stringify(req.body ?? {})
+    const att = await verifyAttestation(
+      {
+        installId: req.headers['x-desktop-install-id'] as string | undefined,
+        timestamp: req.headers['x-desktop-timestamp'] as string | undefined,
+        signature: req.headers['x-desktop-signature'] as string | undefined,
+      },
+      rawBody,
+      desktopInstallStore,
+    )
+    attestOk = att.ok
+    if (att.ok) void desktopInstallStore.touchInstall(att.installId)
   }
+  if (!secretOk && !attestOk) { res.status(401).json({ error: 'unauthorized' }); return }
   const { ProvisionPayloadSchema, provisionTenant } = await import('./routes/desktop-provision')
   const parsed = ProvisionPayloadSchema.safeParse(req.body)
   if (!parsed.success) {

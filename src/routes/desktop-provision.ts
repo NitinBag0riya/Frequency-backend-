@@ -275,6 +275,14 @@ export async function provisionTenant(
   )
   if (iErr) throw new Error(`integration activate failed: ${iErr.message}`)
 
+  // ── 8. Branding + owner profile so the tenant shows its REAL name everywhere
+  //    (storefront + dashboard) with zero manual setup. Fail-SOFT: a hiccup here
+  //    must never abort a provision — the tenant/enterprise/integration already
+  //    stand, and this is cosmetic identity that can be re-derived. ─────────────
+  await applyBrandingAndProfile(supabase, {
+    tenantId, ownerUserId, businessName, ownerPhone: payload.ownerPhone, outlets,
+  })
+
   const loginUrl = await deps.generateLoginLink(ownerEmail)
 
   return {
@@ -291,6 +299,45 @@ export async function provisionTenant(
     outlets: mapping,
     outletsPending,
     integration: INTEGRATION_KEY,
+  }
+}
+
+/**
+ * Fail-soft: give the freshly-provisioned tenant its real identity so the
+ * storefront + dashboard stop showing the default cafe name / placeholder email.
+ *   • tenant_branding.display_name = businessName (+ address / support_phone from
+ *     ownerPhone or the first outlet that has them). on-conflict(tenant_id) refresh.
+ *   • profiles.full_name = businessName (+ wa_number from ownerPhone). on-conflict(id).
+ * Each write is independently guarded — a missing column / RLS hiccup logs and is
+ * skipped, never thrown, so provisioning always completes.
+ */
+async function applyBrandingAndProfile(
+  supabase: SupabaseClient,
+  args: { tenantId: string; ownerUserId: string; businessName: string; ownerPhone?: string; outlets: OutletInput[] },
+): Promise<void> {
+  const { tenantId, ownerUserId, businessName, ownerPhone, outlets } = args
+  const address = outlets.find(o => o.address)?.address
+  const supportPhone = ownerPhone || outlets.find(o => o.phone)?.phone
+
+  try {
+    const branding: Record<string, unknown> = { tenant_id: tenantId, display_name: businessName, updated_at: new Date().toISOString() }
+    if (address) branding.address = address
+    if (supportPhone) branding.support_phone = supportPhone
+    const { error } = await supabase.from('tenant_branding').upsert(branding, { onConflict: 'tenant_id' })
+    if (error) console.warn(`[desktop-provision] tenant_branding upsert non-fatal: ${error.message}`)
+  } catch (e: any) {
+    console.warn(`[desktop-provision] tenant_branding write skipped: ${e?.message ?? e}`)
+  }
+
+  try {
+    // handle_new_user() auto-creates the profile on signup; upsert refreshes it
+    // (and covers the race where the trigger hasn't fired yet).
+    const profile: Record<string, unknown> = { id: ownerUserId, full_name: businessName, updated_at: new Date().toISOString() }
+    if (ownerPhone) profile.wa_number = ownerPhone
+    const { error } = await supabase.from('profiles').upsert(profile, { onConflict: 'id' })
+    if (error) console.warn(`[desktop-provision] profile upsert non-fatal: ${error.message}`)
+  } catch (e: any) {
+    console.warn(`[desktop-provision] profile write skipped: ${e?.message ?? e}`)
   }
 }
 
