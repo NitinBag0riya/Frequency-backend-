@@ -314,6 +314,53 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     console.log(`[aggregator/history] ingested ${parsed.length} past order(s) for outlet ${outletRef}`)
   }
 
+  // Ingest a Zomato/Swiggy customer-complaints snapshot → upsert into public.complaints
+  // (source = channel). Zomato's feed (merchant-api/customer-issues/get-all) carries
+  // order_id + issue_type + expired_at (the SLA deadline to respond) only; the text &
+  // category live inside Zomato, so body/category stay null — the Complaints inbox
+  // shows "full text only on Zomato" for exactly this case. Dedup on source+external_id
+  // so a re-poll never clobbers an operator's acknowledge/resolve on an existing row.
+  const ingestComplaints = async (tenantId: string, outletRef: string | null, body: any) => {
+    const channel = (body?.channel === 'swiggy' || body?.channel === 'zomato')
+      ? body.channel
+      : (outletRef ? await channelForOutlet(tenantId, outletRef) : null) || 'zomato'
+    const entities: any[] = Array.isArray(body?.entities) ? body.entities
+      : Array.isArray(body?.issues) ? body.issues : []
+    const now = new Date().toISOString()
+    const rows = entities.map((e) => {
+      const orderId = String(e?.order_id ?? e?.orderId ?? '')
+      if (!orderId) return null
+      const expRaw = e?.expired_at ? String(e.expired_at) : ''
+      const exp = expRaw ? new Date(expRaw.replace(' ', 'T') + '+05:30') : null
+      const dueAt = exp && !isNaN(exp.getTime()) ? exp.toISOString() : null
+      const t = String(e?.issue_type ?? '').toUpperCase()
+      const responded = e?.response_meta != null
+      const status = (responded || t.includes('CLOSE') || t.includes('RESOLV')) ? 'resolved' : 'new'
+      const dueSoon = dueAt ? (new Date(dueAt).getTime() - Date.now()) <= 12 * 3600_000 : false
+      const severity = status === 'resolved' ? 'low' : (dueSoon ? 'high' : 'normal')
+      return {
+        tenant_id: tenantId, outlet_ref: outletRef, source: channel,
+        external_id: `${channel}:${orderId}`, order_ref: orderId,
+        category: 'unknown', raw_issue_type: e?.issue_type ?? 'issue',
+        severity, status,
+        opened_at: dueAt ?? now, due_at: dueAt,
+        raw: { source: channel, order_id: orderId, issue_type: e?.issue_type ?? null, expired_at: e?.expired_at ?? null, notes: [], note: 'Captured from the merchant customer-issues feed; full text & category only in the aggregator app.' },
+        updated_at: now,
+      }
+    }).filter(Boolean) as any[]
+    if (!rows.length) return
+    const { data: existing } = await supabase.from('complaints')
+      .select('external_id').eq('tenant_id', tenantId).eq('source', channel)
+      .in('external_id', rows.map(r => r.external_id))
+    const have = new Set((existing ?? []).map((x: any) => x.external_id))
+    const fresh = rows.filter(r => !have.has(r.external_id))
+    if (fresh.length) {
+      const { error } = await supabase.from('complaints').insert(fresh)
+      if (error) console.error(`[aggregator/complaints] insert failed: ${error.message}`)
+      else console.log(`[aggregator/complaints] ingested ${fresh.length} new ${channel} complaint(s)`)
+    }
+  }
+
   // Whether the next orders poll should request a one-shot history backfill.
   const needsHistorySync = async (tenantId: string, outletRef: string): Promise<boolean> => {
     const { data } = await supabase.from('aggregator_history_sync')
@@ -899,6 +946,16 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     if (!outletRef) { res.status(400).json({ error: 'outletRef required' }); return }
     try { await ingestHistory(tenantId, outletRef, req.body) }
     catch (e: any) { console.error(`[aggregator/history] ingest error: ${e?.message}`) }
+    res.json({ ok: true })
+  })
+  // Customer-complaints snapshot (Zomato customer-issues / Swiggy). outletRef is
+  // optional — the complaints feed is account-wide, and the order_id is globally
+  // unique, so we dedup on source+external_id rather than per-outlet.
+  r.post('/api/connectors/aggregator/complaints/ingest', ...guardEdit, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const outletRef = String(req.body?.outletRef ?? '') || null
+    try { await ingestComplaints(tenantId, outletRef, req.body) }
+    catch (e: any) { console.error(`[aggregator/complaints] ingest error: ${e?.message}`) }
     res.json({ ok: true })
   })
 
