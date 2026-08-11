@@ -164,27 +164,39 @@ export async function provisionTenant(
     (r: any) => r?.metadata?.desktop_provision_key === key,
   ) as { tenant_id: string; metadata: any } | undefined
 
-  if (existing?.tenant_id) {
+  // Fallback: even when the FULL resId set doesn't match (a PARTIAL reconnect —
+  // only some outlets had logged in when provision fired), resolve to an existing
+  // desktop tenant if ANY incoming channel resId already belongs to one. Without
+  // this, a partial reconnect spawns a duplicate empty tenant for the same merchant.
+  const incomingTokens = new Set(channelTokens(outlets))
+  const byOverlap = existing ? undefined : (existingRows ?? []).find((r: any) => {
+    const outs = r?.metadata?.outlets
+    return Array.isArray(outs) && outs.some((o: any) =>
+      Array.isArray(o?.channels) && o.channels.some((c: any) => incomingTokens.has(`${c.platform}:${c.resId}`)))
+  }) as { tenant_id: string; metadata: any } | undefined
+  const resolved = existing ?? byOverlap
+
+  if (resolved?.tenant_id) {
     const { data: t } = await supabase
       .from('tenants')
       .select('id, slug, user_id, business_type')
-      .eq('id', existing.tenant_id)
+      .eq('id', resolved.tenant_id)
       .maybeSingle()
-    const existingEmail = existing.metadata?.owner_email || ownerEmail
+    const existingEmail = resolved.metadata?.owner_email || ownerEmail
     const loginUrl = await deps.generateLoginLink(existingEmail)
     return {
       ok: true,
       created: false,
-      tenantId: existing.tenant_id,
+      tenantId: resolved.tenant_id,
       slug: (t as any)?.slug ?? '',
       businessType: BUSINESS_TYPE,
       plan: ENTERPRISE_PLAN_ID,
       ownerUserId: (t as any)?.user_id ?? '',
       ownerEmail: existingEmail,
-      ownerEmailPlaceholder: !!existing.metadata?.owner_email_placeholder,
+      ownerEmailPlaceholder: !!resolved.metadata?.owner_email_placeholder,
       loginUrl,
-      outlets: (existing.metadata?.outlets as OutletMapping[]) ?? [],
-      outletsPending: !!existing.metadata?.outlets_pending,
+      outlets: (resolved.metadata?.outlets as OutletMapping[]) ?? [],
+      outletsPending: !!resolved.metadata?.outlets_pending,
       integration: INTEGRATION_KEY,
     }
   }
