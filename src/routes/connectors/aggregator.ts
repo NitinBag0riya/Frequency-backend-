@@ -300,7 +300,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     if (parsed.length) {
       const rows = parsed.map(o => ({
         tenant_id: tenantId, source: 'frequency_desktop', channel, outlet_ref: outletRef,
-        external_order_id: o.external_order_id, status: o.status,
+        external_order_id: o.external_order_id, status: normalizeStatus(o.status),
         customer_name: o.customer_name, item_count: o.item_count, gross_amount: o.gross_amount,
         placed_at: o.placed_at, raw: o.raw, updated_at: now,
       }))

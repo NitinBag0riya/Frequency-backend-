@@ -160,26 +160,38 @@ export function createComplaintsRouter(
   // Upserts a normalised row and, on a GENUINELY NEW row, emits complaint.new
   // down the existing notification path. Idempotent via unique(source,external_id).
   router.post('/complaints/ingest', async (req, res) => {
-    const secret = process.env.INTERNAL_TRIGGER_SECRET
-    const provided = String(req.headers['x-internal-secret'] ?? '')
-    if (!secret || provided.length !== secret.length ||
-        !crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(secret, 'utf8'))) {
+    // Two accepted callers, same model as reviews ingest: the workflow trigger
+    // (x-internal-secret) OR storefront-api's complaint mirror (X-Admin-Secret + slug).
+    const okSecret = (name: string, header: string) => {
+      const secret = process.env[name]
+      const provided = String(req.headers[header] ?? '')
+      return !!secret && provided.length === secret.length &&
+        crypto.timingSafeEqual(Buffer.from(provided, 'utf8'), Buffer.from(secret, 'utf8'))
+    }
+    if (!okSecret('INTERNAL_TRIGGER_SECRET', 'x-internal-secret') &&
+        !okSecret('STOREFRONT_ADMIN_SECRET', 'x-admin-secret')) {
       res.status(401).json({ error: 'unauthorized' }); return
     }
     const b = (req.body ?? {}) as any
+    // Storefront posts a slug (it doesn't know the uuid) — resolve like reviews/order-sync.
+    let tenantId: string | null = b.tenant_id ?? null
+    if (!tenantId && b.slug) {
+      const { data: t } = await supabase.from('tenants').select('id').eq('slug', String(b.slug)).maybeSingle()
+      tenantId = (t as any)?.id ?? null
+    }
     // Accept either a pre-normalised row (tenant_id + source + external_id) OR a
-    // storefront {tenant_id, order, index, text, at, kind} payload.
+    // storefront {slug|tenant_id, order, index, text, at, kind} payload.
     let row: Record<string, any> | null = null
-    if (b.order && b.tenant_id) {
+    if (b.order && tenantId) {
       row = normaliseStorefrontComplaint({
-        tenantId: String(b.tenant_id), order: b.order, index: Number(b.index ?? 0),
+        tenantId: String(tenantId), order: b.order, index: Number(b.index ?? 0),
         text: String(b.text ?? ''), at: b.at ?? null, kind: b.kind === 'rating' ? 'rating' : 'complaint',
       })
-    } else if (b.tenant_id && b.source && b.external_id) {
-      row = { ...b }
+    } else if (tenantId && b.source && b.external_id) {
+      row = { ...b, tenant_id: tenantId }
     }
     if (!row || !row.tenant_id || !row.source || !row.external_id) {
-      res.status(400).json({ error: 'tenant_id, source and (order|external_id) required' }); return
+      res.status(400).json({ error: 'tenant_id/slug, source and (order|external_id) required' }); return
     }
     // Ack early; do the write + notify without blocking the storefront response.
     res.json({ ok: true })
