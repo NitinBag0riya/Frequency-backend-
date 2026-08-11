@@ -57,8 +57,13 @@ export interface DesktopPlatformDownload {
 }
 export interface DesktopDownloadManifest {
   version: string | null
+  /** Apple silicon (arm64) build — the primary Mac download. */
   mac: DesktopPlatformDownload | null
+  /** Intel (x64) build — offered alongside arm64 so Intel Macs get a runnable dmg. */
+  macIntel: DesktopPlatformDownload | null
   win: DesktopPlatformDownload | null
+  /** Human-facing release page (GitHub tag) for "all downloads / release notes". */
+  releaseUrl?: string
   notes?: string
   updatedAt?: string
 }
@@ -76,8 +81,10 @@ function normPlatform(p: unknown): DesktopPlatformDownload | null {
  * defensive: any missing/garbage field degrades to null so the page still renders.
  * Expected value_json:
  *   { version: "0.1.0",
- *     mac: { url: "https://…/Frequency-0.1.0-arm64.dmg", arch: "Apple silicon" },
- *     win: { url: "https://…/Frequency-Setup-0.1.0.exe" },
+ *     mac:      { url: "https://…/Frequency-0.1.0-arm64.dmg", arch: "Apple silicon" },
+ *     macIntel: { url: "https://…/Frequency-0.1.0.dmg", arch: "Intel" },
+ *     win:      { url: "https://…/Frequency.Setup.0.1.0.exe" },
+ *     releaseUrl?: "https://github.com/…/releases/tag/v0.1.0",
  *     notes?: "…", updatedAt?: "2026-08-11" }
  */
 export function resolveDesktopManifest(flagValue: unknown): DesktopDownloadManifest {
@@ -85,7 +92,9 @@ export function resolveDesktopManifest(flagValue: unknown): DesktopDownloadManif
   return {
     version: typeof v.version === 'string' && v.version ? v.version : null,
     mac: normPlatform(v.mac),
+    macIntel: normPlatform(v.macIntel),
     win: normPlatform(v.win),
+    ...(typeof v.releaseUrl === 'string' && v.releaseUrl ? { releaseUrl: v.releaseUrl } : {}),
     ...(typeof v.notes === 'string' ? { notes: v.notes } : {}),
     ...(typeof v.updatedAt === 'string' ? { updatedAt: v.updatedAt } : {}),
   }
