@@ -12,6 +12,8 @@ import Anthropic from '@anthropic-ai/sdk'
 import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets, calendarCreateEvent, gmailSendEmail, getValidGoogleToken } from './google'
 import { createLeadsRouter } from './leads'
 import { createKhataRouter } from './routes/khata'
+import { createReviewsRouter } from './routes/reviews'
+import { createComplaintsRouter } from './routes/complaints'
 import { verifyAttestation, enrollInstall, EnrollSchema, makeInMemoryRateLimiter, type InstallRecord } from './routes/desktop-attestation'
 import { resolveDesktopRuntimeConfig, resolveDesktopManifest } from './routes/desktop-runtime-config'
 import { createListingsRouter } from './routes/listings'
@@ -999,6 +1001,7 @@ const PERMISSION_KEY_ALIASES: Record<string, string[]> = {
   // Org Tasks piggyback on the leads/CRM permission for the RBAC matrix — a
   // role that manages leads can manage internal tasks (feature-gated separately).
   tasks: ['leads', 'contacts'],
+  complaints: ['leads', 'contacts'],
 }
 
 function hasRolePermission(perms: any, feature: string, action: string): boolean {
@@ -5723,6 +5726,8 @@ if (process.env.NODE_ENV !== 'production') {
 // ── Lead Intake module ────────────────────────────────────────────────────────
 app.use('/api', createLeadsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createKhataRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use(createReviewsRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use('/api', createComplaintsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createListingsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createAppointmentsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createTasksRouter(supabase, requireAuth, identifyTenant, checkPermission))

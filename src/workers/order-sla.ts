@@ -19,6 +19,7 @@ import { Q, connection, cronQueue } from '../queue'
 import { logger } from '../lib/logger'
 import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 import { emitNotification } from '../routes/notifications'
+import { runComplaintSlaTick } from './complaint-sla'
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
@@ -37,6 +38,8 @@ async function tenantRecipients(tenantId: string): Promise<string[]> {
 }
 
 async function runTick(): Promise<{ escalated: number }> {
+  // Complaints SLA rides the same tick (no idle worker).
+  try { await runComplaintSlaTick(supabase) } catch (e: any) { logger.warn(`[complaint-sla] ${e?.message}`) }
   const cutoff = new Date(Date.now() - SLA_SECONDS * 1000).toISOString()
   // Small candidate set: still-new, not-yet-escalated orders.
   const { data: orders, error } = await supabase.from('aggregator_orders')
