@@ -121,7 +121,11 @@ export function parseZomatoSnippets(snippets: any[]): ParsedHistOrder[] {
   return out
 }
 
-/** Swiggy orders/v1/history groups (`[{restId, data:{objects}}]`) → past-order rows. */
+/** Swiggy orders/v1/history groups (`[{restId, data:{objects}}]`) → past-order rows.
+ *  Field shape VALIDATED against live capture 2026-08-12: time is `status.ordered_time`
+ *  ("YYYY-MM-DD HH:MM:SS", IST wall-clock), total is `bill`, line items are `cart.items[]`
+ *  ({name, quantity, sub_total/total, is_veg}); Swiggy history does NOT expose the
+ *  customer name. Legacy top-level names kept as fallbacks. */
 export function parseSwiggyHistoryGroups(groups: any[]): ParsedHistOrder[] {
   const out: ParsedHistOrder[] = []
   for (const g of groups) {
@@ -130,15 +134,28 @@ export function parseSwiggyHistoryGroups(groups: any[]): ParsedHistOrder[] {
     for (const o of objects) {
       const id = o?.order_id ?? o?.id ?? o?.rng_order_id
       if (id == null) continue
-      const itemsArr = Array.isArray(o.order_items) ? o.order_items : Array.isArray(o.items) ? o.items : []
+      const st = o.status && typeof o.status === 'object' ? o.status : null
+      const cart = o.cart && typeof o.cart === 'object' ? o.cart : null
+      const itemsArr: any[] = Array.isArray(cart?.items) ? cart.items
+        : Array.isArray(o.order_items) ? o.order_items : Array.isArray(o.items) ? o.items : []
+      const lines = itemsArr.filter((it) => it && typeof it === 'object').map((it: any) => ({
+        name: it.name ?? null,
+        qty: Number(it.quantity ?? it.qty ?? 1) || 1,
+        price: Number(it.sub_total ?? it.total ?? it.price ?? 0) || 0,
+        veg: typeof it.is_veg === 'boolean' ? it.is_veg : (it.is_veg === 1 || it.is_veg === '1' ? true : undefined),
+      }))
+      const orderedTime = st?.ordered_time ?? o.order_time ?? o.ordered_time ?? o.order_placed_time ?? o.created_on ?? null
+      // "2026-08-11 19:12:34" is IST wall-clock, no tz → stamp +05:30 so it stores right.
+      const placedAt = orderedTime && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(String(orderedTime))
+        ? String(orderedTime).replace(' ', 'T') + (/[+Z]/.test(String(orderedTime)) ? '' : '+05:30') : orderedTime
       out.push({
         external_order_id: String(id),
-        status: o.order_status ?? o.status ?? o.state ?? null,
+        status: st?.cancel_reason ? 'cancelled' : (st?.order_status ?? o.order_status ?? 'delivered'),
         customer_name: o.customer_name ?? o.customer?.name ?? null,
-        item_count: itemsArr.reduce((n: number, it: any) => n + (Number(it.quantity ?? it.qty ?? 1) || 1), 0),
-        gross_amount: o.order_total ?? o.bill_total ?? o.total ?? o.net_total ?? null,
-        placed_at: o.order_time ?? o.ordered_time ?? o.order_placed_time ?? o.created_on ?? null,
-        raw: o,
+        item_count: lines.reduce((n, l) => n + l.qty, 0) || itemsArr.length,
+        gross_amount: Number(o.bill ?? o.order_total ?? o.bill_total ?? o.total ?? o.net_total) || null,
+        placed_at: placedAt,
+        raw: { source: 'swiggy', order_id: String(id), lines, note: 'Real Swiggy order-history capture (dishes + time + bill).' },
       })
     }
   }
