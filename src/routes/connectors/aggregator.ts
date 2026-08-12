@@ -71,6 +71,24 @@ export function stripZomatoMarkup(text: unknown): string {
     .replace(/\s+/g, ' ').trim()
 }
 
+const SNIPPET_MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december']
+/** Zomato snippet display time → real ISO. The `topRightText` reads "11:50 AM | 11 August"
+ *  (IST wall-clock, no year). We derive the year: an order can't be in the future, so if the
+ *  current-year instant lands ahead of now, it belongs to last year. Beats null → a fake
+ *  "just now"; the exact `order.createdAt` from an order-details capture still overrides it. */
+export function parseZomatoSnippetTime(text: unknown, now: Date = new Date()): string | null {
+  const m = stripZomatoMarkup(text).match(/(\d{1,2}):(\d{2})\s*(AM|PM)\s*\|\s*(\d{1,2})\s+([A-Za-z]+)/i)
+  if (!m) return null
+  const mon = SNIPPET_MONTHS.indexOf(m[5].toLowerCase())
+  if (mon < 0) return null
+  const hh = (Number(m[1]) % 12) + (/pm/i.test(m[3]) ? 12 : 0)
+  const IST_MS = 5.5 * 60 * 60 * 1000 // Asia/Kolkata offset; snippet times are local IST
+  const at = (y: number) => Date.UTC(y, mon, Number(m[4]), hh, Number(m[2])) - IST_MS
+  let t = at(now.getUTCFullYear())
+  if (t > now.getTime() + 24 * 3600 * 1000) t = at(now.getUTCFullYear() - 1)
+  return new Date(t).toISOString()
+}
+
 /** Zomato get-all-v2 snippets → past-order rows (verified against real La Fiamma capture). */
 export function parseZomatoSnippets(snippets: any[]): ParsedHistOrder[] {
   const out: ParsedHistOrder[] = []
@@ -94,9 +112,9 @@ export function parseZomatoSnippets(snippets: any[]): ParsedHistOrder[] {
       customer_name: idRow ? String(idRow.r).replace(/^by\s+/i, '').trim() || null : null,
       item_count: itemCount,
       gross_amount: gross > 0 ? gross : null,
-      // "11:23 PM | 10 August" — no year in snippet; kept in raw. Backend leaves null
-      // rather than guess a wrong ISO; the order date is recoverable from raw + query.
-      placed_at: null,
+      // Real order time from the snippet display ("11:23 PM | 10 August"); the exact
+      // ISO from an order-details capture still overrides this on enrichment.
+      placed_at: parseZomatoSnippetTime(s?.topRightText?.text),
       raw: s,
     })
   }
@@ -717,7 +735,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   r.get('/api/connectors/aggregator/orders/history', ...guardView, async (req, res) => {
     try {
       let q = supabase.from('aggregator_order_history')
-        .select('id, channel, outlet_ref, external_order_id, status, customer_name, item_count, gross_amount, currency, placed_at')
+        .select('id, channel, outlet_ref, external_order_id, status, customer_name, item_count, gross_amount, currency, placed_at, raw')
         .eq('tenant_id', (req as any).tenantId)
         .order('placed_at', { ascending: false, nullsFirst: false })
         .limit(Math.min(Number(req.query.limit ?? 200), 500))
@@ -725,7 +743,14 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       if (req.query.outlet) q = q.eq('outlet_ref', String(req.query.outlet))
       const { data, error } = await q
       if (error) { res.status(500).json({ error: error.message }); return }
-      res.json(data ?? [])
+      // Surface structured line items when an order-details capture backfilled them
+      // (raw.lines: [{name, qty, price, veg}]). Cosmetic-only: the board still works
+      // without it; strip the bulky raw blob from the payload otherwise.
+      const rows = (data ?? []).map(({ raw, ...o }: any) => ({
+        ...o,
+        lines: Array.isArray(raw?.lines) ? raw.lines : undefined,
+      }))
+      res.json(rows)
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
