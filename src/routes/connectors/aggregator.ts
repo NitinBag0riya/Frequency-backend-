@@ -361,7 +361,13 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // natural key), then clear the outlet's history pending flag.
   const ingestHistory = async (tenantId: string, outletRef: string, body: any) => {
     const parsed = parseOrderHistory(body)
-    const channel = await channelForOutlet(tenantId, outletRef)
+    // Prefer the channel the desktop relays (it KNOWS zomato vs swiggy). The outlet
+    // lookup returns null for the 'manual' outlet the bridge uses, which left every
+    // relayed row channel=null — and null coerces to Zomato on the board, mislabeling
+    // Swiggy history. Fall back to the lookup, then to the order-details raw source.
+    const relayCh = body?.channel === 'swiggy' || body?.channel === 'zomato' ? body.channel : null
+    const rawSrc = body?.order?.cartDetails != null ? 'zomato' : null // Zomato order-details shape
+    const channel = relayCh || (await channelForOutlet(tenantId, outletRef)) || rawSrc
     const now = new Date().toISOString()
     if (parsed.length) {
       const rows = parsed.map(o => ({
