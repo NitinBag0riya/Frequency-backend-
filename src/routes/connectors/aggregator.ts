@@ -145,13 +145,61 @@ export function parseSwiggyHistoryGroups(groups: any[]): ParsedHistOrder[] {
   return out
 }
 
+/** Pull a rupee number out of Zomato's money shapes (a number, or a dict with
+ *  amount/value/total/…). Nested totals are common in cartDetails. */
+export function money(x: any): number {
+  if (typeof x === 'number') return x
+  if (x && typeof x === 'object') {
+    for (const k of ['amount', 'value', 'total', 'finalAmount', 'netAmount', 'grandTotal', 'totalCost', 'payableAmount']) {
+      if (typeof x[k] === 'number') return x[k]
+    }
+    for (const v of Object.values(x)) { const m = money(v); if (m) return m }
+  }
+  return 0
+}
+
+/** Zomato order-details `order` → one enriched past-order row: real placed_at
+ *  (`createdAt`) + structured dishes (`cartDetails.items.dishes[]`, or a dict of
+ *  dish-lists) in the {name,qty,price,veg} shape the board reads from `raw.lines`. */
+export function parseZomatoOrderDetail(order: any): ParsedHistOrder {
+  const cart = order?.cartDetails ?? {}
+  const it = cart.items
+  const dishes: any[] = Array.isArray(it?.dishes) ? it.dishes
+    : Array.isArray(it) ? it
+    : (it && typeof it === 'object') ? Object.values(it).flatMap((v: any) => Array.isArray(v) ? v : [v])
+    : []
+  const lines = dishes.filter((d) => d && typeof d === 'object').map((d: any) => {
+    const tags: string[] = Array.isArray(d.metadata?.tags) ? d.metadata.tags : []
+    return { name: d.name ?? null, qty: Number(d.quantity ?? 1) || 1, price: money(d.unitCost ?? d.totalCost ?? 0),
+             veg: tags.length ? tags.includes('veg') && !tags.includes('non-veg') : undefined }
+  })
+  const itemCount = lines.reduce((n, l) => n + l.qty, 0) || lines.length
+  const gross = money(cart.total) || money(cart.subtotal) || lines.reduce((s, l) => s + l.price * l.qty, 0)
+  return {
+    external_order_id: String(order.id),
+    status: order.state ?? order.status ?? 'DELIVERED',
+    customer_name: order.creator?.name ?? order.customer?.name ?? null,
+    item_count: itemCount,
+    gross_amount: gross || null,
+    placed_at: order.createdAt ?? order.actionedAt ?? order.updatedAt ?? null,
+    raw: { source: 'zomato', order_id: String(order.id), lines, note: 'Real Zomato order-details capture (dishes + time + outlet).' },
+  }
+}
+
 /**
  * Parse a Frequency Desktop order-history snapshot into normalised past-order rows.
  * Handles the real aggregator shapes: Zomato get-all-v2 `snippets[]`, Swiggy
- * orders/v1/history `data[].data.objects[]`, plus generic order arrays / paged
- * shapes. Raw always retained. Verified against live La Fiamma captures 2026-08-11.
+ * orders/v1/history `data[].data.objects[]`, the single Zomato order-details
+ * enrichment body, plus generic order arrays / paged shapes. Raw always retained.
+ * Verified against live La Fiamma captures 2026-08-11.
  */
 export function parseOrderHistory(body: any): ParsedHistOrder[] {
+  // Zomato order-details enrichment: a SINGLE past order opened in the portal
+  // ({ order:{ id, createdAt, cartDetails.items.dishes } }). Carries the real ISO
+  // time + dishes the snippet list lacks; upsert-enriches the row on order.id.
+  if (body?.order?.id != null && (body.order.cartDetails != null || body.order.createdAt != null)) {
+    return [parseZomatoOrderDetail(body.order)]
+  }
   // Zomato order/history/get-all-v2 → { snippets:[{id, primaryTag, topRightText,
   // infoList}] } (a UI-snippet list; text is markdown-wrapped `<tag|{color|TEXT}>`).
   if (Array.isArray(body?.snippets) && body.snippets.some((s: any) => s?.id != null && s?.primaryTag)) {
