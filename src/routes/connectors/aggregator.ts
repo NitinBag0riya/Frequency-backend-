@@ -630,6 +630,31 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
+  // Request an on-demand PAST-order re-pull (older history). Flips the history-sync
+  // flag; /pending-actions surfaces it as `historyResync`, the desktop bridge picks it
+  // up and runs fd.syncHistory() (fetches ~60d of history on the merchant session) then
+  // relays to /history/ingest. Mirrors menu/resync. `channel` is informational.
+  r.post('/api/connectors/aggregator/history/resync', ...guardEdit, async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const outlet = req.body?.outlet ? String(req.body.outlet) : null
+      if (outlet) {
+        await supabase.from('aggregator_history_sync').upsert(
+          { tenant_id: tenantId, outlet_ref: outlet, pending_full_sync: true, updated_at: new Date().toISOString() },
+          { onConflict: 'tenant_id,outlet_ref' })
+      } else {
+        await supabase.from('aggregator_history_sync').update({ pending_full_sync: true, updated_at: new Date().toISOString() })
+          .eq('tenant_id', tenantId)
+        // No history-sync rows yet (first ever) → seed 'manual' so the flag has something
+        // to carry, matching the desktop's snippet-relay outlet convention.
+        await supabase.from('aggregator_history_sync').upsert(
+          { tenant_id: tenantId, outlet_ref: 'manual', pending_full_sync: true, updated_at: new Date().toISOString() },
+          { onConflict: 'tenant_id,outlet_ref' })
+      }
+      res.json({ ok: true, note: 'Older orders re-pull requested — they land on the merchant client\'s next sync (~30s).' })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
   // ── Cross-channel menu reconcile (foundation for absolute menu sync) ──────────
   // Collapse the per-channel menus (our mini-app/POS catalog + captured Zomato +
   // Swiggy) into ONE master keyed by normalised name, so "3 items on Zomato / 4 on
