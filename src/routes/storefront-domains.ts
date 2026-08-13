@@ -17,6 +17,7 @@ import crypto from 'node:crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
 import { sendSmsOtp, sendSmsOrderUpdate } from '../lib/storefront-sms.js'
+import { resolveWaCreds } from '../lib/wa-creds.js'
 import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
 import { emitNotification, tenantNotifyRecipients } from './notifications.js'
 
@@ -219,6 +220,44 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       if (!vv.var3) vv.var3 = await resolveStoreName(String(slug))
       const m = await sendSmsOrderUpdate(supabase, { slug: String(slug), phone: String(phone), vars: vv, templateId })
       res.json({ ok: true, via: m.via })
+    } catch (e: any) {
+      res.status(502).json({ ok: false, error: e?.message || 'send failed' })
+    }
+  })
+
+  // Server-to-server: storefront-api asks us to send ONE transactional WhatsApp to a
+  // customer (order-placed confirmation / feedback ask). The customer opt-in gate lives
+  // in storefront-api (guest.whatsappOptin) — we only get here for opted-in guests. We
+  // resolve the sender (tenant's own WhatsApp → else the FREQ_WA platform number, atomic)
+  // and send the named APPROVED template. Dormant end-to-end until a sender + template
+  // exist: no creds → {ok:false, skipped}. Never throws to the caller.
+  r.post('/api/storefront/send-whatsapp', async (req, res) => {
+    if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
+    const { slug, phone, template, params } = (req.body || {}) as { slug?: string; phone?: string; template?: string; params?: string[] }
+    if (!slug || !phone || !template) return res.status(400).json({ ok: false, error: 'slug, phone and template required' })
+    const ph = String(phone).replace(/\D/g, '')
+    if (!ph) return res.status(400).json({ ok: false, error: 'bad phone' })
+    // Transactional cap (mirror of send-sms): guard against loops/abuse.
+    if (!otpRateOk(`wa-ph:${ph.slice(-10)}`, 6, 10 * 60_000) || !otpRateOk(`wa-tenant:${String(slug)}`, 500, 24 * 60 * 60_000)) {
+      return res.status(429).json({ ok: false, error: 'rate_limited' })
+    }
+    try {
+      const { data: t } = await supabase.from('tenants').select('id').eq('slug', String(slug)).maybeSingle()
+      const tenantId = (t as any)?.id
+      if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
+      const creds = await resolveWaCreds(supabase, tenantId)
+      if (!creds || !creds.phoneNumberId || !creds.accessToken) return res.json({ ok: false, skipped: 'no_wa_sender' })
+      const components = Array.isArray(params) && params.length
+        ? [{ type: 'body', parameters: params.map((p) => ({ type: 'text', text: String(p).slice(0, 180) })) }]
+        : []
+      const wr = await fetch(`https://graph.facebook.com/v21.0/${creds.phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.accessToken}` },
+        body: JSON.stringify({ messaging_product: 'whatsapp', to: ph, type: 'template', template: { name: String(template), language: { code: process.env.FREQ_WA_TPL_LANG || 'en' }, components } }),
+      })
+      const jr: any = await wr.json().catch(() => ({}))
+      if (!wr.ok) return res.status(502).json({ ok: false, error: jr?.error?.message || 'send failed' })
+      res.json({ ok: true, via: creds.mode })
     } catch (e: any) {
       res.status(502).json({ ok: false, error: e?.message || 'send failed' })
     }
