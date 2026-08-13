@@ -4158,6 +4158,54 @@ app.get('/webhook/whatsapp/:token', async (req, res) => {
  *                   their own signing key can't reach across into another
  *                   tenant's inbox by naming a foreign WABA id.
  */
+// ── WhatsApp order-feedback capture (platform number) ───────────────────────────
+// A tap on a feedback template button ("😍 Loved it" / "🙂 Okay" / "😞 Not great") arrives
+// as an inbound message. On the PLATFORM number no tenant resolves by waba_id (platform-
+// fallback tenants have none), so we handle it CROSS-TENANT via storefront-api (which owns
+// the orders): it maps phone→recent unrated order, records the rating, mirrors to Reviews,
+// and routes a low score to Complaints. We then reply on the still-open 24h session.
+const FEEDBACK_BUTTON_RATING: Record<string, number> = { '😍 Loved it': 5, '🙂 Okay': 3, '😞 Not great': 2 }
+
+/** Send a free-text WhatsApp from the Frequency PLATFORM number (FREQ_WA_*). Valid only
+ *  inside the 24h window (here: right after the customer's button reply). No-op if unset. */
+async function sendPlatformWaText(to: string, body: string): Promise<void> {
+  const pnid = process.env.FREQ_WA_PHONE_NUMBER_ID, tok = process.env.FREQ_WA_ACCESS_TOKEN
+  const num = String(to || '').replace(/\D/g, '')
+  if (!pnid || !tok || !num) return
+  try {
+    await fetch(`${GRAPH}/${pnid}/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: num, type: 'text', text: { body: String(body).slice(0, 4000) } }),
+    })
+  } catch (e: any) { console.warn('[wa-feedback] reply send failed:', e?.message ?? e) }
+}
+
+/** If this inbound message is a recognised feedback-button reply, capture the rating via
+ *  storefront-api and send the branch reply. No-op otherwise. */
+async function maybeHandleFeedbackReply(msg: any): Promise<void> {
+  const label = String(msg?.button?.text ?? msg?.interactive?.button_reply?.title ?? '').trim()
+  const rating = FEEDBACK_BUTTON_RATING[label]
+  if (!rating) return
+  const base = process.env.STOREFRONT_API_URL, secret = process.env.STOREFRONT_ADMIN_SECRET
+  if (!base || !secret) return
+  try {
+    const r = await fetch(`${base}/v1/feedback/by-phone`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': secret },
+      body: JSON.stringify({ phone: String(msg.from || ''), rating }),
+    })
+    const j: any = await r.json().catch(() => ({}))
+    if (!j?.found) return
+    const name = j.name && j.name !== 'there' ? `, ${j.name}` : ''
+    const reply = j.low
+      ? `Thank you for the honest feedback${name} — sorry it wasn't great. Our team will look into it and make it right. 🙏`
+      : (j.reviewLink
+          ? `So glad you loved it${name}! 🎉 Would you leave a quick public review? It really helps ${j.store}: ${j.reviewLink}`
+          : `So glad you loved it${name}! 🎉 Thanks for ordering from ${j.store}.`)
+    await sendPlatformWaText(String(msg.from || ''), reply)
+    console.log(`[wa-feedback] ${rating}★ from ${msg.from} → order ${j.orderId} (${j.low ? 'complaint' : 'review'})`)
+  } catch (e: any) { console.warn('[wa-feedback] capture failed:', e?.message ?? e) }
+}
+
 async function handleWaWebhook(
   req: express.Request,
   res: express.Response,
@@ -4238,6 +4286,13 @@ async function handleWaWebhook(
       for (const change of entry.changes ?? []) {
         if (change.field !== 'messages') continue
         const value = change.value
+
+        // Feedback-button replies to OUR PLATFORM number are handled CROSS-TENANT here,
+        // BEFORE the waba_id resolution below drops them (no platform-fallback tenant owns
+        // the platform WABA). storefront-api maps phone→order→tenant.
+        if (value?.metadata?.phone_number_id && value.metadata.phone_number_id === process.env.FREQ_WA_PHONE_NUMBER_ID) {
+          for (const msg of value.messages ?? []) await maybeHandleFeedbackReply(msg)
+        }
 
         // Find tenant by WABA ID. On a BYO endpoint the tenant is already
         // known from the URL token — pin the query to it so a payload naming
@@ -6175,6 +6230,16 @@ async function seedPlatformWaTemplates(): Promise<void> {
   const tpls = [
     { name: 'order_confirmed', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, your order at {{2}} is confirmed (#{{3}}). We will message you when there is an update. Thank you!', example: { body_text: ex } }] },
     { name: 'feedback_request', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, thanks for ordering from {{2}} (#{{3}})! How was it? Reply here with your feedback — we would love to hear from you.', example: { body_text: ex } }] },
+    // Interactive feedback: 3 quick-reply buttons whose text EXACTLY matches
+    // FEEDBACK_BUTTON_RATING in the inbound handler (😍=5, 🙂=3, 😞=2).
+    { name: 'feedback_rating', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, how was your order from {{2}} (#{{3}})? Tap below — it helps us improve.', example: { body_text: ex } },
+      { type: 'BUTTONS', buttons: [
+        { type: 'QUICK_REPLY', text: '😍 Loved it' },
+        { type: 'QUICK_REPLY', text: '🙂 Okay' },
+        { type: 'QUICK_REPLY', text: '😞 Not great' },
+      ] },
+    ] },
   ]
   for (const t of tpls) {
     try {
