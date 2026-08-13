@@ -4164,7 +4164,8 @@ app.get('/webhook/whatsapp/:token', async (req, res) => {
 // fallback tenants have none), so we handle it CROSS-TENANT via storefront-api (which owns
 // the orders): it maps phone→recent unrated order, records the rating, mirrors to Reviews,
 // and routes a low score to Complaints. We then reply on the still-open 24h session.
-const FEEDBACK_BUTTON_RATING: Record<string, number> = { '😍 Loved it': 5, '🙂 Okay': 3, '😞 Not great': 2 }
+// WhatsApp quick-reply buttons can't contain emojis — plain text only.
+const FEEDBACK_BUTTON_RATING: Record<string, number> = { 'Loved it': 5, 'It was okay': 3, 'Not great': 2 }
 
 /** Send a free-text WhatsApp from the Frequency PLATFORM number (FREQ_WA_*). Valid only
  *  inside the 24h window (here: right after the customer's button reply). No-op if unset. */
@@ -6231,13 +6232,14 @@ async function seedPlatformWaTemplates(): Promise<void> {
     { name: 'order_confirmed', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, your order at {{2}} is confirmed (#{{3}}). We will message you when there is an update. Thank you!', example: { body_text: ex } }] },
     { name: 'feedback_request', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, thanks for ordering from {{2}} (#{{3}})! How was it? Reply here with your feedback — we would love to hear from you.', example: { body_text: ex } }] },
     // Interactive feedback: 3 quick-reply buttons whose text EXACTLY matches
-    // FEEDBACK_BUTTON_RATING in the inbound handler (😍=5, 🙂=3, 😞=2).
+    // FEEDBACK_BUTTON_RATING in the inbound handler (Loved it=5, It was okay=3, Not great=2).
+    // NOTE: WhatsApp buttons can't contain emojis/variables/newlines — plain text only.
     { name: 'feedback_rating', language: LANG, category: 'UTILITY', components: [
-      { type: 'BODY', text: 'Hi {{1}}, how was your order from {{2}} (#{{3}})? Tap below — it helps us improve.', example: { body_text: ex } },
+      { type: 'BODY', text: 'Hi {{1}}, how was your order from {{2}} (#{{3}})? Tap below — it helps us improve. 🙏', example: { body_text: ex } },
       { type: 'BUTTONS', buttons: [
-        { type: 'QUICK_REPLY', text: '😍 Loved it' },
-        { type: 'QUICK_REPLY', text: '🙂 Okay' },
-        { type: 'QUICK_REPLY', text: '😞 Not great' },
+        { type: 'QUICK_REPLY', text: 'Loved it' },
+        { type: 'QUICK_REPLY', text: 'It was okay' },
+        { type: 'QUICK_REPLY', text: 'Not great' },
       ] },
     ] },
   ]
