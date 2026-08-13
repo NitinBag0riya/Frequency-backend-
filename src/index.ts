@@ -6142,9 +6142,21 @@ const server = app.listen(PORT, () => {
 // never affects the server). Flip SEED_WA_TEMPLATES off once they appear in WA Manager.
 async function seedPlatformWaTemplates(): Promise<void> {
   if (process.env.SEED_WA_TEMPLATES !== '1') return
-  const WABA = process.env.FREQ_WA_WABA_ID, TOK = process.env.FREQ_WA_ACCESS_TOKEN
+  const TOK = process.env.FREQ_WA_ACCESS_TOKEN
   const LANG = process.env.FREQ_WA_TPL_LANG || 'en'
-  if (!WABA || !TOK) { console.warn('[wa-seed] SEED_WA_TEMPLATES=1 but FREQ_WA_WABA_ID/ACCESS_TOKEN missing — skipped'); return }
+  if (!TOK) { console.warn('[wa-seed] SEED_WA_TEMPLATES=1 but FREQ_WA_ACCESS_TOKEN missing — skipped'); return }
+  // The WABA id is easily confused with the Meta app id (which fails template creation).
+  // Derive the REAL WhatsApp Business Account id from the token's granular scopes; fall
+  // back to the env value only if derivation fails.
+  let WABA = process.env.FREQ_WA_WABA_ID || ''
+  try {
+    const dbg: any = await (await fetch(`${GRAPH}/debug_token?input_token=${encodeURIComponent(TOK)}&access_token=${encodeURIComponent(TOK)}`)).json()
+    const scopes: any[] = dbg?.data?.granular_scopes || []
+    const wm = scopes.find((s) => /whatsapp_business/.test(String(s?.scope || '')))
+    const derived = wm?.target_ids?.[0]
+    if (derived) { console.log(`[wa-seed] derived WABA ${derived} (env FREQ_WA_WABA_ID was ${WABA || 'unset'})`); WABA = String(derived) }
+  } catch (e: any) { console.warn(`[wa-seed] WABA derive failed: ${e?.message ?? e}`) }
+  if (!WABA) { console.warn('[wa-seed] no WABA id (env unset + derive failed) — skipped'); return }
   const ex = [['Aarav', 'La Fiamma', '8291']] // {{1}} name · {{2}} store · {{3}} order#
   const tpls = [
     { name: 'order_confirmed', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, your order at {{2}} is confirmed (#{{3}}). We will message you when there is an update. Thank you!', example: { body_text: ex } }] },
