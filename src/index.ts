@@ -6251,6 +6251,18 @@ async function seedPlatformWaTemplates(): Promise<void> {
       console.log(`[wa-seed] ${t.name}: HTTP ${r.status} ${JSON.stringify(j).slice(0, 300)}`)
     } catch (e: any) { console.warn(`[wa-seed] ${t.name} failed: ${e?.message ?? e}`) }
   }
+  // Subscribe the platform WABA to our app's webhook so inbound (feedback button taps)
+  // actually reach us. The app webhook is already configured (tenant WhatsApp inbound
+  // works); this just adds the platform WABA. Idempotent — safe to re-run.
+  try {
+    const sub = await fetch(`${GRAPH}/${WABA}/subscribed_apps`, { method: 'POST', headers: { Authorization: `Bearer ${TOK}` } })
+    console.log(`[wa-seed] subscribe_apps: HTTP ${sub.status} ${JSON.stringify(await sub.json().catch(() => ({}))).slice(0, 200)}`)
+  } catch (e: any) { console.warn(`[wa-seed] subscribe_apps failed: ${e?.message ?? e}`) }
+  // Report current template review statuses so we can see approval progress in the log.
+  try {
+    const st: any = await (await fetch(`${GRAPH}/${WABA}/message_templates?fields=name,status,category&limit=30&access_token=${encodeURIComponent(TOK)}`)).json()
+    console.log('[wa-seed] template_statuses: ' + JSON.stringify((st?.data || []).map((x: any) => ({ n: x.name, s: x.status }))).slice(0, 500))
+  } catch (e: any) { console.warn(`[wa-seed] template status failed: ${e?.message ?? e}`) }
 }
 
 // Graceful shutdown — finish in-flight requests + close queue connections.
