@@ -33,6 +33,30 @@ const ALLOWED_MIME = new Set([
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_BYTES, files: 1 } })
 
+/** Rehost a remote image URL into OUR public `assets` bucket and return the branded
+ *  assets.getfrequency.app URL — so product images never depend on an aggregator's
+ *  expiring / hotlink-protected CDN link (Swiggy/Zomato). Best-effort: returns null on
+ *  ANY failure so the caller can fall back to the source URL. Validates it's an
+ *  allowlisted image ≤ MAX_BYTES; the `assets` library row is best-effort. */
+export async function rehostImageToAssets(supabase: SupabaseClient, tenantId: string, srcUrl: string): Promise<string | null> {
+  try {
+    if (!tenantId || !srcUrl || !/^https?:\/\//i.test(srcUrl)) return null
+    const resp = await fetch(srcUrl)
+    if (!resp.ok) return null
+    const mime = String(resp.headers.get('content-type') || '').toLowerCase().split(';')[0].trim()
+    if (!ALLOWED_MIME.has(mime) || !mime.startsWith('image/')) return null
+    const buf = Buffer.from(await resp.arrayBuffer())
+    if (!buf.length || buf.length > MAX_BYTES) return null
+    const ext = (mime.split('/')[1] || 'jpg').replace('jpeg', 'jpg').replace('+xml', '')
+    const path = `${tenantId}/${crypto.randomUUID()}-menu.${ext}`
+    const { error: upErr } = await supabase.storage.from(BUCKET).upload(path, buf, { contentType: mime, upsert: false })
+    if (upErr) return null
+    const url = `https://assets.getfrequency.app/${BUCKET}/${path}`
+    await supabase.from('assets').insert({ tenant_id: tenantId, name: 'Menu item image', url, storage_path: path, type: 'image', mime_type: mime, size_bytes: buf.length }).then(() => {}, () => {})
+    return url
+  } catch { return null }
+}
+
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps {
   supabase: SupabaseClient

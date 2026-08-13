@@ -28,6 +28,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { validateBody } from '../../validation'
 import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
 import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity } from '../../connectors/aggregator/menu-import'
+import { rehostImageToAssets } from '../assets.js'
 import { emitNotification, tenantNotifyRecipients } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -812,6 +813,8 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         aggregatorResId: outletRef,
         channel,
         dryRun: !!b.dryRun,
+        // Rehost aggregator photos into our asset bucket → store OUR permanent URL.
+        rehost: b.dryRun ? undefined : (u: string) => rehostImageToAssets(supabase, tenantId, u),
       })
       res.json(result)
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
