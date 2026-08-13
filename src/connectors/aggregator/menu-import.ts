@@ -466,8 +466,9 @@ export async function importMenuToStorefront(
       continue
     }
 
-    // UPDATE — only fields we own: price + availability (soldOut) + outlet scope.
-    // Leave name/description/veg/coins/options/image as the merchant curated them.
+    // UPDATE — only fields we own: price + availability (soldOut) + outlet scope, plus a
+    // one-way image BACKFILL (fill a blank image only). Leave name/description/veg/coins/
+    // options — and any EXISTING image — as the merchant curated them.
     const patch: any = {}
     const changes: Record<string, { from: any; to: any }> = {}
     // Storefront base = the HIGHER of the channels seen (Swiggy vs Zomato), so the
@@ -497,6 +498,13 @@ export async function importMenuToStorefront(
         patch.channels = merged
         changes.channels = { from: existing.channels ?? null, to: merged }
       }
+    }
+    // Backfill a MISSING image only — fill a blank item image from the aggregator (Swiggy/
+    // Zomato) photo, and NEVER overwrite a merchant-curated one. If the aggregator has no
+    // photo either, the item stays blank (per product decision 2026-08-13).
+    if (it.imageUrl && !existing.imageUrl) {
+      patch.imageUrl = it.imageUrl
+      changes.imageUrl = { from: existing.imageUrl ?? null, to: it.imageUrl }
     }
 
     if (Object.keys(patch).length === 0) {
