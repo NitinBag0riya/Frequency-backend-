@@ -6146,17 +6146,27 @@ async function seedPlatformWaTemplates(): Promise<void> {
   const LANG = process.env.FREQ_WA_TPL_LANG || 'en'
   if (!TOK) { console.warn('[wa-seed] SEED_WA_TEMPLATES=1 but FREQ_WA_ACCESS_TOKEN missing — skipped'); return }
   // The WABA id is easily confused with the Meta app id (which fails template creation).
-  // Derive the REAL WhatsApp Business Account id from the token's granular scopes; fall
-  // back to the env value only if derivation fails.
-  let WABA = process.env.FREQ_WA_WABA_ID || ''
+  // Discover the REAL WhatsApp Business Account id from the token itself, logging enough
+  // to pin it: (1) debug_token granular scopes, (2) the phone-number node's parent WABA.
+  let WABA = ''
   try {
     const dbg: any = await (await fetch(`${GRAPH}/debug_token?input_token=${encodeURIComponent(TOK)}&access_token=${encodeURIComponent(TOK)}`)).json()
-    const scopes: any[] = dbg?.data?.granular_scopes || []
-    const wm = scopes.find((s) => /whatsapp_business/.test(String(s?.scope || '')))
-    const derived = wm?.target_ids?.[0]
-    if (derived) { console.log(`[wa-seed] derived WABA ${derived} (env FREQ_WA_WABA_ID was ${WABA || 'unset'})`); WABA = String(derived) }
-  } catch (e: any) { console.warn(`[wa-seed] WABA derive failed: ${e?.message ?? e}`) }
-  if (!WABA) { console.warn('[wa-seed] no WABA id (env unset + derive failed) — skipped'); return }
+    console.log('[wa-seed] debug_token.data=' + JSON.stringify(dbg?.data ?? {}).slice(0, 900))
+    for (const s of (dbg?.data?.granular_scopes || [])) {
+      if (/whatsapp_business/.test(String(s?.scope || '')) && s?.target_ids?.[0]) { WABA = String(s.target_ids[0]); break }
+    }
+  } catch (e: any) { console.warn(`[wa-seed] debug_token failed: ${e?.message ?? e}`) }
+  const PN = process.env.FREQ_WA_PHONE_NUMBER_ID
+  if (!WABA && PN) {
+    try {
+      const p: any = await (await fetch(`${GRAPH}/${PN}?fields=id,display_phone_number,verified_name,whatsapp_business_account{id,name}&access_token=${encodeURIComponent(TOK)}`)).json()
+      console.log('[wa-seed] phone_node=' + JSON.stringify(p ?? {}).slice(0, 500))
+      if (p?.whatsapp_business_account?.id) WABA = String(p.whatsapp_business_account.id)
+    } catch (e: any) { console.warn(`[wa-seed] phone probe failed: ${e?.message ?? e}`) }
+  }
+  if (!WABA) WABA = process.env.FREQ_WA_WABA_ID || '' // last resort (may be the wrong app id)
+  console.log(`[wa-seed] using WABA=${WABA || '(none)'}`)
+  if (!WABA) { console.warn('[wa-seed] no WABA id discovered — skipped'); return }
   const ex = [['Aarav', 'La Fiamma', '8291']] // {{1}} name · {{2}} store · {{3}} order#
   const tpls = [
     { name: 'order_confirmed', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, your order at {{2}} is confirmed (#{{3}}). We will message you when there is an update. Thank you!', example: { body_text: ex } }] },
