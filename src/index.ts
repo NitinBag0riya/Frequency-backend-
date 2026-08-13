@@ -6131,7 +6131,36 @@ if (process.env.NODE_ENV !== 'production') attachDebugListeners()
 const server = app.listen(PORT, () => {
   console.log(`Frequency server running on http://localhost:${PORT}`)
   console.log(`  → Bull Board: http://localhost:${PORT}/admin/queues`)
+  void seedPlatformWaTemplates()
 })
+
+// One-time platform WhatsApp template seed. When SEED_WA_TEMPLATES=1 AND the FREQ_WA
+// platform WABA is configured, submit the two order templates (order_confirmed +
+// feedback_request) to Meta on boot — so the storefront order/feedback WhatsApp works
+// without anyone hand-creating templates in WhatsApp Manager. Idempotent (Meta rejects a
+// duplicate name+language, which we just log) and best-effort (any failure is caught and
+// never affects the server). Flip SEED_WA_TEMPLATES off once they appear in WA Manager.
+async function seedPlatformWaTemplates(): Promise<void> {
+  if (process.env.SEED_WA_TEMPLATES !== '1') return
+  const WABA = process.env.FREQ_WA_WABA_ID, TOK = process.env.FREQ_WA_ACCESS_TOKEN
+  const LANG = process.env.FREQ_WA_TPL_LANG || 'en'
+  if (!WABA || !TOK) { console.warn('[wa-seed] SEED_WA_TEMPLATES=1 but FREQ_WA_WABA_ID/ACCESS_TOKEN missing — skipped'); return }
+  const ex = [['Aarav', 'La Fiamma', '8291']] // {{1}} name · {{2}} store · {{3}} order#
+  const tpls = [
+    { name: 'order_confirmed', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, your order at {{2}} is confirmed (#{{3}}). We will message you when there is an update. Thank you!', example: { body_text: ex } }] },
+    { name: 'feedback_request', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, thanks for ordering from {{2}} (#{{3}})! How was it? Reply here with your feedback — we would love to hear from you.', example: { body_text: ex } }] },
+  ]
+  for (const t of tpls) {
+    try {
+      const r = await fetch(`${GRAPH}/${WABA}/message_templates`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOK}` },
+        body: JSON.stringify(t),
+      })
+      const j: any = await r.json().catch(() => ({}))
+      console.log(`[wa-seed] ${t.name}: HTTP ${r.status} ${JSON.stringify(j).slice(0, 300)}`)
+    } catch (e: any) { console.warn(`[wa-seed] ${t.name} failed: ${e?.message ?? e}`) }
+  }
+}
 
 // Graceful shutdown — finish in-flight requests + close queue connections.
 async function shutdown(signal: string) {
