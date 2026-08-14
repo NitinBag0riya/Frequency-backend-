@@ -161,7 +161,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
 
       let query = supabase.from('tenants')
         .select(`id, business_name, display_phone, waba_id, status, created_at, deleted_at,
-                 user_id,
+                 user_id, lifecycle_state, state_entered_at,
                  tenant_subscriptions ( plan_id, status, trial_ends_at, current_period_end )`,
           { count: 'exact' })
         .order('created_at', { ascending: false })
