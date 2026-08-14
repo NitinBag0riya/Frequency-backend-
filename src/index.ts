@@ -46,6 +46,9 @@ import { createNarutoTenantsRouter }       from './routes/naruto-tenants'
 import { createNarutoOnboardingRouter }    from './routes/naruto-onboarding'
 import { createNarutoCatalogImportRouter } from './routes/naruto-catalog-import'
 import { createNarutoStorefrontRouter }    from './routes/naruto-storefront'
+import { createNarutoSupportRouter }       from './routes/naruto-support'
+import { createNarutoPaymentsRouter }      from './routes/naruto-payments'
+import { createNarutoOrdersRouter }        from './routes/naruto-orders'
 import { touchLastActive }         from './lib/last-active'
 import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
@@ -5990,6 +5993,10 @@ app.use(createNarutoTenantsRouter({ supabase, requireAuth }))
 app.use(createNarutoOnboardingRouter({ supabase, requireAuth }))
 app.use(createNarutoCatalogImportRouter({ supabase, requireAuth }))
 app.use(createNarutoStorefrontRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 3: support console, payments/revenue, order oversight.
+app.use(createNarutoSupportRouter({ supabase, requireAuth }))
+app.use(createNarutoPaymentsRouter({ supabase, requireAuth }))
+app.use(createNarutoOrdersRouter({ supabase, requireAuth }))
 
 // ── Tenant team management (RBAC) ────────────────────────────────────────────
 app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))
