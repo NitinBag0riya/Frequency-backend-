@@ -75,6 +75,7 @@ export const ACTION_CAPABILITY: Record<string, PlatformCapability> = {
   'entitlement.bulk':       'entitlement.bulk.write',
   'payments.route_account': 'payments.route_account.write',
   'payments.payout':        'payments.route_account.write',
+  'payments.killswitch':    'payments.killswitch.write',
   'tenant.suspend':         'tenant.suspend',
   'tenant.delete':          'tenant.delete',
 }

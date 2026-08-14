@@ -52,6 +52,9 @@ import { createNarutoOrdersRouter }        from './routes/naruto-orders'
 import { createPlatformApprovalsRouter }   from './routes/platform-approvals'
 import { createNarutoBulkEntitlementsRouter } from './routes/naruto-bulk-entitlements'
 import { createNarutoPlansRouter }         from './routes/naruto-plans'
+import { createNarutoNudgesRouter }        from './routes/naruto-nudges'
+import { createNarutoGrowthRouter }        from './routes/naruto-growth'
+import { createNarutoTenantReportsRouter } from './routes/naruto-tenant-reports'
 import { touchLastActive }         from './lib/last-active'
 import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
@@ -6004,6 +6007,10 @@ app.use(createNarutoOrdersRouter({ supabase, requireAuth }))
 app.use(createPlatformApprovalsRouter({ supabase, requireAuth }))
 app.use(createNarutoBulkEntitlementsRouter({ supabase, requireAuth }))
 app.use(createNarutoPlansRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 5: nudge engine + platform notifications, growth analytics, per-tenant reports.
+app.use(createNarutoNudgesRouter({ supabase, requireAuth }))
+app.use(createNarutoGrowthRouter({ supabase, requireAuth }))
+app.use(createNarutoTenantReportsRouter({ supabase, requireAuth }))
 
 // ── Tenant team management (RBAC) ────────────────────────────────────────────
 app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))

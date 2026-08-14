@@ -47,6 +47,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { requirePlatformCapability } from '../lib/platform-guard'
 import { recordPlatformAudit } from '../lib/platform-audit'
 import { businessGroup, decideFeature, type BusinessGroup } from '../lib/entitlements'
+import { withApproval, registerPlatformAction, BreakGlassDenied, type ActionExecutor } from './platform-approvals'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -318,6 +319,44 @@ export function createNarutoBulkEntitlementsRouter(deps: Deps): express.Router {
   // config. entitlement.bulk.write is the only capability this surface uses.
   const gate = [requireAuth, requirePlatformCapability(supabase, 'entitlement.bulk.write')] as const
 
+  // Bulk-apply executor — the replayable job-creation body (§2.3). Registered at
+  // setup so an approval survives a process restart between propose and approve.
+  // Auditing is owned by withApproval; this must NOT write its own audit row.
+  const bulkApplyExecutor: ActionExecutor = async ({ args }) => {
+    const { ids, action, reason, filter, idempotencyKey, actorId } = args
+    // Idempotency — a double-clicked Apply returns the first job, no re-fan-out.
+    if (idempotencyKey) {
+      const { data: existing } = await supabase.from('entitlement_bulk_jobs')
+        .select('*').eq('actor_user_id', actorId).eq('idempotency_key', idempotencyKey).maybeSingle()
+      if (existing) return { job: existing, deduped: true }
+    }
+    const items = await planSelection(supabase, ids, action)
+    const affected = items.filter(i => !i.noop)
+    const noopCount = items.length - affected.length
+    const { data: job, error: jobErr } = await supabase.from('entitlement_bulk_jobs').insert({
+      actor_user_id: actorId, action, filter, status: 'running',
+      total: items.length, affected: affected.length, noop: noopCount, reason, idempotency_key: idempotencyKey,
+    }).select().single()
+    if (jobErr || !job) {
+      if (idempotencyKey) {
+        const { data: raced } = await supabase.from('entitlement_bulk_jobs')
+          .select('*').eq('actor_user_id', actorId).eq('idempotency_key', idempotencyKey).maybeSingle()
+        if (raced) return { job: raced, deduped: true }
+      }
+      throw new Error(jobErr?.message ?? 'could not create job')
+    }
+    const itemRows = items.map(i => ({
+      job_id: job.id, tenant_id: i.tenantId, tenant_name: i.name,
+      status: i.noop ? 'noop' : 'pending', before_json: i.before_json, after_json: i.after_json,
+    }))
+    const { error: itemErr } = await supabase.from('entitlement_bulk_job_items').insert(itemRows)
+    if (itemErr) throw new Error(itemErr.message)
+    // Fire-and-forget — non-blocking. The FE polls GET /jobs/:id.
+    void runJob(supabase, job.id)
+    return { job, affected: affected.length, noop: noopCount, total: items.length }
+  }
+  registerPlatformAction('entitlement.bulk', bulkApplyExecutor)
+
   // ── 1. Filter tenants ──────────────────────────────────────────────────────
   // vertical / plan / lifecycle / feature-state (current override for ?feature=).
   router.get(`${P}/tenants`, ...gate, async (req, res) => {
@@ -406,63 +445,21 @@ export function createNarutoBulkEntitlementsRouter(deps: Deps): express.Router {
     const actorId = (req as any).user?.id ?? null
 
     try {
-      // Idempotency — a double-clicked Apply returns the first job, no re-fan-out.
-      if (idempotencyKey) {
-        const { data: existing } = await supabase.from('entitlement_bulk_jobs')
-          .select('*').eq('actor_user_id', actorId).eq('idempotency_key', idempotencyKey).maybeSingle()
-        if (existing) { res.json({ job: existing, deduped: true }); return }
-      }
-
-      const items = await planSelection(supabase, t.ids, a.action)
-      const affected = items.filter(i => !i.noop)
-      const noopCount = items.length - affected.length
-
-      const { data: job, error: jobErr } = await supabase.from('entitlement_bulk_jobs').insert({
-        actor_user_id: actorId,
-        action: a.action,
-        filter,
-        status: 'running',
-        total: items.length,
-        affected: affected.length,
-        noop: noopCount,
-        reason,
-        idempotency_key: idempotencyKey,
-      }).select().single()
-      if (jobErr || !job) {
-        // Unique-violation on idempotency key → fetch + return the winner.
-        if (idempotencyKey) {
-          const { data: raced } = await supabase.from('entitlement_bulk_jobs')
-            .select('*').eq('actor_user_id', actorId).eq('idempotency_key', idempotencyKey).maybeSingle()
-          if (raced) { res.json({ job: raced, deduped: true }); return }
-        }
-        res.status(500).json({ error: jobErr?.message ?? 'could not create job' }); return
-      }
-
-      // One item per tenant — no-ops recorded immediately for a complete report.
-      const itemRows = items.map(i => ({
-        job_id: job.id,
-        tenant_id: i.tenantId,
-        tenant_name: i.name,
-        status: i.noop ? 'noop' : 'pending',
-        before_json: i.before_json,
-        after_json: i.after_json,
-      }))
-      const { error: itemErr } = await supabase.from('entitlement_bulk_job_items').insert(itemRows)
-      if (itemErr) { res.status(500).json({ error: itemErr.message }); return }
-
-      await recordPlatformAudit(supabase, req, {
-        capability: 'entitlement.bulk.write',
-        action: 'entitlement.bulk.apply',
+      // §2.3 — a bulk change is a §1.2 dangerous action. An approval rule may gate
+      // it (propose → second approver → the SAME executor runs on approve). No rule
+      // → applies immediately + audits here (withApproval owns the audit row).
+      const out = await withApproval({
+        supabase, req, action: 'entitlement.bulk',
+        reason: reason ?? 'Bulk entitlement change',
+        breakGlass: !!req.body?.break_glass,
         before: null,
-        after: { job_id: job.id, action: a.action, total: items.length, affected: affected.length, noop: noopCount },
-        reason,
+        args: { ids: t.ids, action: a.action, reason, filter, idempotencyKey, actorId },
+        apply: bulkApplyExecutor,
       })
-
-      // Fire-and-forget — non-blocking. The FE polls GET /jobs/:id.
-      void runJob(supabase, job.id)
-
-      res.json({ job, affected: affected.length, noop: noopCount, total: items.length })
+      if (out.status === 'pending') { res.json(out); return }
+      res.json(out.result)
     } catch (e: any) {
+      if (e instanceof BreakGlassDenied) { res.status(403).json({ error: e.message }); return }
       res.status(500).json({ error: e?.message ?? 'apply failed' })
     }
   })

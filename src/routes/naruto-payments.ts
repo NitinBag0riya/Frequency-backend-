@@ -30,7 +30,7 @@
 import express from 'express'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { requirePlatformCapability } from '../lib/platform-guard.js'
-import { recordPlatformAudit } from '../lib/platform-audit.js'
+import { withApproval, registerPlatformAction, BreakGlassDenied, type ActionExecutor } from './platform-approvals.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw }
@@ -234,6 +234,14 @@ async function tenantMetaBySlug(supabase: SupabaseClient): Promise<Map<string, T
 export function createNarutoPaymentsRouter({ supabase, requireAuth }: Deps): express.Router {
   const r = express.Router()
 
+  // Kill-switch executor — registered at setup so an approval survives a process
+  // restart between propose and approve (§1.2). Auditing owned by withApproval.
+  const killswitchExecutor: ActionExecutor = async ({ args }) => {
+    await sfConfigPatch(args.slug, { settings: { payments: { online: args.online } } })
+    return { online: args.online, slug: args.slug }
+  }
+  registerPlatformAction('payments.killswitch', killswitchExecutor)
+
   // ── 1. Transactions ledger (server-paginated) ──────────────────────────────
   r.get('/api/super-admin/payments/ledger',
     requireAuth, requirePlatformCapability(supabase, 'payments.read'),
@@ -350,21 +358,22 @@ export function createNarutoPaymentsRouter({ supabase, requireAuth }: Deps): exp
       const slug = (t as any)?.slug
       if (!slug) { res.status(404).json({ error: 'unknown tenant' }); return }
       try {
-        await sfConfigPatch(slug, { settings: { payments: { online } } })
-        await recordPlatformAudit(supabase, req, {
-          capability: 'payments.killswitch.write',
-          action: online ? 'payments.online.enable' : 'payments.online.disable',
-          tenant_id: tenantId,
-          before: { 'payments.online': !online },
-          after: { 'payments.online': online },
-          reason,
+        // §1.2 — an approval rule may gate the kill switch. No rule → applies now
+        // + audits (withApproval owns the audit row). Best-effort merchant notify
+        // still pending (see WIRE note): the audit row + storefront change are the
+        // durable record until a merchant-notify primitive exists.
+        const out = await withApproval({
+          supabase, req, action: 'payments.killswitch', tenantId, reason,
+          breakGlass: !!(req.body ?? {}).break_glass,
+          args: { slug, online }, before: { 'payments.online': !online },
+          apply: killswitchExecutor,
         })
-        // Best-effort merchant notification. WIRE(naruto): route a merchant-facing alert
-        // (email/WhatsApp to the owner) that online payments were toggled by the platform —
-        // there is no single merchant-notify primitive to reuse safely here yet. The audit
-        // row + tenant-visible storefront change are the durable record until then.
-        res.json({ ok: true, online, slug })
-      } catch (e: any) { res.status(502).json({ error: e?.message || 'kill switch failed' }) }
+        if (out.status === 'pending') { res.json(out); return }
+        res.json({ ok: true, online, slug, ...(out.breakGlass ? { breakGlass: true } : {}) })
+      } catch (e: any) {
+        if (e instanceof BreakGlassDenied) { res.status(403).json({ error: e.message }); return }
+        res.status(502).json({ error: e?.message || 'kill switch failed' })
+      }
     })
 
   return r
