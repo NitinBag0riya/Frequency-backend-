@@ -233,7 +233,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   // exist: no creds → {ok:false, skipped}. Never throws to the caller.
   r.post('/api/storefront/send-whatsapp', async (req, res) => {
     if (!adminOk(req)) return res.status(401).json({ ok: false, error: 'unauthorized' })
-    const { slug, phone, template, params } = (req.body || {}) as { slug?: string; phone?: string; template?: string; params?: string[] }
+    const { slug, phone, template, params, flow } = (req.body || {}) as { slug?: string; phone?: string; template?: string; params?: string[]; flow?: boolean }
     if (!slug || !phone || !template) return res.status(400).json({ ok: false, error: 'slug, phone and template required' })
     const ph = String(phone).replace(/\D/g, '')
     if (!ph) return res.status(400).json({ ok: false, error: 'bad phone' })
@@ -247,9 +247,14 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       if (!tenantId) return res.status(404).json({ ok: false, error: 'unknown tenant' })
       const creds = await resolveWaCreds(supabase, tenantId)
       if (!creds || !creds.phoneNumberId || !creds.accessToken) return res.json({ ok: false, skipped: 'no_wa_sender' })
-      const components = Array.isArray(params) && params.length
+      const components: any[] = Array.isArray(params) && params.length
         ? [{ type: 'body', parameters: params.map((p) => ({ type: 'text', text: String(p).slice(0, 180) })) }]
         : []
+      // Flow-launch template: append the FLOW button so tapping it opens the flow.
+      // Unique flow_token per send (runtime, not a workflow script).
+      if (flow === true) {
+        components.push({ type: 'button', sub_type: 'flow', index: '0', parameters: [{ type: 'action', action: { flow_token: `${slug}:${ph}:${Date.now()}` } }] })
+      }
       const wr = await fetch(`https://graph.facebook.com/v21.0/${creds.phoneNumberId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.accessToken}` },

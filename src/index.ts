@@ -4184,15 +4184,27 @@ async function sendPlatformWaText(to: string, body: string): Promise<void> {
 /** If this inbound message is a recognised feedback-button reply, capture the rating via
  *  storefront-api and send the branch reply. No-op otherwise. */
 async function maybeHandleFeedbackReply(msg: any): Promise<void> {
+  // Two shapes map to the same "record this rating" action:
+  //  (a) quick-reply BUTTON tap  → rating from the button label (no written review)
+  //  (b) FLOW completion (nfm_reply) → { rating:"1".."5", review } from response_json
   const label = String(msg?.button?.text ?? msg?.interactive?.button_reply?.title ?? '').trim()
-  const rating = FEEDBACK_BUTTON_RATING[label]
+  let rating = FEEDBACK_BUTTON_RATING[label]
+  let review = ''
+  if (!rating && msg?.type === 'interactive' && msg?.interactive?.type === 'nfm_reply') {
+    try {
+      const d = JSON.parse(msg.interactive.nfm_reply?.response_json ?? '{}')
+      const n = Number(d?.rating)
+      if (n >= 1 && n <= 5) rating = n
+      review = String(d?.review ?? '').trim()
+    } catch { /* not a feedback flow submission — ignore */ }
+  }
   if (!rating) return
   const base = process.env.STOREFRONT_API_URL, secret = process.env.STOREFRONT_ADMIN_SECRET
   if (!base || !secret) return
   try {
     const r = await fetch(`${base}/v1/feedback/by-phone`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': secret },
-      body: JSON.stringify({ phone: String(msg.from || ''), rating }),
+      body: JSON.stringify({ phone: String(msg.from || ''), rating, ...(review ? { review } : {}) }),
     })
     const j: any = await r.json().catch(() => ({}))
     if (!j?.found) return
@@ -6302,6 +6314,25 @@ async function seedPlatformWaTemplates(): Promise<void> {
         const pub: any = await (await fetch(`${GRAPH}/${flowId}/publish?access_token=${encodeURIComponent(TOK)}`, { method: 'POST' })).json()
         console.log(`[wa-seed] flow publish: ${JSON.stringify(pub).slice(0, 200)}`)
       }
+    }
+    // Flow-LAUNCH template: a UTILITY message whose single FLOW button opens the
+    // feedback_review flow above (navigate → FEEDBACK screen). This is what we send
+    // post-delivery to collect the rating + written review. Idempotent — Meta returns
+    // "already exists" on re-run, which we just log.
+    if (flowId) {
+      try {
+        const t = { name: 'feedback_flow', language: LANG, category: 'UTILITY', components: [
+          { type: 'BODY', text: 'Hi {{1}}, how was your order from {{2}} (#{{3}})? Tap below to rate and review — it takes 10 seconds and helps us improve.', example: { body_text: ex } },
+          { type: 'BUTTONS', buttons: [
+            { type: 'FLOW', text: 'Give feedback', flow_id: flowId, flow_action: 'navigate', navigate_screen: 'FEEDBACK' },
+          ] },
+        ] }
+        const r = await fetch(`${GRAPH}/${WABA}/message_templates`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOK}` },
+          body: JSON.stringify(t),
+        })
+        console.log(`[wa-seed] feedback_flow: HTTP ${r.status} ${JSON.stringify(await r.json().catch(() => ({}))).slice(0, 300)}`)
+      } catch (e: any) { console.warn(`[wa-seed] feedback_flow failed: ${e?.message ?? e}`) }
     }
   } catch (e: any) { console.warn(`[wa-seed] flow failed: ${e?.message ?? e}`) }
   // Report current template review statuses so we can see approval progress in the log.
