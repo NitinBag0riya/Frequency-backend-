@@ -48,9 +48,16 @@
  */
 
 import express from 'express'
-import jwt, { randomUUID } from 'crypto'   // Node built-in crypto for JWT signing + handoff IDs
+import { randomUUID } from 'crypto'   // one-time handoff IDs
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sanitizeSearch } from '../lib/safe-key'
+// Naruto Platform OS §1 — capability model. New endpoints gate on capability
+// strings via requirePlatformCapability + audit through recordPlatformAudit.
+import { requirePlatformCapability, resolvePlatformRole } from '../lib/platform-guard'
+import { normalizeRole, capabilitiesFor } from '../lib/platform-rbac'
+import { recordPlatformAudit } from '../lib/platform-audit'
+import { mintImpersonationToken } from '../lib/platform-impersonation'
+import { withApproval, registerPlatformAction, BreakGlassDenied, type ActionExecutor } from './platform-approvals'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -121,6 +128,73 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
   const r = express.Router()
   const { supabase, requireAuth } = deps
 
+  // ── FE role source (§1.1) ──────────────────────────────────────────────────
+  // The shell learns the caller's REAL platform role + capability set so client
+  // gating is granular (support ≠ owner) instead of "everyone is super_admin".
+  // Cosmetic only — every mutation stays server-enforced. Any authed platform
+  // user reads their own role; a non-platform user gets 403.
+  r.get('/api/naruto/whoami', requireAuth, async (req, res) => {
+    const user = (req as any).user
+    const canonical = normalizeRole(await resolvePlatformRole(supabase, user.id))
+    if (!canonical) { res.status(403).json({ error: 'Not a platform user' }); return }
+    res.json({ roleKey: canonical, capabilities: [...capabilitiesFor(canonical)] })
+  })
+
+  // ── Dangerous-action executors (registered at setup so an approval survives a
+  // process restart between propose and approve — §1.2). Each is the replayable
+  // mutation body; auditing is owned by withApproval, not these. ──────────────
+  const suspendExecutor: ActionExecutor = async ({ supabase, req, tenantId, args }) => {
+    const userId = (req as any).user.id
+    const { error } = await supabase.from('tenants').update({
+      status: 'suspended', status_changed_at: new Date().toISOString(),
+      status_changed_by: userId, status_change_reason: args.reason,
+    }).eq('id', tenantId)
+    if (error) throw new Error(error.message)
+    await supabase.from('tenant_subscriptions').update({ status: 'suspended' }).eq('tenant_id', tenantId)
+    return { status: 'suspended' }
+  }
+  const deleteExecutor: ActionExecutor = async ({ supabase, req, tenantId, args }) => {
+    const userId = (req as any).user.id
+    const { error } = await supabase.from('tenants').update({
+      status: 'deleted', deleted_at: new Date().toISOString(),
+      status_changed_by: userId, status_change_reason: args.reason,
+    }).eq('id', tenantId)
+    if (error) throw new Error(error.message)
+    return { status: 'deleted', scheduled_for_hard_delete_after_days: 30 }
+  }
+  const subscriptionExecutor: ActionExecutor = async ({ supabase, tenantId, args }) => {
+    const { data, error } = await supabase.from('tenant_subscriptions').update(args.patch).eq('tenant_id', tenantId).select().single()
+    if (error) throw new Error((error as any).code === 'PGRST116' ? 'not found' : error.message)
+    return data
+  }
+  registerPlatformAction('tenant.suspend', suspendExecutor)
+  registerPlatformAction('tenant.delete', deleteExecutor)
+  registerPlatformAction('plan.downgrade', subscriptionExecutor)
+
+  // ── WIRE(naruto) — capability migration map ────────────────────────────────
+  // These endpoints still use the legacy requirePlatformPerm(feature, action)
+  // matrix. Migrate each to requirePlatformCapability(supabase, <capability>)
+  // + recordPlatformAudit (before/after diff). Two are already migrated below
+  // as the reference pattern: POST .../entitlement and POST .../impersonate.
+  //
+  //   GET  /tenants, /tenants/:id, /recent-signups, /stats,
+  //        /mrr-trend, /vertical-stats, /activation-funnel, /agencies*  → 'tenant.read'
+  //   POST /tenants/:id/suspend                                          → 'tenant.suspend'
+  //   POST /tenants/:id/reactivate                                       → 'tenant.write'
+  //   DELETE /tenants/:id                                                → 'tenant.delete'
+  //   GET  /tenants/:id/export                                           → 'tenant.export'
+  //   GET  /plans, /features, /plan-features, /entitlement-matrix        → 'plan.read'
+  //   POST/PATCH/DELETE /plans, PATCH /features, PUT /plans/:id/features → 'plan.pricing.write'
+  //   GET  /roles                                                        → 'role.read'
+  //   PATCH/DELETE /roles/:id                                            → 'role.write'
+  //   GET  /audit, /webhook-failures*                                    → 'audit.read'
+  //   POST /webhook-failures/:id/replay                                  → 'support.fix.run'
+  //   GET/PATCH /feature-flags*                                          → 'feature_flag.write' (PATCH)
+  //   GET/POST/DELETE /announcements*                                    → 'announcement.write'
+  //   GET/PATCH /approval-rules*                                         → 'approval_rule.write'
+  //   POST /tenants/:id/subscription                                     → 'plan.assign.write'
+  // Reveal of masked secrets anywhere → gate on 'secret.reveal' + re-auth.
+
   // ─── Tenants ──────────────────────────────────────────────────────────────
   r.get('/api/super-admin/tenants',
     requireAuth, requirePlatformPerm(supabase, 'tenants', 'view'),
@@ -132,7 +206,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
 
       let query = supabase.from('tenants')
         .select(`id, business_name, display_phone, waba_id, status, created_at, deleted_at,
-                 user_id,
+                 user_id, lifecycle_state, state_entered_at,
                  tenant_subscriptions ( plan_id, status, trial_ends_at, current_period_end )`,
           { count: 'exact' })
         .order('created_at', { ascending: false })
@@ -182,26 +256,25 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
     })
 
   r.post('/api/super-admin/tenants/:id/suspend',
-    requireAuth, requirePlatformPerm(supabase, 'tenants', 'edit'),
+    requireAuth, requirePlatformCapability(supabase, 'tenant.suspend'),
     async (req, res) => {
       const id = String(req.params.id)
       const reason = String(req.body?.reason ?? '').trim()
       if (!reason) { res.status(400).json({ error: 'Reason required for suspend' }); return }
-
-      const userId = (req as any).user.id
-      const { error } = await supabase.from('tenants').update({
-        status: 'suspended',
-        status_changed_at: new Date().toISOString(),
-        status_changed_by: userId,
-        status_change_reason: reason,
-      }).eq('id', id)
-      if (error) { res.status(500).json({ error: error.message }); return }
-
-      // Mirror onto subscription so quota checks treat as suspended
-      await supabase.from('tenant_subscriptions').update({ status: 'suspended' }).eq('tenant_id', id)
-
-      await audit(supabase, req, { action: 'tenant.suspend', target_tenant_id: id, reason })
-      res.json({ success: true })
+      try {
+        // §1.2 dangerous action → approval rule may gate it. No rule → applies now.
+        const out = await withApproval({
+          supabase, req, action: 'tenant.suspend', tenantId: id, reason,
+          breakGlass: !!req.body?.break_glass, args: { reason },
+          before: async () => (await supabase.from('tenants').select('status').eq('id', id).maybeSingle()).data ?? null,
+          apply: suspendExecutor,
+        })
+        if (out.status === 'pending') { res.json(out); return }
+        res.json({ success: true, ...(out.breakGlass ? { breakGlass: true } : {}) })
+      } catch (e: any) {
+        if (e instanceof BreakGlassDenied) { res.status(403).json({ error: e.message }); return }
+        res.status(500).json({ error: e?.message ?? 'suspend failed' })
+      }
     })
 
   r.post('/api/super-admin/tenants/:id/reactivate',
@@ -227,32 +300,35 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
     })
 
   r.delete('/api/super-admin/tenants/:id',
-    requireAuth, requirePlatformPerm(supabase, 'tenants', 'delete'),
+    requireAuth, requirePlatformCapability(supabase, 'tenant.delete'),
     async (req, res) => {
       const id = String(req.params.id)
       const reason = String(req.body?.reason ?? '').trim()
       const confirm = String(req.body?.confirm_name ?? '').trim()
       if (!reason) { res.status(400).json({ error: 'Reason required' }); return }
 
-      // GitHub-style "type org name to confirm"
+      // GitHub-style "type org name to confirm" — validate BEFORE proposing/applying.
       const { data: tenant } = await supabase.from('tenants')
-        .select('business_name').eq('id', id).maybeSingle()
+        .select('business_name, status').eq('id', id).maybeSingle()
       if (!tenant) { res.status(404).json({ error: 'Tenant not found' }); return }
       if (tenant.business_name && confirm !== tenant.business_name) {
         res.status(400).json({ error: `Type the org name to confirm: "${tenant.business_name}"` }); return
       }
 
-      // Soft delete — hard cascade after grace period (separate cron worker)
-      const userId = (req as any).user.id
-      await supabase.from('tenants').update({
-        status: 'deleted',
-        deleted_at: new Date().toISOString(),
-        status_changed_by: userId,
-        status_change_reason: reason,
-      }).eq('id', id)
-
-      await audit(supabase, req, { action: 'tenant.delete_soft', target_tenant_id: id, reason })
-      res.json({ success: true, scheduled_for_hard_delete_after_days: 30 })
+      try {
+        // §1.2 dangerous action → approval rule may gate it. No rule → applies now.
+        const out = await withApproval({
+          supabase, req, action: 'tenant.delete', tenantId: id, reason,
+          breakGlass: !!req.body?.break_glass, args: { reason },
+          before: { status: tenant.status },
+          apply: deleteExecutor,
+        })
+        if (out.status === 'pending') { res.json(out); return }
+        res.json({ success: true, scheduled_for_hard_delete_after_days: 30, ...(out.breakGlass ? { breakGlass: true } : {}) })
+      } catch (e: any) {
+        if (e instanceof BreakGlassDenied) { res.status(403).json({ error: e.message }); return }
+        res.status(500).json({ error: e?.message ?? 'delete failed' })
+      }
     })
 
   // Data export bundle — the "export" half of export-then-delete. Returns the
@@ -399,7 +475,8 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
 
   // ─── Per-tenant entitlement editor (allow / deny / reset + reason/expiry/quota) ─
   // is_enabled: true=force-on, false=force-off, null=reset (delete row → back to plan default).
-  r.post('/api/super-admin/tenants/:id/entitlement', requireAuth, requirePlatformPerm(supabase, 'tenants', 'edit'),
+  // REFERENCE PATTERN (naruto §1): capability guard + before→after audit diff.
+  r.post('/api/super-admin/tenants/:id/entitlement', requireAuth, requirePlatformCapability(supabase, 'tenant.entitlement.write'),
     async (req, res) => {
       const tenantId = String(req.params.id)
       const { feature, is_enabled, reason, expires_at, quota_override } = req.body ?? {}
@@ -409,11 +486,16 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       if (expires_at != null && Number.isNaN(new Date(expires_at).getTime())) { res.status(400).json({ error: 'expires_at must be an ISO timestamp' }); return }
       if (quota_override != null && (typeof quota_override !== 'object' || Array.isArray(quota_override))) { res.status(400).json({ error: 'quota_override must be an object' }); return }
 
+      // Capture the prior override row so the audit carries a real diff.
+      const { data: before } = await supabase.from('tenant_entitlements')
+        .select('feature, is_enabled, override_reason, expires_at, quota_override')
+        .eq('tenant_id', tenantId).eq('feature', feature).maybeSingle()
+
       if (is_enabled === null && quota_override == null) {
         // Reset — remove the override row entirely.
         const { error } = await supabase.from('tenant_entitlements').delete().eq('tenant_id', tenantId).eq('feature', feature)
         if (error) { res.status(500).json({ error: error.message }); return }
-        await audit(supabase, req, { action: 'entitlement.reset', target_tenant_id: tenantId, payload: { feature }, reason })
+        await recordPlatformAudit(supabase, req, { capability: 'tenant.entitlement.write', action: 'entitlement.reset', tenant_id: tenantId, before, after: null, reason })
         res.json({ success: true, reset: true }); return
       }
       const user = (req as any).user
@@ -428,7 +510,12 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       }
       const { error } = await supabase.from('tenant_entitlements').upsert(row, { onConflict: 'tenant_id,feature' })
       if (error) { res.status(500).json({ error: error.message }); return }
-      await audit(supabase, req, { action: 'entitlement.set', target_tenant_id: tenantId, payload: { feature, is_enabled, expires_at, quota_override }, reason })
+      await recordPlatformAudit(supabase, req, {
+        capability: 'tenant.entitlement.write', action: 'entitlement.set', tenant_id: tenantId,
+        before,
+        after: { feature, is_enabled: row.is_enabled, override_reason: row.override_reason, expires_at: row.expires_at, quota_override: row.quota_override },
+        reason,
+      })
       res.json({ success: true })
     })
 
@@ -525,52 +612,47 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
     }
   }, 60_000).unref?.()
 
+  // REFERENCE PATTERN (naruto §1.2): capability guard + reason REQUIRED + TTL
+  // default 30m + read-only by default. Token minted via the shared
+  // impersonation model (platform-impersonation.ts).
   r.post('/api/super-admin/tenants/:id/impersonate',
-    requireAuth, requirePlatformPerm(supabase, 'impersonate', 'edit'),
+    requireAuth, requirePlatformCapability(supabase, 'tenant.impersonate'),
     async (req, res) => {
       const tenantId = String(req.params.id)
       const userId = (req as any).user.id
-      const reason = String(req.body?.reason ?? '').trim() || 'Support ticket'
+      const reason = String(req.body?.reason ?? '').trim()
+      if (!reason) { res.status(400).json({ error: 'Reason required to impersonate.' }); return }
 
+      // Optional override of the 30-min default via the feature flag.
       const { data: ttlFlag } = await supabase.from('feature_flags')
         .select('value_json').eq('key', 'impersonation_ttl_minutes').maybeSingle()
-      const ttlMinutes = (ttlFlag?.value_json as any)?.value ?? 60
+      const ttlMinutes = Number((ttlFlag?.value_json as any)?.value) || undefined
 
-      const expiresAt = Date.now() + ttlMinutes * 60 * 1000
-      const payload = { typ: 'imp', actor: userId, tenant_id: tenantId, exp: expiresAt, read_only: true }
-      // Dedicated impersonation secret. Must be a long random string. Refuses
-      // to mint if missing in production — a hardcoded fallback like
-      // 'dev-secret' would let any code-leak forge tenant-impersonation
-      // tokens. Falls back to GOOGLE_TOKEN_SECRET (the legacy var) for backward
-      // compat during deploys, but prefer the dedicated one going forward.
-      const secret = process.env.IMPERSONATION_HMAC_SECRET ?? process.env.GOOGLE_TOKEN_SECRET
-      if (!secret || secret.length < 32) {
-        if (process.env.NODE_ENV === 'production') {
-          res.status(503).json({ error: 'Impersonation not configured. Set IMPERSONATION_HMAC_SECRET (≥32 chars) on the server.' })
-          return
-        }
-        // Dev: warn loudly but still mint so local dev isn't blocked.
-        console.warn('[super-admin] WARNING: minting impersonation token with weak/missing secret. Set IMPERSONATION_HMAC_SECRET.')
+      let minted
+      try {
+        // read_only by default — write-mode is a separate elevation gated by
+        // owner approval / an approval rule (not exposed here yet).
+        minted = mintImpersonationToken({ actor: userId, tenant_id: tenantId, reason, ttlMinutes })
+      } catch {
+        res.status(503).json({ error: 'Impersonation not configured. Set IMPERSONATION_HMAC_SECRET (≥32 chars) on the server.' })
+        return
       }
-      const effectiveSecret = secret && secret.length >= 32 ? secret : `dev-only-${process.pid}-${Date.now()}`
-      const data = Buffer.from(JSON.stringify(payload)).toString('base64url')
-      const sig = jwt.createHmac('sha256', effectiveSecret).update(data).digest('base64url')
-      const token = `${data}.${sig}`
 
-      // Stash the JWT under a random one-time handoff id.
+      // Stash the JWT under a random one-time handoff id (JWT never in a URL).
       const handoffId = randomUUID()
       pendingHandoffs.set(handoffId, {
         actor_user_id: userId,
-        token,
-        expires_at: new Date(expiresAt).toISOString(),
+        token: minted.token,
+        expires_at: minted.expires_at,
         tenant_id: tenantId,
-        read_only: true,
+        read_only: minted.session.read_only,
         created_at: Date.now(),
       })
 
-      await audit(supabase, req, { action: 'impersonate.start', target_tenant_id: tenantId, reason, payload: { ttl_minutes: ttlMinutes } })
-      // Return only the handoff id — caller opens a new tab with it, the new
-      // tab claims it, JWT never appears in any URL.
+      await recordPlatformAudit(supabase, req, {
+        capability: 'tenant.impersonate', action: 'impersonate.start', tenant_id: tenantId, reason,
+        after: { expires_at: minted.expires_at, read_only: minted.session.read_only },
+      })
       res.json({ handoff_id: handoffId, handoff_expires_in_ms: HANDOFF_TTL_MS })
     })
 
@@ -693,19 +775,50 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
     })
 
   // ─── Subscription change (extend trial / change plan) ─────────────────────
-  r.post('/api/super-admin/tenants/:id/subscription', requireAuth, requirePlatformPerm(supabase, 'subscriptions', 'edit'),
+  r.post('/api/super-admin/tenants/:id/subscription', requireAuth, requirePlatformCapability(supabase, 'plan.assign.write'),
     async (req, res) => {
       const tenantId = String(req.params.id)
       const { plan_id, extend_trial_days, status, reason } = req.body
       const patch: Record<string, any> = { updated_at: new Date().toISOString() }
       if (plan_id) patch.plan_id = plan_id
       if (status)  patch.status  = status
+      const { data: curSub } = await supabase.from('tenant_subscriptions').select('plan_id, trial_ends_at').eq('tenant_id', tenantId).maybeSingle()
       if (extend_trial_days) {
-        const { data: cur } = await supabase.from('tenant_subscriptions').select('trial_ends_at').eq('tenant_id', tenantId).maybeSingle()
-        const base = cur?.trial_ends_at ? new Date(cur.trial_ends_at) : new Date()
+        const base = curSub?.trial_ends_at ? new Date(curSub.trial_ends_at) : new Date()
         base.setDate(base.getDate() + Number(extend_trial_days))
         patch.trial_ends_at = base.toISOString()
       }
+
+      // Is this a DOWNGRADE? (§1.2 gates downgrades only; upgrades/trial/status stay
+      // direct.) Compare monthly price of target vs current plan — lower = downgrade.
+      // Enterprise custom sentinel (-1) is uncomparable → treated as non-downgrade.
+      let isDowngrade = false
+      if (plan_id && curSub?.plan_id && curSub.plan_id !== plan_id) {
+        const { data: prices } = await supabase.from('plans').select('id, monthly_price_inr').in('id', [curSub.plan_id, plan_id])
+        const priceOf = (pid: string) => Number((prices ?? []).find((p: any) => p.id === pid)?.monthly_price_inr ?? 0)
+        const cur = priceOf(curSub.plan_id), tgt = priceOf(plan_id)
+        isDowngrade = cur >= 0 && tgt >= 0 && tgt < cur
+      }
+
+      if (isDowngrade) {
+        try {
+          const out = await withApproval({
+            supabase, req, action: 'plan.downgrade', tenantId,
+            reason: String(reason ?? '').trim() || 'Plan downgrade',
+            breakGlass: !!req.body?.break_glass, args: { patch },
+            before: { plan_id: curSub?.plan_id ?? null },
+            apply: subscriptionExecutor,
+          })
+          if (out.status === 'pending') { res.json(out); return }
+          res.json(out.result)
+        } catch (e: any) {
+          if (e instanceof BreakGlassDenied) { res.status(403).json({ error: e.message }); return }
+          res.status(500).json({ error: e?.message ?? 'subscription change failed' })
+        }
+        return
+      }
+
+      // Non-downgrade → direct + audit (unchanged behaviour).
       const { data, error } = await supabase.from('tenant_subscriptions').update(patch).eq('tenant_id', tenantId).select().single()
       if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: plan_id ? 'plan.change' : 'subscription.update', target_tenant_id: tenantId, payload: { changes: patch }, reason })

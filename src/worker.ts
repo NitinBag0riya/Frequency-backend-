@@ -24,6 +24,8 @@ import { startTrialEndingWorker }      from './workers/trial-ending'
 import { startConsentExpirySweepWorker } from './workers/consent-expiry-sweep'
 import { startGmailPollerWorker }      from './workers/gmail-poller'
 import { startLookalikeRefreshWorker } from './workers/lookalike-refresh'
+// Naruto §6/§16 — nudge engine + platform notifications (daily 6h tick, NUDGE_EVALUATOR gate)
+import { startNudgeEvaluatorWorker } from './workers/nudge-evaluator'
 // P0.9 — Instagram comment poller (5 min tick, safety net for webhook gaps)
 import { startInstagramCommentPollerWorker } from './workers/instagram-comment-poller'
 // P0.7 — DPDPA breach notification fan-out (migration 075)
@@ -75,6 +77,7 @@ async function main() {
   const lr  = await startLookalikeRefreshWorker()
   const igp = await startInstagramCommentPollerWorker()
   const bns = await startBreachNotificationSenderWorker()
+  const nudge = await startNudgeEvaluatorWorker()
 
   // WA Calling workers — concurrency per env (defaults in `01-backend-design.md` §11).
   const cd = startCallDispatchWorker()
@@ -151,7 +154,7 @@ async function main() {
     console.log(`[worker] received ${signal} — draining…`)
     await Promise.allSettled([
       wf.close(), ms.close(), bw.close(),
-      sp.close(), ts.close(), ds.close(), te.close(), ces.close(), gp.close(), lr.close(), igp.close(), bns.close(),
+      sp.close(), ts.close(), ds.close(), te.close(), ces.close(), gp.close(), lr.close(), igp.close(), bns.close(), nudge.close(),
       // WA Calling
       cd.close(), ce.close(), ca.close(), ct.close(),
       dispatchFailureListener.close(),

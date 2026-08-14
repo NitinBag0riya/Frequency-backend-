@@ -42,6 +42,19 @@ import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
 import { createSuperAdminRouter }  from './routes/super-admin'
+import { createNarutoTenantsRouter }       from './routes/naruto-tenants'
+import { createNarutoOnboardingRouter }    from './routes/naruto-onboarding'
+import { createNarutoCatalogImportRouter } from './routes/naruto-catalog-import'
+import { createNarutoStorefrontRouter }    from './routes/naruto-storefront'
+import { createNarutoSupportRouter }       from './routes/naruto-support'
+import { createNarutoPaymentsRouter }      from './routes/naruto-payments'
+import { createNarutoOrdersRouter }        from './routes/naruto-orders'
+import { createPlatformApprovalsRouter }   from './routes/platform-approvals'
+import { createNarutoBulkEntitlementsRouter } from './routes/naruto-bulk-entitlements'
+import { createNarutoPlansRouter }         from './routes/naruto-plans'
+import { createNarutoNudgesRouter }        from './routes/naruto-nudges'
+import { createNarutoGrowthRouter }        from './routes/naruto-growth'
+import { createNarutoTenantReportsRouter } from './routes/naruto-tenant-reports'
 import { touchLastActive }         from './lib/last-active'
 import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
@@ -5981,6 +5994,23 @@ app.use(createSegmentsRouter({ supabase, requireAuth, identifyTenant, checkPermi
 
 // ── Super-admin API (platform-level operations) ──────────────────────────────
 app.use(createSuperAdminRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 2: onboarding, lifecycle+create-tenant, catalog import, storefront setup.
+app.use(createNarutoTenantsRouter({ supabase, requireAuth }))
+app.use(createNarutoOnboardingRouter({ supabase, requireAuth }))
+app.use(createNarutoCatalogImportRouter({ supabase, requireAuth }))
+app.use(createNarutoStorefrontRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 3: support console, payments/revenue, order oversight.
+app.use(createNarutoSupportRouter({ supabase, requireAuth }))
+app.use(createNarutoPaymentsRouter({ supabase, requireAuth }))
+app.use(createNarutoOrdersRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 4: approval rules, bulk entitlement ops, plan matrix + limits.
+app.use(createPlatformApprovalsRouter({ supabase, requireAuth }))
+app.use(createNarutoBulkEntitlementsRouter({ supabase, requireAuth }))
+app.use(createNarutoPlansRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 5: nudge engine + platform notifications, growth analytics, per-tenant reports.
+app.use(createNarutoNudgesRouter({ supabase, requireAuth }))
+app.use(createNarutoGrowthRouter({ supabase, requireAuth }))
+app.use(createNarutoTenantReportsRouter({ supabase, requireAuth }))
 
 // ── Tenant team management (RBAC) ────────────────────────────────────────────
 app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))
