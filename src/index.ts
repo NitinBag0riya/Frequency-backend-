@@ -6260,6 +6260,50 @@ async function seedPlatformWaTemplates(): Promise<void> {
     const sub = await fetch(`${GRAPH}/${WABA}/subscribed_apps`, { method: 'POST', headers: { Authorization: `Bearer ${TOK}` } })
     console.log(`[wa-seed] subscribe_apps: HTTP ${sub.status} ${JSON.stringify(await sub.json().catch(() => ({}))).slice(0, 200)}`)
   } catch (e: any) { console.warn(`[wa-seed] subscribe_apps failed: ${e?.message ?? e}`) }
+  // Create + PUBLISH the post-order feedback WhatsApp FLOW — an interactive rating +
+  // review form (a Meta "Flow" object, distinct from the message templates above).
+  // Idempotent: reuse an existing 'feedback_review' flow, re-upload its JSON, republish.
+  try {
+    const flowJson = {
+      version: '3.1',
+      screens: [{
+        id: 'FEEDBACK', title: 'Your feedback', terminal: true, data: {},
+        layout: { type: 'SingleColumnLayout', children: [
+          { type: 'TextHeading', text: 'How was your order?' },
+          { type: 'TextBody', text: 'Your feedback helps us serve you better.' },
+          { type: 'RadioButtonsGroup', name: 'rating', label: 'Rate your experience', required: true,
+            'data-source': [
+              { id: '5', title: 'Loved it' }, { id: '4', title: 'Good' }, { id: '3', title: 'Okay' },
+              { id: '2', title: 'Not great' }, { id: '1', title: 'Bad' },
+            ] },
+          { type: 'TextArea', name: 'review', label: 'Tell us more (optional)', required: false },
+          { type: 'Footer', label: 'Submit', 'on-click-action': { name: 'complete', payload: { rating: '${form.rating}', review: '${form.review}' } } },
+        ] },
+      }],
+    }
+    const flows: any = await (await fetch(`${GRAPH}/${WABA}/flows?access_token=${encodeURIComponent(TOK)}`)).json()
+    let flowId: string | undefined = (flows?.data || []).find((f: any) => f?.name === 'feedback_review')?.id
+    if (!flowId) {
+      const c: any = await (await fetch(`${GRAPH}/${WABA}/flows`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'feedback_review', categories: ['SURVEY'], access_token: TOK }),
+      })).json()
+      flowId = c?.id
+      console.log(`[wa-seed] flow create: ${JSON.stringify(c).slice(0, 200)}`)
+    } else { console.log(`[wa-seed] flow reuse ${flowId}`) }
+    if (flowId) {
+      const fd = new FormData()
+      fd.append('asset_type', 'FLOW_JSON')
+      fd.append('name', 'flow.json')
+      fd.append('file', new Blob([JSON.stringify(flowJson)], { type: 'application/json' }), 'flow.json')
+      const up: any = await (await fetch(`${GRAPH}/${flowId}/assets?access_token=${encodeURIComponent(TOK)}`, { method: 'POST', body: fd })).json()
+      console.log(`[wa-seed] flow json upload: ${JSON.stringify(up).slice(0, 300)}`)
+      if (up && !up.error && up.success !== false) {
+        const pub: any = await (await fetch(`${GRAPH}/${flowId}/publish?access_token=${encodeURIComponent(TOK)}`, { method: 'POST' })).json()
+        console.log(`[wa-seed] flow publish: ${JSON.stringify(pub).slice(0, 200)}`)
+      }
+    }
+  } catch (e: any) { console.warn(`[wa-seed] flow failed: ${e?.message ?? e}`) }
   // Report current template review statuses so we can see approval progress in the log.
   try {
     const st: any = await (await fetch(`${GRAPH}/${WABA}/message_templates?fields=name,status,category&limit=30&access_token=${encodeURIComponent(TOK)}`)).json()
