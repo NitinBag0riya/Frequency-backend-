@@ -6265,7 +6265,7 @@ async function seedPlatformWaTemplates(): Promise<void> {
   // Idempotent: reuse an existing 'feedback_review' flow, re-upload its JSON, republish.
   try {
     const flowJson = {
-      version: '3.1',
+      version: '7.0', // Meta deprecates old Flow JSON versions; 3.x is rejected at publish
       screens: [{
         id: 'FEEDBACK', title: 'Your feedback', terminal: true, data: {},
         layout: { type: 'SingleColumnLayout', children: [
@@ -6298,7 +6298,7 @@ async function seedPlatformWaTemplates(): Promise<void> {
       fd.append('file', new Blob([JSON.stringify(flowJson)], { type: 'application/json' }), 'flow.json')
       const up: any = await (await fetch(`${GRAPH}/${flowId}/assets?access_token=${encodeURIComponent(TOK)}`, { method: 'POST', body: fd })).json()
       console.log(`[wa-seed] flow json upload: ${JSON.stringify(up).slice(0, 300)}`)
-      if (up && !up.error && up.success !== false) {
+      if (up && up.success !== false && !up.error && !((up.validation_errors || []).length)) {
         const pub: any = await (await fetch(`${GRAPH}/${flowId}/publish?access_token=${encodeURIComponent(TOK)}`, { method: 'POST' })).json()
         console.log(`[wa-seed] flow publish: ${JSON.stringify(pub).slice(0, 200)}`)
       }
