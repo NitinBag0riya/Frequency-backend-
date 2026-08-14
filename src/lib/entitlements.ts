@@ -70,6 +70,29 @@ async function loadFeatures(sb: SupabaseClient): Promise<Map<string, FeatureRow>
 /** Test/ops hook — drop the features cache (e.g. after a matrix edit). */
 export function invalidateFeaturesCache(): void { _featuresCache = null }
 
+// ── Platform kill-switch (§2.1 layer 1) ──────────────────────────────────────
+// A feature_flags row keyed to a feature registry key with is_enabled=false is a
+// GLOBAL OFF: it forces that feature off for EVERY tenant, above plan and tenant
+// override (non-overridable). Only an explicit is_enabled=false kills — a missing
+// flag never does. Cached like features; fail-OPEN on the switch (a flags-table
+// hiccup must not silently disable everyone's features).
+let _killCache: { at: number; keys: Set<string> } | null = null
+const KILL_TTL_MS = 60_000
+
+async function loadKillSwitches(sb: SupabaseClient): Promise<Set<string>> {
+  if (_killCache && Date.now() - _killCache.at < KILL_TTL_MS) return _killCache.keys
+  const keys = new Set<string>()
+  try {
+    const { data } = await sb.from('feature_flags').select('key').eq('is_enabled', false)
+    for (const r of (data ?? []) as { key: string }[]) keys.add(r.key)
+  } catch { /* flags read failed → no kill switches this cycle (fail-open on the switch) */ }
+  _killCache = { at: Date.now(), keys }
+  return keys
+}
+
+/** Test/ops hook — drop the kill-switch cache (e.g. after a flag toggle). */
+export function invalidateKillSwitchCache(): void { _killCache = null }
+
 async function loadTenant(sb: SupabaseClient, tenantId: string): Promise<TenantRow | null> {
   const [{ data: t }, { data: sub }] = await Promise.all([
     sb.from('tenants').select('business_type').eq('id', tenantId).maybeSingle(),
@@ -127,6 +150,9 @@ export async function hasFeature(sb: SupabaseClient, tenantId: string, key: stri
     const bg = businessGroup(tenant.business_type)
     if (!verticalAllowed(feature, bg)) return false  // HARD vertical gate
 
+    const killed = await loadKillSwitches(sb)
+    if (killed.has(key)) return false                // layer 1: platform kill-switch (non-overridable)
+
     const ov = await loadOverride(sb, tenantId, key)
     if (overrideActive(ov) && ov!.is_enabled !== null) return ov!.is_enabled  // layer 3
 
@@ -168,12 +194,14 @@ export async function resolveEntitlements(
     ovMap.set(o.feature, o)
   }
 
+  const killed = await loadKillSwitches(sb)
   const access = grantsAccess(tenant?.status ?? null)
   const out: Record<string, boolean> = {}
   const gate_styles: Record<string, string> = {}
   for (const [key, f] of features) {
     gate_styles[key] = f.gate_style
     if (!verticalAllowed(f, bg)) { out[key] = false; continue }
+    if (killed.has(key)) { out[key] = false; continue }   // layer 1: platform kill-switch
     const ov = ovMap.get(key)
     if (ov && ov.is_enabled !== null) { out[key] = ov.is_enabled; continue }
     out[key] = (access && granted.has(key)) || f.default_enabled
@@ -214,8 +242,8 @@ export interface FeatureMatrixRow {
   quota_override: Record<string, number> | null
   /** Effective on/off after the full merge. */
   resolved: boolean
-  /** What decided `resolved`: which layer won (or the hard gate). */
-  source: 'override' | 'plan' | 'default' | 'vertical'
+  /** What decided `resolved`: which layer won (hard gate or platform kill-switch). */
+  source: 'override' | 'plan' | 'default' | 'vertical' | 'kill_switch'
   /** Feature is not allowed for this tenant's vertical — locked, not toggleable. */
   vertical_locked: boolean
 }
@@ -274,6 +302,7 @@ export async function resolveEntitlementsDetailed(
     if (o.quota_override && typeof o.quota_override === 'object') Object.assign(quotaMerged, o.quota_override)
   }
   const access = grantsAccess(tenant?.status ?? null)
+  const killed = await loadKillSwitches(sb)
 
   const features: FeatureMatrixRow[] = (featureRows ?? []).map((f: any) => {
     const verticals: string[] = f.verticals ?? ['*']
@@ -281,9 +310,12 @@ export async function resolveEntitlementsDetailed(
     const ov = ovMap.get(f.key) ?? null
     const plan_granted = access && granted.has(f.key)
     const override_enabled = ov ? ov.is_enabled : null
-    const { resolved, source } = decideFeature({
-      vertical_locked, override_enabled, plan_granted, default_enabled: !!f.default_enabled,
-    })
+    // Layer 1: a global kill-switch forces OFF and is non-overridable — surface it
+    // as its own source so the cockpit shows WHY the row is locked off.
+    const killSwitched = killed.has(f.key)
+    const { resolved, source } = killSwitched
+      ? { resolved: false, source: 'kill_switch' as const }
+      : decideFeature({ vertical_locked, override_enabled, plan_granted, default_enabled: !!f.default_enabled })
 
     return {
       key: f.key, name: f.name, category: f.category ?? 'platform',
@@ -292,7 +324,7 @@ export async function resolveEntitlementsDetailed(
       override_enabled,
       expires_at: ov?.expires_at ?? null,
       quota_override: (ov?.quota_override as Record<string, number>) ?? null,
-      resolved, source, vertical_locked,
+      resolved, source, vertical_locked: vertical_locked || killSwitched,
     }
   })
 

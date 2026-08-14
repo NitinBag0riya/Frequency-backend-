@@ -355,6 +355,10 @@ export interface ImportOpts {
   dryRun?: boolean
   /** Injected storefront client (tests). Defaults to the real X-Admin-Secret sf(). */
   client?: (method: string, path: string, slug: string, body?: unknown) => Promise<any>
+  /** Rehost an aggregator image URL into OUR asset bucket, returning our permanent URL
+   *  (or null → keep the source URL). Injected by the route (has supabase + tenantId) so
+   *  stored product images never depend on Swiggy/Zomato's expiring CDN links. */
+  rehost?: (srcUrl: string) => Promise<string | null>
 }
 
 /** Resolve a storefront outlet id from an aggregator restaurant id, via the tenant's
@@ -454,7 +458,9 @@ export async function importMenuToStorefront(
       // Seed this channel's per-channel detail (real price + stock + binding); the
       // other channel defaults to available with no override (server normalises).
       if (channel) body.channels = { [channel]: detailFor(it) }
-      if (it.imageUrl) body.imageUrl = it.imageUrl
+      // Store OUR rehosted asset URL (never the aggregator's expiring CDN link); fall
+      // back to the source URL if rehost is unavailable/fails.
+      if (it.imageUrl) body.imageUrl = (opts.rehost && await opts.rehost(it.imageUrl)) || it.imageUrl
       if (!opts.dryRun) {
         const res = await call('POST', '/admin/items', slug, body)
         itemByNorm.set(key, res)
@@ -466,8 +472,9 @@ export async function importMenuToStorefront(
       continue
     }
 
-    // UPDATE — only fields we own: price + availability (soldOut) + outlet scope.
-    // Leave name/description/veg/coins/options/image as the merchant curated them.
+    // UPDATE — only fields we own: price + availability (soldOut) + outlet scope, plus a
+    // one-way image BACKFILL (fill a blank image only). Leave name/description/veg/coins/
+    // options — and any EXISTING image — as the merchant curated them.
     const patch: any = {}
     const changes: Record<string, { from: any; to: any }> = {}
     // Storefront base = the HIGHER of the channels seen (Swiggy vs Zomato), so the
@@ -497,6 +504,14 @@ export async function importMenuToStorefront(
         patch.channels = merged
         changes.channels = { from: existing.channels ?? null, to: merged }
       }
+    }
+    // Backfill a MISSING image only — fill a blank item image from the aggregator (Swiggy/
+    // Zomato) photo, and NEVER overwrite a merchant-curated one. If the aggregator has no
+    // photo either, the item stays blank (per product decision 2026-08-13).
+    if (it.imageUrl && !existing.imageUrl) {
+      const ourUrl = (opts.rehost && await opts.rehost(it.imageUrl)) || it.imageUrl
+      patch.imageUrl = ourUrl
+      changes.imageUrl = { from: existing.imageUrl ?? null, to: ourUrl }
     }
 
     if (Object.keys(patch).length === 0) {

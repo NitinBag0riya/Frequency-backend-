@@ -28,6 +28,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { validateBody } from '../../validation'
 import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
 import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity } from '../../connectors/aggregator/menu-import'
+import { rehostImageToAssets } from '../assets.js'
 import { emitNotification, tenantNotifyRecipients } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -71,6 +72,24 @@ export function stripZomatoMarkup(text: unknown): string {
     .replace(/\s+/g, ' ').trim()
 }
 
+const SNIPPET_MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december']
+/** Zomato snippet display time → real ISO. The `topRightText` reads "11:50 AM | 11 August"
+ *  (IST wall-clock, no year). We derive the year: an order can't be in the future, so if the
+ *  current-year instant lands ahead of now, it belongs to last year. Beats null → a fake
+ *  "just now"; the exact `order.createdAt` from an order-details capture still overrides it. */
+export function parseZomatoSnippetTime(text: unknown, now: Date = new Date()): string | null {
+  const m = stripZomatoMarkup(text).match(/(\d{1,2}):(\d{2})\s*(AM|PM)\s*\|\s*(\d{1,2})\s+([A-Za-z]+)/i)
+  if (!m) return null
+  const mon = SNIPPET_MONTHS.indexOf(m[5].toLowerCase())
+  if (mon < 0) return null
+  const hh = (Number(m[1]) % 12) + (/pm/i.test(m[3]) ? 12 : 0)
+  const IST_MS = 5.5 * 60 * 60 * 1000 // Asia/Kolkata offset; snippet times are local IST
+  const at = (y: number) => Date.UTC(y, mon, Number(m[4]), hh, Number(m[2])) - IST_MS
+  let t = at(now.getUTCFullYear())
+  if (t > now.getTime() + 24 * 3600 * 1000) t = at(now.getUTCFullYear() - 1)
+  return new Date(t).toISOString()
+}
+
 /** Zomato get-all-v2 snippets → past-order rows (verified against real La Fiamma capture). */
 export function parseZomatoSnippets(snippets: any[]): ParsedHistOrder[] {
   const out: ParsedHistOrder[] = []
@@ -94,16 +113,20 @@ export function parseZomatoSnippets(snippets: any[]): ParsedHistOrder[] {
       customer_name: idRow ? String(idRow.r).replace(/^by\s+/i, '').trim() || null : null,
       item_count: itemCount,
       gross_amount: gross > 0 ? gross : null,
-      // "11:23 PM | 10 August" — no year in snippet; kept in raw. Backend leaves null
-      // rather than guess a wrong ISO; the order date is recoverable from raw + query.
-      placed_at: null,
+      // Real order time from the snippet display ("11:23 PM | 10 August"); the exact
+      // ISO from an order-details capture still overrides this on enrichment.
+      placed_at: parseZomatoSnippetTime(s?.topRightText?.text),
       raw: s,
     })
   }
   return out
 }
 
-/** Swiggy orders/v1/history groups (`[{restId, data:{objects}}]`) → past-order rows. */
+/** Swiggy orders/v1/history groups (`[{restId, data:{objects}}]`) → past-order rows.
+ *  Field shape VALIDATED against live capture 2026-08-12: time is `status.ordered_time`
+ *  ("YYYY-MM-DD HH:MM:SS", IST wall-clock), total is `bill`, line items are `cart.items[]`
+ *  ({name, quantity, sub_total/total, is_veg}); Swiggy history does NOT expose the
+ *  customer name. Legacy top-level names kept as fallbacks. */
 export function parseSwiggyHistoryGroups(groups: any[]): ParsedHistOrder[] {
   const out: ParsedHistOrder[] = []
   for (const g of groups) {
@@ -112,28 +135,89 @@ export function parseSwiggyHistoryGroups(groups: any[]): ParsedHistOrder[] {
     for (const o of objects) {
       const id = o?.order_id ?? o?.id ?? o?.rng_order_id
       if (id == null) continue
-      const itemsArr = Array.isArray(o.order_items) ? o.order_items : Array.isArray(o.items) ? o.items : []
+      const st = o.status && typeof o.status === 'object' ? o.status : null
+      const cart = o.cart && typeof o.cart === 'object' ? o.cart : null
+      const itemsArr: any[] = Array.isArray(cart?.items) ? cart.items
+        : Array.isArray(o.order_items) ? o.order_items : Array.isArray(o.items) ? o.items : []
+      const lines = itemsArr.filter((it) => it && typeof it === 'object').map((it: any) => ({
+        name: it.name ?? null,
+        qty: Number(it.quantity ?? it.qty ?? 1) || 1,
+        price: Number(it.sub_total ?? it.total ?? it.price ?? 0) || 0,
+        veg: typeof it.is_veg === 'boolean' ? it.is_veg : (it.is_veg === 1 || it.is_veg === '1' ? true : undefined),
+      }))
+      const orderedTime = st?.ordered_time ?? o.order_time ?? o.ordered_time ?? o.order_placed_time ?? o.created_on ?? null
+      // "2026-08-11 19:12:34" is IST wall-clock, no tz → stamp +05:30 so it stores right.
+      const placedAt = orderedTime && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(String(orderedTime))
+        ? String(orderedTime).replace(' ', 'T') + (/[+Z]/.test(String(orderedTime)) ? '' : '+05:30') : orderedTime
       out.push({
         external_order_id: String(id),
-        status: o.order_status ?? o.status ?? o.state ?? null,
+        status: st?.cancel_reason ? 'cancelled' : (st?.order_status ?? o.order_status ?? 'delivered'),
         customer_name: o.customer_name ?? o.customer?.name ?? null,
-        item_count: itemsArr.reduce((n: number, it: any) => n + (Number(it.quantity ?? it.qty ?? 1) || 1), 0),
-        gross_amount: o.order_total ?? o.bill_total ?? o.total ?? o.net_total ?? null,
-        placed_at: o.order_time ?? o.ordered_time ?? o.order_placed_time ?? o.created_on ?? null,
-        raw: o,
+        item_count: lines.reduce((n, l) => n + l.qty, 0) || itemsArr.length,
+        gross_amount: Number(o.bill ?? o.order_total ?? o.bill_total ?? o.total ?? o.net_total) || null,
+        placed_at: placedAt,
+        raw: { source: 'swiggy', order_id: String(id), lines, note: 'Real Swiggy order-history capture (dishes + time + bill).' },
       })
     }
   }
   return out
 }
 
+/** Pull a rupee number out of Zomato's money shapes (a number, or a dict with
+ *  amount/value/total/…). Nested totals are common in cartDetails. */
+export function money(x: any): number {
+  if (typeof x === 'number') return x
+  if (x && typeof x === 'object') {
+    for (const k of ['amount', 'value', 'total', 'finalAmount', 'netAmount', 'grandTotal', 'totalCost', 'payableAmount']) {
+      if (typeof x[k] === 'number') return x[k]
+    }
+    for (const v of Object.values(x)) { const m = money(v); if (m) return m }
+  }
+  return 0
+}
+
+/** Zomato order-details `order` → one enriched past-order row: real placed_at
+ *  (`createdAt`) + structured dishes (`cartDetails.items.dishes[]`, or a dict of
+ *  dish-lists) in the {name,qty,price,veg} shape the board reads from `raw.lines`. */
+export function parseZomatoOrderDetail(order: any): ParsedHistOrder {
+  const cart = order?.cartDetails ?? {}
+  const it = cart.items
+  const dishes: any[] = Array.isArray(it?.dishes) ? it.dishes
+    : Array.isArray(it) ? it
+    : (it && typeof it === 'object') ? Object.values(it).flatMap((v: any) => Array.isArray(v) ? v : [v])
+    : []
+  const lines = dishes.filter((d) => d && typeof d === 'object').map((d: any) => {
+    const tags: string[] = Array.isArray(d.metadata?.tags) ? d.metadata.tags : []
+    return { name: d.name ?? null, qty: Number(d.quantity ?? 1) || 1, price: money(d.unitCost ?? d.totalCost ?? 0),
+             veg: tags.length ? tags.includes('veg') && !tags.includes('non-veg') : undefined }
+  })
+  const itemCount = lines.reduce((n, l) => n + l.qty, 0) || lines.length
+  const gross = money(cart.total) || money(cart.subtotal) || lines.reduce((s, l) => s + l.price * l.qty, 0)
+  return {
+    external_order_id: String(order.id),
+    status: order.state ?? order.status ?? 'DELIVERED',
+    customer_name: order.creator?.name ?? order.customer?.name ?? null,
+    item_count: itemCount,
+    gross_amount: gross || null,
+    placed_at: order.createdAt ?? order.actionedAt ?? order.updatedAt ?? null,
+    raw: { source: 'zomato', order_id: String(order.id), lines, note: 'Real Zomato order-details capture (dishes + time + outlet).' },
+  }
+}
+
 /**
  * Parse a Frequency Desktop order-history snapshot into normalised past-order rows.
  * Handles the real aggregator shapes: Zomato get-all-v2 `snippets[]`, Swiggy
- * orders/v1/history `data[].data.objects[]`, plus generic order arrays / paged
- * shapes. Raw always retained. Verified against live La Fiamma captures 2026-08-11.
+ * orders/v1/history `data[].data.objects[]`, the single Zomato order-details
+ * enrichment body, plus generic order arrays / paged shapes. Raw always retained.
+ * Verified against live La Fiamma captures 2026-08-11.
  */
 export function parseOrderHistory(body: any): ParsedHistOrder[] {
+  // Zomato order-details enrichment: a SINGLE past order opened in the portal
+  // ({ order:{ id, createdAt, cartDetails.items.dishes } }). Carries the real ISO
+  // time + dishes the snippet list lacks; upsert-enriches the row on order.id.
+  if (body?.order?.id != null && (body.order.cartDetails != null || body.order.createdAt != null)) {
+    return [parseZomatoOrderDetail(body.order)]
+  }
   // Zomato order/history/get-all-v2 → { snippets:[{id, primaryTag, topRightText,
   // infoList}] } (a UI-snippet list; text is markdown-wrapped `<tag|{color|TEXT}>`).
   if (Array.isArray(body?.snippets) && body.snippets.some((s: any) => s?.id != null && s?.primaryTag)) {
@@ -295,12 +379,18 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // natural key), then clear the outlet's history pending flag.
   const ingestHistory = async (tenantId: string, outletRef: string, body: any) => {
     const parsed = parseOrderHistory(body)
-    const channel = await channelForOutlet(tenantId, outletRef)
+    // Prefer the channel the desktop relays (it KNOWS zomato vs swiggy). The outlet
+    // lookup returns null for the 'manual' outlet the bridge uses, which left every
+    // relayed row channel=null — and null coerces to Zomato on the board, mislabeling
+    // Swiggy history. Fall back to the lookup, then to the order-details raw source.
+    const relayCh = body?.channel === 'swiggy' || body?.channel === 'zomato' ? body.channel : null
+    const rawSrc = body?.order?.cartDetails != null ? 'zomato' : null // Zomato order-details shape
+    const channel = relayCh || (await channelForOutlet(tenantId, outletRef)) || rawSrc
     const now = new Date().toISOString()
     if (parsed.length) {
       const rows = parsed.map(o => ({
         tenant_id: tenantId, source: 'frequency_desktop', channel, outlet_ref: outletRef,
-        external_order_id: o.external_order_id, status: o.status,
+        external_order_id: o.external_order_id, status: normalizeStatus(o.status),
         customer_name: o.customer_name, item_count: o.item_count, gross_amount: o.gross_amount,
         placed_at: o.placed_at, raw: o.raw, updated_at: now,
       }))
@@ -312,6 +402,53 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       { tenant_id: tenantId, outlet_ref: outletRef, pending_full_sync: false, last_synced_at: now, updated_at: now },
       { onConflict: 'tenant_id,outlet_ref' })
     console.log(`[aggregator/history] ingested ${parsed.length} past order(s) for outlet ${outletRef}`)
+  }
+
+  // Ingest a Zomato/Swiggy customer-complaints snapshot → upsert into public.complaints
+  // (source = channel). Zomato's feed (merchant-api/customer-issues/get-all) carries
+  // order_id + issue_type + expired_at (the SLA deadline to respond) only; the text &
+  // category live inside Zomato, so body/category stay null — the Complaints inbox
+  // shows "full text only on Zomato" for exactly this case. Dedup on source+external_id
+  // so a re-poll never clobbers an operator's acknowledge/resolve on an existing row.
+  const ingestComplaints = async (tenantId: string, outletRef: string | null, body: any) => {
+    const channel = (body?.channel === 'swiggy' || body?.channel === 'zomato')
+      ? body.channel
+      : (outletRef ? await channelForOutlet(tenantId, outletRef) : null) || 'zomato'
+    const entities: any[] = Array.isArray(body?.entities) ? body.entities
+      : Array.isArray(body?.issues) ? body.issues : []
+    const now = new Date().toISOString()
+    const rows = entities.map((e) => {
+      const orderId = String(e?.order_id ?? e?.orderId ?? '')
+      if (!orderId) return null
+      const expRaw = e?.expired_at ? String(e.expired_at) : ''
+      const exp = expRaw ? new Date(expRaw.replace(' ', 'T') + '+05:30') : null
+      const dueAt = exp && !isNaN(exp.getTime()) ? exp.toISOString() : null
+      const t = String(e?.issue_type ?? '').toUpperCase()
+      const responded = e?.response_meta != null
+      const status = (responded || t.includes('CLOSE') || t.includes('RESOLV')) ? 'resolved' : 'new'
+      const dueSoon = dueAt ? (new Date(dueAt).getTime() - Date.now()) <= 12 * 3600_000 : false
+      const severity = status === 'resolved' ? 'low' : (dueSoon ? 'high' : 'normal')
+      return {
+        tenant_id: tenantId, outlet_ref: outletRef, source: channel,
+        external_id: `${channel}:${orderId}`, order_ref: orderId,
+        category: 'unknown', raw_issue_type: e?.issue_type ?? 'issue',
+        severity, status,
+        opened_at: dueAt ?? now, due_at: dueAt,
+        raw: { source: channel, order_id: orderId, issue_type: e?.issue_type ?? null, expired_at: e?.expired_at ?? null, notes: [], note: 'Captured from the merchant customer-issues feed; full text & category only in the aggregator app.' },
+        updated_at: now,
+      }
+    }).filter(Boolean) as any[]
+    if (!rows.length) return
+    const { data: existing } = await supabase.from('complaints')
+      .select('external_id').eq('tenant_id', tenantId).eq('source', channel)
+      .in('external_id', rows.map(r => r.external_id))
+    const have = new Set((existing ?? []).map((x: any) => x.external_id))
+    const fresh = rows.filter(r => !have.has(r.external_id))
+    if (fresh.length) {
+      const { error } = await supabase.from('complaints').insert(fresh)
+      if (error) console.error(`[aggregator/complaints] insert failed: ${error.message}`)
+      else console.log(`[aggregator/complaints] ingested ${fresh.length} new ${channel} complaint(s)`)
+    }
   }
 
   // Whether the next orders poll should request a one-shot history backfill.
@@ -511,6 +648,31 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
+  // Request an on-demand PAST-order re-pull (older history). Flips the history-sync
+  // flag; /pending-actions surfaces it as `historyResync`, the desktop bridge picks it
+  // up and runs fd.syncHistory() (fetches ~60d of history on the merchant session) then
+  // relays to /history/ingest. Mirrors menu/resync. `channel` is informational.
+  r.post('/api/connectors/aggregator/history/resync', ...guardEdit, async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const outlet = req.body?.outlet ? String(req.body.outlet) : null
+      if (outlet) {
+        await supabase.from('aggregator_history_sync').upsert(
+          { tenant_id: tenantId, outlet_ref: outlet, pending_full_sync: true, updated_at: new Date().toISOString() },
+          { onConflict: 'tenant_id,outlet_ref' })
+      } else {
+        await supabase.from('aggregator_history_sync').update({ pending_full_sync: true, updated_at: new Date().toISOString() })
+          .eq('tenant_id', tenantId)
+        // No history-sync rows yet (first ever) → seed 'manual' so the flag has something
+        // to carry, matching the desktop's snippet-relay outlet convention.
+        await supabase.from('aggregator_history_sync').upsert(
+          { tenant_id: tenantId, outlet_ref: 'manual', pending_full_sync: true, updated_at: new Date().toISOString() },
+          { onConflict: 'tenant_id,outlet_ref' })
+      }
+      res.json({ ok: true, note: 'Older orders re-pull requested — they land on the merchant client\'s next sync (~30s).' })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
   // ── Cross-channel menu reconcile (foundation for absolute menu sync) ──────────
   // Collapse the per-channel menus (our mini-app/POS catalog + captured Zomato +
   // Swiggy) into ONE master keyed by normalised name, so "3 items on Zomato / 4 on
@@ -651,6 +813,8 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         aggregatorResId: outletRef,
         channel,
         dryRun: !!b.dryRun,
+        // Rehost aggregator photos into our asset bucket → store OUR permanent URL.
+        rehost: b.dryRun ? undefined : (u: string) => rehostImageToAssets(supabase, tenantId, u),
       })
       res.json(result)
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
@@ -670,7 +834,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   r.get('/api/connectors/aggregator/orders/history', ...guardView, async (req, res) => {
     try {
       let q = supabase.from('aggregator_order_history')
-        .select('id, channel, outlet_ref, external_order_id, status, customer_name, item_count, gross_amount, currency, placed_at')
+        .select('id, channel, outlet_ref, external_order_id, status, customer_name, item_count, gross_amount, currency, placed_at, raw')
         .eq('tenant_id', (req as any).tenantId)
         .order('placed_at', { ascending: false, nullsFirst: false })
         .limit(Math.min(Number(req.query.limit ?? 200), 500))
@@ -678,7 +842,14 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       if (req.query.outlet) q = q.eq('outlet_ref', String(req.query.outlet))
       const { data, error } = await q
       if (error) { res.status(500).json({ error: error.message }); return }
-      res.json(data ?? [])
+      // Surface structured line items when an order-details capture backfilled them
+      // (raw.lines: [{name, qty, price, veg}]). Cosmetic-only: the board still works
+      // without it; strip the bulky raw blob from the payload otherwise.
+      const rows = (data ?? []).map(({ raw, ...o }: any) => ({
+        ...o,
+        lines: Array.isArray(raw?.lines) ? raw.lines : undefined,
+      }))
+      res.json(rows)
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
@@ -899,6 +1070,16 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     if (!outletRef) { res.status(400).json({ error: 'outletRef required' }); return }
     try { await ingestHistory(tenantId, outletRef, req.body) }
     catch (e: any) { console.error(`[aggregator/history] ingest error: ${e?.message}`) }
+    res.json({ ok: true })
+  })
+  // Customer-complaints snapshot (Zomato customer-issues / Swiggy). outletRef is
+  // optional — the complaints feed is account-wide, and the order_id is globally
+  // unique, so we dedup on source+external_id rather than per-outlet.
+  r.post('/api/connectors/aggregator/complaints/ingest', ...guardEdit, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const outletRef = String(req.body?.outletRef ?? '') || null
+    try { await ingestComplaints(tenantId, outletRef, req.body) }
+    catch (e: any) { console.error(`[aggregator/complaints] ingest error: ${e?.message}`) }
     res.json({ ok: true })
   })
 

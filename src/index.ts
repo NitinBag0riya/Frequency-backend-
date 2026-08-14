@@ -42,6 +42,19 @@ import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
 import { createSuperAdminRouter }  from './routes/super-admin'
+import { createNarutoTenantsRouter }       from './routes/naruto-tenants'
+import { createNarutoOnboardingRouter }    from './routes/naruto-onboarding'
+import { createNarutoCatalogImportRouter } from './routes/naruto-catalog-import'
+import { createNarutoStorefrontRouter }    from './routes/naruto-storefront'
+import { createNarutoSupportRouter }       from './routes/naruto-support'
+import { createNarutoPaymentsRouter }      from './routes/naruto-payments'
+import { createNarutoOrdersRouter }        from './routes/naruto-orders'
+import { createPlatformApprovalsRouter }   from './routes/platform-approvals'
+import { createNarutoBulkEntitlementsRouter } from './routes/naruto-bulk-entitlements'
+import { createNarutoPlansRouter }         from './routes/naruto-plans'
+import { createNarutoNudgesRouter }        from './routes/naruto-nudges'
+import { createNarutoGrowthRouter }        from './routes/naruto-growth'
+import { createNarutoTenantReportsRouter } from './routes/naruto-tenant-reports'
 import { touchLastActive }         from './lib/last-active'
 import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
@@ -4158,6 +4171,67 @@ app.get('/webhook/whatsapp/:token', async (req, res) => {
  *                   their own signing key can't reach across into another
  *                   tenant's inbox by naming a foreign WABA id.
  */
+// ── WhatsApp order-feedback capture (platform number) ───────────────────────────
+// A tap on a feedback template button ("😍 Loved it" / "🙂 Okay" / "😞 Not great") arrives
+// as an inbound message. On the PLATFORM number no tenant resolves by waba_id (platform-
+// fallback tenants have none), so we handle it CROSS-TENANT via storefront-api (which owns
+// the orders): it maps phone→recent unrated order, records the rating, mirrors to Reviews,
+// and routes a low score to Complaints. We then reply on the still-open 24h session.
+// WhatsApp quick-reply buttons can't contain emojis — plain text only.
+const FEEDBACK_BUTTON_RATING: Record<string, number> = { 'Loved it': 5, 'It was okay': 3, 'Not great': 2 }
+
+/** Send a free-text WhatsApp from the Frequency PLATFORM number (FREQ_WA_*). Valid only
+ *  inside the 24h window (here: right after the customer's button reply). No-op if unset. */
+async function sendPlatformWaText(to: string, body: string): Promise<void> {
+  const pnid = process.env.FREQ_WA_PHONE_NUMBER_ID, tok = process.env.FREQ_WA_ACCESS_TOKEN
+  const num = String(to || '').replace(/\D/g, '')
+  if (!pnid || !tok || !num) return
+  try {
+    await fetch(`${GRAPH}/${pnid}/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: num, type: 'text', text: { body: String(body).slice(0, 4000) } }),
+    })
+  } catch (e: any) { console.warn('[wa-feedback] reply send failed:', e?.message ?? e) }
+}
+
+/** If this inbound message is a recognised feedback-button reply, capture the rating via
+ *  storefront-api and send the branch reply. No-op otherwise. */
+async function maybeHandleFeedbackReply(msg: any): Promise<void> {
+  // Two shapes map to the same "record this rating" action:
+  //  (a) quick-reply BUTTON tap  → rating from the button label (no written review)
+  //  (b) FLOW completion (nfm_reply) → { rating:"1".."5", review } from response_json
+  const label = String(msg?.button?.text ?? msg?.interactive?.button_reply?.title ?? '').trim()
+  let rating = FEEDBACK_BUTTON_RATING[label]
+  let review = ''
+  if (!rating && msg?.type === 'interactive' && msg?.interactive?.type === 'nfm_reply') {
+    try {
+      const d = JSON.parse(msg.interactive.nfm_reply?.response_json ?? '{}')
+      const n = Number(d?.rating)
+      if (n >= 1 && n <= 5) rating = n
+      review = String(d?.review ?? '').trim()
+    } catch { /* not a feedback flow submission — ignore */ }
+  }
+  if (!rating) return
+  const base = process.env.STOREFRONT_API_URL, secret = process.env.STOREFRONT_ADMIN_SECRET
+  if (!base || !secret) return
+  try {
+    const r = await fetch(`${base}/v1/feedback/by-phone`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': secret },
+      body: JSON.stringify({ phone: String(msg.from || ''), rating, ...(review ? { review } : {}) }),
+    })
+    const j: any = await r.json().catch(() => ({}))
+    if (!j?.found) return
+    const name = j.name && j.name !== 'there' ? `, ${j.name}` : ''
+    const reply = j.low
+      ? `Thank you for the honest feedback${name} — sorry it wasn't great. Our team will look into it and make it right. 🙏`
+      : (j.reviewLink
+          ? `So glad you loved it${name}! 🎉 Would you leave a quick public review? It really helps ${j.store}: ${j.reviewLink}`
+          : `So glad you loved it${name}! 🎉 Thanks for ordering from ${j.store}.`)
+    await sendPlatformWaText(String(msg.from || ''), reply)
+    console.log(`[wa-feedback] ${rating}★ from ${msg.from} → order ${j.orderId} (${j.low ? 'complaint' : 'review'})`)
+  } catch (e: any) { console.warn('[wa-feedback] capture failed:', e?.message ?? e) }
+}
+
 async function handleWaWebhook(
   req: express.Request,
   res: express.Response,
@@ -4238,6 +4312,13 @@ async function handleWaWebhook(
       for (const change of entry.changes ?? []) {
         if (change.field !== 'messages') continue
         const value = change.value
+
+        // Feedback-button replies to OUR PLATFORM number are handled CROSS-TENANT here,
+        // BEFORE the waba_id resolution below drops them (no platform-fallback tenant owns
+        // the platform WABA). storefront-api maps phone→order→tenant.
+        if (value?.metadata?.phone_number_id && value.metadata.phone_number_id === process.env.FREQ_WA_PHONE_NUMBER_ID) {
+          for (const msg of value.messages ?? []) await maybeHandleFeedbackReply(msg)
+        }
 
         // Find tenant by WABA ID. On a BYO endpoint the tenant is already
         // known from the URL token — pin the query to it so a payload naming
@@ -5913,6 +5994,23 @@ app.use(createSegmentsRouter({ supabase, requireAuth, identifyTenant, checkPermi
 
 // ── Super-admin API (platform-level operations) ──────────────────────────────
 app.use(createSuperAdminRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 2: onboarding, lifecycle+create-tenant, catalog import, storefront setup.
+app.use(createNarutoTenantsRouter({ supabase, requireAuth }))
+app.use(createNarutoOnboardingRouter({ supabase, requireAuth }))
+app.use(createNarutoCatalogImportRouter({ supabase, requireAuth }))
+app.use(createNarutoStorefrontRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 3: support console, payments/revenue, order oversight.
+app.use(createNarutoSupportRouter({ supabase, requireAuth }))
+app.use(createNarutoPaymentsRouter({ supabase, requireAuth }))
+app.use(createNarutoOrdersRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 4: approval rules, bulk entitlement ops, plan matrix + limits.
+app.use(createPlatformApprovalsRouter({ supabase, requireAuth }))
+app.use(createNarutoBulkEntitlementsRouter({ supabase, requireAuth }))
+app.use(createNarutoPlansRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 5: nudge engine + platform notifications, growth analytics, per-tenant reports.
+app.use(createNarutoNudgesRouter({ supabase, requireAuth }))
+app.use(createNarutoGrowthRouter({ supabase, requireAuth }))
+app.use(createNarutoTenantReportsRouter({ supabase, requireAuth }))
 
 // ── Tenant team management (RBAC) ────────────────────────────────────────────
 app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))
@@ -6131,7 +6229,148 @@ if (process.env.NODE_ENV !== 'production') attachDebugListeners()
 const server = app.listen(PORT, () => {
   console.log(`Frequency server running on http://localhost:${PORT}`)
   console.log(`  → Bull Board: http://localhost:${PORT}/admin/queues`)
+  void seedPlatformWaTemplates()
 })
+
+// One-time platform WhatsApp template seed. When SEED_WA_TEMPLATES=1 AND the FREQ_WA
+// platform WABA is configured, submit the two order templates (order_confirmed +
+// feedback_request) to Meta on boot — so the storefront order/feedback WhatsApp works
+// without anyone hand-creating templates in WhatsApp Manager. Idempotent (Meta rejects a
+// duplicate name+language, which we just log) and best-effort (any failure is caught and
+// never affects the server). Flip SEED_WA_TEMPLATES off once they appear in WA Manager.
+async function seedPlatformWaTemplates(): Promise<void> {
+  if (process.env.SEED_WA_TEMPLATES !== '1') return
+  const TOK = process.env.FREQ_WA_ACCESS_TOKEN
+  const LANG = process.env.FREQ_WA_TPL_LANG || 'en'
+  if (!TOK) { console.warn('[wa-seed] SEED_WA_TEMPLATES=1 but FREQ_WA_ACCESS_TOKEN missing — skipped'); return }
+  // The WABA id is easily confused with the Meta app id (which fails template creation).
+  // Discover the REAL WhatsApp Business Account id from the token itself, logging enough
+  // to pin it: (1) debug_token granular scopes, (2) the phone-number node's parent WABA.
+  const PN = process.env.FREQ_WA_PHONE_NUMBER_ID
+  const probe = async (url: string): Promise<any> => { try { return await (await fetch(url)).json() } catch (e: any) { return { error: String(e?.message ?? e) } } }
+  // SYSTEM_USER token: no per-WABA target_ids in scopes → list the owning business's
+  // WhatsApp Business Accounts and pick the one that owns our phone number.
+  let WABA = '', matched = false
+  const bizIds = new Set<string>(['1274871184395812']) // Frequency Studio (known business id)
+  const meBz = await probe(`${GRAPH}/me/businesses?access_token=${encodeURIComponent(TOK)}`)
+  for (const b of (meBz?.data || [])) if (b?.id) bizIds.add(String(b.id))
+  console.log('[wa-seed] businesses=' + JSON.stringify([...bizIds]))
+  for (const bid of bizIds) {
+    if (matched) break
+    const wabas = await probe(`${GRAPH}/${bid}/owned_whatsapp_business_accounts?access_token=${encodeURIComponent(TOK)}`)
+    console.log(`[wa-seed] biz ${bid} wabas=` + JSON.stringify(wabas).slice(0, 400))
+    for (const w of (wabas?.data || [])) {
+      if (!WABA) WABA = String(w.id)
+      if (PN) {
+        const pns = await probe(`${GRAPH}/${w.id}/phone_numbers?access_token=${encodeURIComponent(TOK)}`)
+        if ((pns?.data || []).some((p: any) => String(p?.id) === String(PN))) { WABA = String(w.id); matched = true; break }
+      }
+    }
+  }
+  console.log(`[wa-seed] using WABA=${WABA || '(none)'} matchedByPhone=${matched}`)
+  if (!WABA) { console.warn('[wa-seed] no WABA discovered — skipped'); return }
+  const ex = [['Aarav', 'La Fiamma', '8291']] // {{1}} name · {{2}} store · {{3}} order#
+  const tpls = [
+    { name: 'order_confirmed', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, your order at {{2}} is confirmed (#{{3}}). We will message you when there is an update. Thank you!', example: { body_text: ex } }] },
+    { name: 'feedback_request', language: LANG, category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}, thanks for ordering from {{2}} (#{{3}})! How was it? Reply here with your feedback — we would love to hear from you.', example: { body_text: ex } }] },
+    // Interactive feedback: 3 quick-reply buttons whose text EXACTLY matches
+    // FEEDBACK_BUTTON_RATING in the inbound handler (Loved it=5, It was okay=3, Not great=2).
+    // NOTE: WhatsApp buttons can't contain emojis/variables/newlines — plain text only.
+    { name: 'feedback_rating', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, how was your order from {{2}} (#{{3}})? Tap below — it helps us improve. 🙏', example: { body_text: ex } },
+      { type: 'BUTTONS', buttons: [
+        { type: 'QUICK_REPLY', text: 'Loved it' },
+        { type: 'QUICK_REPLY', text: 'It was okay' },
+        { type: 'QUICK_REPLY', text: 'Not great' },
+      ] },
+    ] },
+  ]
+  for (const t of tpls) {
+    try {
+      const r = await fetch(`${GRAPH}/${WABA}/message_templates`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOK}` },
+        body: JSON.stringify(t),
+      })
+      const j: any = await r.json().catch(() => ({}))
+      console.log(`[wa-seed] ${t.name}: HTTP ${r.status} ${JSON.stringify(j).slice(0, 300)}`)
+    } catch (e: any) { console.warn(`[wa-seed] ${t.name} failed: ${e?.message ?? e}`) }
+  }
+  // Subscribe the platform WABA to our app's webhook so inbound (feedback button taps)
+  // actually reach us. The app webhook is already configured (tenant WhatsApp inbound
+  // works); this just adds the platform WABA. Idempotent — safe to re-run.
+  try {
+    const sub = await fetch(`${GRAPH}/${WABA}/subscribed_apps`, { method: 'POST', headers: { Authorization: `Bearer ${TOK}` } })
+    console.log(`[wa-seed] subscribe_apps: HTTP ${sub.status} ${JSON.stringify(await sub.json().catch(() => ({}))).slice(0, 200)}`)
+  } catch (e: any) { console.warn(`[wa-seed] subscribe_apps failed: ${e?.message ?? e}`) }
+  // Create + PUBLISH the post-order feedback WhatsApp FLOW — an interactive rating +
+  // review form (a Meta "Flow" object, distinct from the message templates above).
+  // Idempotent: reuse an existing 'feedback_review' flow, re-upload its JSON, republish.
+  try {
+    const flowJson = {
+      version: '7.0', // Meta deprecates old Flow JSON versions; 3.x is rejected at publish
+      screens: [{
+        id: 'FEEDBACK', title: 'Your feedback', terminal: true, data: {},
+        layout: { type: 'SingleColumnLayout', children: [
+          { type: 'TextHeading', text: 'How was your order?' },
+          { type: 'TextBody', text: 'Your feedback helps us serve you better.' },
+          { type: 'RadioButtonsGroup', name: 'rating', label: 'Rate your experience', required: true,
+            'data-source': [
+              { id: '5', title: 'Loved it' }, { id: '4', title: 'Good' }, { id: '3', title: 'Okay' },
+              { id: '2', title: 'Not great' }, { id: '1', title: 'Bad' },
+            ] },
+          { type: 'TextArea', name: 'review', label: 'Tell us more (optional)', required: false },
+          { type: 'Footer', label: 'Submit', 'on-click-action': { name: 'complete', payload: { rating: '${form.rating}', review: '${form.review}' } } },
+        ] },
+      }],
+    }
+    const flows: any = await (await fetch(`${GRAPH}/${WABA}/flows?access_token=${encodeURIComponent(TOK)}`)).json()
+    let flowId: string | undefined = (flows?.data || []).find((f: any) => f?.name === 'feedback_review')?.id
+    if (!flowId) {
+      const c: any = await (await fetch(`${GRAPH}/${WABA}/flows`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'feedback_review', categories: ['SURVEY'], access_token: TOK }),
+      })).json()
+      flowId = c?.id
+      console.log(`[wa-seed] flow create: ${JSON.stringify(c).slice(0, 200)}`)
+    } else { console.log(`[wa-seed] flow reuse ${flowId}`) }
+    if (flowId) {
+      const fd = new FormData()
+      fd.append('asset_type', 'FLOW_JSON')
+      fd.append('name', 'flow.json')
+      fd.append('file', new Blob([JSON.stringify(flowJson)], { type: 'application/json' }), 'flow.json')
+      const up: any = await (await fetch(`${GRAPH}/${flowId}/assets?access_token=${encodeURIComponent(TOK)}`, { method: 'POST', body: fd })).json()
+      console.log(`[wa-seed] flow json upload: ${JSON.stringify(up).slice(0, 300)}`)
+      if (up && up.success !== false && !up.error && !((up.validation_errors || []).length)) {
+        const pub: any = await (await fetch(`${GRAPH}/${flowId}/publish?access_token=${encodeURIComponent(TOK)}`, { method: 'POST' })).json()
+        console.log(`[wa-seed] flow publish: ${JSON.stringify(pub).slice(0, 200)}`)
+      }
+    }
+    // Flow-LAUNCH template: a UTILITY message whose single FLOW button opens the
+    // feedback_review flow above (navigate → FEEDBACK screen). This is what we send
+    // post-delivery to collect the rating + written review. Idempotent — Meta returns
+    // "already exists" on re-run, which we just log.
+    if (flowId) {
+      try {
+        const t = { name: 'feedback_flow', language: LANG, category: 'UTILITY', components: [
+          { type: 'BODY', text: 'Hi {{1}}, how was your order from {{2}} (#{{3}})? Tap below to rate and review — it takes 10 seconds and helps us improve.', example: { body_text: ex } },
+          { type: 'BUTTONS', buttons: [
+            { type: 'FLOW', text: 'Give feedback', flow_id: flowId, flow_action: 'navigate', navigate_screen: 'FEEDBACK' },
+          ] },
+        ] }
+        const r = await fetch(`${GRAPH}/${WABA}/message_templates`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOK}` },
+          body: JSON.stringify(t),
+        })
+        console.log(`[wa-seed] feedback_flow: HTTP ${r.status} ${JSON.stringify(await r.json().catch(() => ({}))).slice(0, 300)}`)
+      } catch (e: any) { console.warn(`[wa-seed] feedback_flow failed: ${e?.message ?? e}`) }
+    }
+  } catch (e: any) { console.warn(`[wa-seed] flow failed: ${e?.message ?? e}`) }
+  // Report current template review statuses so we can see approval progress in the log.
+  try {
+    const st: any = await (await fetch(`${GRAPH}/${WABA}/message_templates?fields=name,status,category&limit=30&access_token=${encodeURIComponent(TOK)}`)).json()
+    console.log('[wa-seed] template_statuses: ' + JSON.stringify((st?.data || []).map((x: any) => ({ n: x.name, s: x.status }))).slice(0, 500))
+  } catch (e: any) { console.warn(`[wa-seed] template status failed: ${e?.message ?? e}`) }
+}
 
 // Graceful shutdown — finish in-flight requests + close queue connections.
 async function shutdown(signal: string) {
