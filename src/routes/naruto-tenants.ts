@@ -153,7 +153,7 @@ async function createTenant(supabase: SupabaseClient, input: CreateTenantInput) 
     const sub: Record<string, unknown> = {
       tenant_id: tenantId,
       plan_id: input.planId,
-      status: trialing ? 'trialing' : 'active',
+      status: trialing ? 'trial' : 'active',  // 'trial' is the value the check-constraint + trial-ending worker use
       updated_at: new Date().toISOString(),
     }
     if (trialing) {

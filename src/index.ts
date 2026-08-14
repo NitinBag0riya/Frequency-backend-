@@ -49,6 +49,9 @@ import { createNarutoStorefrontRouter }    from './routes/naruto-storefront'
 import { createNarutoSupportRouter }       from './routes/naruto-support'
 import { createNarutoPaymentsRouter }      from './routes/naruto-payments'
 import { createNarutoOrdersRouter }        from './routes/naruto-orders'
+import { createPlatformApprovalsRouter }   from './routes/platform-approvals'
+import { createNarutoBulkEntitlementsRouter } from './routes/naruto-bulk-entitlements'
+import { createNarutoPlansRouter }         from './routes/naruto-plans'
 import { touchLastActive }         from './lib/last-active'
 import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
@@ -5997,6 +6000,10 @@ app.use(createNarutoStorefrontRouter({ supabase, requireAuth }))
 app.use(createNarutoSupportRouter({ supabase, requireAuth }))
 app.use(createNarutoPaymentsRouter({ supabase, requireAuth }))
 app.use(createNarutoOrdersRouter({ supabase, requireAuth }))
+// Platform-OS (/naruto) wave 4: approval rules, bulk entitlement ops, plan matrix + limits.
+app.use(createPlatformApprovalsRouter({ supabase, requireAuth }))
+app.use(createNarutoBulkEntitlementsRouter({ supabase, requireAuth }))
+app.use(createNarutoPlansRouter({ supabase, requireAuth }))
 
 // ── Tenant team management (RBAC) ────────────────────────────────────────────
 app.use(createTeamsRouter({ supabase, requireAuth, identifyTenant }))
