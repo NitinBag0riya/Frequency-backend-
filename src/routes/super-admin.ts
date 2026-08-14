@@ -48,9 +48,14 @@
  */
 
 import express from 'express'
-import jwt, { randomUUID } from 'crypto'   // Node built-in crypto for JWT signing + handoff IDs
+import { randomUUID } from 'crypto'   // one-time handoff IDs
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sanitizeSearch } from '../lib/safe-key'
+// Naruto Platform OS §1 — capability model. New endpoints gate on capability
+// strings via requirePlatformCapability + audit through recordPlatformAudit.
+import { requirePlatformCapability } from '../lib/platform-guard'
+import { recordPlatformAudit } from '../lib/platform-audit'
+import { mintImpersonationToken } from '../lib/platform-impersonation'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -120,6 +125,30 @@ async function audit(
 export function createSuperAdminRouter(deps: Deps): express.Router {
   const r = express.Router()
   const { supabase, requireAuth } = deps
+
+  // ── WIRE(naruto) — capability migration map ────────────────────────────────
+  // These endpoints still use the legacy requirePlatformPerm(feature, action)
+  // matrix. Migrate each to requirePlatformCapability(supabase, <capability>)
+  // + recordPlatformAudit (before/after diff). Two are already migrated below
+  // as the reference pattern: POST .../entitlement and POST .../impersonate.
+  //
+  //   GET  /tenants, /tenants/:id, /recent-signups, /stats,
+  //        /mrr-trend, /vertical-stats, /activation-funnel, /agencies*  → 'tenant.read'
+  //   POST /tenants/:id/suspend                                          → 'tenant.suspend'
+  //   POST /tenants/:id/reactivate                                       → 'tenant.write'
+  //   DELETE /tenants/:id                                                → 'tenant.delete'
+  //   GET  /tenants/:id/export                                           → 'tenant.export'
+  //   GET  /plans, /features, /plan-features, /entitlement-matrix        → 'plan.read'
+  //   POST/PATCH/DELETE /plans, PATCH /features, PUT /plans/:id/features → 'plan.pricing.write'
+  //   GET  /roles                                                        → 'role.read'
+  //   PATCH/DELETE /roles/:id                                            → 'role.write'
+  //   GET  /audit, /webhook-failures*                                    → 'audit.read'
+  //   POST /webhook-failures/:id/replay                                  → 'support.fix.run'
+  //   GET/PATCH /feature-flags*                                          → 'feature_flag.write' (PATCH)
+  //   GET/POST/DELETE /announcements*                                    → 'announcement.write'
+  //   GET/PATCH /approval-rules*                                         → 'approval_rule.write'
+  //   POST /tenants/:id/subscription                                     → 'plan.assign.write'
+  // Reveal of masked secrets anywhere → gate on 'secret.reveal' + re-auth.
 
   // ─── Tenants ──────────────────────────────────────────────────────────────
   r.get('/api/super-admin/tenants',
@@ -399,7 +428,8 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
 
   // ─── Per-tenant entitlement editor (allow / deny / reset + reason/expiry/quota) ─
   // is_enabled: true=force-on, false=force-off, null=reset (delete row → back to plan default).
-  r.post('/api/super-admin/tenants/:id/entitlement', requireAuth, requirePlatformPerm(supabase, 'tenants', 'edit'),
+  // REFERENCE PATTERN (naruto §1): capability guard + before→after audit diff.
+  r.post('/api/super-admin/tenants/:id/entitlement', requireAuth, requirePlatformCapability(supabase, 'tenant.entitlement.write'),
     async (req, res) => {
       const tenantId = String(req.params.id)
       const { feature, is_enabled, reason, expires_at, quota_override } = req.body ?? {}
@@ -409,11 +439,16 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       if (expires_at != null && Number.isNaN(new Date(expires_at).getTime())) { res.status(400).json({ error: 'expires_at must be an ISO timestamp' }); return }
       if (quota_override != null && (typeof quota_override !== 'object' || Array.isArray(quota_override))) { res.status(400).json({ error: 'quota_override must be an object' }); return }
 
+      // Capture the prior override row so the audit carries a real diff.
+      const { data: before } = await supabase.from('tenant_entitlements')
+        .select('feature, is_enabled, override_reason, expires_at, quota_override')
+        .eq('tenant_id', tenantId).eq('feature', feature).maybeSingle()
+
       if (is_enabled === null && quota_override == null) {
         // Reset — remove the override row entirely.
         const { error } = await supabase.from('tenant_entitlements').delete().eq('tenant_id', tenantId).eq('feature', feature)
         if (error) { res.status(500).json({ error: error.message }); return }
-        await audit(supabase, req, { action: 'entitlement.reset', target_tenant_id: tenantId, payload: { feature }, reason })
+        await recordPlatformAudit(supabase, req, { capability: 'tenant.entitlement.write', action: 'entitlement.reset', tenant_id: tenantId, before, after: null, reason })
         res.json({ success: true, reset: true }); return
       }
       const user = (req as any).user
@@ -428,7 +463,12 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       }
       const { error } = await supabase.from('tenant_entitlements').upsert(row, { onConflict: 'tenant_id,feature' })
       if (error) { res.status(500).json({ error: error.message }); return }
-      await audit(supabase, req, { action: 'entitlement.set', target_tenant_id: tenantId, payload: { feature, is_enabled, expires_at, quota_override }, reason })
+      await recordPlatformAudit(supabase, req, {
+        capability: 'tenant.entitlement.write', action: 'entitlement.set', tenant_id: tenantId,
+        before,
+        after: { feature, is_enabled: row.is_enabled, override_reason: row.override_reason, expires_at: row.expires_at, quota_override: row.quota_override },
+        reason,
+      })
       res.json({ success: true })
     })
 
@@ -525,52 +565,47 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
     }
   }, 60_000).unref?.()
 
+  // REFERENCE PATTERN (naruto §1.2): capability guard + reason REQUIRED + TTL
+  // default 30m + read-only by default. Token minted via the shared
+  // impersonation model (platform-impersonation.ts).
   r.post('/api/super-admin/tenants/:id/impersonate',
-    requireAuth, requirePlatformPerm(supabase, 'impersonate', 'edit'),
+    requireAuth, requirePlatformCapability(supabase, 'tenant.impersonate'),
     async (req, res) => {
       const tenantId = String(req.params.id)
       const userId = (req as any).user.id
-      const reason = String(req.body?.reason ?? '').trim() || 'Support ticket'
+      const reason = String(req.body?.reason ?? '').trim()
+      if (!reason) { res.status(400).json({ error: 'Reason required to impersonate.' }); return }
 
+      // Optional override of the 30-min default via the feature flag.
       const { data: ttlFlag } = await supabase.from('feature_flags')
         .select('value_json').eq('key', 'impersonation_ttl_minutes').maybeSingle()
-      const ttlMinutes = (ttlFlag?.value_json as any)?.value ?? 60
+      const ttlMinutes = Number((ttlFlag?.value_json as any)?.value) || undefined
 
-      const expiresAt = Date.now() + ttlMinutes * 60 * 1000
-      const payload = { typ: 'imp', actor: userId, tenant_id: tenantId, exp: expiresAt, read_only: true }
-      // Dedicated impersonation secret. Must be a long random string. Refuses
-      // to mint if missing in production — a hardcoded fallback like
-      // 'dev-secret' would let any code-leak forge tenant-impersonation
-      // tokens. Falls back to GOOGLE_TOKEN_SECRET (the legacy var) for backward
-      // compat during deploys, but prefer the dedicated one going forward.
-      const secret = process.env.IMPERSONATION_HMAC_SECRET ?? process.env.GOOGLE_TOKEN_SECRET
-      if (!secret || secret.length < 32) {
-        if (process.env.NODE_ENV === 'production') {
-          res.status(503).json({ error: 'Impersonation not configured. Set IMPERSONATION_HMAC_SECRET (≥32 chars) on the server.' })
-          return
-        }
-        // Dev: warn loudly but still mint so local dev isn't blocked.
-        console.warn('[super-admin] WARNING: minting impersonation token with weak/missing secret. Set IMPERSONATION_HMAC_SECRET.')
+      let minted
+      try {
+        // read_only by default — write-mode is a separate elevation gated by
+        // owner approval / an approval rule (not exposed here yet).
+        minted = mintImpersonationToken({ actor: userId, tenant_id: tenantId, reason, ttlMinutes })
+      } catch {
+        res.status(503).json({ error: 'Impersonation not configured. Set IMPERSONATION_HMAC_SECRET (≥32 chars) on the server.' })
+        return
       }
-      const effectiveSecret = secret && secret.length >= 32 ? secret : `dev-only-${process.pid}-${Date.now()}`
-      const data = Buffer.from(JSON.stringify(payload)).toString('base64url')
-      const sig = jwt.createHmac('sha256', effectiveSecret).update(data).digest('base64url')
-      const token = `${data}.${sig}`
 
-      // Stash the JWT under a random one-time handoff id.
+      // Stash the JWT under a random one-time handoff id (JWT never in a URL).
       const handoffId = randomUUID()
       pendingHandoffs.set(handoffId, {
         actor_user_id: userId,
-        token,
-        expires_at: new Date(expiresAt).toISOString(),
+        token: minted.token,
+        expires_at: minted.expires_at,
         tenant_id: tenantId,
-        read_only: true,
+        read_only: minted.session.read_only,
         created_at: Date.now(),
       })
 
-      await audit(supabase, req, { action: 'impersonate.start', target_tenant_id: tenantId, reason, payload: { ttl_minutes: ttlMinutes } })
-      // Return only the handoff id — caller opens a new tab with it, the new
-      // tab claims it, JWT never appears in any URL.
+      await recordPlatformAudit(supabase, req, {
+        capability: 'tenant.impersonate', action: 'impersonate.start', tenant_id: tenantId, reason,
+        after: { expires_at: minted.expires_at, read_only: minted.session.read_only },
+      })
       res.json({ handoff_id: handoffId, handoff_expires_in_ms: HANDOFF_TTL_MS })
     })
 
