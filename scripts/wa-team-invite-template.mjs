@@ -42,7 +42,15 @@ const NAME = env('WA_TEAM_INVITE_TEMPLATE') || 'team_invite'
 const LANG = env('WA_TEAM_INVITE_TEMPLATE_LANG') || 'en_US'
 // Where the "Accept invite" button points. The token is appended by Meta as the
 // dynamic URL suffix ({{1}}), which the sender fills with the opaque invite token.
-const ACCEPT_BASE = (env('FRONTEND_URL') || 'https://getfrequency.app').replace(/\/+$/, '')
+// A WhatsApp template's button URL is baked in + public-facing, so a dev
+// FRONTEND_URL (localhost) must NEVER end up in it. Ignore localhost/loopback and
+// fall back to the prod domain; allow override via WA_ACCEPT_BASE for other envs.
+const ACCEPT_BASE = (() => {
+  const f = env('WA_ACCEPT_BASE') || env('FRONTEND_URL') || ''
+  return (f && !/localhost|127\.0\.0\.1|\.local(:|\/|$)/i.test(f))
+    ? f.replace(/\/+$/, '')
+    : 'https://getfrequency.app'
+})()
 
 const auth = { Authorization: `Bearer ${TOKEN}` }
 
