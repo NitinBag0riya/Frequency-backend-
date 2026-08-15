@@ -20,6 +20,7 @@ import crypto from 'crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { emitNotification } from './notifications'
 import { sendTeamInviteWa } from '../lib/team-invite-wa'
+import { sendTeamInviteSms } from '../lib/storefront-sms.js'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -242,18 +243,25 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const { data: t } = await supabase.from('tenants').select('business_name').eq('id', tenantId).maybeSingle()
       const orgName = (t as any)?.business_name ?? 'a team'
 
-      // Delivery is best-effort: if WhatsApp fails (no sender / template not
-      // approved), we STILL return the accept link so the admin can share it.
-      let wa_sent = false
-      let wa_error: string | undefined
+      // Delivery mirrors /api/storefront/send-otp: MSG91 SMS is the PRIMARY gateway
+      // (the same DLT rail as the login OTP), WhatsApp is the fallback. Best-effort:
+      // if both fail we STILL return the accept link so the admin can share it.
+      let sent_via: 'sms' | 'whatsapp' | null = null
+      let deliver_error: string | undefined
       try {
-        await sendTeamInviteWa(supabase, { tenantId, phone: e164, token, orgName })
-        wa_sent = true
-      } catch (e: any) {
-        wa_error = e?.message
-        console.warn('[invite-phone] WhatsApp send failed:', e?.message)
+        await sendTeamInviteSms(supabase, { phone: e164, orgName, acceptUrl })
+        sent_via = 'sms'
+      } catch (smsErr: any) {
+        try {
+          await sendTeamInviteWa(supabase, { tenantId, phone: e164, token, orgName })
+          sent_via = 'whatsapp'
+        } catch (waErr: any) {
+          deliver_error = `sms="${smsErr?.message}" wa="${waErr?.message}"`
+          console.warn('[invite-phone] SMS + WhatsApp both failed:', deliver_error)
+        }
       }
-      res.json({ success: true, invite, accept_url: acceptUrl, wa_sent, wa_error })
+      // wa_sent kept for back-compat with the existing FE toast.
+      res.json({ success: true, invite, accept_url: acceptUrl, sent_via, wa_sent: sent_via != null, deliver_error })
     })
 
   // ─── Add an existing platform user to this tenant ─────────────────────────
