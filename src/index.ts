@@ -660,6 +660,11 @@ app.use('/api/wa-calling/dispatch',  sendLimiter)
 const authLimiter = makeLimiter({ windowMs: 60_000, max: 10, perUser: false })
 app.use('/api/auth/',     authLimiter)
 app.use('/api/onboarding', authLimiter)
+// Phone team invites: creating one sends a WhatsApp (Meta credit) → sendLimiter;
+// accepting one is unauthenticated + creates an auth account (brute-force
+// surface) → authLimiter, IP-keyed like the other account-creation flows.
+app.use('/api/team/invite-phone',         sendLimiter)
+app.use('/api/team/accept-invite-phone',  authLimiter)
 
 app.get('/api/ping', (req, res) => res.json({ pong: true }))
 

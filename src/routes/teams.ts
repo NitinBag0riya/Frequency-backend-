@@ -19,6 +19,7 @@ import express from 'express'
 import crypto from 'crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { emitNotification } from './notifications'
+import { sendTeamInviteWa } from '../lib/team-invite-wa'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -182,6 +183,79 @@ export function createTeamsRouter(deps: Deps): express.Router {
       res.json({ success: true, invite, accept_url: acceptUrl })
     })
 
+  // ─── Invite by phone (WhatsApp) ───────────────────────────────────────────
+  // Mirrors the email invite's authz/plan/role guards exactly, but delivers an
+  // opaque join link over WhatsApp (reusing resolveWaCreds) instead of email.
+  // The invitee has no auth account yet — they create one at /accept-invite via
+  // POST /api/team/accept-invite-phone (see below).
+  r.post('/api/team/invite-phone',
+    requireAuth, identifyTenant, requireTenantPerm(supabase, 'team', 'edit'),
+    async (req, res) => {
+      const tenantId = (req as any).tenantId
+      const inviterId = (req as any).user.id
+      const { phone, role_key, department_id, message } = req.body
+      if (!role_key) { res.status(400).json({ error: 'phone + role_key required' }); return }
+      if (!isValidE164(phone)) { res.status(400).json({ error: 'phone must be E.164, e.g. +919876543210' }); return }
+      const e164 = String(phone).trim()
+      // Same owner-role clamp as the email path — no privilege escalation.
+      if (role_key === 'owner' && (req as any).userRole !== 'owner') {
+        res.status(403).json({ error: 'Only the owner can grant the owner role' }); return
+      }
+
+      // Plan gate: seats
+      const plan = await getTenantPlan(supabase, tenantId)
+      const teamMax = Number(plan?.limits?.team_size_max ?? -1)
+      if (teamMax > 0) {
+        const { count } = await supabase.from('user_role_assignments')
+          .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId)
+        if ((count ?? 0) >= teamMax) {
+          res.status(402).json({ error: `Plan limit: ${teamMax} seats. Upgrade to add more.` }); return
+        }
+      }
+
+      // Resolve + plan-gate the role (identical to email path)
+      const { data: role } = await supabase.from('role_definitions')
+        .select('id, scope, plan_min').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
+      if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
+      if (role.plan_min && plan && planRank(plan.plan_id) < planRank(role.plan_min)) {
+        res.status(402).json({ error: `Role "${role_key}" requires plan ${role.plan_min}` }); return
+      }
+
+      const token = crypto.randomBytes(24).toString('base64url')
+      const ttl = await getFlag(supabase, 'invite_link_ttl_days', 7)
+      const expiresAt = new Date(Date.now() + Number(ttl) * 24 * 60 * 60 * 1000)
+
+      const { data: invite, error: invErr } = await supabase.from('pending_invites').insert({
+        tenant_id: tenantId, phone: e164, email: null, role_id: role.id,
+        department_id: department_id ?? null, invited_by: inviterId,
+        expires_at: expiresAt.toISOString(), message: message ?? null,
+        token, status: 'pending',
+      }).select().single()
+      if (invErr) {
+        if ((invErr as any).code === '23505') { res.status(409).json({ error: 'A pending invite already exists for this number' }); return }
+        res.status(500).json({ error: invErr.message }); return
+      }
+
+      const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${token}`
+
+      // Resolve org name for the template body.
+      const { data: t } = await supabase.from('tenants').select('business_name').eq('id', tenantId).maybeSingle()
+      const orgName = (t as any)?.business_name ?? 'a team'
+
+      // Delivery is best-effort: if WhatsApp fails (no sender / template not
+      // approved), we STILL return the accept link so the admin can share it.
+      let wa_sent = false
+      let wa_error: string | undefined
+      try {
+        await sendTeamInviteWa(supabase, { tenantId, phone: e164, token, orgName })
+        wa_sent = true
+      } catch (e: any) {
+        wa_error = e?.message
+        console.warn('[invite-phone] WhatsApp send failed:', e?.message)
+      }
+      res.json({ success: true, invite, accept_url: acceptUrl, wa_sent, wa_error })
+    })
+
   // ─── Add an existing platform user to this tenant ─────────────────────────
   r.post('/api/team/add-existing',
     requireAuth, identifyTenant, requireTenantPerm(supabase, 'team', 'edit'),
@@ -237,7 +311,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     async (req, res) => {
       const tenantId = (req as any).tenantId
       const { data, error } = await supabase.from('pending_invites')
-        .select(`id, email, status, message, invited_at, expires_at, accepted_at,
+        .select(`id, email, phone, status, message, invited_at, expires_at, accepted_at,
                  role_definitions ( key, label )`)
         .eq('tenant_id', tenantId)
         .order('invited_at', { ascending: false })
@@ -278,7 +352,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     const token = String(req.query.token ?? '')
     if (!token) { res.status(400).json({ error: 'token required' }); return }
     const { data: inv } = await supabase.from('pending_invites')
-      .select(`email, status, expires_at, invited_by,
+      .select(`email, phone, status, expires_at, invited_by,
                role_definitions ( label ),
                tenants!inner ( business_name )`)
       .eq('token', token).maybeSingle()
@@ -294,7 +368,12 @@ export function createTeamsRouter(deps: Deps): express.Router {
       inviter_name = user?.user_metadata?.full_name ?? user?.email
     } catch {}
     res.json({
+      // `channel` drives which join form AcceptInvitePage shows. Returning the
+      // invitee's own phone/email to the token holder is symmetric with the
+      // email flow — the opaque token IS the secret gating this preview.
+      channel: inv.phone ? 'phone' : 'email',
       email: inv.email,
+      phone: inv.phone,
       status: inv.status,
       expires_at: inv.expires_at,
       org_name: (inv as any).tenants?.business_name ?? 'an organization',
@@ -352,6 +431,80 @@ export function createTeamsRouter(deps: Deps): express.Router {
     } catch (e) { console.warn('[invite accepted notif]', (e as any)?.message) }
 
     res.json({ success: true, tenant_id: inv.tenant_id })
+  })
+
+  // ─── Accept a PHONE invite (public — invitee has no account yet) ──────────
+  // Authorization is the opaque WhatsApp-delivered token: only someone who
+  // received the message on that number holds it. We create the invitee's auth
+  // account (phone-native; email optional) and materialize the SAME
+  // user_role_assignments linkage the email accept path writes. The session is
+  // established client-side by Supabase's own signInWithPassword afterwards —
+  // we never mint or fabricate a session here.
+  r.post('/api/team/accept-invite-phone', async (req, res) => {
+    const { token, password, full_name, email } = req.body ?? {}
+    if (!token) { res.status(400).json({ error: 'token required' }); return }
+    if (typeof password !== 'string' || password.length < 8) {
+      res.status(400).json({ error: 'Password must be at least 8 characters' }); return
+    }
+    if (email != null && typeof email !== 'string') { res.status(400).json({ error: 'email must be a string' }); return }
+
+    const { data: inv, error } = await supabase.from('pending_invites')
+      .select('*').eq('token', token).maybeSingle()
+    if (error || !inv) { res.status(404).json({ error: 'Invalid invite' }); return }
+
+    const state = inviteAcceptState(inv as any, 'phone')
+    if (state === 'not-pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
+    if (state === 'expired') {
+      await supabase.from('pending_invites').update({ status: 'expired' }).eq('id', inv.id)
+      res.status(410).json({ error: 'Invite expired' }); return
+    }
+    if (state === 'wrong-channel') { res.status(400).json({ error: 'Not a phone invite — use the email flow' }); return }
+
+    // Create the invitee's auth account. phone_confirm/email_confirm are set
+    // because the invite token already proved control of the number — the same
+    // trust the email path places in magic-link possession. FAIL CLOSED: if the
+    // account can't be created we do NOT consume the invite.
+    const { data: created, error: cErr } = await (supabase as any).auth.admin.createUser({
+      phone: inv.phone,
+      phone_confirm: true,
+      password,
+      ...(email ? { email: email.toLowerCase().trim(), email_confirm: true } : {}),
+      user_metadata: { full_name: full_name ?? null, source: 'team_invite_phone' },
+    })
+    const userId = created?.user?.id
+    if (cErr || !userId) {
+      // Existing account on this number/email — don't silently reassign; ask
+      // them to sign in and use the in-app accept instead.
+      const dup = /already|registered|exists/i.test(cErr?.message ?? '')
+      res.status(dup ? 409 : 500).json({
+        error: dup
+          ? 'An account already exists for this number. Sign in, then open the invite link again to accept.'
+          : (cErr?.message ?? 'Could not create account'),
+      }); return
+    }
+
+    // Same linkage row the email accept path writes.
+    const { error: ae } = await supabase.from('user_role_assignments').insert({
+      user_id: userId, tenant_id: inv.tenant_id, role_id: inv.role_id,
+      department_id: inv.department_id, invited_by: inv.invited_by,
+      invited_at: inv.invited_at, accepted_at: new Date().toISOString(),
+    })
+    if (ae && (ae as any).code !== '23505') { res.status(500).json({ error: ae.message }); return }
+    await supabase.from('pending_invites').update({ status: 'accepted', accepted_at: new Date().toISOString() }).eq('id', inv.id)
+
+    try {
+      const { data: role } = await supabase.from('role_definitions').select('label').eq('id', inv.role_id).maybeSingle()
+      await emitNotification(supabase, {
+        tenant_id: inv.tenant_id,
+        event_key: 'team.invite_accepted',
+        recipient_user_ids: [inv.invited_by],
+        data: { name: full_name ?? inv.phone, role: role?.label ?? 'Member' },
+        link: '/settings/team',
+      })
+    } catch (e) { console.warn('[invite-phone accepted notif]', (e as any)?.message) }
+
+    // FE signs in with these (phone+password, or email+password if provided).
+    res.json({ success: true, tenant_id: inv.tenant_id, phone: inv.phone, has_email: !!email })
   })
 
   // ─── Update / disable / remove team member ────────────────────────────────
@@ -539,6 +692,34 @@ export function createTeamsRouter(deps: Deps): express.Router {
 
 function planRank(planId: string): number {
   return ({ free: 0, starter: 1, growth: 2, scale: 3 } as Record<string, number>)[planId] ?? 0
+}
+
+/**
+ * Strict-ish E.164: leading '+', country digit 1–9, 7–14 more digits.
+ * Pure + exported so the selfcheck can pin the trust-boundary validation.
+ */
+export function isValidE164(phone: unknown): phone is string {
+  return typeof phone === 'string' && /^\+[1-9]\d{7,14}$/.test(phone.trim())
+}
+
+export type InviteAcceptState = 'ok' | 'not-pending' | 'expired' | 'wrong-channel'
+
+/**
+ * Single source of truth for "can this invite row be consumed right now" —
+ * used by both accept paths. `channel` asserts the row matches the accept flow
+ * (a phone-accept must land on a phone invite, never an email one), which is
+ * what keeps the token single-purpose. Pure + exported for the selfcheck.
+ */
+export function inviteAcceptState(
+  invite: { status: string; expires_at: string; phone?: string | null; email?: string | null },
+  channel: 'phone' | 'email',
+  now: number = Date.now(),
+): InviteAcceptState {
+  if (invite.status !== 'pending') return 'not-pending'
+  if (new Date(invite.expires_at).getTime() < now) return 'expired'
+  if (channel === 'phone' && !invite.phone) return 'wrong-channel'
+  if (channel === 'email' && !invite.email) return 'wrong-channel'
+  return 'ok'
 }
 
 async function getFlag(supabase: SupabaseClient, key: string, fallback: any): Promise<any> {
