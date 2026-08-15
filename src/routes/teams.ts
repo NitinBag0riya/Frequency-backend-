@@ -243,21 +243,23 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const { data: t } = await supabase.from('tenants').select('business_name').eq('id', tenantId).maybeSingle()
       const orgName = (t as any)?.business_name ?? 'a team'
 
-      // Delivery mirrors /api/storefront/send-otp: MSG91 SMS is the PRIMARY gateway
-      // (the same DLT rail as the login OTP), WhatsApp is the fallback. Best-effort:
-      // if both fail we STILL return the accept link so the admin can share it.
+      // Delivery: WhatsApp is the PRIMARY channel — an APPROVED UTILITY template
+      // sent over resolveWaCreds (tenant's own number, else the FREQ_WA platform
+      // number). MSG91 SMS is the dormant fallback that lights up automatically
+      // once its DLT template lands. Best-effort: if both fail we STILL return the
+      // accept link so the admin can share it manually.
       let sent_via: 'sms' | 'whatsapp' | null = null
       let deliver_error: string | undefined
       try {
-        await sendTeamInviteSms(supabase, { phone: e164, orgName, acceptUrl })
-        sent_via = 'sms'
-      } catch (smsErr: any) {
+        await sendTeamInviteWa(supabase, { tenantId, phone: e164, token, orgName })
+        sent_via = 'whatsapp'
+      } catch (waErr: any) {
         try {
-          await sendTeamInviteWa(supabase, { tenantId, phone: e164, token, orgName })
-          sent_via = 'whatsapp'
-        } catch (waErr: any) {
-          deliver_error = `sms="${smsErr?.message}" wa="${waErr?.message}"`
-          console.warn('[invite-phone] SMS + WhatsApp both failed:', deliver_error)
+          await sendTeamInviteSms(supabase, { phone: e164, orgName, acceptUrl })
+          sent_via = 'sms'
+        } catch (smsErr: any) {
+          deliver_error = `wa="${waErr?.message}" sms="${smsErr?.message}"`
+          console.warn('[invite-phone] WhatsApp + SMS both failed:', deliver_error)
         }
       }
       // wa_sent kept for back-compat with the existing FE toast.
@@ -441,20 +443,31 @@ export function createTeamsRouter(deps: Deps): express.Router {
     res.json({ success: true, tenant_id: inv.tenant_id })
   })
 
-  // ─── Accept a PHONE invite (public — invitee has no account yet) ──────────
-  // Authorization is the opaque WhatsApp-delivered token: only someone who
-  // received the message on that number holds it. We create the invitee's auth
-  // account (phone-native; email optional) and materialize the SAME
-  // user_role_assignments linkage the email accept path writes. The session is
-  // established client-side by Supabase's own signInWithPassword afterwards —
-  // we never mint or fabricate a session here.
+  // ─── Accept a PHONE / WhatsApp invite (public — invitee has no account yet) ─
+  //
+  // Authorization is the opaque token delivered to the invitee's WhatsApp number:
+  // only someone who received that message holds it. It is single-use, server-
+  // expiring, and channel-gated (inviteAcceptState) — and it is the ONLY thing
+  // that authorizes account creation here.
+  //
+  // NO Supabase phone provider is used (enabling Phone auth needs an SMS gateway
+  // the owner can't run). Instead we mint the account on the always-on EMAIL
+  // provider under a DETERMINISTIC internal identity derived from the phone
+  // (teammateEmailFromPhone → wa-<e164>@teammate.getfrequency.app — a domain we
+  // control that never receives mail), with the REAL phone kept in user_metadata,
+  // never in the auth `phone` field. The invitee CHOOSES A PASSWORD here: because
+  // there is no SMS/OTP fallback, that password is their only durable way to sign
+  // in again (the login page maps their phone back to this same internal email).
+  //
+  // FAIL CLOSED: if the account can't be created/resolved we do NOT consume the
+  // invite. The FE establishes the browser session itself via signInWithPassword
+  // — we never mint or hand out a session token here.
   r.post('/api/team/accept-invite-phone', async (req, res) => {
-    const { token, password, full_name, email } = req.body ?? {}
-    if (!token) { res.status(400).json({ error: 'token required' }); return }
+    const { token, password, full_name } = req.body ?? {}
+    if (!token || typeof token !== 'string') { res.status(400).json({ error: 'token required' }); return }
     if (typeof password !== 'string' || password.length < 8) {
       res.status(400).json({ error: 'Password must be at least 8 characters' }); return
     }
-    if (email != null && typeof email !== 'string') { res.status(400).json({ error: 'email must be a string' }); return }
 
     const { data: inv, error } = await supabase.from('pending_invites')
       .select('*').eq('token', token).maybeSingle()
@@ -468,36 +481,41 @@ export function createTeamsRouter(deps: Deps): express.Router {
     }
     if (state === 'wrong-channel') { res.status(400).json({ error: 'Not a phone invite — use the email flow' }); return }
 
-    // Create the invitee's auth account. phone_confirm/email_confirm are set
-    // because the invite token already proved control of the number — the same
-    // trust the email path places in magic-link possession. FAIL CLOSED: if the
-    // account can't be created we do NOT consume the invite.
-    const { data: created, error: cErr } = await (supabase as any).auth.admin.createUser({
-      phone: inv.phone,
-      phone_confirm: true,
-      password,
-      ...(email ? { email: email.toLowerCase().trim(), email_confirm: true } : {}),
-      user_metadata: { full_name: full_name ?? null, source: 'team_invite_phone' },
-    })
-    const userId = created?.user?.id
-    if (cErr || !userId) {
-      // Existing account on this number/email — don't silently reassign; ask
-      // them to sign in and use the in-app accept instead.
-      const dup = /already|registered|exists/i.test(cErr?.message ?? '')
-      res.status(dup ? 409 : 500).json({
-        error: dup
-          ? 'An account already exists for this number. Sign in, then open the invite link again to accept.'
-          : (cErr?.message ?? 'Could not create account'),
-      }); return
-    }
+    const internalEmail = teammateEmailFromPhone(inv.phone)
+    if (!internalEmail) { res.status(400).json({ error: 'Invite has no valid phone' }); return }
+    const cleanName = typeof full_name === 'string' ? full_name.trim().slice(0, 80) || null : null
 
-    // Same linkage row the email accept path writes.
+    // Create the account on the EMAIL provider (email pre-confirmed — the invite
+    // token already proved control of the number, the same trust the email path
+    // places in magic-link possession).
+    const { data: created, error: cErr } = await (supabase as any).auth.admin.createUser({
+      email: internalEmail,
+      email_confirm: true,
+      password,
+      user_metadata: { full_name: cleanName, phone: inv.phone, source: 'team_invite_whatsapp' },
+    })
+    let userId: string | undefined = created?.user?.id
+    if (!userId) {
+      // Returning teammate: an account for this number already exists. Do NOT
+      // reset its password (they prove it at sign-in — no silent takeover); just
+      // resolve the id so the role can be (re)linked. generateLink is used purely
+      // as an id lookup here, its link discarded — the session stays password-based.
+      const dup = /already|registered|exists/i.test(cErr?.message ?? '')
+      if (!dup) { res.status(500).json({ error: cErr?.message ?? 'Could not create account' }); return }
+      const { data: link } = await (supabase as any).auth.admin.generateLink({ type: 'magiclink', email: internalEmail })
+      userId = link?.user?.id
+    }
+    if (!userId) { res.status(500).json({ error: 'Could not resolve account for this invite' }); return }
+
+    // Same linkage row the email accept path writes (idempotent on re-accept).
     const { error: ae } = await supabase.from('user_role_assignments').insert({
       user_id: userId, tenant_id: inv.tenant_id, role_id: inv.role_id,
       department_id: inv.department_id, invited_by: inv.invited_by,
       invited_at: inv.invited_at, accepted_at: new Date().toISOString(),
     })
     if (ae && (ae as any).code !== '23505') { res.status(500).json({ error: ae.message }); return }
+
+    // Consume the invite only after account + linkage both succeeded.
     await supabase.from('pending_invites').update({ status: 'accepted', accepted_at: new Date().toISOString() }).eq('id', inv.id)
 
     try {
@@ -506,13 +524,14 @@ export function createTeamsRouter(deps: Deps): express.Router {
         tenant_id: inv.tenant_id,
         event_key: 'team.invite_accepted',
         recipient_user_ids: [inv.invited_by],
-        data: { name: full_name ?? inv.phone, role: role?.label ?? 'Member' },
+        data: { name: cleanName ?? inv.phone, role: role?.label ?? 'Member' },
         link: '/settings/team',
       })
     } catch (e) { console.warn('[invite-phone accepted notif]', (e as any)?.message) }
 
-    // FE signs in with these (phone+password, or email+password if provided).
-    res.json({ success: true, tenant_id: inv.tenant_id, phone: inv.phone, has_email: !!email })
+    // FE signs in with (login_email, password); future logins are phone+password
+    // mapped back to this same login_email by the dashboard login page.
+    res.json({ success: true, tenant_id: inv.tenant_id, login_email: internalEmail })
   })
 
   // ─── Update / disable / remove team member ────────────────────────────────
@@ -708,6 +727,24 @@ function planRank(planId: string): number {
  */
 export function isValidE164(phone: unknown): phone is string {
   return typeof phone === 'string' && /^\+[1-9]\d{7,14}$/.test(phone.trim())
+}
+
+/**
+ * Deterministic internal login identity for a WhatsApp-invited teammate.
+ *
+ * We never enable Supabase's Phone provider (it needs an SMS gateway the owner
+ * can't run), so a phone invitee is minted on the always-on EMAIL provider under
+ * this synthetic address. `@teammate.getfrequency.app` is a domain we control
+ * that never receives mail — nothing is ever delivered to it; it exists only as a
+ * stable primary key derived from the E.164 number, so the same phone always maps
+ * to the same account (account creation here + phone-login on the dashboard must
+ * agree byte-for-byte). Pure + exported for the selfcheck. Returns null for
+ * anything that isn't a valid E.164 number.
+ */
+export function teammateEmailFromPhone(phone: unknown): string | null {
+  if (!isValidE164(phone)) return null
+  const digits = phone.trim().replace(/\D/g, '')
+  return `wa-${digits}@teammate.getfrequency.app`
 }
 
 export type InviteAcceptState = 'ok' | 'not-pending' | 'expired' | 'wrong-channel'
