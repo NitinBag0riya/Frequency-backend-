@@ -49,6 +49,7 @@ import { createNarutoStorefrontRouter }    from './routes/naruto-storefront'
 import { createNarutoSupportRouter }       from './routes/naruto-support'
 import { createNarutoPaymentsRouter }      from './routes/naruto-payments'
 import { createNarutoOrdersRouter }        from './routes/naruto-orders'
+import { createSeoGscRouter }              from './routes/seo-gsc'
 import { createPlatformApprovalsRouter }   from './routes/platform-approvals'
 import { createNarutoBulkEntitlementsRouter } from './routes/naruto-bulk-entitlements'
 import { createNarutoPlansRouter }         from './routes/naruto-plans'
@@ -5851,6 +5852,8 @@ app.use(createPhase3Router({ supabase, requireAuth, identifyTenant, checkPermiss
 app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createStorefrontDomainsRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createStorefrontAppRouter({ supabase, requireAuth, identifyTenant }))
+// Connect Google Search Console (ship-dormant: inert until GOOGLE_OAUTH_* env is set).
+app.use(createSeoGscRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createAuthEmailHookRouter())  // Supabase Send-Email hook → Brevo (auth emails)
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
