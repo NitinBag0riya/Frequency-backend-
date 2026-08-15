@@ -61,6 +61,9 @@ export interface OauthStatePayload {
   /** Optional connector key (e.g. 'google_drive', 'google_sheets') so a shared
    *  callback can route the result to the right connector row. */
   k?: string
+  /** Optional flow source (e.g. 'naruto') so a shared callback can return the
+   *  operator to the right surface. Absent for the normal tenant flow. */
+  s?: string
 }
 
 function hmac(secret: string, data: string): string {
@@ -68,13 +71,14 @@ function hmac(secret: string, data: string): string {
 }
 
 /** Sign a fresh OAuth state. TTL is 10 min from now. */
-export function signOauthState(payload: { userId: string; tenantId?: string | null; connectorKey?: string }): string {
+export function signOauthState(payload: { userId: string; tenantId?: string | null; connectorKey?: string; src?: string }): string {
   const body: OauthStatePayload = {
     u: payload.userId,
     t: payload.tenantId ?? null,
     n: crypto.randomBytes(16).toString('base64url'),
     e: Date.now() + STATE_TTL_MS,
     ...(payload.connectorKey ? { k: payload.connectorKey } : {}),
+    ...(payload.src ? { s: payload.src } : {}),
   }
   const blob = Buffer.from(JSON.stringify(body), 'utf8').toString('base64url')
   const sig = hmac(getSecret(), blob)

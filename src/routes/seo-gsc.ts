@@ -30,6 +30,7 @@ import express from 'express'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { signOauthState, verifyOauthState } from '../lib/oauth-state'
 import { encryptSecret, decryptSecret } from '../lib/app-secrets'
+import { requirePlatformCapability } from '../lib/platform-guard'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -205,26 +206,68 @@ async function tenantSlugAndDomains(supabase: SupabaseClient, tenantId: string):
   }
 }
 
+/** Route-shaped error carrying the HTTP status the handler should send. */
+class GscError extends Error { constructor(public status: number, msg: string) { super(msg) } }
+
 export function createSeoGscRouter({ supabase, requireAuth, identifyTenant }: Deps): express.Router {
   const r = express.Router()
+
+  // ── Per-tenant core (shared by the tenant routes and the super-admin routes;
+  //    tenantId is always an explicit argument, never read from the request) ────
+  async function statusFor(tenantId: string) {
+    const { data } = await supabase.from('tenant_gsc')
+      .select('site_url, verified, sitemap_submitted_at, google_email, refresh_token_enc')
+      .eq('tenant_id', tenantId).maybeSingle()
+    return {
+      configured: gscConfigured(),
+      connected: !!(data as any)?.refresh_token_enc,
+      verified: !!(data as any)?.verified,
+      siteUrl: (data as any)?.site_url ?? null,
+      sitemapSubmittedAt: (data as any)?.sitemap_submitted_at ?? null,
+      googleEmail: (data as any)?.google_email ?? null,
+    }
+  }
+
+  /** Build the Google consent URL. `src` ('naruto') travels in the signed state
+   *  so the shared callback knows which surface to return the operator to. */
+  function connectUrl(tenantId: string, userId: string, src?: string): string {
+    const state = signOauthState({ userId, tenantId, connectorKey: 'gsc', src })
+    return 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+      client_id: CLIENT_ID(), redirect_uri: REDIRECT_URI(), response_type: 'code',
+      scope: SCOPES.join(' '), access_type: 'offline', prompt: 'consent',
+      include_granted_scopes: 'true', state,
+    })
+  }
+
+  async function submitSitemapFor(tenantId: string): Promise<string> {
+    if (!gscConfigured()) throw new GscError(501, 'not configured')
+    const { data } = await supabase.from('tenant_gsc')
+      .select('refresh_token_enc, site_url, sitemap_url').eq('tenant_id', tenantId).maybeSingle()
+    const enc = (data as any)?.refresh_token_enc
+    const siteUrl = (data as any)?.site_url
+    const sitemapUrl = (data as any)?.sitemap_url
+    if (!enc || !siteUrl || !sitemapUrl) throw new GscError(409, 'not connected')
+    const access = await accessTokenFromRefresh(decryptSecret(enc))
+    await scSubmitSitemap(access, siteUrl, sitemapUrl)
+    const at = new Date().toISOString()
+    await supabase.from('tenant_gsc').update({ sitemap_submitted_at: at, updated_at: at }).eq('tenant_id', tenantId)
+    return at
+  }
+
+  async function disconnectFor(tenantId: string): Promise<void> {
+    const { data } = await supabase.from('tenant_gsc')
+      .select('refresh_token_enc').eq('tenant_id', tenantId).maybeSingle()
+    const enc = (data as any)?.refresh_token_enc
+    if (enc && gscConfigured()) { try { await revokeToken(decryptSecret(enc)) } catch { /* best-effort */ } }
+    await supabase.from('tenant_gsc').delete().eq('tenant_id', tenantId)
+  }
 
   // ── status ──────────────────────────────────────────────────────────────────
   r.get('/api/seo/gsc/status', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId
     if (!tenantId) { res.status(400).json({ error: 'no tenant' }); return }
-    try {
-      const { data } = await supabase.from('tenant_gsc')
-        .select('site_url, verified, sitemap_submitted_at, google_email, refresh_token_enc')
-        .eq('tenant_id', tenantId).maybeSingle()
-      res.json({
-        configured: gscConfigured(),
-        connected: !!(data as any)?.refresh_token_enc,
-        verified: !!(data as any)?.verified,
-        siteUrl: (data as any)?.site_url ?? null,
-        sitemapSubmittedAt: (data as any)?.sitemap_submitted_at ?? null,
-        googleEmail: (data as any)?.google_email ?? null,
-      })
-    } catch (e: any) { res.status(500).json({ error: e?.message || 'status unavailable' }) }
+    try { res.json(await statusFor(tenantId)) }
+    catch (e: any) { res.status(500).json({ error: e?.message || 'status unavailable' }) }
   })
 
   // ── connect → return the Google consent URL ──────────────────────────────────
@@ -233,25 +276,24 @@ export function createSeoGscRouter({ supabase, requireAuth, identifyTenant }: De
     const tenantId = (req as any).tenantId
     const userId = (req as any).user?.id
     if (!tenantId || !userId) { res.status(400).json({ error: 'no tenant' }); return }
-    const state = signOauthState({ userId, tenantId, connectorKey: 'gsc' })
-    const url = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-      client_id: CLIENT_ID(), redirect_uri: REDIRECT_URI(), response_type: 'code',
-      scope: SCOPES.join(' '), access_type: 'offline', prompt: 'consent',
-      include_granted_scopes: 'true', state,
-    })
-    res.json({ url })
+    res.json({ url: connectUrl(tenantId, userId) })
   })
 
   // ── callback (NO auth middleware — the browser arrives from Google without our
   //    Bearer; the signed `state` is what authenticates the tenant) ─────────────
   r.get('/api/seo/gsc/callback', async (req, res) => {
-    const backTo = (q: string) => `${DASHBOARD_URL()}/settings/storefront?${q}`
+    // Default to the tenant settings page; switch to /naruto once a naruto-sourced
+    // state is verified (payload.s === 'naruto'). `fail` closes over this `let`.
+    let backTo = (q: string) => `${DASHBOARD_URL()}/settings/storefront?${q}`
     const fail = (reason: string) => res.redirect(302, backTo(`gsc=error&reason=${encodeURIComponent(reason)}`))
     if (!gscConfigured()) { fail('not_configured'); return }
     const code = String(req.query.code || '')
     const payload = verifyOauthState(String(req.query.state || ''))
     if (!code || !payload || payload.k !== 'gsc' || !payload.t) { fail('bad_state'); return }
     const tenantId = String(payload.t)
+    if (payload.s === 'naruto') {
+      backTo = (q: string) => `${DASHBOARD_URL()}/naruto/onboarding/storefront?tenant=${encodeURIComponent(tenantId)}&${q}`
+    }
 
     try {
       const tokens = await exchangeCode(code)
@@ -305,34 +347,42 @@ export function createSeoGscRouter({ supabase, requireAuth, identifyTenant }: De
 
   // ── re-submit sitemap (menu/catalog changed) ─────────────────────────────────
   r.post('/api/seo/gsc/submit-sitemap', requireAuth, identifyTenant, async (req, res) => {
-    if (!gscConfigured()) { res.status(501).json({ error: 'not configured' }); return }
-    const tenantId = (req as any).tenantId
-    try {
-      const { data } = await supabase.from('tenant_gsc')
-        .select('refresh_token_enc, site_url, sitemap_url').eq('tenant_id', tenantId).maybeSingle()
-      const enc = (data as any)?.refresh_token_enc
-      const siteUrl = (data as any)?.site_url
-      const sitemapUrl = (data as any)?.sitemap_url
-      if (!enc || !siteUrl || !sitemapUrl) { res.status(409).json({ error: 'not connected' }); return }
-      const access = await accessTokenFromRefresh(decryptSecret(enc))
-      await scSubmitSitemap(access, siteUrl, sitemapUrl)
-      const at = new Date().toISOString()
-      await supabase.from('tenant_gsc').update({ sitemap_submitted_at: at, updated_at: at }).eq('tenant_id', tenantId)
-      res.json({ ok: true, sitemapSubmittedAt: at })
-    } catch (e: any) { res.status(502).json({ error: e?.message || 'sitemap submit failed' }) }
+    try { res.json({ ok: true, sitemapSubmittedAt: await submitSitemapFor((req as any).tenantId) }) }
+    catch (e: any) { res.status(e?.status || 502).json({ error: e?.message || 'sitemap submit failed' }) }
   })
 
   // ── disconnect (revoke + delete row) ─────────────────────────────────────────
   r.post('/api/seo/gsc/disconnect', requireAuth, identifyTenant, async (req, res) => {
-    const tenantId = (req as any).tenantId
-    try {
-      const { data } = await supabase.from('tenant_gsc')
-        .select('refresh_token_enc').eq('tenant_id', tenantId).maybeSingle()
-      const enc = (data as any)?.refresh_token_enc
-      if (enc && gscConfigured()) { try { await revokeToken(decryptSecret(enc)) } catch { /* best-effort */ } }
-      await supabase.from('tenant_gsc').delete().eq('tenant_id', tenantId)
-      res.json({ ok: true })
-    } catch (e: any) { res.status(500).json({ error: e?.message || 'disconnect failed' }) }
+    try { await disconnectFor((req as any).tenantId); res.json({ ok: true }) }
+    catch (e: any) { res.status(500).json({ error: e?.message || 'disconnect failed' }) }
+  })
+
+  // ── SUPER-ADMIN cross-tenant (tenantId from the URL param, NOT the session).
+  //    Platform-gated (tenant.write — platform_owner/admin/onboarding hold it);
+  //    connect signs src:'naruto' so the shared callback returns to /naruto. ────
+  const requireSuper = requirePlatformCapability(supabase, 'tenant.write')
+
+  r.get('/api/super-admin/seo/:tenantId/gsc/status', requireAuth, requireSuper, async (req, res) => {
+    try { res.json(await statusFor(String(req.params.tenantId))) }
+    catch (e: any) { res.status(500).json({ error: e?.message || 'status unavailable' }) }
+  })
+
+  r.get('/api/super-admin/seo/:tenantId/gsc/connect', requireAuth, requireSuper, async (req, res) => {
+    if (!gscConfigured()) { res.status(501).json({ error: 'not configured' }); return }
+    const tenantId = String(req.params.tenantId)
+    const userId = (req as any).user?.id
+    if (!tenantId || !userId) { res.status(400).json({ error: 'no tenant' }); return }
+    res.json({ url: connectUrl(tenantId, userId, 'naruto') })
+  })
+
+  r.post('/api/super-admin/seo/:tenantId/gsc/submit-sitemap', requireAuth, requireSuper, async (req, res) => {
+    try { res.json({ ok: true, sitemapSubmittedAt: await submitSitemapFor(String(req.params.tenantId)) }) }
+    catch (e: any) { res.status(e?.status || 502).json({ error: e?.message || 'sitemap submit failed' }) }
+  })
+
+  r.post('/api/super-admin/seo/:tenantId/gsc/disconnect', requireAuth, requireSuper, async (req, res) => {
+    try { await disconnectFor(String(req.params.tenantId)); res.json({ ok: true }) }
+    catch (e: any) { res.status(500).json({ error: e?.message || 'disconnect failed' }) }
   })
 
   return r

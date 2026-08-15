@@ -23,6 +23,18 @@ import { resolveSiteUrl, extractMetaToken, gscConfigured, type TenantDomain } fr
   assert.equal(p!.k, 'gsc', 'connector key round-trips (callback checks k===gsc)')
 }
 
+// ── State: naruto source round-trips (callback returns the operator to /naruto) ──
+{
+  const state = signOauthState({ userId: 'op1', tenantId: 'T9', connectorKey: 'gsc', src: 'naruto' })
+  const p = verifyOauthState(state)
+  assert.ok(p, 'naruto-sourced state verifies')
+  assert.equal(p!.s, 'naruto', 'src round-trips → callback redirects to /naruto/onboarding/storefront')
+  assert.equal(p!.t, 'T9', 'tenant from the super-admin URL param travels in the state')
+  // The plain tenant flow must NOT carry a source (keeps the /settings/storefront redirect).
+  const plain = verifyOauthState(signOauthState({ userId: 'u1', tenantId: 'T1', connectorKey: 'gsc' }))
+  assert.equal(plain!.s, undefined, 'tenant flow has no src')
+}
+
 // ── State: tampered → rejected ──────────────────────────────────────────────────
 {
   const state = signOauthState({ userId: 'u1', tenantId: 'T1', connectorKey: 'gsc' })
