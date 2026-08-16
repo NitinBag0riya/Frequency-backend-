@@ -132,6 +132,43 @@ async function vercel(method: string, path: string, body?: unknown): Promise<{ o
   return { ok: r.ok, status: r.status, json }
 }
 
+// Ask Vercel for a domain's CURRENT state and make it true: force a re-verify, then
+// make sure a TLS cert actually exists. Shared by the operator's "Recheck status"
+// button and the background sweep below, so both can never drift apart.
+async function checkDomain(hostname: string, kind?: string): Promise<{ verified: boolean; ssl_status: string; cfg: any }> {
+  const project = projectFor(kind)
+  const enc = encodeURIComponent(hostname)
+  // verified = Vercel confirms ownership AND the DNS records are correctly set.
+  // A plain GET is a CACHED read — it replays the last check's result and never
+  // re-resolves DNS, so a domain added while its DNS was still wrong stays Pending
+  // forever no matter how often the operator clicks. POST /verify forces a fresh look.
+  const [ver, cfg] = await Promise.all([
+    vercel('POST', `/v9/projects/${project}/domains/${enc}/verify`),
+    vercel('GET', `/v6/domains/${enc}/config`),
+  ])
+  const dom = ver.ok ? ver : await vercel('GET', `/v9/projects/${project}/domains/${enc}`)
+  const verified = dom.ok && dom.json?.verified === true && cfg.ok && cfg.json?.misconfigured === false
+
+  // ssl_status is CHECK-constrained to 'pending' | 'issued' (+ error states) — NOT
+  // 'active'. Vercel USUALLY auto-issues once DNS verifies, but when the first attempt
+  // fails (domain added before DNS pointed at us) it does NOT retry on its own — the
+  // domain sits verified with no certificate and HTTPS hard-fails at the TLS handshake.
+  // So confirm a cert exists and request one if it doesn't, rather than optimistically
+  // recording 'issued' and lying to the operator about a store nobody can reach.
+  let ssl_status = 'pending'
+  if (verified) {
+    const have = await vercel('GET', `/v4/certs?domain=${enc}`)
+    let certOk = have.ok && Array.isArray(have.json?.certs) && have.json.certs.length > 0
+    if (!certOk) {
+      const made = await vercel('POST', '/v4/certs', { cns: [hostname] })
+      certOk = made.ok
+      if (!certOk) console.warn(`[storefront-domains] cert issue "${hostname}" → ${made.status}: ${made.json?.error?.message || 'failed'}`)
+    }
+    ssl_status = certOk ? 'issued' : 'pending'
+  }
+  return { verified, ssl_status, cfg: cfg.ok ? cfg.json : null }
+}
+
 function normalizeHostname(raw: string): string {
   return String(raw || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/\.$/, '')
 }
@@ -166,6 +203,30 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   } else {
     console.warn('[storefront-domains] VERCEL_API_TOKEN / VERCEL_TEAM_ID not set — custom domains will record only, no Vercel registration.')
   }
+
+  // Background sweep for domains that aren't fully live yet. Operators point DNS on
+  // their own schedule (often hours later, at their registrar, without telling us), and
+  // Vercel does not retry a failed cert issuance — so without this a domain only ever
+  // advances when a human happens to click "Recheck status". Same in-process
+  // setInterval pattern as the dashboard-origin refresh in index.ts: no extra worker,
+  // no queue, no cost. Bounded per tick so a backlog can't burst the Vercel API.
+  async function sweepPendingDomains(): Promise<void> {
+    try {
+      const { data } = await supabase.from('tenant_domains')
+        .select('id, hostname, kind, verified, ssl_status')
+        .or('verified.is.false,ssl_status.neq.issued')
+        .limit(25)
+      for (const row of (data || []) as any[]) {
+        try {
+          const { verified, ssl_status } = await checkDomain(row.hostname, row.kind)
+          if (verified === row.verified && ssl_status === row.ssl_status) continue   // no change → no write
+          await supabase.from('tenant_domains').update({ verified, ssl_status }).eq('id', row.id)
+          console.log(`[storefront-domains] sweep "${row.hostname}" → verified=${verified} ssl=${ssl_status}`)
+        } catch (e: any) { console.warn(`[storefront-domains] sweep "${row.hostname}" failed: ${e?.message}`) }
+      }
+    } catch (e: any) { console.warn('[storefront-domains] sweep query failed:', e?.message) }
+  }
+  if (vercelConfigured) setInterval(() => void sweepPendingDomains(), 10 * 60_000).unref()
 
   // Server-to-server: storefront-api asks us to deliver a login OTP over
   // WhatsApp (tenant's WABA, else Frequency fallback). Authenticated by the
@@ -373,6 +434,16 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
           // 403/forbidden often means the domain belongs to another Vercel account.
           res.status(502).json({ error: msg }); return
         }
+        // An apex also needs its `www.` twin registered, redirecting to the apex. Most
+        // registrars create a www CNAME by default and customers type it out of habit,
+        // but www is a SEPARATE hostname to Vercel: unregistered, it gets no route and
+        // no certificate, so https://www.<domain> dies at the TLS handshake while the
+        // apex works. Apex-ness comes from Vercel's own apexName (no public-suffix
+        // guessing); best-effort — a www failure must never block the real connect.
+        if (add.json?.apexName === hostname) {
+          const www = await vercel('POST', `/v10/projects/${project}/domains`, { name: `www.${hostname}`, redirect: hostname, redirectStatusCode: 308 })
+          if (!www.ok && www.status !== 409) console.warn(`[storefront-domains] www.${hostname} → ${www.status}: ${www.json?.error?.message || 'skipped'}`)
+        }
       }
 
       // 2. Record against the tenant. Unique on hostname → a domain belongs to exactly
@@ -415,7 +486,8 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   })
 
   // Re-poll Vercel for a pending domain's DNS/verification state and persist it.
-  // The UI calls this from a "Recheck status" button — there is no background poller.
+  // The UI's "Recheck status" button is the impatient path; sweepPendingDomains()
+  // above does the same thing on a timer so nobody HAS to click it.
   r.post('/api/storefront/domains/:id/recheck', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId
     try {
@@ -425,23 +497,13 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       if (!vercelConfigured) { res.json({ domain: row, dns: null, misconfigured: null }); return }
 
       const hostname = row.hostname as string
-      // verified = Vercel confirms ownership AND the DNS records are correctly set.
-      const [dom, cfg] = await Promise.all([
-        vercel('GET', `/v9/projects/${projectFor(row.kind as string)}/domains/${encodeURIComponent(hostname)}`),
-        vercel('GET', `/v6/domains/${encodeURIComponent(hostname)}/config`),
-      ])
-      const ownershipOk = dom.ok && dom.json?.verified === true
-      const dnsOk = cfg.ok && cfg.json?.misconfigured === false
-      const verified = ownershipOk && dnsOk
-      // ssl_status is CHECK-constrained to 'pending' | 'issued' (+ error states) —
-      // NOT 'active'. Vercel auto-issues the cert once DNS verifies.
-      const ssl_status = verified ? 'issued' : 'pending'
+      const { verified, ssl_status, cfg } = await checkDomain(hostname, row.kind as string)
 
       const { data: updated, error } = await supabase.from('tenant_domains')
         .update({ verified, ssl_status }).eq('id', row.id).eq('tenant_id', tenantId).select('*').single()
       if (error) { res.status(500).json({ error: error.message }); return }
-      console.log(`[storefront-domains] recheck "${hostname}" → verified=${verified} dnsOk=${dnsOk} ownershipOk=${ownershipOk}`)
-      res.json({ domain: updated, dns: cfg.ok ? cfg.json : null, misconfigured: cfg.json?.misconfigured ?? null })
+      console.log(`[storefront-domains] recheck "${hostname}" → verified=${verified} ssl=${ssl_status}`)
+      res.json({ domain: updated, dns: cfg, misconfigured: cfg?.misconfigured ?? null })
     } catch (e: any) {
       console.error(`[storefront-domains] recheck threw:`, e?.message)
       res.status(500).json({ error: e?.message || 'Could not check the domain status.' })
