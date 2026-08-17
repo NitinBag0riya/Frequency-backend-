@@ -2226,7 +2226,7 @@ const desktopEnrollLimiter = makeInMemoryRateLimiter(10, 60_000)
 // failure never fails the ack (the desktop must not treat a heartbeat blip as an error).
 const desktopHeartbeatLimiter = makeInMemoryRateLimiter(60, 60_000)
 app.post('/api/desktop/heartbeat', async (req, res) => {
-  if (!desktopHeartbeatLimiter(req.ip ?? 'unknown')) { res.status(429).json({ error: 'rate limited' }); return }
+  if (desktopHeartbeatLimiter(req.ip ?? 'unknown')) { res.status(429).json({ error: 'rate limited' }); return }
   const rawBody = ((req as any).rawBody as Buffer | undefined)?.toString('utf8') ?? JSON.stringify(req.body ?? {})
   const att = await verifyAttestation(
     {
