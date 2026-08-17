@@ -421,7 +421,7 @@ app.use('/api/hooks/auth-email', express.json({
 // Frequency Desktop provisioning — the per-install attestation signature is over
 // the EXACT request bytes, so capture rawBody before the global parser (the legacy
 // shared-secret path ignores it). Verified in routes/desktop-attestation.ts.
-app.use('/api/desktop/provision', express.json({
+app.use(['/api/desktop/provision', '/api/desktop/heartbeat'], express.json({
   limit: '1mb',
   verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf) },
 }))
@@ -2207,9 +2207,60 @@ const desktopInstallStore = {
     await supabase.from('desktop_installs')
       .update({ last_seen_at: new Date().toISOString() }).eq('install_id', id)
   },
+  // Health heartbeat: store the compact snapshot + when it arrived so /naruto can
+  // show which merchants are live. Best-effort; a write failure never breaks the ack.
+  recordHeartbeat: async (id: string, health: unknown, tenantSlug: string | null, appVersion: string | null): Promise<void> => {
+    const now = new Date().toISOString()
+    await supabase.from('desktop_installs')
+      .update({ last_seen_at: now, last_heartbeat_at: now, health, tenant_slug: tenantSlug, app_version: appVersion })
+      .eq('install_id', id)
+  },
 }
 // Enrol is low-volume + pre-tenant → a small per-ip in-memory cap is enough.
 const desktopEnrollLimiter = makeInMemoryRateLimiter(10, 60_000)
+
+// ── Frequency Desktop health heartbeat ───────────────────────────────────────
+// Signed (per-install attestation) POST every ~2 min carrying a compact health
+// snapshot. Lets /naruto show which merchants are actually live + capturing,
+// instead of learning an order was missed from a complaint. Best-effort; a write
+// failure never fails the ack (the desktop must not treat a heartbeat blip as an error).
+const desktopHeartbeatLimiter = makeInMemoryRateLimiter(60, 60_000)
+app.post('/api/desktop/heartbeat', async (req, res) => {
+  if (!desktopHeartbeatLimiter(req.ip ?? 'unknown')) { res.status(429).json({ error: 'rate limited' }); return }
+  const rawBody = ((req as any).rawBody as Buffer | undefined)?.toString('utf8') ?? JSON.stringify(req.body ?? {})
+  const att = await verifyAttestation(
+    {
+      installId: req.headers['x-desktop-install-id'] as string | undefined,
+      timestamp: req.headers['x-desktop-timestamp'] as string | undefined,
+      signature: req.headers['x-desktop-signature'] as string | undefined,
+    },
+    rawBody,
+    desktopInstallStore,
+  )
+  if (!att.ok) { res.status(att.status).json({ error: att.error }); return }
+  const b = (req.body ?? {}) as { health?: unknown; tenantSlug?: unknown; appVersion?: unknown }
+  const slug = typeof b.tenantSlug === 'string' ? b.tenantSlug.slice(0, 80) : null
+  const ver = typeof b.appVersion === 'string' ? b.appVersion.slice(0, 40) : null
+  try { await desktopInstallStore.recordHeartbeat(att.installId, b.health ?? null, slug, ver) } catch { /* best-effort */ }
+  res.json({ ok: true })
+})
+
+// Super-admin read (/naruto): every install's latest health, freshest first.
+app.get('/api/naruto/desktop-health', requireSuperAdminOrLocal, async (_req, res) => {
+  const { data, error } = await supabase.from('desktop_installs')
+    .select('install_id, tenant_slug, app_version, last_heartbeat_at, last_seen_at, revoked, health')
+    .order('last_heartbeat_at', { ascending: false, nullsFirst: false })
+    .limit(500)
+  if (error) { res.status(500).json({ error: error.message }); return }
+  const now = Date.now()
+  const rows = (data ?? []).map((r: any) => ({
+    installId: r.install_id, tenantSlug: r.tenant_slug, appVersion: r.app_version,
+    lastHeartbeatAt: r.last_heartbeat_at, revoked: !!r.revoked, health: r.health,
+    // "live" = a heartbeat within the last 6 min (≈3 missed 2-min beats).
+    live: !!r.last_heartbeat_at && (now - new Date(r.last_heartbeat_at).getTime()) < 6 * 60_000,
+  }))
+  res.json({ installs: rows })
+})
 
 // ── Frequency Desktop runtime routing config ─────────────────────────────────
 // Public, no auth: returns ONLY which backend an install should talk to (URLs,
