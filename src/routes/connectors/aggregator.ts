@@ -489,7 +489,9 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       if (req.query.status)  q = q.eq('status', String(req.query.status))
       const { data, error } = await q
       if (error) { res.status(500).json({ error: error.message }); return }
-      res.json(data ?? [])
+      // Never surface MockFeed test fixtures (status_identifier 'mock_*') on a real board —
+      // legacy demo rows were seeding into prod and stranding in the live count forever.
+      res.json((data ?? []).filter(o => !String((o as any).status_identifier ?? '').startsWith('mock_')))
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
