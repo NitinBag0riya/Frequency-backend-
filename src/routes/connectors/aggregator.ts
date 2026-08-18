@@ -950,7 +950,15 @@ export function createAggregatorConnector(deps: Deps): express.Router {
 
           if (!changed) continue   // unchanged re-push — no bell, no trigger
           notified++
-          const isNew = isNewRow && status === 'new'
+          // Ring for a freshly-SEEN order in any early (pre-fulfilment) state, not only
+          // exact 'new'. Zomato orders routinely leave NEW before our ~8s poll catches them
+          // (they're accepted fast), so they're first seen at 'accepted'/'preparing' — still
+          // a brand-new order that must ring. Recency-gated (30 min) + first-seen-only so a
+          // late history backfill of old/delivered orders never false-rings.
+          const EARLY_STATES = new Set(['new', 'accepted', 'preparing', 'ready'])
+          const placedMs = row.placed_at ? Date.parse(row.placed_at) : NaN
+          const recentEnough = !Number.isFinite(placedMs) || (Date.now() - placedMs) < 30 * 60 * 1000
+          const isNew = isNewRow && EARLY_STATES.has(status) && recentEnough
           void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross) })
           void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
             fireOrderTrigger(supabase, tenantId, {
