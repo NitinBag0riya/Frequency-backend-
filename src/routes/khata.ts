@@ -21,6 +21,7 @@
 
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
+import { maybeAutoTaskForKhataDue } from '../lib/task-auto'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -155,6 +156,13 @@ export function createKhataRouter(supabase: SupabaseClient, requireAuth: Mw, ide
     })
     if (error) return res.status(500).json({ error: error.message })
     res.json({ entry: data })
+    // SOP auto-fire: a debit that pushes a customer's running balance over the threshold
+    // spawns a follow-up task for the owner. Fire-and-forget — never delays/fails the
+    // ledger write (already responded above); deduped per party via source_key.
+    if (data && direction === 'debit') {
+      void maybeAutoTaskForKhataDue(supabase, tenantId, { partyKey: (data as any).party_key, partyName: (data as any).party_name })
+        .catch(err => console.warn('[khata] auto-task failed:', err?.message))
+    }
   })
 
   // PATCH /khata/entries/:id — edit amount/direction/note (tenant-scoped).
