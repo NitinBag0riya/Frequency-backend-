@@ -46,7 +46,7 @@ export const TRANSITIONS: Record<TaskAction, { from: TaskStatus[]; to: TaskStatu
   submit: { from: ['accepted', 'in_progress'], to: 'submitted' },
   approve: { from: ['submitted'], to: 'done' },
   bounce: { from: ['submitted'], to: 'in_progress' },
-  cancel: { from: ['pending', 'accepted', 'in_progress', 'rejected'], to: 'cancelled' },
+  cancel: { from: ['pending', 'accepted', 'in_progress', 'submitted', 'rejected'], to: 'cancelled' },
 }
 
 /** The activity `action` verb written to task_activity for each transition. */

@@ -127,7 +127,9 @@ export function createTasksRouter(
       .select('*').eq('tenant_id', tenantId).eq('id', req.params.id).maybeSingle()
     if (loadErr) return res.status(500).json({ error: loadErr.message })
     if (!task) return res.status(404).json({ error: 'task not found' })
-    if (task.created_by && task.created_by !== meId) return res.status(403).json({ error: 'only the creator can edit this task' })
+    // Fail-CLOSED: a task with no creator is not editable by just anyone (mirrors the
+    // assignee gate). A null created_by must never fall through to "allowed".
+    if (!task.created_by || task.created_by !== meId) return res.status(403).json({ error: 'only the creator can edit this task' })
     if (!isOpen(task.status as TaskStatus)) return res.status(409).json({ error: `cannot edit a '${task.status}' task` })
 
     const patch: Record<string, unknown> = { updated_at: new Date().toISOString() }
@@ -146,6 +148,15 @@ export function createTasksRouter(
       patch.status = 'pending'
       patch.reject_reason = null
       patch.completed_at = null
+      // Clear the previous assignee's proof/review so the new person (and the creator's
+      // next review) never sees stale evidence from the old assignee.
+      patch.proof = null
+      patch.submission_note = null
+      patch.submitted_at = null
+      patch.review_note = null
+      patch.reviewed_by = null
+      patch.reviewed_at = null
+      patch.accepted_at = null
       reassignedTo = b.assignedTo || null
     }
 
@@ -176,9 +187,10 @@ export function createTasksRouter(
     if (loadErr) return res.status(500).json({ error: loadErr.message })
     if (!task) return res.status(404).json({ error: 'task not found' })
 
-    // Identity gate — server-enforced, not a UI hint.
+    // Identity gate — server-enforced, not a UI hint. Fail-CLOSED on both sides: a task
+    // with no creator must NOT let just anyone approve/bounce/cancel it (proof-bypass).
     if (CREATOR_ACTIONS.has(action)) {
-      if (task.created_by && task.created_by !== meId) return res.status(403).json({ error: `only the creator can ${action === 'cancel' ? 'cancel' : 'review'} this task` })
+      if (!task.created_by || task.created_by !== meId) return res.status(403).json({ error: `only the creator can ${action === 'cancel' ? 'cancel' : 'review'} this task` })
     } else {
       if (!task.assigned_to || task.assigned_to !== meId) return res.status(403).json({ error: 'only the assignee can do that' })
     }
@@ -252,9 +264,15 @@ export function createTasksRouter(
   // ── GET /tasks/:id/activity — the update trail ─────────────────────────────
   router.get('/tasks/:id/activity', ...view, async (req, res) => {
     const tenantId = (req as any).tenantId
+    const me = actor(req).id
     // Confirm the task is in this tenant before returning its trail.
-    const { data: task } = await supabase.from('tasks').select('id').eq('tenant_id', tenantId).eq('id', req.params.id).maybeSingle()
+    const { data: task } = await supabase.from('tasks').select('id, assigned_to, created_by').eq('tenant_id', tenantId).eq('id', req.params.id).maybeSingle()
     if (!task) return res.status(404).json({ error: 'task not found' })
+    // Own-scoped staff only read the trail (reject/bounce reasons, notes) of a task they're
+    // on — same boundary the list endpoint applies; otherwise a guessed id leaks it.
+    if ((req as any).userDataScope === 'own' && task.assigned_to !== me && task.created_by !== me) {
+      return res.status(403).json({ error: 'you can only view your own tasks' })
+    }
     const { data, error } = await supabase.from('task_activity')
       .select('*').eq('task_id', req.params.id).order('at', { ascending: true })
     if (error) return res.status(500).json({ error: error.message })
