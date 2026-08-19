@@ -28,6 +28,7 @@ export interface POLine {
   unit: string
   qtyReceived?: number
   price?: number
+  ingredientId?: string | null   // links an inventory ingredient → survives for re-sync
 }
 
 /** Last-10 digits — the same normalisation the khata party key uses, so a
@@ -50,6 +51,7 @@ export function cleanLines(raw: unknown, withReceipt = false): POLine[] {
       qty: Number.isFinite(qty) && qty > 0 ? qty : 1,
       unit: typeof r?.unit === 'string' && r.unit.trim() ? r.unit.trim() : 'pcs',
     }
+    if (r?.ingredientId) line.ingredientId = String(r.ingredientId).slice(0, 64)
     if (withReceipt) {
       const qr = Number(r?.qtyReceived)
       const price = Number(r?.price)
@@ -204,13 +206,9 @@ export function createVendorsRouter(
       .select('*').eq('tenant_id', tenantId).eq('id', req.params.id).maybeSingle()
     if (loadErr) return res.status(500).json({ error: loadErr.message })
     if (!po) return res.status(404).json({ error: 'order not found' })
-
-    // Idempotency guard — simplest correct: block a second receipt. Once a
-    // payable is posted (ledger_entry_id set / status received) we never
-    // re-post; the original ledger entry stays untouched (money-integrity).
-    // Correcting a received order = a NEW khata entry by the operator, by design.
-    if (po.status === 'received' || po.ledger_entry_id) {
-      return res.status(409).json({ error: 'this order is already received' })
+    // Only a sent order can be received (never a draft, cancelled, or already-received one).
+    if (po.status !== 'sent') {
+      return res.status(409).json({ error: po.status === 'received' ? 'this order is already received' : `cannot receive a ${po.status} order` })
     }
 
     const lines = cleanLines(b.lines, true)
@@ -224,8 +222,23 @@ export function createVendorsRouter(
       if (v) { vendorName = v.name || vendorName; phone = vendorPhone(v.phone) }
     }
 
-    // Post the payable only when something actually arrived (amount > 0). A
-    // zero-value receipt still closes the PO but writes no ledger noise.
+    // ATOMIC CLAIM — the real idempotency guard. Flip sent→received ONLY if the row is
+    // still 'sent' and has no payable yet. On a double-tap / retry / two-tab race exactly
+    // ONE request wins this conditional update; every other gets 409 and posts nothing.
+    // (A read-then-check guard is a TOCTOU hole that can double-post the payable.)
+    const { data: claimed, error: claimErr } = await supabase.from('purchase_orders').update({
+      status: 'received',
+      received_at: new Date().toISOString(),
+      lines,
+      ...(typeof b.note === 'string' ? { note: b.note.trim() || null } : {}),
+    }).eq('tenant_id', tenantId).eq('id', req.params.id).eq('status', 'sent').is('ledger_entry_id', null).select().maybeSingle()
+    if (claimErr) return res.status(500).json({ error: claimErr.message })
+    if (!claimed) return res.status(409).json({ error: 'this order is already received' })
+
+    // Only the winner reaches here → post the payable, then pin ledger_entry_id. A crash
+    // between the claim and this post leaves a received PO with no payable (reconcilable,
+    // and far cheaper than a double-charge). Party key uses the SAME token the FE keys
+    // "You owe" by — phone last-10, else the vendor id — so the payable is never orphaned.
     let ledgerEntryId: string | null = null
     if (amount > 0) {
       const { data: entry, error: ledErr } = await addLedgerEntry(supabase, tenantId, {
@@ -240,17 +253,10 @@ export function createVendorsRouter(
       })
       if (ledErr) return res.status(500).json({ error: ledErr.message })
       ledgerEntryId = entry?.id ?? null
+      if (ledgerEntryId) await supabase.from('purchase_orders').update({ ledger_entry_id: ledgerEntryId }).eq('tenant_id', tenantId).eq('id', req.params.id)
     }
 
-    const { data, error } = await supabase.from('purchase_orders').update({
-      status: 'received',
-      received_at: new Date().toISOString(),
-      lines,
-      ledger_entry_id: ledgerEntryId,
-      ...(typeof b.note === 'string' ? { note: b.note.trim() || null } : {}),
-    }).eq('tenant_id', tenantId).eq('id', req.params.id).select().single()
-    if (error) return res.status(500).json({ error: error.message })
-    res.json({ order: data, amount })
+    res.json({ order: { ...claimed, ledger_entry_id: ledgerEntryId }, amount })
   })
 
   return router
