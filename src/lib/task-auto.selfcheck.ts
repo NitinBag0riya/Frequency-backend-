@@ -21,6 +21,17 @@ const ok = (m: string) => { n++; console.log('  ✓', m) }
   assert.ok(w)
   assert.match(w!.title, /a customer/)
   ok('threshold is inclusive; blank name → "a customer" fallback')
+
+  // Per-tenant threshold param.
+  const P = { partyKey: 'p3', partyName: 'Sam' }
+  assert.equal(khataDueTask(999, P, 1000), null)
+  assert.ok(khataDueTask(1000, P, 1000))
+  ok('custom threshold gates: 999 < 1000 → none; 1000 → task')
+
+  assert.ok(khataDueTask(1, P, 0))        // 0 ⇒ any positive due fires
+  assert.equal(khataDueTask(0, P, 0), null)   // no due
+  assert.equal(khataDueTask(-50, P, 0), null) // advance / they owe nothing
+  ok('threshold 0 fires on any positive due, never on 0 or a negative advance')
 }
 
 // ── createAutoTask dedup (stub supabase) ──────────────────────────────────────

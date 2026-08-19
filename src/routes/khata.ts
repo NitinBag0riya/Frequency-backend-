@@ -204,5 +204,24 @@ export function createKhataRouter(supabase: SupabaseClient, requireAuth: Mw, ide
     res.json({ ok: true })
   })
 
+  // GET /khata/settings — the per-tenant auto-follow-up threshold (₹). null ⇒ 500 default.
+  router.get('/khata/settings', ...view, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const { data, error } = await supabase.from('tenants').select('khata_due_task_threshold').eq('id', tenantId).maybeSingle()
+    if (error) return res.status(500).json({ error: error.message })
+    const stored = (data as any)?.khata_due_task_threshold
+    res.json({ dueTaskThreshold: Number.isInteger(stored) && stored >= 0 ? stored : 500 })
+  })
+
+  // PATCH /khata/settings — set the threshold (integer ≥ 0; 0 = a task for any due).
+  router.patch('/khata/settings', ...edit, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const n = Number((req.body ?? {}).dueTaskThreshold)
+    if (!Number.isInteger(n) || n < 0) return res.status(400).json({ error: 'dueTaskThreshold must be a whole number ≥ 0' })
+    const { error } = await supabase.from('tenants').update({ khata_due_task_threshold: n }).eq('id', tenantId)
+    if (error) return res.status(500).json({ error: error.message })
+    res.json({ dueTaskThreshold: n })
+  })
+
   return router
 }
