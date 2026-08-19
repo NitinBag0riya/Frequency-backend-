@@ -67,7 +67,7 @@ function rollup(rows: any[]): PartyRollup[] {
 export async function addLedgerEntry(
   supabase: SupabaseClient,
   tenantId: string,
-  e: { partyName?: string; partyPhone?: string; partyKey?: string; direction: Direction; amount: number; note?: string; source?: string; byEmail?: string; at?: string },
+  e: { partyName?: string; partyPhone?: string; partyKey?: string; direction: Direction; amount: number; note?: string; source?: string; byEmail?: string; at?: string; outletId?: string | null },
 ) {
   const party_key = e.partyKey || partyKeyFrom(e.partyPhone, e.partyName)
   return supabase.from('ledger_entries').insert({
@@ -80,6 +80,8 @@ export async function addLedgerEntry(
     note: e.note ?? null,
     source: e.source ?? 'manual',
     by_email: e.byEmail ?? null,
+    // Which outlet this due/payment belongs to (AdminOutlet id); null = unassigned.
+    outlet_id: e.outletId ? String(e.outletId).slice(0, 64) : null,
     ...(e.at ? { at: e.at } : {}),
   }).select().single()
 }
@@ -148,7 +150,7 @@ export function createKhataRouter(supabase: SupabaseClient, requireAuth: Mw, ide
     if (!b.partyName && !b.partyPhone && !b.partyKey) return res.status(400).json({ error: 'a party name or phone is required' })
     const { data, error } = await addLedgerEntry(supabase, tenantId, {
       partyName: b.partyName, partyPhone: b.partyPhone, partyKey: b.partyKey,
-      direction: direction as Direction, amount, note: b.note, at: b.at,
+      direction: direction as Direction, amount, note: b.note, at: b.at, outletId: b.outletId,
       byEmail: (req as any).user?.email ?? null,
     })
     if (error) return res.status(500).json({ error: error.message })
@@ -170,6 +172,7 @@ export function createKhataRouter(supabase: SupabaseClient, requireAuth: Mw, ide
     }
     if (b.note !== undefined) patch.note = b.note
     if (b.at !== undefined) patch.at = b.at
+    if (b.outletId !== undefined) patch.outlet_id = b.outletId ? String(b.outletId).slice(0, 64) : null
     // Party rename/rephone (the dashboard edit form sends these) — recompute the
     // stable party_key so the entry still merges with the right customer.
     if (b.partyName !== undefined || b.partyPhone !== undefined) {
