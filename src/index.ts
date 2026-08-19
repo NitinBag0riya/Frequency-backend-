@@ -19,6 +19,7 @@ import { resolveDesktopRuntimeConfig, resolveDesktopManifest } from './routes/de
 import { createListingsRouter } from './routes/listings'
 import { createAppointmentsRouter } from './routes/appointments'
 import { createTasksRouter } from './routes/tasks'
+import { createVendorsRouter } from './routes/vendors'
 import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
@@ -1021,6 +1022,9 @@ const PERMISSION_KEY_ALIASES: Record<string, string[]> = {
   // role that manages leads can manage internal tasks (feature-gated separately).
   tasks: ['leads', 'contacts'],
   complaints: ['leads', 'contacts'],
+  // Order-stock / suppliers reuse the leads/CRM permission for the RBAC matrix
+  // (feature-gated separately via the `suppliers` entitlement), like khata/tasks.
+  suppliers: ['leads', 'contacts'],
 }
 
 function hasRolePermission(perms: any, feature: string, action: string): boolean {
@@ -5894,6 +5898,7 @@ app.use('/api', createComplaintsRouter(supabase, requireAuth, identifyTenant, ch
 app.use('/api', createListingsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createAppointmentsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createTasksRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use('/api', createVendorsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api/admin', createAdminRouter(supabase, requireAuth, isPlatformUser))
 
 // ── Phase 3: campaigns, analytics, execution logs, activity ──────────────────
