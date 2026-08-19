@@ -22,9 +22,10 @@ const OPEN_STATUSES = ['pending', 'accepted', 'in_progress', 'submitted', 'rejec
 
 /** Pure: the task payload for a Khata-due follow-up, or null when below threshold.
  *  Extracted so the rule is unit-testable without a DB (see task-auto.selfcheck). */
-export function khataDueTask(balance: number, party: { partyKey: string; partyName: string | null }):
+export function khataDueTask(balance: number, party: { partyKey: string; partyName: string | null }, threshold = KHATA_DUE_THRESHOLD):
   { title: string; sourceKey: string } | null {
-  if (!(balance >= KHATA_DUE_THRESHOLD)) return null
+  // threshold 0 ⇒ any positive due fires; else the balance must reach the threshold.
+  if (!(balance > 0 && balance >= threshold)) return null
   const name = (party.partyName || '').trim() || 'a customer'
   return { title: `Follow up on ₹${Math.round(balance)} due — ${name}`, sourceKey: `khata_due:${party.partyKey}` }
 }
@@ -64,8 +65,11 @@ export async function maybeAutoTaskForKhataDue(
     .select('direction, amount').eq('tenant_id', tenantId).eq('party_key', party.partyKey)
   if (!rows) return
   const balance = rows.reduce((s, e: any) => s + (e.direction === 'debit' ? Number(e.amount) : -Number(e.amount)), 0)
-  const task = khataDueTask(balance, party)
+  // Per-tenant threshold (₹). A stored integer ≥ 0 wins (0 = any due); else the ₹500 default.
+  const { data: t } = await sb.from('tenants').select('user_id, khata_due_task_threshold').eq('id', tenantId).maybeSingle()
+  const stored = (t as any)?.khata_due_task_threshold
+  const threshold = Number.isInteger(stored) && stored >= 0 ? stored : KHATA_DUE_THRESHOLD
+  const task = khataDueTask(balance, party, threshold)
   if (!task) return
-  const { data: t } = await sb.from('tenants').select('user_id').eq('id', tenantId).maybeSingle()
   await createAutoTask(sb, tenantId, { ...task, assignedTo: (t as any)?.user_id ?? null })
 }
