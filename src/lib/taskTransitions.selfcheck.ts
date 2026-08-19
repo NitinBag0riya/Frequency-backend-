@@ -24,6 +24,25 @@ ok(evaluateTransition('accepted', 'reject').to === 'rejected', 'reject from acce
 for (const s of ['pending', 'accepted', 'in_progress', 'rejected'] as TaskStatus[])
   ok(evaluateTransition(s, 'cancel').to === 'cancelled', `cancel from ${s}`)
 
+// Proof-of-work path: accepted/in_progress → submitted → done (approve) | in_progress (bounce)
+ok(evaluateTransition('accepted', 'submit').to === 'submitted', 'submit from accepted')
+ok(evaluateTransition('in_progress', 'submit').to === 'submitted', 'submit from in_progress')
+ok(evaluateTransition('submitted', 'approve').to === 'done', 'approve from submitted')
+ok(evaluateTransition('submitted', 'bounce').to === 'in_progress', 'bounce from submitted')
+
+// Illegal proof transitions must fail closed
+ok(!evaluateTransition('pending', 'submit').ok, 'cannot submit straight from pending')
+ok(!evaluateTransition('submitted', 'submit').ok, 'cannot re-submit an in-review task')
+ok(!evaluateTransition('accepted', 'approve').ok, 'cannot approve before submission')
+ok(!evaluateTransition('in_progress', 'approve').ok, 'cannot approve an in-progress task')
+ok(!evaluateTransition('done', 'bounce').ok, 'cannot bounce a done task')
+ok(!evaluateTransition('accepted', 'bounce').ok, 'cannot bounce before submission')
+
+// Role guards for the proof actions
+ok(ACTION_ROLE.submit === 'assignee', 'submit is an assignee action')
+ok(ACTION_ROLE.approve === 'creator', 'approve is a creator action')
+ok(ACTION_ROLE.bounce === 'creator', 'bounce is a creator action')
+
 // Illegal transitions must fail closed
 ok(!evaluateTransition('done', 'accept').ok, 'cannot accept a done task')
 ok(!evaluateTransition('done', 'start').ok, 'cannot start a done task')
