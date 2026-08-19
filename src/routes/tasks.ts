@@ -100,6 +100,7 @@ export function createTasksRouter(
       assignee_name: b.assigneeName ?? null,
       priority,
       status: 'pending',
+      requires_proof: !!b.requiresProof,
       due_at: b.dueAt || null,
       linked_type: linkedType,
       linked_id: linkedType ? (b.linkedId ?? null) : null,
@@ -134,6 +135,7 @@ export function createTasksRouter(
     if (b.description !== undefined) patch.description = b.description === '' ? null : b.description
     if (b.dueAt !== undefined) patch.due_at = b.dueAt || null
     if (b.priority !== undefined) { if (!PRIORITIES.includes(b.priority)) return res.status(400).json({ error: 'bad priority' }); patch.priority = b.priority }
+    if (b.requiresProof !== undefined) patch.requires_proof = !!b.requiresProof
 
     // Reassign — hands the task to a new teammate. Resets to pending so the new
     // assignee runs the accept/reject flow fresh; notifies them.
@@ -157,7 +159,13 @@ export function createTasksRouter(
   })
 
   // ── Lifecycle actions ──────────────────────────────────────────────────────
-  // accept / reject / start / complete → assignee only; cancel → creator only.
+  // accept / reject / start / complete / submit → assignee only;
+  // approve / bounce / cancel → creator only.
+  const CREATOR_ACTIONS = new Set<TaskAction>(['cancel', 'approve', 'bounce'])
+  // Proof files must live in OUR public assets bucket — never a caller-supplied
+  // arbitrary URL. Mirrors the assets-route host (assets.getfrequency.app).
+  const ASSETS_HOST = 'https://assets.getfrequency.app/'
+
   const runAction = (action: TaskAction) => async (req: express.Request, res: express.Response) => {
     const tenantId = (req as any).tenantId
     const { id: meId, email: meEmail } = actor(req)
@@ -169,33 +177,62 @@ export function createTasksRouter(
     if (!task) return res.status(404).json({ error: 'task not found' })
 
     // Identity gate — server-enforced, not a UI hint.
-    if (action === 'cancel') {
-      if (task.created_by && task.created_by !== meId) return res.status(403).json({ error: 'only the creator can cancel this task' })
+    if (CREATOR_ACTIONS.has(action)) {
+      if (task.created_by && task.created_by !== meId) return res.status(403).json({ error: `only the creator can ${action === 'cancel' ? 'cancel' : 'review'} this task` })
     } else {
       if (!task.assigned_to || task.assigned_to !== meId) return res.status(403).json({ error: 'only the assignee can do that' })
     }
 
-    // Reject requires a reason.
+    // Reject / bounce both require a reason.
     let reason: string | null = null
-    if (action === 'reject') {
+    if (action === 'reject' || action === 'bounce') {
       reason = typeof b.reason === 'string' ? b.reason.trim() : ''
-      if (!reason) return res.status(400).json({ error: 'a reason is required to reject' })
+      if (!reason) return res.status(400).json({ error: `a reason is required to ${action === 'reject' ? 'reject' : 'send back'}` })
+    }
+
+    // Submit requires ≥1 proof item, each hosted in our assets bucket.
+    let proof: { url: string; type: string | null; name: string | null; size: number | null }[] | null = null
+    let submissionNote: string | null = null
+    if (action === 'submit') {
+      const raw = Array.isArray(b.proof) ? b.proof : []
+      const clean = raw
+        .filter((p: any) => p && typeof p.url === 'string' && p.url.startsWith(ASSETS_HOST))
+        .map((p: any) => ({
+          url: p.url as string,
+          type: typeof p.type === 'string' ? p.type : null,
+          name: typeof p.name === 'string' ? p.name : null,
+          size: typeof p.size === 'number' ? p.size : null,
+        }))
+      if (clean.length === 0) return res.status(400).json({ error: 'attach at least one proof file to submit' })
+      proof = clean
+      submissionNote = typeof b.note === 'string' && b.note.trim() ? b.note.trim() : null
+    }
+
+    // Close the boundary: a proof task can never take the plain done path.
+    if (action === 'complete' && task.requires_proof) {
+      return res.status(409).json({ error: 'this task needs proof — submit proof for review instead' })
     }
 
     const t = evaluateTransition(task.status as TaskStatus, action)
     if (!t.ok) return res.status(409).json({ error: t.error })
 
-    const patch: Record<string, unknown> = { status: t.to, updated_at: new Date().toISOString() }
+    const now = new Date().toISOString()
+    const patch: Record<string, unknown> = { status: t.to, updated_at: now }
     if (action === 'reject') patch.reject_reason = reason
-    if (t.to === 'done') patch.completed_at = new Date().toISOString()
+    if (action === 'accept') patch.accepted_at = now
+    if (action === 'submit') { patch.proof = proof; patch.submission_note = submissionNote; patch.submitted_at = now }
+    if (action === 'approve') { patch.reviewed_by = meId ?? null; patch.reviewed_at = now }
+    if (action === 'bounce') { patch.review_note = reason; patch.reviewed_by = meId ?? null; patch.reviewed_at = now }
+    if (t.to === 'done') patch.completed_at = now
 
     const { data, error } = await supabase.from('tasks').update(patch)
       .eq('tenant_id', tenantId).eq('id', req.params.id).select().single()
     if (error) return res.status(500).json({ error: error.message })
 
-    await logActivity(data.id, meId, ACTION_VERB[action], reason)
-    // Notify the OTHER party: assignee actions → creator; cancel → assignee.
-    const other = action === 'cancel' ? data.assigned_to : data.created_by
+    await logActivity(data.id, meId, ACTION_VERB[action], action === 'submit' ? submissionNote : reason)
+    // Notify the OTHER party: assignee actions → creator; creator actions
+    // (cancel/approve/bounce) → assignee.
+    const other = CREATOR_ACTIONS.has(action) ? data.assigned_to : data.created_by
     await notify(tenantId, other, meId, 'task.updated', {
       status: t.to, title: data.title, actor: meEmail ?? 'A teammate',
       summary: reason ? `${meEmail ?? 'A teammate'}: ${reason}` : `${meEmail ?? 'A teammate'} marked it ${t.to}`,
@@ -207,6 +244,9 @@ export function createTasksRouter(
   router.post('/tasks/:id/reject', ...edit, runAction('reject'))
   router.post('/tasks/:id/start', ...edit, runAction('start'))
   router.post('/tasks/:id/complete', ...edit, runAction('complete'))
+  router.post('/tasks/:id/submit', ...edit, runAction('submit'))
+  router.post('/tasks/:id/approve', ...edit, runAction('approve'))
+  router.post('/tasks/:id/bounce', ...edit, runAction('bounce'))
   router.post('/tasks/:id/cancel', ...edit, runAction('cancel'))
 
   // ── GET /tasks/:id/activity — the update trail ─────────────────────────────

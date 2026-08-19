@@ -5,17 +5,22 @@
  *
  * Roles:
  *   • assignee — the person the task was assigned to. Accepts / rejects / starts
- *                / completes it.
- *   • creator  — the person who created & assigned it. Can cancel while open.
+ *                / completes (or, on a proof task, submits) it.
+ *   • creator  — the person who created & assigned it. Can cancel while open,
+ *                and on a proof task approves / bounces the submitted work.
+ *
+ * Proof-of-work path (opt-in per task via `requires_proof`): the assignee
+ * SUBMITs proof instead of completing directly → 'submitted'; the creator then
+ * APPROVEs (→ done) or BOUNCEs it back with a reason (→ in_progress).
  *
  * Enforcement stays server-side (routes check `actor === assigned_to` etc.);
  * this module only answers "is this transition valid at all?".
  */
 
-export type TaskStatus = 'pending' | 'accepted' | 'rejected' | 'in_progress' | 'done' | 'cancelled'
-export type TaskAction = 'accept' | 'reject' | 'start' | 'complete' | 'cancel'
+export type TaskStatus = 'pending' | 'accepted' | 'rejected' | 'in_progress' | 'submitted' | 'done' | 'cancelled'
+export type TaskAction = 'accept' | 'reject' | 'start' | 'complete' | 'submit' | 'approve' | 'bounce' | 'cancel'
 
-export const TASK_STATUSES: TaskStatus[] = ['pending', 'accepted', 'rejected', 'in_progress', 'done', 'cancelled']
+export const TASK_STATUSES: TaskStatus[] = ['pending', 'accepted', 'rejected', 'in_progress', 'submitted', 'done', 'cancelled']
 
 /** Terminal states — no further transitions allowed. */
 export const TERMINAL_STATUSES: TaskStatus[] = ['rejected', 'done', 'cancelled']
@@ -26,6 +31,9 @@ export const ACTION_ROLE: Record<TaskAction, 'assignee' | 'creator'> = {
   reject: 'assignee',
   start: 'assignee',
   complete: 'assignee',
+  submit: 'assignee',
+  approve: 'creator',
+  bounce: 'creator',
   cancel: 'creator',
 }
 
@@ -35,6 +43,9 @@ export const TRANSITIONS: Record<TaskAction, { from: TaskStatus[]; to: TaskStatu
   reject: { from: ['pending', 'accepted'], to: 'rejected' },
   start: { from: ['pending', 'accepted'], to: 'in_progress' },
   complete: { from: ['accepted', 'in_progress'], to: 'done' },
+  submit: { from: ['accepted', 'in_progress'], to: 'submitted' },
+  approve: { from: ['submitted'], to: 'done' },
+  bounce: { from: ['submitted'], to: 'in_progress' },
   cancel: { from: ['pending', 'accepted', 'in_progress', 'rejected'], to: 'cancelled' },
 }
 
@@ -44,6 +55,9 @@ export const ACTION_VERB: Record<TaskAction, string> = {
   reject: 'rejected',
   start: 'started',
   complete: 'completed',
+  submit: 'submitted',
+  approve: 'approved',
+  bounce: 'bounced',
   cancel: 'cancelled',
 }
 
