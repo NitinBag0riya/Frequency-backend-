@@ -50,7 +50,6 @@ import { createNarutoStorefrontRouter }    from './routes/naruto-storefront'
 import { createNarutoSupportRouter }       from './routes/naruto-support'
 import { createNarutoPaymentsRouter }      from './routes/naruto-payments'
 import { createNarutoOrdersRouter }        from './routes/naruto-orders'
-import { createSeoGscRouter }              from './routes/seo-gsc'
 import { createPlatformApprovalsRouter }   from './routes/platform-approvals'
 import { createNarutoBulkEntitlementsRouter } from './routes/naruto-bulk-entitlements'
 import { createNarutoPlansRouter }         from './routes/naruto-plans'
@@ -662,11 +661,6 @@ app.use('/api/wa-calling/dispatch',  sendLimiter)
 const authLimiter = makeLimiter({ windowMs: 60_000, max: 10, perUser: false })
 app.use('/api/auth/',     authLimiter)
 app.use('/api/onboarding', authLimiter)
-// Phone team invites: creating one sends a WhatsApp (Meta credit) → sendLimiter;
-// accepting one is unauthenticated + creates an auth account (brute-force
-// surface) → authLimiter, IP-keyed like the other account-creation flows.
-app.use('/api/team/invite-phone',         sendLimiter)
-app.use('/api/team/accept-invite-phone',  authLimiter)
 
 app.get('/api/ping', (req, res) => res.json({ pong: true }))
 
@@ -1022,8 +1016,6 @@ const PERMISSION_KEY_ALIASES: Record<string, string[]> = {
   // role that manages leads can manage internal tasks (feature-gated separately).
   tasks: ['leads', 'contacts'],
   complaints: ['leads', 'contacts'],
-  // Order-stock / suppliers reuse the leads/CRM permission for the RBAC matrix
-  // (feature-gated separately via the `suppliers` entitlement), like khata/tasks.
   suppliers: ['leads', 'contacts'],
 }
 
@@ -2719,7 +2711,7 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
 
   // 1. Tenants the user owns
   const { data: ownedTenants, error: e1 } = await supabase.from('tenants')
-    .select('id,slug,waba_id,phone_number_id,business_name,legal_name,billing_address,business_type,display_phone,status,google_email,created_at')
+    .select('id,slug,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
     .eq('user_id', user.id)
   if (e1) { res.status(500).json({ error: e1.message }); return }
 
@@ -2741,7 +2733,7 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
   let teamTenants: any[] = []
   if (memberTenantIds.length > 0) {
     const { data: extra } = await supabase.from('tenants')
-      .select('id,slug,waba_id,phone_number_id,business_name,legal_name,billing_address,business_type,display_phone,status,google_email,created_at')
+      .select('id,slug,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
       .in('id', memberTenantIds)
     teamTenants = extra ?? []
   }
@@ -2749,31 +2741,6 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
   const all = [...(ownedTenants ?? []), ...teamTenants]
   console.log(`[/api/tenants] user=${user.id}, found ${all.length} tenant(s)`)
   res.json(all)
-})
-
-// Admin/owner-only workspace edit — business name + basic details. Server-side
-// authz (checkPermission gates it to roles with settings:edit; owner/super_admin
-// short-circuit). business_type/vertical is LOCKED (see sanitizeTenantPatch).
-app.patch('/api/tenants/:id', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
-  const tenantId = (req as any).tenantId
-  // identifyTenant already resolved the caller's tenant authoritatively; reject
-  // a path id that doesn't match so a member of tenant A can't edit tenant B.
-  // Super-admins legitimately target any tenant via X-Tenant-ID and bypass.
-  if (!(req as any).isSuperAdmin && req.params.id !== tenantId) {
-    res.status(403).json({ error: 'Forbidden' }); return
-  }
-
-  const { sanitizeTenantPatch } = await import('./lib/tenant-patch')
-  const { patch, error: vErr } = sanitizeTenantPatch(req.body ?? {})
-  if (vErr) { res.status(400).json({ error: vErr }); return }
-
-  patch.updated_at = new Date().toISOString()
-  const { data, error } = await supabase.from('tenants')
-    .update(patch).eq('id', tenantId)
-    .select('id,slug,business_name,legal_name,display_phone,billing_address,business_type,status')
-    .single()
-  if (error) { res.status(500).json({ error: error.message }); return }
-  res.json(data)
 })
 
 app.delete('/api/tenants/:id', requireAuth, async (req, res) => {
@@ -5908,8 +5875,6 @@ app.use(createPhase3Router({ supabase, requireAuth, identifyTenant, checkPermiss
 app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createStorefrontDomainsRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createStorefrontAppRouter({ supabase, requireAuth, identifyTenant }))
-// Connect Google Search Console (ship-dormant: inert until GOOGLE_OAUTH_* env is set).
-app.use(createSeoGscRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createAuthEmailHookRouter())  // Supabase Send-Email hook → Brevo (auth emails)
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
