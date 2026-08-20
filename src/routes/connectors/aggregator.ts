@@ -597,6 +597,27 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
+  // Escape hatch — mark a stranded aggregator order DONE from the board. When the
+  // desktop stops relaying status, a queued accept/ready never resolves and the order
+  // sits in Live at new/preparing forever. This directly sets a terminal status
+  // ('delivered' — the board's Live/Past split treats it as done, see isDone/AGG_DONE)
+  // and clears any queued pending_action so the row leaves the Live queue. It is a LOCAL
+  // bookkeeping close only — it does NOT write to Zomato/Swiggy (the order is typically
+  // long delivered on their side); it just unblocks the operator's board. Idempotent
+  // (re-running re-sets the same terminal state) and tenant-scoped.
+  r.post('/api/connectors/aggregator/orders/:id/archive', ...guardEdit, async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const { data, error } = await supabase.from('aggregator_orders')
+        .update({ status: 'delivered', pending_action: null, updated_at: new Date().toISOString() })
+        .eq('tenant_id', tenantId).eq('id', String(req.params.id))
+        .select('id').maybeSingle()
+      if (error) { res.status(500).json({ error: error.message }); return }
+      if (!data) { res.status(404).json({ error: 'Order not found' }); return }
+      res.json({ ok: true, status: 'delivered' })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
   // Item / category stock toggle.
   const StockBody = z.object({
     channel:    z.enum(['zomato', 'swiggy']).optional(),   // resolved server-side if omitted
