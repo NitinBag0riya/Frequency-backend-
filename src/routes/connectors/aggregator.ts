@@ -29,6 +29,7 @@ import { validateBody } from '../../validation'
 import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
 import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity } from '../../connectors/aggregator/menu-import'
 import { rehostImageToAssets } from '../assets.js'
+import { channelIsLive, channelConnected } from './aggregator-health.js'
 import { emitNotification, tenantNotifyRecipients } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -856,13 +857,28 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   })
 
   // Connection health — is the merchant's Frequency Desktop app polling us?
+  // Also reports PER-CHANNEL status so both the web dashboard and the desktop
+  // shell can show "Zomato connected" / "Swiggy connected" durably, instead of the
+  // desktop-only, in-memory signal that never reached the server. A channel counts
+  // as connected when the desktop is live (fresh heartbeat) AND we have ingested
+  // that channel's orders at least once (i.e. the merchant logged in and it pulled
+  // data). Derived from existing rows — no new desktop reporting required.
   r.get('/api/connectors/aggregator/health', ...guardView, async (req, res) => {
     try {
+      const tenantId = (req as any).tenantId
       const { data } = await supabase.from('aggregator_heartbeats')
-        .select('last_seen_at, source').eq('tenant_id', (req as any).tenantId).maybeSingle()
+        .select('last_seen_at, source').eq('tenant_id', tenantId).maybeSingle()
       const lastSeen = (data as any)?.last_seen_at ?? null
-      const online = lastSeen ? (Date.now() - new Date(lastSeen).getTime()) < 90_000 : false
-      res.json({ online, lastSeenAt: lastSeen, source: (data as any)?.source ?? null })
+      const online = channelIsLive(lastSeen)
+      const channels: Record<AggregatorChannel, { connected: boolean; everSeen: boolean }> =
+        { zomato: { connected: false, everSeen: false }, swiggy: { connected: false, everSeen: false } }
+      await Promise.all((Object.keys(channels) as AggregatorChannel[]).map(async ch => {
+        const { count } = await supabase.from('aggregator_orders')
+          .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).eq('channel', ch)
+        const everSeen = !!count && count > 0
+        channels[ch] = { everSeen, connected: channelConnected(online, everSeen) }
+      }))
+      res.json({ online, lastSeenAt: lastSeen, source: (data as any)?.source ?? null, channels })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
