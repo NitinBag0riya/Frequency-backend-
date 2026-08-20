@@ -33,6 +33,10 @@ assert.deepEqual(extractOrderLines(swiggy), [{ name: 'Veg Biryani', qty: 1 }, { 
 // normalized raw.lines shape ({name, qty}) also works
 assert.deepEqual(extractOrderLines({ lines: [{ name: 'Latte', qty: 1 }] }), [{ name: 'Latte', qty: 1 }], 'normalized lines')
 
+// srcId is emitted when the payload item carries a stable id (depletion can then bind by
+// channel srcId, surviving a dashboard rename); omitted when absent (the cases above have none)
+assert.deepEqual(extractOrderLines({ items: [{ name: 'Latte', qty: 1, id: 'ZID-42' }] }), [{ name: 'Latte', qty: 1, srcId: 'ZID-42' }], 'srcId extracted from item id')
+
 // junk is dropped, not thrown
 assert.deepEqual(extractOrderLines({ items: [{ name: '', quantity: 5 }, { name: 'X', quantity: 0 }, { quantity: 1 }] }), [], 'unnamed/zero-qty dropped')
 assert.deepEqual(extractOrderLines(null), [], 'null payload → []')
