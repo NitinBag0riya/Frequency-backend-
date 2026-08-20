@@ -27,7 +27,8 @@ import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { validateBody } from '../../validation'
 import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connectors/aggregator'
-import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity } from '../../connectors/aggregator/menu-import'
+import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity, sf } from '../../connectors/aggregator/menu-import'
+import { inventoryActionForStatus, externalOrderKey, extractOrderLines } from './aggregator-inventory.js'
 import { rehostImageToAssets } from '../assets.js'
 import { channelIsLive, channelConnected } from './aggregator-health.js'
 import { emitNotification, tenantNotifyRecipients } from '../notifications'
@@ -284,6 +285,25 @@ function extractSummary(data: any): { name: string | null; phone: string | null;
     gross: n(o.total_cost) ?? n(o.net_amount) ?? n(o.order_total) ?? n(o.grand_total) ?? n(o.bill_amount)
         ?? n(o.final_amount) ?? n(o.net_total) ?? n(o.order_value) ?? n(o.total) ?? n(o.invoice?.total) ?? lineSum ?? null,
   }
+}
+
+// Off-platform (Zomato/Swiggy) sale → inventory. Deplete when the order is accepted,
+// reverse on cancel/reject (see inventoryActionForStatus). Best-effort + idempotent —
+// storefront-api keys applySale/applyRestock on the namespaced orderId — so it is safe
+// to call on every status transition and it NEVER blocks or fails order ingest.
+const HORECA_INV_TYPES = new Set(['horeca', 'restaurant', 'cafe', 'hotel'])
+async function syncOrderInventory(slug: string, channel: AggregatorChannel, externalId: string, status: string, data: any): Promise<void> {
+  const action = inventoryActionForStatus(status)
+  if (action === 'none') return
+  const orderId = externalOrderKey(channel, externalId)
+  try {
+    if (action === 'deplete') {
+      const lines = extractOrderLines(data)
+      if (lines.length) await sf('POST', '/admin/inventory/apply-external-sale', slug, { orderId, source: channel, lines })
+    } else {
+      await sf('POST', '/admin/inventory/reverse-external-sale', slug, { orderId })
+    }
+  } catch (e: any) { console.warn(`[aggregator/inv] ${orderId} ${status}: ${e?.message}`) }
 }
 
 export function createAggregatorConnector(deps: Deps): express.Router {
@@ -954,6 +974,17 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         } catch (e: any) { console.warn(`[aggregator/ingest] prior-status query failed (all treated as new): ${e?.message}`) }
       }
 
+      // Tenant slug + vertical, resolved once for this batch — used to deplete
+      // ingredient stock for accepted aggregator sales. HoReCa-only (unset ⇒ HoReCa,
+      // matching storefront-api). A miss just skips inventory sync; never fatal.
+      let invSlug: string | null = null
+      if (orders.length) {
+        try {
+          const { data: tr } = await supabase.from('tenants').select('slug, business_type').eq('id', tenantId).maybeSingle()
+          if (tr && HORECA_INV_TYPES.has(String((tr as any).business_type || 'horeca').toLowerCase())) invSlug = (tr as any).slug || null
+        } catch { /* inventory sync is optional */ }
+      }
+
       let notified = 0, failed = 0
       for (const el of orders) {
         try {
@@ -982,6 +1013,10 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           let upErr = (await supabase.from('aggregator_orders').upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })).error
           if (upErr) upErr = (await supabase.from('aggregator_orders').upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })).error
           if (upErr) { console.error(`[aggregator/ingest] upsert failed after retry (order ${externalOrderId}): ${upErr.message}`); failed++; continue }
+
+          // Off-platform sale → inventory: deplete on accept, reverse on cancel/reject.
+          // Only on a status transition; idempotent + best-effort, never blocks ingest.
+          if (changed && invSlug) void syncOrderInventory(invSlug, channel, externalOrderId, status, el.data)
 
           if (!changed) continue   // unchanged re-push — no bell, no trigger
           notified++

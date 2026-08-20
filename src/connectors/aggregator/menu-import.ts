@@ -311,7 +311,7 @@ export function mapEntities(entities: ParsedEntity[]): { categories: MappedCateg
 // ── storefront-api admin client (server-to-server, shared secret) ───────────────
 // Read env INSIDE the call so a caller (e.g. the live-run script) can point these at
 // a specific environment before invoking, without import-time capture.
-async function sf(method: string, path: string, slug: string, body?: unknown): Promise<any> {
+export async function sf(method: string, path: string, slug: string, body?: unknown): Promise<any> {
   const base = process.env.STOREFRONT_API_URL || 'http://localhost:5181'
   const secret = process.env.STOREFRONT_ADMIN_SECRET || 'dev-admin'
   const r = await fetch(`${base}${path}`, {
