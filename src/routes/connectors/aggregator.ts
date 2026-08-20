@@ -306,6 +306,12 @@ async function syncOrderInventory(slug: string, channel: AggregatorChannel, exte
   } catch (e: any) { console.warn(`[aggregator/inv] ${orderId} ${status}: ${e?.message}`) }
 }
 
+// A "detection marker" ping (Swiggy activity sensed, no order captured) that the desktop
+// relays as `{ source: 'lastOrderEventTimestamps' }` — shape-tolerant (checks one level of
+// nesting too). These are NOT orders and must never ring / trigger / render.
+const isGhostMarker = (data: any): boolean =>
+  (data?.source ?? data?.data?.source) === 'lastOrderEventTimestamps'
+
 export function createAggregatorConnector(deps: Deps): express.Router {
   const r = express.Router()
   const { supabase, requireAuth, identifyTenant, checkPermission } = deps
@@ -997,6 +1003,11 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           const s = extractSummary(el.data)
           const externalOrderId = String(el.orderId ?? '')
           if (!externalOrderId) continue
+          // A Swiggy "activity detected" ping the desktop relays with no order behind it
+          // ({source:'lastOrderEventTimestamps'}) — NOT a real order. Skip entirely: no row,
+          // no bell, no workflow trigger. (The board also filters these on read; this kills
+          // the phantom ring + trigger at the source.)
+          if (isGhostMarker(el.data)) continue
           const prior = priorByKey.get(`${channel}:${externalOrderId}`)
           const isNewRow = prior === undefined
           const changed = isNewRow || prior !== status
