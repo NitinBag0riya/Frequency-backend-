@@ -319,6 +319,20 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (e: any) { console.warn(`[aggregator] notify failed (non-fatal): ${e?.message}`) }
   }
 
+  // Realtime "the desktop is alive" ping. One fire-and-forget broadcast on a
+  // tenant topic — `.send()` without `.subscribe()` goes out over HTTP, so there
+  // is NO held socket and NO DB write (mirrors publishCallState in call-dispatch).
+  // The dashboard flips to online the instant this lands instead of waiting for a
+  // poll; cost ceiling is the desktop's own ~40s heartbeat cadence.
+  const AGG_STATUS_TOPIC = (tenantId: string) => `aggregator-status:${tenantId}`
+  const broadcastHeartbeat = (tenantId: string) => {
+    try {
+      const ch = supabase.channel(AGG_STATUS_TOPIC(tenantId), { config: { broadcast: { ack: false } } })
+      void ch.send({ type: 'broadcast', event: 'beat', payload: { at: Date.now() } })
+        .finally(() => { void supabase.removeChannel(ch).catch(() => {}) })
+    } catch { /* realtime is best-effort */ }
+  }
+
   // Bump the desktop-app liveness heartbeat (called from the regular poll).
   const bumpHeartbeat = async (tenantId: string) => {
     try {
@@ -327,6 +341,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         { onConflict: 'tenant_id' },
       )
     } catch { /* non-fatal */ }
+    broadcastHeartbeat(tenantId)
   }
 
   // Best-effort channel for an outlet (from orders we've already seen).
@@ -878,7 +893,9 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         const everSeen = !!count && count > 0
         channels[ch] = { everSeen, connected: channelConnected(online, everSeen) }
       }))
-      res.json({ online, lastSeenAt: lastSeen, source: (data as any)?.source ?? null, channels })
+      // `channel` lets the dashboard subscribe to the realtime liveness pings
+      // without needing to know its own tenant id.
+      res.json({ online, lastSeenAt: lastSeen, source: (data as any)?.source ?? null, channels, channel: AGG_STATUS_TOPIC(tenantId) })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
