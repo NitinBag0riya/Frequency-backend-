@@ -517,7 +517,11 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   r.get('/api/connectors/aggregator/orders', ...guardView, async (req, res) => {
     try {
       let q = supabase.from('aggregator_orders')
-        .select('id, source, channel, external_order_id, outlet_ref, status, status_identifier, customer_name, item_count, gross_amount, currency, placed_at, pending_action, last_action_result, updated_at')
+        // psource = payload->>source only (NOT the raw payload, which carries customer
+        // PII). Lets the board drop "detection marker" ghost rows whose source is
+        // 'lastOrderEventTimestamps' — a Swiggy activity ping the desktop relays with no
+        // real order behind it (0 items, no bill).
+        .select('id, source, channel, external_order_id, outlet_ref, status, status_identifier, customer_name, item_count, gross_amount, currency, placed_at, pending_action, last_action_result, updated_at, psource:payload->>source')
         .eq('tenant_id', (req as any).tenantId)
         .order('placed_at', { ascending: false, nullsFirst: false })
         .limit(Math.min(Number(req.query.limit ?? 100), 200))
