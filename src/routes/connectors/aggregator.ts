@@ -292,18 +292,35 @@ function extractSummary(data: any): { name: string | null; phone: string | null;
 // storefront-api keys applySale/applyRestock on the namespaced orderId — so it is safe
 // to call on every status transition and it NEVER blocks or fails order ingest.
 const HORECA_INV_TYPES = new Set(['horeca', 'restaurant', 'cafe', 'hotel'])
-async function syncOrderInventory(slug: string, channel: AggregatorChannel, externalId: string, status: string, data: any): Promise<void> {
+// Returns an operator-facing coverage-gap summary (for a low-priority notification)
+// when a depletion silently no-ops on some lines, else null. Never throws into ingest.
+async function syncOrderInventory(slug: string, channel: AggregatorChannel, externalId: string, status: string, data: any): Promise<string | null> {
   const action = inventoryActionForStatus(status)
-  if (action === 'none') return
+  if (action === 'none') return null
   const orderId = externalOrderKey(channel, externalId)
   try {
     if (action === 'deplete') {
       const lines = extractOrderLines(data)
-      if (lines.length) await sf('POST', '/admin/inventory/apply-external-sale', slug, { orderId, source: channel, lines })
+      if (!lines.length) return null
+      const resp = await sf('POST', '/admin/inventory/apply-external-sale', slug, { orderId, source: channel, lines })
+      // Depletion is best-effort per line. The endpoint reports lines that matched no dish
+      // (unmatched), matched a dish with no recipe (missing), or whose recipe points at a
+      // removed ingredient (orphan) — each deplete NOTHING. Silently dropping these hides a
+      // renamed/unmapped Zomato/Swiggy dish, so surface the total as an operator signal.
+      const r = (resp && typeof resp === 'object') ? (resp.result ?? resp) : {}
+      const unmatched = Number(r?.unmatched) || 0
+      const missing = Number(r?.missing) || 0
+      const orphan = Number(r?.orphan) || 0
+      const gaps = unmatched + missing + orphan
+      if (gaps > 0) {
+        console.warn(`[aggregator/inv] coverage gap — ${orderId}: unmatched=${unmatched} missing=${missing} orphan=${orphan}`)
+        return `${CHANNEL_LABEL[channel]} order ${externalId}: ${gaps} item(s) didn't deplete stock (unmapped/no recipe) — check Recipe coverage`
+      }
     } else {
       await sf('POST', '/admin/inventory/reverse-external-sale', slug, { orderId })
     }
   } catch (e: any) { console.warn(`[aggregator/inv] ${orderId} ${status}: ${e?.message}`) }
+  return null
 }
 
 // A "detection marker" ping (Swiggy activity sensed, no order captured) that the desktop
@@ -1053,6 +1070,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           // Off-platform sale → inventory: deplete on accept, reverse on cancel/reject.
           // Only on a status transition; idempotent + best-effort, never blocks ingest.
           if (changed && invSlug) void syncOrderInventory(invSlug, channel, externalOrderId, status, el.data)
+            .then(gap => { if (gap) void notifyOrder(tenantId, { isNew: false, channel, orderId: externalOrderId, status, summary: gap }) })
 
           if (!changed) continue   // unchanged re-push — no bell, no trigger
           notified++
