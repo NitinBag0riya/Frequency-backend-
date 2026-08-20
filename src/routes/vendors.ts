@@ -242,7 +242,7 @@ export function createVendorsRouter(
     let ledgerEntryId: string | null = null
     if (amount > 0) {
       const { data: entry, error: ledErr } = await addLedgerEntry(supabase, tenantId, {
-        partyKey: 'vendor:' + (phone || po.vendor_id || 'unknown'),
+        partyKey: 'vendor:' + (po.vendor_id || 'unknown'),   // immutable id, not phone (a phone edit must not orphan the ledger)
         partyName: vendorName,
         partyPhone: phone || undefined,
         direction: 'credit',           // credit = WE OWE the supplier (payable; balance goes negative)
