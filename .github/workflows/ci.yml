@@ -24,6 +24,8 @@ jobs:
         run: npm ci
       - name: Typecheck
         run: npx tsc --noEmit
+      - name: RLS gate (no public table without row level security)
+        run: npm run rls:check
       - name: Lint (if configured)
         run: npm run lint --if-present
       - name: Build (if configured)
