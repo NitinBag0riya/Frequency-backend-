@@ -22,6 +22,10 @@ export function channelIsLive(lastSeenAt: string | null | undefined, now: number
 // per-channel on its authenticated poll, recent order flow is the honest signal.
 export const RECENT_ORDER_WINDOW_MS = 90 * 60_000 // 90 min
 
+// The desktop heartbeat cadence is ~120s; treat its reported per-channel login state as
+// fresh (authoritative) for a few missed beats before falling back to the order-flow proxy.
+export const DESKTOP_HB_WINDOW_MS = 6 * 60_000
+
 export function orderRecent(lastOrderAt: string | null | undefined, now: number = Date.now()): boolean {
   if (!lastOrderAt) return false
   const t = new Date(lastOrderAt).getTime()

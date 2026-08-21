@@ -30,7 +30,7 @@ import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connec
 import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity, sf } from '../../connectors/aggregator/menu-import'
 import { inventoryActionForStatus, externalOrderKey, extractOrderLines } from './aggregator-inventory.js'
 import { rehostImageToAssets } from '../assets.js'
-import { channelIsLive, channelConnected, orderRecent } from './aggregator-health.js'
+import { channelIsLive, channelConnected, orderRecent, DESKTOP_HB_WINDOW_MS } from './aggregator-health.js'
 import { emitNotification, tenantNotifyRecipients } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -955,15 +955,38 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         .select('last_seen_at, source').eq('tenant_id', tenantId).maybeSingle()
       const lastSeen = (data as any)?.last_seen_at ?? null
       const online = channelIsLive(lastSeen)
-      const channels: Record<AggregatorChannel, { connected: boolean; everLinked: boolean; receiving: boolean; lastOrderAt: string | null }> =
-        { zomato: { connected: false, everLinked: false, receiving: false, lastOrderAt: null }, swiggy: { connected: false, everLinked: false, receiving: false, lastOrderAt: null } }
+      // AUTHORITATIVE per-channel truth: the Frequency Desktop app reports each channel's
+      // real login state ('connected'|'needs_login') in its signed heartbeat →
+      // desktop_installs.health, attributed by tenant_slug. Pull the freshest install for
+      // this tenant. When present + fresh it beats the order-flow proxy (which only exists
+      // as a fallback for older apps that don't yet send an attributed slug).
+      let deskState: Partial<Record<AggregatorChannel, string>> = {}
+      let deskFresh = false
+      try {
+        const { data: t } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+        const slug = (t as any)?.slug
+        if (slug) {
+          const { data: inst } = await supabase.from('desktop_installs')
+            .select('health, last_heartbeat_at').eq('tenant_slug', slug)
+            .order('last_heartbeat_at', { ascending: false }).limit(1).maybeSingle()
+          const hbAt = (inst as any)?.last_heartbeat_at ?? null
+          deskFresh = hbAt ? (Date.now() - new Date(hbAt).getTime()) < DESKTOP_HB_WINDOW_MS : false
+          deskState = ((inst as any)?.health?.aggregators ?? {}) as Partial<Record<AggregatorChannel, string>>
+        }
+      } catch { /* fall back to order-flow */ }
+      const channels: Record<AggregatorChannel, { connected: boolean; state: string | null; everLinked: boolean; receiving: boolean; lastOrderAt: string | null }> =
+        { zomato: { connected: false, state: null, everLinked: false, receiving: false, lastOrderAt: null }, swiggy: { connected: false, state: null, everLinked: false, receiving: false, lastOrderAt: null } }
       await Promise.all((Object.keys(channels) as AggregatorChannel[]).map(async ch => {
         const { data: last } = await supabase.from('aggregator_orders')
           .select('created_at').eq('tenant_id', tenantId).eq('channel', ch)
           .order('created_at', { ascending: false }).limit(1).maybeSingle()
         const lastOrderAt = (last as any)?.created_at ?? null
         const receiving = orderRecent(lastOrderAt)
-        channels[ch] = { everLinked: !!lastOrderAt, lastOrderAt, receiving, connected: channelConnected(online, receiving) }
+        const reported = deskFresh ? (deskState[ch] ?? null) : null   // real login state, only when fresh
+        // connected = the desktop confirms this channel is logged in NOW, OR (fallback) a
+        // real order arrived recently. Lifetime history never counts.
+        const connected = reported === 'connected' || channelConnected(online, receiving)
+        channels[ch] = { connected, state: reported, everLinked: !!lastOrderAt, lastOrderAt, receiving }
       }))
       // `channel` lets the dashboard subscribe to the realtime liveness pings
       // without needing to know its own tenant id.
