@@ -30,7 +30,7 @@ import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connec
 import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity, sf } from '../../connectors/aggregator/menu-import'
 import { inventoryActionForStatus, externalOrderKey, extractOrderLines } from './aggregator-inventory.js'
 import { rehostImageToAssets } from '../assets.js'
-import { channelIsLive, channelConnected } from './aggregator-health.js'
+import { channelIsLive, channelConnected, orderRecent } from './aggregator-health.js'
 import { emitNotification, tenantNotifyRecipients } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -939,13 +939,15 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
-  // Connection health — is the merchant's Frequency Desktop app polling us?
-  // Also reports PER-CHANNEL status so both the web dashboard and the desktop
-  // shell can show "Zomato connected" / "Swiggy connected" durably, instead of the
-  // desktop-only, in-memory signal that never reached the server. A channel counts
-  // as connected when the desktop is live (fresh heartbeat) AND we have ingested
-  // that channel's orders at least once (i.e. the merchant logged in and it pulled
-  // data). Derived from existing rows — no new desktop reporting required.
+  // Connection health — is the merchant's Frequency Desktop app polling us, and is
+  // each channel actually RECEIVING orders right now? A channel is only reported
+  // `connected` on server-verifiable proof of liveness: the desktop is live AND a
+  // real order arrived on it within the recent window (see aggregator-health.ts).
+  // We do NOT use lifetime order history — that shows green forever after one old
+  // order even while the channel is logged out and no orders flow (a lie that makes
+  // merchants miss orders). `everLinked` + `lastOrderAt` are returned as honest
+  // context, never as the connected signal. The exact needs_login truth needs the
+  // desktop to report per-channel state on its authed poll; wired to consume it here.
   r.get('/api/connectors/aggregator/health', ...guardView, async (req, res) => {
     try {
       const tenantId = (req as any).tenantId
@@ -953,13 +955,15 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         .select('last_seen_at, source').eq('tenant_id', tenantId).maybeSingle()
       const lastSeen = (data as any)?.last_seen_at ?? null
       const online = channelIsLive(lastSeen)
-      const channels: Record<AggregatorChannel, { connected: boolean; everSeen: boolean }> =
-        { zomato: { connected: false, everSeen: false }, swiggy: { connected: false, everSeen: false } }
+      const channels: Record<AggregatorChannel, { connected: boolean; everLinked: boolean; receiving: boolean; lastOrderAt: string | null }> =
+        { zomato: { connected: false, everLinked: false, receiving: false, lastOrderAt: null }, swiggy: { connected: false, everLinked: false, receiving: false, lastOrderAt: null } }
       await Promise.all((Object.keys(channels) as AggregatorChannel[]).map(async ch => {
-        const { count } = await supabase.from('aggregator_orders')
-          .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).eq('channel', ch)
-        const everSeen = !!count && count > 0
-        channels[ch] = { everSeen, connected: channelConnected(online, everSeen) }
+        const { data: last } = await supabase.from('aggregator_orders')
+          .select('created_at').eq('tenant_id', tenantId).eq('channel', ch)
+          .order('created_at', { ascending: false }).limit(1).maybeSingle()
+        const lastOrderAt = (last as any)?.created_at ?? null
+        const receiving = orderRecent(lastOrderAt)
+        channels[ch] = { everLinked: !!lastOrderAt, lastOrderAt, receiving, connected: channelConnected(online, receiving) }
       }))
       // `channel` lets the dashboard subscribe to the realtime liveness pings
       // without needing to know its own tenant id.
