@@ -720,7 +720,27 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       if (error) { res.status(500).json({ error: error.message }); return }
       // Distinct outlets for the FE outlet selector.
       const outlets = Array.from(new Set((data ?? []).map((m: any) => m.outlet_ref)))
-      res.json({ menu: data ?? [], outlets })
+      // …and their human names, so the picker doesn't read "21949044" vs "22340216".
+      // Sourced from the STOREFRONT outlets (swiggyResId/zomatoResId) — the same
+      // mapping order attribution resolves through — and not from the provision
+      // metadata, so a picker label can never disagree with which outlet an order
+      // is actually filed under. Additive: `outlets` keeps its shape, and a ref with
+      // no outlet claiming it is simply absent (the FE falls back to the raw id).
+      const outletLabels: Record<string, string> = {}
+      try {
+        const { data: t } = await supabase.from('tenants')
+          .select('slug').eq('id', (req as any).tenantId).maybeSingle()
+        const slug = (t as any)?.slug
+        if (slug) {
+          const cfg = await sf('GET', '/admin/config', slug)
+          for (const o of (Array.isArray(cfg?.outlets) ? cfg.outlets : [])) {
+            for (const ref of [o?.swiggyResId, o?.zomatoResId]) {
+              if (ref && o?.name) outletLabels[String(ref)] = String(o.name)
+            }
+          }
+        }
+      } catch { /* labels are cosmetic — never fail the menu read over them */ }
+      res.json({ menu: data ?? [], outlets, outletLabels })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
