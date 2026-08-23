@@ -398,7 +398,14 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // then clear the outlet's pending_full_sync flag.
   const ingestMenu = async (tenantId: string, outletRef: string, body: any) => {
     const entities = parseMenuSnapshot(body)
-    const channel = await channelForOutlet(tenantId, outletRef)
+    // Trust the channel the desktop actually scraped; only fall back to inferring it
+    // from a prior order. The inference alone is a chicken-and-egg: an outlet that has
+    // synced its menu but never taken an order got channel=null on every row, which
+    // left its dishes unattributable in the menu views.
+    const declared = String(body?.channel ?? '').toLowerCase()
+    const channel = (declared === 'zomato' || declared === 'swiggy')
+      ? declared
+      : await channelForOutlet(tenantId, outletRef)
     const now = new Date().toISOString()
     if (entities.length) {
       const rows = entities.map(e => ({
