@@ -99,7 +99,9 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
         // fall back to legacy catalogue shapes. null → flagged needs-review, never dropped.
         price: zomatoWrapperPrice(w),
         category_ref: cat.category?.categoryId != null ? String(cat.category.categoryId) : null,
-        raw: cat,
+        // catalogueTags ("veg" | "non-veg" | "egg" | …) live on the WRAPPER, not the
+        // catalogue — carry them into raw so the dietary mark can read them. Additive.
+        raw: cat.catalogueTags ? cat : { ...cat, catalogueTags: w?.catalogueTags },
       })
     }
     if (rows.length) return rows
@@ -139,19 +141,78 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
 export const normKey = (s: unknown): string => String(s ?? '').toLowerCase().normalize('NFKD')
   .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ')
 
-/** Best-effort veg flag across Swiggy (is_veg:"VEG"|"NON_VEG") + Zomato (veg/1|2). */
-export function vegOf(raw: any): boolean {
+/** Mirrors the storefront's FoodType — see storefront-api/food-type.js. */
+export type FoodType = 'veg' | 'nonveg' | 'egg' | 'unset'
+
+/**
+ * Best-effort dietary mark across Swiggy (is_veg:"VEG"|"NON_VEG") + Zomato (1=veg,
+ * 2=non-veg, 3=egg).
+ *
+ * Returns 'unset' when the payload does not say — which is common, because neither
+ * aggregator guarantees the field on every item. That is the whole point: the old
+ * boolean version fell back to `false`, so an unclassified import silently landed in
+ * OUR menu as non-veg, and a veg dish showed a red mark to the diner. Unknown must
+ * stay unknown until a human says otherwise.
+ *
+ * NOTE the asymmetry when pushing back the other way: Swiggy treats a MISSING food
+ * type as NON-VEG on their side, so an 'unset' item must never be published to them
+ * — resolve it with the operator first.
+ */
+/**
+ * Resolve a dietary mark from a list of free-text tags.
+ * ORDER MATTERS: "non-veg" contains "veg", so non-veg must be ruled out first.
+ */
+function fromTags(tags: unknown): FoodType | null {
+  if (!Array.isArray(tags)) return null
+  const list = tags.filter((t) => typeof t === 'string').map((t) => (t as string).toLowerCase().trim())
+  if (!list.length) return null
+  if (list.some((t) => t.includes('non') && t.includes('veg'))) return 'nonveg'
+  if (list.some((t) => t.includes('egg'))) return 'egg'
+  if (list.some((t) => t === 'veg' || t === 'vegetarian' || t === 'pure-veg')) return 'veg'
+  return null
+}
+
+/**
+ * Zomato's real get_content_menu payload states the dietary mark as a dish attribute
+ * (`dishAttributes[].attributes[]` with attributeKey "primary_dietary_tags"), NOT as
+ * an is_veg scalar. Verified against the captured La Fiamma snapshot.
+ */
+function dietaryAttributeTags(raw: any): string[] {
+  const out: string[] = []
+  for (const d of Array.isArray(raw?.dishAttributes) ? raw.dishAttributes : []) {
+    for (const a of Array.isArray(d?.attributes) ? d.attributes : []) {
+      if (String(a?.attributeKey ?? '').toLowerCase().includes('dietary')) {
+        for (const v of Array.isArray(a?.attributeValues) ? a.attributeValues : []) out.push(String(v))
+      }
+    }
+  }
+  return out
+}
+
+export function foodTypeOf(raw: any): FoodType {
   const v = raw?.is_veg ?? raw?.veg ?? raw?.isVeg ?? raw?.classifier ?? raw?.item_attribute
-  if (typeof v === 'boolean') return v
+  if (typeof v === 'boolean') return v ? 'veg' : 'nonveg'
   if (typeof v === 'string') {
     const s = v.toUpperCase()
-    if (s.includes('NON')) return false
-    if (s === 'VEG' || s === '1' || s === 'TRUE' || s === 'YES') return true
-    return false
+    if (s.includes('EGG')) return 'egg'
+    if (s.includes('NON')) return 'nonveg'   // must precede the VEG test — "NON_VEG" contains "VEG"
+    if (s === 'VEG' || s === '1' || s === 'TRUE' || s === 'YES') return 'veg'
+    if (s === '2' || s === 'FALSE' || s === 'NO') return 'nonveg'
+    return 'unset'
   }
-  if (v === 1) return true   // Zomato: 1 = veg
-  if (v === 2) return false  // Zomato: 2 = non-veg
-  return false
+  if (v === 1) return 'veg'      // Zomato: 1 = veg
+  if (v === 2) return 'nonveg'   // Zomato: 2 = non-veg
+  if (v === 3) return 'egg'      // Zomato: 3 = contains egg
+  // No scalar — fall back to the shapes the LIVE payloads actually use.
+  return fromTags(dietaryAttributeTags(raw))       // Zomato: primary_dietary_tags
+      ?? fromTags(raw?.catalogueTags)              // Zomato: wrapper-level tags
+      ?? fromTags(raw?.tags)                       // Swiggy / generic tag lists
+      ?? 'unset'                                   // told nothing → say nothing
+}
+
+/** Back-compat wrapper for callers that still want the bool. Only true veg is true. */
+export function vegOf(raw: any): boolean {
+  return foodTypeOf(raw) === 'veg'
 }
 
 /**
@@ -276,6 +337,7 @@ export interface MappedItem {
   name: string
   priceInr: number
   veg: boolean
+  foodType: FoodType
   soldOut: boolean
   description: string
   imageUrl: string | null
@@ -297,6 +359,7 @@ export function mapEntities(entities: ParsedEntity[]): { categories: MappedCateg
         sourceId: e.entity_id,
         name,
         priceInr: Math.max(0, Math.round(Number(e.price) || 0)),
+        foodType: foodTypeOf(e.raw),
         veg: vegOf(e.raw),
         soldOut: !e.in_stock,
         description: String(e.raw?.description ?? e.raw?.desc ?? '').slice(0, 160),
@@ -449,6 +512,8 @@ export async function importMenuToStorefront(
       const body: any = {
         name: it.name,
         priceInr: it.priceInr,
+        // foodType is the truth; veg rides along as the mirror older readers use.
+        foodType: it.foodType,
         veg: it.veg,
         soldOut: it.soldOut,
         description: it.description,
