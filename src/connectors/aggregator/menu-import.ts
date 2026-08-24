@@ -34,6 +34,67 @@ export interface ParsedEntity {
   price: number | null
   category_ref: string | null
   raw: any
+  /** Add-on groups the aggregator attaches to this dish (Zomato modifier groups).
+   *  Maps 1:1 onto our OptionGroup — see zomatoOptionGroups(). */
+  options?: ParsedOptionGroup[]
+}
+
+export interface ParsedOptionGroup {
+  name: string
+  type: 'single' | 'multi'
+  choices: { name: string; priceDelta: number }[]
+}
+
+/**
+ * Zomato add-ons: dishes and modifiers share `catalogueWrappers`, and the binding is
+ *   catalogueWrappers[].mapModifierGroupOrder  → modifierGroupId(s) for that dish
+ *   modifierGroupWrappers[].variantModifierGroupMaps[] → variantId per group
+ *   mapVariantIdToCatalogueId                  → the modifier's own catalogue
+ * so a dish's options are its groups, each holding the non-root catalogues mapped to it.
+ * `max`/`maxSelectionsPerItem` gives single vs multi. Verified against the captured
+ * Sambar Sutra payload (__fixtures__/zomato-menu-modifiers.json).
+ */
+export function zomatoOptionGroups(mr: any): Map<string, ParsedOptionGroup[]> {
+  const out = new Map<string, ParsedOptionGroup[]>()
+  const groups: any[] = Array.isArray(mr?.modifierGroupWrappers) ? mr.modifierGroupWrappers : []
+  if (!groups.length) return out
+  const v2c: Record<string, any> = mr?.mapVariantIdToCatalogueId ?? {}
+  // every catalogue (root AND modifier) by id, with its resolved price
+  const cats = new Map<string, { name: string; price: number }>()
+  for (const w of (mr?.catalogueWrappers ?? [])) {
+    const c = w?.catalogue
+    if (c?.catalogueId == null) continue
+    cats.set(String(c.catalogueId), { name: String(c.name ?? ''), price: Number(zomatoWrapperPrice(w) ?? 0) || 0 })
+  }
+  const byGroupId = new Map<string, ParsedOptionGroup>()
+  for (const g of groups) {
+    const mg = g?.modifierGroup
+    if (mg?.modifierGroupId == null) continue
+    const max = Number(mg.maxSelectionsPerItem ?? mg.max ?? 0) || 0
+    const choices: { name: string; priceDelta: number }[] = []
+    const seen = new Set<string>()
+    for (const mp of (g?.variantModifierGroupMaps ?? [])) {
+      const cid = v2c[String(mp?.variantId)] ?? v2c[mp?.variantId]
+      const c = cid != null ? cats.get(String(cid)) : undefined
+      if (!c?.name || seen.has(c.name)) continue
+      seen.add(c.name)
+      choices.push({ name: c.name, priceDelta: c.price })
+    }
+    if (!choices.length) continue
+    byGroupId.set(String(mg.modifierGroupId), {
+      name: String(mg.displayName || mg.name || 'Options'),
+      type: max === 1 ? 'single' : 'multi',
+      choices,
+    })
+  }
+  for (const w of (mr?.catalogueWrappers ?? [])) {
+    const c = w?.catalogue
+    if (c?.catalogueId == null || c.isRootCatalogue !== true) continue
+    const order = w?.mapModifierGroupOrder ?? {}
+    const gs = Object.keys(order).map(id => byGroupId.get(String(id))).filter(Boolean) as ParsedOptionGroup[]
+    if (gs.length) out.set(String(c.catalogueId), gs)
+  }
+  return out
 }
 
 /**
@@ -94,6 +155,7 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
     // Cheese, Olives…) as sellable dishes. Only trust the flag when the payload actually
     // uses it, so older/other shapes that never set it are untouched.
     const usesRootFlag = mr.catalogueWrappers.some((w: any) => w?.catalogue?.isRootCatalogue === true)
+    const optionsByCatalogue = zomatoOptionGroups(mr)
     for (const w of mr.catalogueWrappers) {
       const cat = w?.catalogue
       if (cat?.catalogueId == null) continue
@@ -106,6 +168,7 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
         // (service="delivery"). Resolve from there first (verified live 2026-08-11);
         // fall back to legacy catalogue shapes. null → flagged needs-review, never dropped.
         price: zomatoWrapperPrice(w),
+        options: optionsByCatalogue.get(String(cat.catalogueId)),
         category_ref: cat.category?.categoryId != null ? String(cat.category.categoryId) : null,
         // catalogueTags ("veg" | "non-veg" | "egg" | …) live on the WRAPPER, not the
         // catalogue — carry them into raw so the dietary mark can read them. Additive.
@@ -350,6 +413,8 @@ export interface MappedItem {
   description: string
   imageUrl: string | null
   catSourceId: string | null
+  /** Aggregator add-on groups → our OptionGroup shape (absent when it has none). */
+  options?: ParsedOptionGroup[]
 }
 
 /** Map normalised aggregator entities → storefront categories + items. */
@@ -372,6 +437,7 @@ export function mapEntities(entities: ParsedEntity[]): { categories: MappedCateg
         soldOut: !e.in_stock,
         description: String(e.raw?.description ?? e.raw?.desc ?? '').slice(0, 160),
         imageUrl: e.raw?.image_url ?? e.raw?.s3_image_url ?? e.raw?.imageUrl ?? e.raw?.image ?? null,
+        options: e.options,
         catSourceId: e.category_ref,
       })
     }
@@ -523,6 +589,7 @@ export async function importMenuToStorefront(
         // foodType is the truth; veg rides along as the mirror older readers use.
         foodType: it.foodType,
         veg: it.veg,
+        ...(it.options?.length ? { options: it.options } : {}),
         soldOut: it.soldOut,
         description: it.description,
         categoryId,

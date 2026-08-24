@@ -9,7 +9,7 @@
 import assert from 'node:assert'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { foodTypeOf, vegOf, parseMenuSnapshot } from './menu-import.js'
+import { foodTypeOf, vegOf, parseMenuSnapshot, zomatoOptionGroups } from './menu-import.js'
 
 let n = 0
 const ok = (m: string) => { n++; console.log('  ✓', m) }
@@ -73,6 +73,33 @@ ok('vegOf stays true only for veg — egg and unset are never green')
   const names = parseMenuSnapshot(snap).filter((r) => r.entity_type === 'item').map((r) => r.name)
   assert.deepStrictEqual(names, ['Masala Dosai'], 'only root catalogues are dishes')
   ok('Zomato add-ons stay out of the dish list even when they carry catalogueIds')
+}
+
+
+// ── Zomato modifier groups → our OptionGroups (REAL captured payload) ────────
+{
+  const body = JSON.parse(readFileSync(join(__dirname, '__fixtures__/zomato-menu-modifiers.json'), 'utf8'))
+  const mr = body.data.menuResponse
+  const map = zomatoOptionGroups(mr)
+  assert.ok(map.size > 0, 'dishes must resolve modifier groups')
+
+  const all = [...map.values()].flat()
+  assert.ok(all.every(g => g.name && g.choices.length), 'every group is named and non-empty')
+  assert.ok(all.every(g => g.type === 'single' || g.type === 'multi'), 'valid group types')
+
+  // the binding verified by hand against the live payload
+  const idli = mr.catalogueWrappers.find((w: any) => w?.catalogue?.name === 'Butter Fried Idli')
+  const gs = map.get(String(idli.catalogue.catalogueId)) ?? []
+  assert.deepStrictEqual(gs.map(g => g.name).sort(), ['Beverages', 'Chutney'],
+    'Butter Fried Idli offers exactly Beverages + Chutney')
+  const bev = gs.find(g => g.name === 'Beverages')!
+  assert.ok(bev.choices.some(c => /Plain Chai/i.test(c.name)), 'Beverages holds the chai add-ons')
+  assert.equal(bev.type, 'multi', 'max 6 → multi-select')
+
+  // modifiers must NOT also appear as dishes
+  const dishes = parseMenuSnapshot(body).filter(r => r.entity_type === 'item').map(r => r.name)
+  assert.ok(!dishes.includes('Set Of 2 Plain Chai'), 'an add-on never imports as a dish')
+  ok(`${map.size} dishes carry real Zomato add-on groups; modifiers stay out of the dish list`)
 }
 
 console.log(`\n  ${n} groups passed`)
