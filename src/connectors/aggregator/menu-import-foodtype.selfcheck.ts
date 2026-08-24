@@ -61,4 +61,18 @@ ok('vegOf stays true only for veg — egg and unset are never green')
   ok(`${items.length - unset}/${items.length} real Zomato dishes resolve a dietary mark`)
 }
 
+// ── add-ons must not import as dishes ────────────────────────────────────────
+// Zomato puts dishes and add-ons in ONE array, split by `isRootCatalogue`. The old
+// catalogueId!=null guard passed add-ons through on listings that give them real ids.
+{
+  const snap = { menuResponse: { resId: '1', catalogueWrappers: [
+    { catalogue: { catalogueId: '1', name: 'Masala Dosai', isRootCatalogue: true, inStock: true } },
+    { catalogue: { catalogueId: '2', name: 'Extra Sambhar', inStock: true } },      // add-on WITH an id
+    { catalogue: { catalogueId: null, name: 'Candles', inStock: true } },           // add-on without one
+  ] } }
+  const names = parseMenuSnapshot(snap).filter((r) => r.entity_type === 'item').map((r) => r.name)
+  assert.deepStrictEqual(names, ['Masala Dosai'], 'only root catalogues are dishes')
+  ok('Zomato add-ons stay out of the dish list even when they carry catalogueIds')
+}
+
 console.log(`\n  ${n} groups passed`)

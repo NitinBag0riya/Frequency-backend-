@@ -87,9 +87,17 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
         in_stock: true, price: null, category_ref: null, raw: c,
       })
     }
+    // Zomato mixes DISHES and ADD-ONS in one catalogueWrappers array; `isRootCatalogue`
+    // is the discriminator (add-ons have category:[] and no root flag). We used to rely on
+    // add-ons having a null catalogueId — true on some listings, NOT on others, so a
+    // listing whose add-ons carry real ids imported 27 modifiers (Extra Sambhar, Burrata
+    // Cheese, Olives…) as sellable dishes. Only trust the flag when the payload actually
+    // uses it, so older/other shapes that never set it are untouched.
+    const usesRootFlag = mr.catalogueWrappers.some((w: any) => w?.catalogue?.isRootCatalogue === true)
     for (const w of mr.catalogueWrappers) {
       const cat = w?.catalogue
       if (cat?.catalogueId == null) continue
+      if (usesRootFlag && cat.isRootCatalogue !== true) continue   // an add-on, not a dish
       rows.push({
         entity_type: 'item', entity_id: String(cat.catalogueId), name: cat.name ?? null,
         in_stock: cat.inStock !== false,
