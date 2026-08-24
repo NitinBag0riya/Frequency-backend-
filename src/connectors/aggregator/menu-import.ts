@@ -612,11 +612,19 @@ export async function importMenuToStorefront(
       continue
     }
 
-    // UPDATE — only fields we own: price + availability (soldOut) + outlet scope, plus a
-    // one-way image BACKFILL (fill a blank image only). Leave name/description/veg/coins/
-    // options — and any EXISTING image — as the merchant curated them.
+    // UPDATE — only fields we own: price + availability (soldOut) + outlet scope, plus
+    // one-way BACKFILLS (fill a blank only). Leave name/description/veg/coins — and any
+    // EXISTING image or option groups — as the merchant curated them.
     const patch: any = {}
     const changes: Record<string, { from: any; to: any }> = {}
+    // Add-on groups: backfill ONLY when the item has none. Items that predate add-on
+    // support carry no options, so without this every existing dish would stay without
+    // its aggregator modifiers forever (imports only ever created them). One-way: an
+    // operator's own groups are never touched.
+    if (it.options?.length && !(Array.isArray(existing.options) && existing.options.length)) {
+      patch.options = it.options
+      changes.options = { from: 0, to: it.options.length }
+    }
     // Storefront base = the HIGHER of the channels seen (Swiggy vs Zomato), so the
     // direct price is never below what an aggregator charges. Only ever raises to
     // match the top channel; a later cheaper channel never lowers it.
