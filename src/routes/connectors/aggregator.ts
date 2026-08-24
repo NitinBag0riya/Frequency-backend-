@@ -412,7 +412,12 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         tenant_id: tenantId, source: 'frequency_desktop', channel, outlet_ref: outletRef,
         entity_type: e.entity_type, entity_id: e.entity_id, name: e.name,
         in_stock: e.in_stock, price: e.price, category_ref: e.category_ref,
-        raw: e.raw, last_synced_at: now, updated_at: now,
+        // Add-on groups are resolved from the WHOLE snapshot (modifierGroupWrappers +
+        // the variant→catalogue maps), so they can't be re-derived from a single stored
+        // row later. Stash them alongside the raw entity — import-to-pos reads the DB,
+        // not the snapshot, and would otherwise silently drop every option group.
+        raw: e.options?.length ? { ...e.raw, _optionGroups: e.options } : e.raw,
+        last_synced_at: now, updated_at: now,
       }))
       const { error } = await supabase.from('aggregator_menu')
         .upsert(rows, { onConflict: 'tenant_id,outlet_ref,entity_type,entity_id' })
@@ -915,6 +920,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         entities = (data ?? []).map((m: any) => ({
           entity_type: m.entity_type, entity_id: String(m.entity_id), name: m.name,
           in_stock: m.in_stock !== false, price: m.price, category_ref: m.category_ref, raw: m.raw ?? {},
+          options: (m.raw as any)?._optionGroups,          // restored from ingest
         }))
       }
       if (!entities.length) {
