@@ -342,18 +342,37 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // Ring the bell: emit an in-app notification for an order event. Fire-and-forget.
   const notifyOrder = async (
     tenantId: string,
-    ev: { isNew: boolean; channel: AggregatorChannel; orderId: string; status: string; summary: string },
+    ev: { isNew: boolean; channel: AggregatorChannel; orderId: string; status: string; summary: string; outletRef?: string | null },
   ) => {
     try {
       const recipients = await tenantRecipients(tenantId)
       if (!recipients.length) return
+      // Per-outlet channel pause: the operator switched this channel off in POS, so
+      // don't ring for it. The ORDER is still ingested and still lands on the board —
+      // only the alert is suppressed. Fails OPEN: any lookup hiccup rings as normal,
+      // because a missed ring costs a real order and a stray ring costs nothing.
+      if (ev.isNew && ev.outletRef) {
+        try {
+          const { data: t } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+          const slug = (t as any)?.slug
+          if (slug) {
+            const cfg = await sf('GET', '/admin/config', slug)
+            const outlet = (Array.isArray(cfg?.outlets) ? cfg.outlets : []).find((x: any) =>
+              String(x?.swiggyResId ?? '') === String(ev.outletRef) || String(x?.zomatoResId ?? '') === String(ev.outletRef))
+            if (outlet?.orderChannels?.[ev.channel] === false) {
+              console.log(`[aggregator] ${ev.channel} paused at ${outlet.name} — order ingested, ring suppressed`)
+              return
+            }
+          }
+        } catch { /* fail open — ring anyway */ }
+      }
       await emitNotification(supabase, {
         tenant_id: tenantId,
         event_key: ev.isNew ? 'order.new' : 'order.status',
         recipient_user_ids: recipients,
         link: '/settings/orders',   // the real orders-board route (org slug is added client-side)
         data: {
-          channel: ev.channel, channel_label: CHANNEL_LABEL[ev.channel],
+          channel: ev.channel, channel_label: CHANNEL_LABEL[ev.channel], outlet_ref: ev.outletRef ?? null,
           order_id: ev.orderId, status: ev.status, status_label: STATUS_LABEL[ev.status] ?? ev.status,
           summary: ev.isNew ? `${ev.summary} — accept now` : ev.summary,
           priority: ev.isNew ? 'high' : 'normal',
@@ -1143,7 +1162,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           const placedMs = row.placed_at ? Date.parse(row.placed_at) : NaN
           const recentEnough = !Number.isFinite(placedMs) || (Date.now() - placedMs) < 30 * 60 * 1000
           const isNew = isNewRow && EARLY_STATES.has(status) && recentEnough
-          void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross) })
+          void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross), outletRef: el.resId != null ? String(el.resId) : null })
           void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
             fireOrderTrigger(supabase, tenantId, {
               kind: isNew ? 'new_order' : 'order_status', channel, status,
