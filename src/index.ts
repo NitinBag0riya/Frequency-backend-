@@ -48,6 +48,7 @@ import { createNarutoOnboardingRouter }    from './routes/naruto-onboarding'
 import { createNarutoCatalogImportRouter } from './routes/naruto-catalog-import'
 import { createNarutoStorefrontRouter }    from './routes/naruto-storefront'
 import { createNarutoSupportRouter }       from './routes/naruto-support'
+import { createSupportRouter }             from './routes/support'
 import { createNarutoPaymentsRouter }      from './routes/naruto-payments'
 import { createNarutoOrdersRouter }        from './routes/naruto-orders'
 import { createSeoGscRouter }              from './routes/seo-gsc'
@@ -1826,6 +1827,9 @@ const COPILOT_TOOLS = [
 
 // Tight rate limit — copilot is conversational so callers fire often.
 app.use('/api/copilot/', makeLimiter({ windowMs: 60_000, max: 20, perUser: true }))
+// Support tickets are a deliberate human action — a handful a minute is plenty,
+// and the cap keeps a retry loop (or a frustrated merchant) from flooding Slack.
+app.use('/api/support/', makeLimiter({ windowMs: 60_000, max: 5, perUser: true }))
 
 app.post('/api/copilot/stream', async (req, res) => {
   const { message, history = [], persona = 'public', page_path = '/', intents = [], business_group, role } = req.body ?? {}
@@ -6189,6 +6193,9 @@ app.use(createNarutoCatalogImportRouter({ supabase, requireAuth }))
 app.use(createNarutoStorefrontRouter({ supabase, requireAuth }))
 // Platform-OS (/naruto) wave 3: support console, payments/revenue, order oversight.
 app.use(createNarutoSupportRouter({ supabase, requireAuth }))
+// Merchant-facing support intake (Copilot → Slack). Distinct from the naruto
+// support console above, which is the platform team looking IN at a tenant.
+app.use(createSupportRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createNarutoPaymentsRouter({ supabase, requireAuth }))
 app.use(createNarutoOrdersRouter({ supabase, requireAuth }))
 // Platform-OS (/naruto) wave 4: approval rules, bulk entitlement ops, plan matrix + limits.
