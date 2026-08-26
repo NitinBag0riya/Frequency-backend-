@@ -20,6 +20,8 @@ import { sendSmsOtp, sendSmsOrderUpdate } from '../lib/storefront-sms.js'
 import { resolveWaCreds } from '../lib/wa-creds.js'
 import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
 import { emitNotification, tenantNotifyRecipients } from './notifications.js'
+import { resolvePlatformRole } from '../lib/platform-guard.js'
+import { normalizeRole, can } from '../lib/platform-rbac.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -660,6 +662,34 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     const upstreamPath = req.originalUrl.replace(/^\/api\/storefront/, '') // → /admin/... (keeps query string)
     const method = req.method.toUpperCase()
     const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'DELETE'
+
+    // ── OPS-ONLY GUARD ───────────────────────────────────────────────────────
+    // This proxy attaches the shared ADMIN_SECRET to whatever /admin/* path it is
+    // handed, and it builds the upstream headers FRESH — so storefront-api sees an
+    // identical request from a merchant and from a platform operator and cannot
+    // tell them apart. Every route it guards with that secret is therefore
+    // merchant-reachable, including ones whose comments say "OPS ONLY". This side
+    // is the only one that knows the caller's role, so the check has to live here.
+    //
+    // Two things a merchant must never do to themselves, because both make them
+    // self-serve for the PLATFORM gateway and so walk straight around payout KYC:
+    //   • resolve their own payout / settlement
+    //   • set their own Route payout account (routeAccountId)
+    // Without a verified linked account, prepaid orders collect real customer money
+    // into the platform account with nothing that can settle back to the merchant.
+    const OPS_ONLY = [/^\/admin\/payout\/status\b/, /^\/admin\/settlement\/resolve\b/]
+    const touchesRouteAccount =
+      /^\/admin\/config\b/.test(upstreamPath) &&
+      hasBody && req.body && typeof req.body === 'object' &&
+      Object.prototype.hasOwnProperty.call(req.body, 'routeAccountId')
+    if (OPS_ONLY.some(re => re.test(upstreamPath)) || touchesRouteAccount) {
+      const role = normalizeRole(await resolvePlatformRole(supabase, (req as any).user?.id))
+      if (!role || !can('payments.route_account.write', role)) {
+        res.status(403).json({ error: 'This is set by Frequency ops, not from the merchant dashboard.' })
+        return
+      }
+    }
+
     try {
       const up = await fetch(`${SF_API}${upstreamPath}`, {
         method,
