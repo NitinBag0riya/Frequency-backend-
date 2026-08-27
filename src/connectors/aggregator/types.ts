@@ -72,7 +72,7 @@ export interface AdapterCapabilities {
   offers: boolean          // promotions / ads
   // Per-channel "make item/category live/visible" — a stock-visibility write.
   // 'live' = we can apply it now (Swiggy setStock); 'gated' = blocked on
-  // partner/PetPooja (Zomato). The FE reads this to render "publish" vs
+  // Zomato write path not yet mapped. The FE reads this to render "publish" vs
   // "pending partner" per channel instead of hardcoding it.
   publish: Record<AggregatorChannel, 'live' | 'gated'>
 }
