@@ -677,7 +677,7 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     //   • set their own Route payout account (routeAccountId)
     // Without a verified linked account, prepaid orders collect real customer money
     // into the platform account with nothing that can settle back to the merchant.
-    const OPS_ONLY = [/^\/admin\/payout\/status\b/, /^\/admin\/payout\/full\b/, /^\/admin\/settlement\/resolve\b/]
+    const OPS_ONLY = [/^\/admin\/payout\/status\b/, /^\/admin\/payout\/full\b/, /^\/admin\/payouts\//, /^\/admin\/settlement\/resolve\b/]
     const touchesRouteAccount =
       /^\/admin\/config\b/.test(upstreamPath) &&
       hasBody && req.body && typeof req.body === 'object' &&
