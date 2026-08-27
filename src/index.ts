@@ -12,7 +12,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets, calendarCreateEvent, gmailSendEmail, getValidGoogleToken } from './google'
 import { createLeadsRouter } from './leads'
 import { createKhataRouter } from './routes/khata'
-import { createReviewsRouter } from './routes/reviews'
+import { createReviewsRouter, ingestReview } from './routes/reviews'
 import { createComplaintsRouter } from './routes/complaints'
 import { verifyAttestation, enrollInstall, EnrollSchema, makeInMemoryRateLimiter, type InstallRecord } from './routes/desktop-attestation'
 import { resolveDesktopRuntimeConfig, resolveDesktopManifest } from './routes/desktop-runtime-config'
@@ -4365,7 +4365,9 @@ app.get('/webhook/whatsapp/:token', async (req, res) => {
 // as an inbound message. On the PLATFORM number no tenant resolves by waba_id (platform-
 // fallback tenants have none), so we handle it CROSS-TENANT via storefront-api (which owns
 // the orders): it maps phone→recent unrated order, records the rating, mirrors to Reviews,
-// and routes a low score to Complaints. We then reply on the still-open 24h session.
+// and routes a low score to Complaints. We then re-mirror the review under source
+// 'whatsapp' (only WE know the channel; ingestReview collapses the pair onto one row)
+// and reply on the still-open 24h session.
 // WhatsApp quick-reply buttons can't contain emojis — plain text only.
 const FEEDBACK_BUTTON_RATING: Record<string, number> = { 'Loved it': 5, 'It was okay': 3, 'Not great': 2 }
 
@@ -4381,6 +4383,28 @@ async function sendPlatformWaText(to: string, body: string): Promise<void> {
       body: JSON.stringify({ messaging_product: 'whatsapp', to: num, type: 'text', text: { body: String(body).slice(0, 4000) } }),
     })
   } catch (e: any) { console.warn('[wa-feedback] reply send failed:', e?.message ?? e) }
+}
+
+/** Mirror a captured WhatsApp rating into the unified Reviews inbox under source
+ *  'whatsapp'. Best-effort: the rating is already persisted on the order regardless. */
+async function mirrorWaReview(j: any, rating: number, review: string, phone: string): Promise<void> {
+  if (!j?.slug || !j?.orderId) return
+  try {
+    const { data: t } = await supabase.from('tenants').select('id').eq('slug', String(j.slug)).maybeSingle()
+    const tenantId = (t as any)?.id
+    if (!tenantId) { console.warn(`[wa-feedback] no tenant for slug ${j.slug} — review not mirrored`); return }
+    await ingestReview(supabase, {
+      tenantId,
+      source: 'whatsapp',
+      sourceReviewId: String(j.orderId),   // one review per order → re-rating updates
+      orderRef: String(j.orderId),
+      rating,
+      text: review || null,
+      customerName: j.name && j.name !== 'there' ? String(j.name) : null,
+      sourceMeta: { channel: 'whatsapp', phone },
+      reviewAt: new Date().toISOString(),
+    })
+  } catch (e: any) { console.warn('[wa-feedback] review mirror failed:', e?.message ?? e) }
 }
 
 /** If this inbound message is a recognised feedback-button reply, capture the rating via
@@ -4411,6 +4435,15 @@ async function maybeHandleFeedbackReply(msg: any): Promise<void> {
     const j: any = await r.json().catch(() => ({}))
     if (!j?.found) return
     const name = j.name && j.name !== 'there' ? `, ${j.name}` : ''
+
+    // Mirror into the unified Reviews inbox with the channel we actually know.
+    // storefront-api mirrors this same order too (source 'storefront', fire-and-forget)
+    // — ingestReview collapses both onto ONE row keyed by (tenant, order) and keeps the
+    // 'whatsapp' label whichever of the two lands first. The order id is the
+    // sourceReviewId, so a guest re-rating UPDATES rather than duplicating.
+    // storefront-api's ≤3★ → Complaints mirror is untouched: a low score lands in BOTH
+    // places, which is correct — it is a review AND a complaint.
+    await mirrorWaReview(j, rating, review, String(msg.from || ''))
     const reply = j.low
       ? `Thank you for the honest feedback${name} — sorry it wasn't great. Our team will look into it and make it right. 🙏`
       : (j.reviewLink

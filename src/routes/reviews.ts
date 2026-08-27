@@ -1,12 +1,21 @@
 /**
  * Reviews & Ratings — unified inbox + analytics + low-rating alert.
  *
- * One normalised table (public.reviews) fed by three sources:
+ * One normalised table (public.reviews) fed by four sources:
  *   • storefront — ours; real read + real reply (this app owns the surface).
+ *   • whatsapp   — ours too: the same guest rating, arriving via the feedback
+ *                  template button / Flow instead of the mini-app. Reply is
+ *                  QUEUED, not sent — see REPLY_UNSUPPORTED below for why.
  *   • zomato     — review LIST endpoint known; per-review ROW shape + reply
  *                  endpoint are capture-gated → reply is QUEUED, never faked.
  *   • swiggy     — only an AGGREGATE rating is exposed today → is_aggregate row;
  *                  per-review rows + reply stay disabled until captured.
+ *
+ * One order = one review row. storefront-api mirrors EVERY rating it records
+ * (source 'storefront'), and the WhatsApp webhook mirrors the same rating with
+ * the channel it actually knows — two concurrent fire-and-forget writes for one
+ * guest rating. ingestReview collapses them onto a single row keyed by
+ * (tenant, order_ref); see OWN_CHANNELS.
  *
  * Honesty rule (docs/reviews-ratings-design.md §0): NEVER claim an aggregator
  * reply posted that we didn't verify from a live capture. Aggregator reply →
@@ -33,9 +42,33 @@ import { emitNotification, tenantNotifyRecipients } from './notifications'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
-const SOURCES = ['storefront', 'zomato', 'swiggy'] as const
-const REPLY_UNSUPPORTED: Record<string, boolean> = { zomato: true, swiggy: true }
+const SOURCES = ['storefront', 'whatsapp', 'zomato', 'swiggy'] as const
+
+/**
+ * Sources whose reply we cannot verifiably deliver → reply_status 'queued', never 'sent'.
+ *
+ * zomato/swiggy: reply endpoint contract not captured (§0 honesty rule).
+ * whatsapp: we DO hold the guest's number, so a reply is technically possible — but
+ *   only inside Meta's 24h customer-service window, which has almost always closed by
+ *   the time an operator reads the review. Outside it a free-text send is rejected and
+ *   only an APPROVED template may go out; no review-reply template exists (we ship
+ *   order_placed / feedback / feedback_flow). Marking such a reply 'sent' without
+ *   reading the Graph response would be exactly the false claim §0 forbids.
+ *   Upgrade path: ship a `review_reply_v1` template, send it from the reply route, and
+ *   flip to 'sent' ONLY on a 200 carrying a message id.
+ */
+const REPLY_UNSUPPORTED: Record<string, boolean> = { zomato: true, swiggy: true, whatsapp: true }
 const STATUSES = ['new', 'seen', 'actioned', 'ignored'] as const
+
+/**
+ * Our own channels — the mini-app and WhatsApp are two doors onto the SAME guest
+ * rating on the SAME order. Identity across them is (tenant_id, order_ref), not
+ * (tenant_id, source, source_review_id): a second row would double-count the avg,
+ * the distribution and the reply-rate the whole Reviews page is built on.
+ * 'whatsapp' wins the label whichever write lands first — the arrival order of two
+ * concurrent fire-and-forget writes must not decide what the operator sees.
+ */
+const OWN_CHANNELS = ['storefront', 'whatsapp']
 
 // HoReCa theme label set (§7). Keyword → theme; first-match, cheap, deterministic.
 const THEME_KEYWORDS: [string, RegExp][] = [
@@ -123,14 +156,25 @@ export async function ingestReview(supabase: SupabaseClient, input: ReviewInput)
   const theme = deriveThemes(text)
 
   // Was there already a row? (decides whether to emit — never re-alert a re-sync)
-  const { data: existing } = await supabase.from('reviews')
-    .select('id, reply_status')
-    .eq('tenant_id', input.tenantId).eq('source', input.source).eq('source_review_id', input.sourceReviewId)
-    .maybeSingle()
+  // For our own channels the match is by ORDER, so the mini-app mirror and the
+  // WhatsApp mirror of one rating find each other and update instead of doubling.
+  const byOrder = OWN_CHANNELS.includes(input.source) && !!input.orderRef
+  const { data: existing } = byOrder
+    ? await supabase.from('reviews')
+        .select('id, source, reply_status')
+        .eq('tenant_id', input.tenantId).eq('order_ref', input.orderRef!).in('source', OWN_CHANNELS)
+        .limit(1).maybeSingle()
+    : await supabase.from('reviews')
+        .select('id, source, reply_status')
+        .eq('tenant_id', input.tenantId).eq('source', input.source).eq('source_review_id', input.sourceReviewId)
+        .maybeSingle()
+  // 'whatsapp' is the more specific fact (we know how it came in) — it never gets
+  // demoted back to 'storefront' by the sibling mirror landing second.
+  const source = byOrder && (existing as any)?.source === 'whatsapp' ? 'whatsapp' : input.source
 
   const row: any = {
     tenant_id: input.tenantId,
-    source: input.source,
+    source,
     source_review_id: input.sourceReviewId,
     order_ref: input.orderRef ?? null,
     outlet_ref: input.outletRef ?? null,
@@ -152,9 +196,16 @@ export async function ingestReview(supabase: SupabaseClient, input: ReviewInput)
     updated_at: new Date().toISOString(),
   }
 
-  const { data: saved, error } = await supabase.from('reviews')
-    .upsert(row, { onConflict: 'tenant_id,source,source_review_id' })
-    .select('id').single()
+  // A sparser second write must never erase a richer first one: in an ingest a null
+  // (or an empty derived array) means "this channel didn't carry the field", never
+  // "clear it". Only ever applies on the update path — inserts keep the full shape.
+  if (existing) for (const [k, v] of Object.entries(row)) if (v === null || (Array.isArray(v) && !v.length)) delete row[k]
+
+  const { data: saved, error } = existing
+    ? await supabase.from('reviews').update(row).eq('id', (existing as any).id).select('id').single()
+    : await supabase.from('reviews')
+        .upsert(row, { onConflict: 'tenant_id,source,source_review_id' })
+        .select('id').single()
   if (error) { console.warn('[reviews] upsert failed:', error.message); return { ok: false, error: error.message } }
 
   // Real-time low-rating alert: only for a NEW, real (non-aggregate) ≤3★ review.
@@ -171,7 +222,7 @@ export async function ingestReview(supabase: SupabaseClient, input: ReviewInput)
           event_key: 'review.low',
           recipient_user_ids: gated,
           data: {
-            source: input.source, stars,
+            source, stars,
             text_snippet: snippet(text) || '(no comment)',
             customer_name: input.customerName || 'A customer',
             outlet: input.outletRef || (t as any)?.name || '',
