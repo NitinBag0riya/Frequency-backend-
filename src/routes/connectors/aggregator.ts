@@ -695,7 +695,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // Publish / make-visible an item or category on a channel. This is the
   // menu-visibility surface: "publish to Swiggy" is a REAL stock-visibility
   // write (setStock on the merchant's session); "publish to Zomato" is
-  // partner/PetPooja-gated, so it is queued and the desktop reports it back as
+  // not yet mapped in aggregatorClient, so it is queued and the desktop reports it back as
   // gated (dashboard shows "pending partner") — never a fake success. Reuses the
   // SAME aggregator_stock_actions queue + pull/result path as stock toggles,
   // because publish == a visibility write.
@@ -725,7 +725,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       res.json({
         ok: true, ...out, channel: b.channel, gated: cap === 'gated',
         note: cap === 'gated'
-          ? 'Queued — Zomato menu/visibility publishing is partner/PetPooja-gated; it will report back as pending partner.'
+          ? 'Queued — Zomato menu/visibility write is not yet mapped in the desktop client; it will report back as gated until the endpoint is captured and wired.'
           : 'Queued — the merchant client applies it on Swiggy on its next poll (~30s).',
       })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
