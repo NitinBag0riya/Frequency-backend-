@@ -6512,6 +6512,35 @@ async function seedPlatformWaTemplates(): Promise<void> {
         { type: 'QUICK_REPLY', text: 'Not great' },
       ] },
     ] },
+    // ── the moments the guest is actually WAITING on ──────────────────────────
+    // Push already covers eight lifecycle events; WhatsApp covered only the two the
+    // guest already knows about (just ordered, just ate). These are the ones they are
+    // sitting there wondering about.
+    //
+    // ALL BODY-ONLY, deliberately. `send-whatsapp` builds only a `body` component, so a
+    // template with a dynamic URL button would APPROVE and then fail on every send.
+    // Quick-reply buttons need no send-time component (proven by feedback_rating above),
+    // which is why the rating template can have them and these cannot have links.
+    //
+    // The param COUNT here is a contract: sending a different number of values than the
+    // approved body declares makes Meta reject the send, and notifyCustomerWa only logs
+    // NETWORK errors — so a rejection looks exactly like a guest who never opted in.
+    // Every one of these is 3 params ({{1}} name · {{2}} store · {{3}} order#) to match
+    // the existing sends, except refund_issued which needs the amount.
+    { name: 'order_ready', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, your order at {{2}} (#{{3}}) is ready. Please collect it at the counter.', example: { body_text: ex } },
+    ] },
+    { name: 'order_on_the_way', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, your order from {{2}} (#{{3}}) is on the way. It will reach you shortly.', example: { body_text: ex } },
+    ] },
+    { name: 'order_cancelled', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, your order at {{2}} (#{{3}}) has been cancelled. If you have paid, the amount will be returned to you. Please contact the store if you need help.', example: { body_text: ex } },
+    ] },
+    // FOUR params: the amount is the whole point of this message.
+    { name: 'refund_issued', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, a refund of {{4}} for your order at {{2}} (#{{3}}) has been processed. It usually reaches your account in 5 to 7 working days.',
+        example: { body_text: [['Aarav', 'La Fiamma', '8291', 'Rs 450']] } },
+    ] },
   ]
   for (const t of tpls) {
     try {
