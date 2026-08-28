@@ -28,26 +28,24 @@ export class FrequencyDesktopAdapter implements AggregatorAdapter {
   constructor(private supabase: SupabaseClient) {}
 
   capabilities(): AdapterCapabilities {
-    // The desktop source rides the merchant dashboard's *order-ops* surface only.
-    // It can take orders and flip items on/off, but it cannot build or edit a
-    // menu — those live behind a heavier surface it doesn't cover. The FE greys
-    // out menu editing accordingly until the tenant moves to a direct/middleware
-    // source that reports these true.
+    // The desktop source rides the merchant dashboard's *order-ops* surface + the
+    // Menu Editor's Submit Changes flow (mapped live 2026-08-28). It can take orders,
+    // flip items on/off (Swiggy), AND submit item edits (both channels — Swiggy via
+    // vhc-composer QC, Zomato via update_content_menu — see aggregatorClient.editItem).
     return {
       orders:      true,
       orderStatus: true,
       stock:       true,
       menuRead:    true,
-      menuEdit:    false,
+      menuEdit:    true,     // both channels — Swiggy queuedToQc, Zomato instant
       categories:  false,
       variants:    false,
       offers:      false,
-      // Publishing = flipping an item/category visible. Swiggy has a real,
-      // calibrated stock-status write (setStock), so it's live. Zomato is
-      // reported as gated because the write isn't mapped in aggregatorClient
-      // yet — proven live 2026-08-28 that the Zomato Menu Editor's Submit
-      // Changes flow works (PetPooja marker is a soft warn, not a hard block),
-      // so this can flip to 'live' once the endpoint is captured and wired.
+      // Publishing = flipping an item/category visible via the STOCK endpoint.
+      // Swiggy stock-status is live (setStock), Zomato stock is still gated because
+      // its setStock endpoint hasn't been captured yet — Zomato uses a different
+      // path than editItem. Flip zomato to 'live' when the Zomato item-stock
+      // toggle POST is captured and setStock's zomato branch is wired.
       publish:     { swiggy: 'live', zomato: 'gated' },
     }
   }
