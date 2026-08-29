@@ -493,6 +493,49 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     }
   }
 
+  // Ingest an aggregator reviews snapshot into public.reviews. Best-effort field
+  // discovery across Zomato + Swiggy shapes — the exact URL/body will be locked
+  // in on first live capture from a real Reviews-page visit. Reuses the same
+  // dedup discipline as complaints (source + external_id). Reply capability stays
+  // reply_status='unsupported' until the aggregator reply endpoint is captured
+  // (see routes/reviews.ts REPLY_UNSUPPORTED map).
+  const ingestAggregatorReviews = async (tenantId: string, outletRef: string | null, body: any) => {
+    const channel = (body?.channel === 'swiggy' || body?.channel === 'zomato')
+      ? body.channel
+      : (outletRef ? await channelForOutlet(tenantId, outletRef) : null) || 'zomato'
+    const list: any[] = Array.isArray(body?.reviews) ? body.reviews
+                     : Array.isArray(body?.data) ? body.data
+                     : Array.isArray(body?.entities) ? body.entities
+                     : []
+    const now = new Date().toISOString()
+    const rows = list.map((r) => {
+      const externalId = String(r?.id ?? r?.review_id ?? r?.rating_id ?? r?.reviewId ?? '')
+      if (!externalId) return null
+      const stars = Number(r?.stars ?? r?.rating ?? r?.star_count ?? r?.rating_value ?? 0) || null
+      const text  = String(r?.review ?? r?.comment ?? r?.review_text ?? r?.text ?? '').slice(0, 4000) || null
+      const name  = String(r?.customer_name ?? r?.user_name ?? r?.author ?? r?.name ?? 'A customer').slice(0, 80)
+      const at    = String(r?.review_at ?? r?.created_at ?? r?.date ?? r?.reviewed_on ?? '').slice(0, 40) || now
+      return {
+        tenant_id: tenantId, outlet_ref: outletRef, source: channel,
+        external_id: `${channel}:${externalId}`, order_ref: String(r?.order_id ?? r?.orderId ?? '') || null,
+        stars, review: text, customer_name: name, review_at: at,
+        reply_status: 'unsupported',   // flip to 'queued'/'sent' once reply endpoint wired
+        raw: r, updated_at: now,
+      }
+    }).filter(Boolean) as any[]
+    if (!rows.length) return
+    const { data: existing } = await supabase.from('reviews')
+      .select('external_id').eq('tenant_id', tenantId).eq('source', channel)
+      .in('external_id', rows.map((r: any) => r.external_id))
+    const have = new Set((existing ?? []).map((x: any) => x.external_id))
+    const fresh = rows.filter((r: any) => !have.has(r.external_id))
+    if (fresh.length) {
+      const { error } = await supabase.from('reviews').insert(fresh)
+      if (error) console.error(`[aggregator/reviews] insert failed: ${error.message}`)
+      else console.log(`[aggregator/reviews] ingested ${fresh.length} new ${channel} review(s)`)
+    }
+  }
+
   // Whether the next orders poll should request a one-shot history backfill.
   const needsHistorySync = async (tenantId: string, outletRef: string): Promise<boolean> => {
     const { data } = await supabase.from('aggregator_history_sync')
@@ -1194,6 +1237,18 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     const outletRef = String(req.body?.outletRef ?? '') || null
     try { await ingestComplaints(tenantId, outletRef, req.body) }
     catch (e: any) { console.error(`[aggregator/complaints] ingest error: ${e?.message}`) }
+    res.json({ ok: true })
+  })
+  // Customer-reviews snapshot from either aggregator. Mirrors complaints — outletRef
+  // is optional (reviews are per-outlet on Zomato but the account-wide feed suffices for
+  // dedup by source+external_id). The route is TENANT-authed via the merchant session so
+  // it cannot collide with the STOREFRONT_ADMIN_SECRET route on POST /api/reviews/ingest
+  // that the storefront-api uses to push our own storefront reviews.
+  r.post('/api/connectors/aggregator/reviews/ingest', ...guardEdit, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const outletRef = String(req.body?.outletRef ?? '') || null
+    try { await ingestAggregatorReviews(tenantId, outletRef, req.body) }
+    catch (e: any) { console.error(`[aggregator/reviews] ingest error: ${e?.message}`) }
     res.json({ ok: true })
   })
 
