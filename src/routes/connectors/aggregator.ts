@@ -754,6 +754,45 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
+  // Whole-outlet online/offline ("store open-close"). Reuses the SAME
+  // aggregator_stock_actions queue + pull/result path as item stock, with
+  // entity_type='outlet' — a store toggle IS a visibility write, so it needs no
+  // second queue, no migration (entity_type is free text) and no FE plumbing
+  // (pending-actions already surfaces it under `stock`).
+  //
+  // Honesty: the desktop applies Swiggy in both directions and Zomato online-only;
+  // Zomato go-offline reports back gated (endpoint not captured yet), so the row
+  // terminates in 'gated' rather than a fake 'done'.
+  //
+  // NOTE going offline has a real commercial cost — Swiggy penalises outlets for
+  // it (`is_penalised` in their availability payload) — so callers should confirm
+  // before sending open:false. Deliberately no aggregator_menu write here: an
+  // outlet has no menu row.
+  const StoreStatusBody = z.object({
+    channel:   z.enum(['zomato', 'swiggy']),
+    outletRef: z.string().min(1),
+    open:      z.boolean(),
+  })
+  r.post('/api/connectors/aggregator/store-status', ...guardEdit, validateBody(StoreStatusBody), async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const adapter = await resolveAdapter(supabase, tenantId)
+      if (!adapter.capabilities().stock) { res.status(422).json({ error: `${adapter.source} cannot toggle store status` }); return }
+      const b = req.body as z.infer<typeof StoreStatusBody>
+      const out = await adapter.submitStockToggle(
+        { tenantId, source: adapter.source },
+        { channel: b.channel, outletRef: b.outletRef, entityType: 'outlet', entityId: b.outletRef, inStock: b.open },
+      )
+      const gated = b.channel === 'zomato' && !b.open
+      res.json({
+        ok: true, ...out, channel: b.channel, open: b.open, gated,
+        note: gated
+          ? 'Queued, but Zomato go-offline is not mapped yet — it will report back as gated and the outlet will NOT be taken offline.'
+          : `Queued — the merchant client takes the outlet ${b.open ? 'online' : 'offline'} on its next poll (~30s).`,
+      })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
   // Publish / make-visible an item or category on a channel. This is the
   // menu-visibility surface: "publish to Swiggy" is a REAL stock-visibility
   // write (setStock on the merchant's session); "publish to Zomato" is

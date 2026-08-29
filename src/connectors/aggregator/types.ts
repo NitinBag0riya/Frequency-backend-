@@ -52,7 +52,8 @@ export interface OrderDecision {
 export interface StockToggle {
   channel: AggregatorChannel
   outletRef: string
-  entityType: 'item' | 'category'
+  /** 'outlet' = whole-store online/offline; it rides this same queue (see /store-status). */
+  entityType: 'item' | 'category' | 'outlet'
   entityId: string
   inStock: boolean
 }
