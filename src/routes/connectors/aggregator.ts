@@ -453,11 +453,30 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // shows "full text only on Zomato" for exactly this case. Dedup on source+external_id
   // so a re-poll never clobbers an operator's acknowledge/resolve on an existing row.
   const ingestComplaints = async (tenantId: string, outletRef: string | null, body: any) => {
+    // Swiggy sends complaints via GraphQL: { data:{ getComplaints:{ complaints:[...] } } }
+    // where each entry has { complaintId, orderId, channel:'Swiggy', issueType,
+    // issueDescription, createTimestamp, complaintExpiryTimestamp, complaintState,
+    // complaintItemDescription, restaurantResolution: {resolutionStatus,...}, ratings }.
+    // Normalise both shapes into a common list of {order_id, issue_type, expired_at,
+    // response_meta} that the row-builder below already handles.
+    const swigList = body?.data?.getComplaints?.complaints
     const channel = (body?.channel === 'swiggy' || body?.channel === 'zomato')
       ? body.channel
+      : Array.isArray(swigList) ? 'swiggy'
       : (outletRef ? await channelForOutlet(tenantId, outletRef) : null) || 'zomato'
     const entities: any[] = Array.isArray(body?.entities) ? body.entities
-      : Array.isArray(body?.issues) ? body.issues : []
+      : Array.isArray(body?.issues) ? body.issues
+      : Array.isArray(swigList) ? swigList.map((c: any) => ({
+          order_id: c.orderId ?? c.complaintId,
+          issue_type: c.issueType ?? 'issue',
+          // Swiggy expiry is complaintExpiryTimestamp (epoch seconds); convert to
+          // the "YYYY-MM-DD HH:mm:ss +05:30" shape the row-builder expects, so the
+          // dueAt normaliser below produces a valid due_at.
+          expired_at: c.complaintExpiryTimestamp ? new Date(c.complaintExpiryTimestamp * 1000).toISOString().replace('T',' ').replace(/\.\d+Z$/,'') : null,
+          response_meta: c.restaurantResolution?.resolutionStatus === 'GIVEN' ? c.restaurantResolution : null,
+          _swig: c,     // stash the raw Swiggy row for the raw field
+        }))
+      : []
     const now = new Date().toISOString()
     const rows = entities.map((e) => {
       const orderId = String(e?.order_id ?? e?.orderId ?? '')
