@@ -42,6 +42,7 @@ import { createTradeindiaConnector } from './tradeindia'
 import { createLeadWebhookConnectors } from './lead-webhooks'
 import { createZomatoConnector } from './zomato'
 import { createAggregatorConnector } from './aggregator'
+import { createTenantAggregatorSessionRouter } from '../tenant-aggregator-session'
 import { createGbpConnector } from './gbp'
 import { signOauthState } from '../../lib/oauth-state'
 import { readSecretValue, writeSecretValue } from '../../lib/wa-creds'
@@ -1549,6 +1550,7 @@ export function createConnectorsRouter(deps: Deps): express.Router {
   r.use(createLeadWebhookConnectors(deps))
   r.use(createZomatoConnector(deps))
   r.use(createAggregatorConnector(deps))
+  r.use(createTenantAggregatorSessionRouter({ supabase: deps.supabase, guardView: [deps.requireAuth, deps.identifyTenant, deps.checkPermission('integrations', 'view')], guardEdit: [deps.requireAuth, deps.identifyTenant, deps.checkPermission('integrations', 'edit')] }))
   r.use(createGbpConnector(deps))
 
   // ── Google OAuth start routes — mounted inline (sub-router nesting causes
