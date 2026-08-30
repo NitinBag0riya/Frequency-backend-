@@ -584,23 +584,26 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       const at    = String(r?.review_at ?? r?.created_at ?? r?.date ?? r?.reviewed_on ?? '').slice(0, 40) || now
       return {
         tenant_id: tenantId, outlet_ref: outletRef, source: channel,
-        external_id: `${channel}:${externalId}`, order_ref: String(r?.order_id ?? r?.orderId ?? '') || null,
-        stars, review: text, customer_name: name, review_at: at,
+        // Column names must match public.reviews EXACTLY. This block previously wrote
+        // `external_id`, `review` and `raw` — none of which exist on the table — so every
+        // aggregator review insert failed with an unknown-column error that was only
+        // console.error'd, while the route still returned ok. That is why production held
+        // 18 Zomato complaints (correct columns) and ZERO aggregator reviews.
+        source_review_id: `${channel}:${externalId}`,
+        order_ref: String(r?.order_id ?? r?.orderId ?? '') || null,
+        stars, rating: stars, text, customer_name: name, review_at: at,
         reply_status: 'unsupported',   // flip to 'queued'/'sent' once reply endpoint wired
-        raw: r, updated_at: now,
+        source_meta: r, updated_at: now,
       }
     }).filter(Boolean) as any[]
     if (!rows.length) return
-    const { data: existing } = await supabase.from('reviews')
-      .select('external_id').eq('tenant_id', tenantId).eq('source', channel)
-      .in('external_id', rows.map((r: any) => r.external_id))
-    const have = new Set((existing ?? []).map((x: any) => x.external_id))
-    const fresh = rows.filter((r: any) => !have.has(r.external_id))
-    if (fresh.length) {
-      const { error } = await supabase.from('reviews').insert(fresh)
-      if (error) console.error(`[aggregator/reviews] insert failed: ${error.message}`)
-      else console.log(`[aggregator/reviews] ingested ${fresh.length} new ${channel} review(s)`)
-    }
+    // Upsert on the table's own UNIQUE (tenant_id, source, source_review_id) instead of
+    // read-then-filter: the old select/compare could not dedupe at all (it keyed on a
+    // column that does not exist) and raced two concurrent ingests besides.
+    const { error } = await supabase.from('reviews')
+      .upsert(rows, { onConflict: 'tenant_id,source,source_review_id', ignoreDuplicates: true })
+    if (error) console.error(`[aggregator/reviews] upsert failed: ${error.message}`)
+    else console.log(`[aggregator/reviews] ingested up to ${rows.length} ${channel} review(s)`)
   }
 
   // Whether the next orders poll should request a one-shot history backfill.
