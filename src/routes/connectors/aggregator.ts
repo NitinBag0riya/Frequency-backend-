@@ -1115,16 +1115,22 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       // as a fallback for older apps that don't yet send an attributed slug).
       let deskState: Partial<Record<AggregatorChannel, string>> = {}
       let deskFresh = false
+      // The desktop build the merchant is actually RUNNING. The dashboard needs this to
+      // avoid offering a control the installed app cannot execute — a store on/off switch
+      // on a pre-1.0.7 install would animate, save, and silently do nothing, because
+      // setStoreStatus does not exist there. A UI that lies is worse than no UI.
+      let deskVersion: string | null = null
       try {
         const { data: t } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
         const slug = (t as any)?.slug
         if (slug) {
           const { data: inst } = await supabase.from('desktop_installs')
-            .select('health, last_heartbeat_at').eq('tenant_slug', slug)
+            .select('health, last_heartbeat_at, app_version').eq('tenant_slug', slug)
             .order('last_heartbeat_at', { ascending: false }).limit(1).maybeSingle()
           const hbAt = (inst as any)?.last_heartbeat_at ?? null
           deskFresh = hbAt ? (Date.now() - new Date(hbAt).getTime()) < DESKTOP_HB_WINDOW_MS : false
           deskState = ((inst as any)?.health?.aggregators ?? {}) as Partial<Record<AggregatorChannel, string>>
+          deskVersion = (inst as any)?.app_version ?? null
         }
       } catch { /* fall back to order-flow */ }
       const channels: Record<AggregatorChannel, { connected: boolean; state: string | null; everLinked: boolean; receiving: boolean; lastOrderAt: string | null }> =
@@ -1143,7 +1149,12 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       }))
       // `channel` lets the dashboard subscribe to the realtime liveness pings
       // without needing to know its own tenant id.
-      res.json({ online, lastSeenAt: lastSeen, source: (data as any)?.source ?? null, channels, channel: AGG_STATUS_TOPIC(tenantId) })
+      res.json({
+        online, lastSeenAt: lastSeen, source: (data as any)?.source ?? null, channels,
+        // null when no fresh heartbeat — callers must treat unknown as "cannot", never as "can".
+        desktopVersion: deskFresh ? deskVersion : null,
+        channel: AGG_STATUS_TOPIC(tenantId),
+      })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
