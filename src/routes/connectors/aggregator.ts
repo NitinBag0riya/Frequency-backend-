@@ -1369,7 +1369,15 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         }).eq('tenant_id', tenantId).eq('id', b.id)
       } else if (b.kind === 'menuEdit' && b.id != null) {
         // Swiggy menu edit is async QC — 'done' = accepted into QC, 'failed' = errored/rejected.
-        const failed = !!(b.result?.error || b.result?.rejection)
+        // This used to key ONLY on error/rejection, so a hard reject that reports
+        // { ok:false, status:400, message:"Bad request for CreateOrEditItem" } — no
+        // `error`, no `rejection` — was recorded as DONE. Proven live 2026-08-30: two
+        // pushes Swiggy refused outright both read as successful. A bulk push would look
+        // like it worked while changing nothing. Trust ok/status too.
+        const r: any = b.result ?? {}
+        const failed = r.ok === false
+          || !!(r.error || r.rejection)
+          || (typeof r.status === 'number' && r.status >= 400)
         await supabase.from('aggregator_menu_actions').update({
           status: failed ? 'failed' : 'done', result: b.result ?? null, updated_at: new Date().toISOString(),
         }).eq('tenant_id', tenantId).eq('id', b.id)
