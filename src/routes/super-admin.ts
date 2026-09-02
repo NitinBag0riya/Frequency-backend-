@@ -819,7 +819,17 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       }
 
       // Non-downgrade → direct + audit (unchanged behaviour).
-      const { data, error } = await supabase.from('tenant_subscriptions').update(patch).eq('tenant_id', tenantId).select().single()
+      // Tenants created via /naruto without a planId (or via auto-signup) have NO
+      // tenant_subscriptions row — createTenant only inserts one when input.planId
+      // is set. A plain UPDATE therefore 404s on those tenants and the platform
+      // Change Plan modal fails. Same shape as createTenant / billing.ts / naruto-plans.ts:
+      // when a plan_id is being set, UPSERT so the first assignment CREATES the row.
+      // Status/trial-only changes still 404 on tenants with no sub (nothing to modify).
+      const useUpsert = !!plan_id
+      const query = useUpsert
+        ? supabase.from('tenant_subscriptions').upsert({ tenant_id: tenantId, ...patch }, { onConflict: 'tenant_id' })
+        : supabase.from('tenant_subscriptions').update(patch).eq('tenant_id', tenantId)
+      const { data, error } = await query.select().single()
       if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: plan_id ? 'plan.change' : 'subscription.update', target_tenant_id: tenantId, payload: { changes: patch }, reason })
       res.json(data)
