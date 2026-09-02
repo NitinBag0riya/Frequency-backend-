@@ -115,27 +115,55 @@ export function createGbpConnector(deps: Deps): express.Router {
   })
 
   // ── Status ────────────────────────────────────────────────────────────────
+  //
+  // ?debug=1 — support-only diagnostic. Includes the raw accounts.list result
+  // and the resolved account name Google returned (or null). Never used by the
+  // UI; hit from DevTools when a merchant sees the "No businesses" state to
+  // find out whether Google returned zero accounts vs an account with zero
+  // locations vs a role-scoped hidden org. gbp_refresh_token is required to
+  // reach this branch, and only the tenant's own view permission gates it, so
+  // this doesn't reveal anything the tenant couldn't already query themselves.
   r.get('/api/connectors/gbp/status',
     requireAuth, identifyTenant, checkPermission('integrations', 'view'),
     async (req, res) => {
       const tenantId = (req as any).tenantId
       const tenant = await loadTenant(tenantId)
       if (!tenant?.gbp_refresh_token) { res.json({ connected: false }); return }
+      const debug = req.query.debug === '1'
 
       let apiAccess: ApiAccess = 'unknown'
       try {
         const token = await getValidGbpToken(tenant)
-        const account = await getFirstAccount(token)
+        // Fetch accounts raw to expose the raw list when ?debug=1. Same call
+        // getFirstAccount would make; we just don't discard the rest.
+        const accountsResp = await fetch('https://mybusinessaccountmanagement.googleapis.com/v1/accounts', {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        const accountsData: any = await accountsResp.json().catch(() => ({}))
+        if (accountsResp.status === 403) throw new GbpPermissionDenied(accountsData?.error?.message)
+        if (!accountsResp.ok) throw new Error(`accounts.list ${accountsResp.status}: ${accountsData?.error?.message ?? 'failed'}`)
+        const account: string | null = accountsData?.accounts?.[0]?.name ?? null
         const locations = account ? await listLocations(token, account) : []
         apiAccess = 'ok'
-        res.json({ connected: true, email: tenant.gbp_email ?? null, apiAccess, locations })
+        const body: any = { connected: true, email: tenant.gbp_email ?? null, apiAccess, locations }
+        if (debug) {
+          body.debug = {
+            accountsRaw: accountsData,
+            accountsCount: Array.isArray(accountsData?.accounts) ? accountsData.accounts.length : 0,
+            firstAccount: account,
+            firstAccountType: accountsData?.accounts?.[0]?.type ?? null,
+            firstAccountRole: accountsData?.accounts?.[0]?.role ?? null,
+            locationsCount: locations.length,
+          }
+        }
+        res.json(body)
       } catch (err: any) {
         if (err instanceof GbpPermissionDenied) {
-          res.json({ connected: true, email: tenant.gbp_email ?? null, apiAccess: 'denied' })
+          res.json({ connected: true, email: tenant.gbp_email ?? null, apiAccess: 'denied', ...(debug ? { debug: { error: err.message } } : {}) })
           return
         }
         console.error('[gbp] status error:', err?.message)
-        res.json({ connected: true, email: tenant.gbp_email ?? null, apiAccess: 'unknown', error: err?.message })
+        res.json({ connected: true, email: tenant.gbp_email ?? null, apiAccess: 'unknown', error: err?.message, ...(debug ? { debug: { error: err?.message, stack: err?.stack } } : {}) })
       }
     })
 
