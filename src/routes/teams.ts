@@ -128,7 +128,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     async (req, res) => {
       const tenantId = (req as any).tenantId
       const inviterId = (req as any).user.id
-      const { email, role_key, department_id, message } = req.body
+      const { email, role_key, department_id, message, full_name } = req.body
       if (!email || !role_key) { res.status(400).json({ error: 'email + role_key required' }); return }
       if (role_key === 'owner' && (req as any).userRole !== 'owner') {
         res.status(403).json({ error: 'Only the owner can grant the owner role' }); return
@@ -162,7 +162,8 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const { data: invite, error: invErr } = await supabase.from('pending_invites').insert({
         tenant_id: tenantId, email, role_id: role.id, department_id: department_id ?? null,
         invited_by: inviterId, expires_at: expiresAt.toISOString(),
-        message: message ?? null, token, status: 'pending',
+        message: message ?? null, full_name: (typeof full_name === 'string' ? full_name.trim().slice(0, 120) : null) || null,
+        token, status: 'pending',
       }).select().single()
       if (invErr) {
         if ((invErr as any).code === '23505') { res.status(409).json({ error: 'A pending invite already exists for this email' }); return }
@@ -194,7 +195,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     async (req, res) => {
       const tenantId = (req as any).tenantId
       const inviterId = (req as any).user.id
-      const { phone, role_key, department_id, message } = req.body
+      const { phone, role_key, department_id, message, full_name } = req.body
       if (!role_key) { res.status(400).json({ error: 'phone + role_key required' }); return }
       if (!isValidE164(phone)) { res.status(400).json({ error: 'phone must be E.164, e.g. +919876543210' }); return }
       const e164 = String(phone).trim()
@@ -230,6 +231,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
         tenant_id: tenantId, phone: e164, email: null, role_id: role.id,
         department_id: department_id ?? null, invited_by: inviterId,
         expires_at: expiresAt.toISOString(), message: message ?? null,
+        full_name: (typeof full_name === 'string' ? full_name.trim().slice(0, 120) : null) || null,
         token, status: 'pending',
       }).select().single()
       if (invErr) {
@@ -362,7 +364,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     const token = String(req.query.token ?? '')
     if (!token) { res.status(400).json({ error: 'token required' }); return }
     const { data: inv } = await supabase.from('pending_invites')
-      .select(`email, phone, status, expires_at, invited_by,
+      .select(`email, phone, status, expires_at, invited_by, full_name, message,
                role_definitions ( label ),
                tenants!inner ( business_name )`)
       .eq('token', token).maybeSingle()
@@ -389,6 +391,9 @@ export function createTeamsRouter(deps: Deps): express.Router {
       org_name: (inv as any).tenants?.business_name ?? 'an organization',
       role_label: (inv as any).role_definitions?.label ?? 'Member',
       inviter_name,
+      // Inviter-typed name for the invitee (first-class). Falls back to
+      // legacy `message` for invites already in flight before the column landed.
+      full_name: (inv as any).full_name ?? (inv as any).message ?? null,
     })
   })
 
