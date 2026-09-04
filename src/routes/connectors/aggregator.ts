@@ -1268,15 +1268,23 @@ export function createAggregatorConnector(deps: Deps): express.Router {
 
           if (!changed) continue   // unchanged re-push — no bell, no trigger
           notified++
-          // Ring for a freshly-SEEN order in any early (pre-fulfilment) state, not only
-          // exact 'new'. Zomato orders leave NEW before our ~8s poll catches them (accepted
-          // fast), so they're first seen at 'accepted'/'preparing' — still a brand-new order
-          // that must ring. Recency-gated (30 min) + first-seen-only so a late history
-          // backfill of old/delivered orders never false-rings.
-          const EARLY_STATES = new Set(['new', 'accepted', 'preparing', 'ready'])
+          // First sighting of an order (isNewRow) IS a "new order" from the operator's
+          // point of view — even if the aggregator has already marked it delivered by
+          // the time our ~8s poll caught it. The prior EARLY_STATES gate stripped
+          // order.new for every fast-cycle Swiggy order (placed → delivered in <30s
+          // is common) — 862 order.status events in the last 60 days, only 92
+          // matching order.new. Operators literally never heard the ring for those.
+          //
+          // Recency remains the safety rail (30 min from placed_at) so a history
+          // backfill of a truly-old delivered order never false-rings. That is what
+          // was actually preventing bad rings all along — the state check was noise.
+          //
+          // Trade-off: an order that entered our system at 'delivered' will now
+          // ring on the POS. That is correct — the operator needs to know it
+          // happened (settlement, wastage, review-window kickoff). Fixed 2026-09-05.
           const placedMs = row.placed_at ? Date.parse(row.placed_at) : NaN
           const recentEnough = !Number.isFinite(placedMs) || (Date.now() - placedMs) < 30 * 60 * 1000
-          const isNew = isNewRow && EARLY_STATES.has(status) && recentEnough
+          const isNew = isNewRow && recentEnough
           void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross), outletRef: el.resId != null ? String(el.resId) : null })
           void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
             fireOrderTrigger(supabase, tenantId, {

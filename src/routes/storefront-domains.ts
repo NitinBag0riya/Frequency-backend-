@@ -82,17 +82,35 @@ async function notifyStorefrontOrder(supabase: SupabaseClient, tenantId: string,
     const isNew = !last
     const recipients = await tenantNotifyRecipients(supabase, tenantId)
     if (!recipients.length) return
+    // Channel from the ORDER, not hardcoded. This route is called by the desktop
+    // agent for BOTH storefront/counter orders AND aggregator (Swiggy/Zomato)
+    // orders it scrapes from the merchant's logged-in session. Hardcoding
+    // 'storefront' misidentified Swiggy/Zomato ingests, which then triggered
+    // OrderAlertProvider's POS-skip clause (posOwnsIt === true) → the operator's
+    // POS bell never rang for aggregator orders. Fixed 2026-09-05.
+    const rawCh = String(order?.source ?? order?.channel ?? '').toLowerCase()
+    const ch = rawCh === 'swiggy' || rawCh === 'zomato' ? rawCh
+      : rawCh === 'counter' ? 'counter'
+      : rawCh === 'miniapp' ? 'miniapp'
+      : 'storefront'
+    const chLabel = ch === 'swiggy' ? 'Swiggy' : ch === 'zomato' ? 'Zomato' : ch === 'counter' ? 'Counter' : 'Storefront'
     const where = order?.table ? `Table ${order.table}` : (order?.mode === 'dinein' ? 'Dine-in' : 'Pickup')
     const items = Array.isArray(order?.lines) ? order.lines.reduce((n: number, l: any) => n + (Number(l?.qty) || 1), 0) : 0
+    // Summary reads the channel too: "New Swiggy order · #123… · 3 items — accept now"
+    // vs the generic mini-app "New order · Table 4 · 3 items — accept now".
+    const isAgg = ch === 'swiggy' || ch === 'zomato'
+    const newSummary = isAgg
+      ? `New ${chLabel} order · #${orderId.slice(-4)} · ${items} item${items === 1 ? '' : 's'} — accept now`
+      : `New order · ${where} · ${items} item${items === 1 ? '' : 's'} — accept now`
     await emitNotification(supabase, {
       tenant_id: tenantId,
       event_key: isNew ? 'order.new' : 'order.status',
       recipient_user_ids: recipients,
       link: '/settings/orders',   // canonical orders board (matches aggregator + OrderAlertProvider silence-on-view)
       data: {
-        channel: 'storefront', channel_label: 'Storefront',
+        channel: ch, channel_label: chLabel,
         order_id: orderId, status, status_label: status,
-        summary: isNew ? `New order · ${where} · ${items} item${items === 1 ? '' : 's'} — accept now` : `${where} · ${status}`,
+        summary: isNew ? newSummary : `${where} · ${status}`,
         priority: isNew ? 'high' : 'normal',
       },
     })

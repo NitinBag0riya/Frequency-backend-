@@ -2418,6 +2418,58 @@ app.get('/api/desktop/download-manifest', async (_req, res) => {
   res.json(resolveDesktopManifest(flagValue))
 })
 
+// ── electron-updater YAML shims ─────────────────────────────────────────────
+// Existing 1.0.6+ installs poll `updates.getfrequency.app/desktop/latest-mac.yml`
+// (and `.../latest.yml` for Windows) — the URL baked into the app at build time.
+// That Vercel project got deleted at some point, so every existing install has
+// been silently failing to auto-update. Health check on 2026-09-05 confirms
+// La Fiamma's outlet is stuck on 1.0.8 while the manifest advertises 1.0.10.
+//
+// Fix: serve the YAML files from THIS server. Point `updates.getfrequency.app`
+// (Vercel alias or DNS CNAME) at `api.getfrequency.app` and the routes below
+// answer. Content is pulled fresh from the GitHub Release for the version in
+// the `desktop_release` feature flag (single source of truth), URLs are
+// rewritten from relative → absolute GitHub Release URLs so electron-updater
+// resolves them without needing a static asset host of our own. 60s cache so
+// GitHub rate limits are respected.
+const YAML_CACHE_MS = 60_000
+const _ymlCache = new Map<string, { at: number; text: string }>()
+async function serveElectronYaml(res: any, ymlName: 'latest-mac.yml' | 'latest.yml' | 'latest-linux.yml'): Promise<void> {
+  try {
+    const { data } = await supabase
+      .from('feature_flags').select('value_json').eq('key', 'desktop_release').maybeSingle()
+    const version = (data?.value_json as any)?.version
+    if (typeof version !== 'string' || !version) { res.status(503).type('text/plain').send('no version configured'); return }
+    const key = `${version}:${ymlName}`
+    const cached = _ymlCache.get(key)
+    if (cached && Date.now() - cached.at < YAML_CACHE_MS) {
+      res.type('text/yaml').set('Cache-Control', 'public, max-age=60').send(cached.text); return
+    }
+    const base = `https://github.com/NitinBag0riya/frequency-desktop-releases/releases/download/v${version}`
+    const r = await fetch(`${base}/${ymlName}`)
+    if (!r.ok) { res.status(502).type('text/plain').send(`GitHub Release fetch: ${r.status}`); return }
+    let text = await r.text()
+    // Rewrite bare filenames on `url:` lines to absolute GitHub Release URLs so
+    // electron-updater fetches binaries directly from GitHub, not from THIS host.
+    text = text.replace(/(\n\s*-?\s*url:\s*)([^\s].*)$/gm, (_m, prefix, val) => {
+      const v = String(val).trim()
+      if (/^https?:\/\//i.test(v)) return `${prefix}${v}`
+      return `${prefix}${base}/${v}`
+    })
+    _ymlCache.set(key, { at: Date.now(), text })
+    res.type('text/yaml').set('Cache-Control', 'public, max-age=60').send(text)
+  } catch (e: any) {
+    res.status(500).type('text/plain').send(`shim failed: ${e?.message || 'unknown'}`)
+  }
+}
+app.get('/desktop/latest-mac.yml', (_req, res) => { void serveElectronYaml(res, 'latest-mac.yml') })
+app.get('/desktop/latest.yml', (_req, res) => { void serveElectronYaml(res, 'latest.yml') })
+app.get('/desktop/latest-linux.yml', (_req, res) => { void serveElectronYaml(res, 'latest-linux.yml') })
+// Also serve at the /api prefix in case anything else fetches it there.
+app.get('/api/desktop/latest-mac.yml', (_req, res) => { void serveElectronYaml(res, 'latest-mac.yml') })
+app.get('/api/desktop/latest.yml', (_req, res) => { void serveElectronYaml(res, 'latest.yml') })
+app.get('/api/desktop/latest-linux.yml', (_req, res) => { void serveElectronYaml(res, 'latest-linux.yml') })
+
 // ── Frequency Desktop enrolment ──────────────────────────────────────────────
 // First launch: the install registers its Ed25519 public key against a self-minted
 // install id. First-write-wins (a known id can't be rebound to a new key). The
