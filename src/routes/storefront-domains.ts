@@ -94,6 +94,13 @@ async function notifyStorefrontOrder(supabase: SupabaseClient, tenantId: string,
       : rawCh === 'miniapp' ? 'miniapp'
       : 'storefront'
     const chLabel = ch === 'swiggy' ? 'Swiggy' : ch === 'zomato' ? 'Zomato' : ch === 'counter' ? 'Counter' : 'Storefront'
+    // Owner ask 2026-09-05: a POS counter order is initiated BY the operator —
+    // ringing the alert on every other logged-in device is noise (they know
+    // they just made the order). Skip the counter path here entirely, so no
+    // realtime notification fans out. If someone still wants the ring for a
+    // counter order on other devices, remove this guard — but the default is
+    // 'operators don't ring themselves'.
+    if (ch === 'counter' && isNew) return
     const where = order?.table ? `Table ${order.table}` : (order?.mode === 'dinein' ? 'Dine-in' : 'Pickup')
     const items = Array.isArray(order?.lines) ? order.lines.reduce((n: number, l: any) => n + (Number(l?.qty) || 1), 0) : 0
     // Summary reads the channel too: "New Swiggy order · #123… · 3 items — accept now"
