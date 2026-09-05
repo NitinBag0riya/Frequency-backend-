@@ -1269,22 +1269,19 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           if (!changed) continue   // unchanged re-push — no bell, no trigger
           notified++
           // First sighting of an order (isNewRow) IS a "new order" from the operator's
-          // point of view — even if the aggregator has already marked it delivered by
-          // the time our ~8s poll caught it. The prior EARLY_STATES gate stripped
-          // order.new for every fast-cycle Swiggy order (placed → delivered in <30s
-          // is common) — 862 order.status events in the last 60 days, only 92
-          // matching order.new. Operators literally never heard the ring for those.
-          //
-          // Recency remains the safety rail (30 min from placed_at) so a history
-          // backfill of a truly-old delivered order never false-rings. That is what
-          // was actually preventing bad rings all along — the state check was noise.
-          //
-          // Trade-off: an order that entered our system at 'delivered' will now
-          // ring on the POS. That is correct — the operator needs to know it
-          // happened (settlement, wastage, review-window kickoff). Fixed 2026-09-05.
-          const placedMs = row.placed_at ? Date.parse(row.placed_at) : NaN
-          const recentEnough = !Number.isFinite(placedMs) || (Date.now() - placedMs) < 30 * 60 * 1000
-          const isNew = isNewRow && recentEnough
+          // point of view. Widened gate 2026-09-05 after the audit found La Fiamma
+          // getting zero aggregator rings since Aug 20:
+          //   - EARLIER gate (EARLY_STATES only) killed every Swiggy that entered
+          //     post-'new' status. Widened to recency-only.
+          //   - RECENCY gate (30-min from placed_at) then killed every Swiggy that
+          //     fast-cycled placed→delivered in <30min and was caught post-fulfilment.
+          //     Result: 0 order.new events for 15+ days despite live orders.
+          // NEW gate: skip ONLY when the first-sighting is already terminal (delivered
+          // / cancelled / rejected — the operator can't act on those anyway; they're
+          // history backfill). Anything else rings, regardless of age — the operator
+          // needs to know for settlement, wastage, review-window kickoff.
+          const TERMINAL_ON_ARRIVAL = new Set(['delivered', 'cancelled', 'rejected', 'returned', 'refunded'])
+          const isNew = isNewRow && !TERMINAL_ON_ARRIVAL.has(status)
           void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross), outletRef: el.resId != null ? String(el.resId) : null })
           void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
             fireOrderTrigger(supabase, tenantId, {
