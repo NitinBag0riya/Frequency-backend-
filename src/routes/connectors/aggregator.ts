@@ -55,6 +55,10 @@ function chan(...vals: unknown[]): AggregatorChannel {
   return 'zomato'
 }
 const CHANNEL_LABEL: Record<AggregatorChannel, string> = { zomato: 'Zomato', swiggy: 'Swiggy' }
+// First-sighting statuses we do NOT ring for — history backfill of already-finished
+// orders that the operator can't act on. Anything else (placed/new/preparing/ready/
+// accepted) rings as a fresh order, regardless of ingestion age.
+const TERMINAL_ON_ARRIVAL = new Set(['delivered', 'cancelled', 'rejected', 'returned', 'refunded'])
 const STATUS_LABEL: Record<string, string> = {
   new: 'New', preparing: 'Preparing', ready: 'Ready', picked_up: 'Picked up',
   delivered: 'Delivered', rejected: 'Rejected', cancelled: 'Cancelled',
@@ -492,6 +496,50 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       { tenant_id: tenantId, outlet_ref: outletRef, pending_full_sync: false, last_synced_at: now, updated_at: now },
       { onConflict: 'tenant_id,outlet_ref' })
     console.log(`[aggregator/history] ingested ${parsed.length} past order(s) for outlet ${outletRef}`)
+
+    // LIVE-MIRROR: parsed rows in a non-terminal status (placed/new/accepted/
+    // preparing/ready) are LIVE orders that came in through the wrong door — the
+    // desktop's Zomato bridge routes many active orders through /history/ingest
+    // instead of /orders/ingest, which is silent (no notifyOrder → no ring).
+    // Mirror them into aggregator_orders + fire the ring so the operator hears
+    // the order regardless of which endpoint the desktop chose. Idempotent:
+    // aggregator_orders is upsert-by-natural-key, and isNew is gated on
+    // first-sighting-and-not-terminal so a re-relayed same-status row is silent.
+    if (parsed.length && channel) {
+      const live = parsed.filter(o => !TERMINAL_ON_ARRIVAL.has(normalizeStatus(o.status)))
+      if (live.length) {
+        const priorByKey = new Map<string, string>()
+        try {
+          const { data: prior } = await supabase.from('aggregator_orders')
+            .select('external_order_id, status').eq('tenant_id', tenantId).eq('channel', channel)
+            .in('external_order_id', live.map(o => o.external_order_id))
+          for (const p of prior ?? []) priorByKey.set((p as any).external_order_id, (p as any).status)
+        } catch { /* fail open — false re-ring beats a dropped order */ }
+        for (const o of live) {
+          const status = normalizeStatus(o.status)
+          const prior = priorByKey.get(o.external_order_id)
+          const isNewRow = prior === undefined
+          if (!isNewRow && prior === status) continue   // unchanged re-push — no bell
+          const row = {
+            tenant_id: tenantId, source: 'frequency_desktop', channel, external_order_id: o.external_order_id,
+            outlet_ref: outletRef, status, status_identifier: String(o.status ?? ''),
+            customer_name: o.customer_name ?? null, customer_phone_masked: null,
+            item_count: o.item_count ?? 0, gross_amount: o.gross_amount ?? null,
+            placed_at: o.placed_at ?? null, payload: o.raw ?? {}, updated_at: now,
+          }
+          const { error: mErr } = await supabase.from('aggregator_orders')
+            .upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })
+          if (mErr) { console.error(`[aggregator/history→live] upsert failed ${o.external_order_id}: ${mErr.message}`); continue }
+          const isNew = isNewRow && !TERMINAL_ON_ARRIVAL.has(status)
+          void notifyOrder(tenantId, {
+            isNew, channel, orderId: o.external_order_id, status,
+            summary: orderSummary(o.item_count ?? 0, o.gross_amount ?? null),
+            outletRef,
+          })
+          console.log(`[aggregator/history→live] mirrored ${channel}:${o.external_order_id} status=${status} isNew=${isNew}`)
+        }
+      }
+    }
   }
 
   // Ingest a Zomato/Swiggy customer-complaints snapshot → upsert into public.complaints
@@ -1280,7 +1328,6 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           // / cancelled / rejected — the operator can't act on those anyway; they're
           // history backfill). Anything else rings, regardless of age — the operator
           // needs to know for settlement, wastage, review-window kickoff.
-          const TERMINAL_ON_ARRIVAL = new Set(['delivered', 'cancelled', 'rejected', 'returned', 'refunded'])
           const isNew = isNewRow && !TERMINAL_ON_ARRIVAL.has(status)
           void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross), outletRef: el.resId != null ? String(el.resId) : null })
           void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
