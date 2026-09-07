@@ -6518,6 +6518,12 @@ const server = app.listen(PORT, () => {
   console.log(`Frequency server running on http://localhost:${PORT}`)
   console.log(`  → Bull Board: http://localhost:${PORT}/admin/queues`)
   void seedPlatformWaTemplates()
+  // 24/7 realtime tap on the order-notifications bus — every order.* event lands
+  // in Fly logs so `flyctl logs -a frequency-api-prod | grep watchdog` shows the
+  // exact same signal the dashboard subscribes to. If this line isn't in the logs,
+  // no client ring is possible.
+  void import('./lib/order-watchdog').then(({ startOrderWatchdog }) =>
+    startOrderWatchdog(supabase, { machineId: process.env.FLY_MACHINE_ID }))
 })
 
 // One-time platform WhatsApp template seed. When SEED_WA_TEMPLATES=1 AND the FREQ_WA
