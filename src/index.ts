@@ -42,6 +42,7 @@ import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue 
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
+import { createMetaBusinessAssetsRouter } from './routes/meta-business-assets'
 import { createSuperAdminRouter }  from './routes/super-admin'
 import { createNarutoTenantsRouter }       from './routes/naruto-tenants'
 import { createNarutoOnboardingRouter }    from './routes/naruto-onboarding'
@@ -518,6 +519,9 @@ const SENSITIVE_LOG_PATHS = new Set([
   '/api/auth/airtable/callback',
   '/api/auth/shopify/callback',
   '/api/auth/razorpay/callback',
+  // FBLfB (Instagram + Meta Ads + Leads via FB.login({config_id})).
+  // Body carries the one-time `code` — same sensitivity as query-based OAuth callbacks.
+  '/api/auth/meta_business_assets/callback',
   // P1 #11 — Shopify direct OAuth callback + inbound webhook. Both carry
   // signed payloads (state HMAC and Shopify HMAC respectively).
   '/api/shopify/callback',
@@ -6239,6 +6243,10 @@ app.use(createDataDeletionRouter({ supabase }))
 app.use(createTelegramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createInstagramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createMetaAdsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+// Unified FBLfB callback for Instagram / Meta Ads / FB Leads. Bypasses the
+// classic dialog/oauth "URL Blocked" error by using FB.login({config_id})
+// client-side. See routes/meta-business-assets.ts.
+app.use(createMetaBusinessAssetsRouter({ supabase, requireAuth, identifyTenant }))
 
 // ── Shopify (P1 #11) ────────────────────────────────────────────────────────
 // Three routers, deliberately split so the signature-verified write paths
