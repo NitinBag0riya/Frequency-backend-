@@ -1462,6 +1462,43 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     catch (e: any) { console.error(`[aggregator/menu] ingest error: ${e?.message}`) }
     res.json({ ok: true })
   })
+  // ─── Decision templates (learned accept/ready/reject POST shapes) ─────────
+  // The desktop's decisionLearner captures the REAL Zomato/Swiggy request the
+  // merchant fires when they click Accept/Ready/Reject on the aggregator dashboard.
+  // Storing per-tenant on the server (was: per-desktop local JSON file) means every
+  // desktop for a tenant reuses the same learned template — one merchant clicks once,
+  // every operator surface can then fire from Frequency. Also survives desktop
+  // reinstalls and cross-device.
+  r.get('/api/connectors/aggregator/decision-templates', ...guardView, async (req, res) => {
+    const { data, error } = await supabase.from('aggregator_decision_templates')
+      .select('aggregator,action,method,url_pattern,body_pattern,headers,sample_order_id,captured_at')
+      .eq('tenant_id', (req as any).tenantId)
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data ?? [])
+  })
+  r.post('/api/connectors/aggregator/decision-templates', ...guardEdit, async (req, res) => {
+    const b = req.body || {}
+    const agg = String(b.aggregator ?? '')
+    const act = String(b.action ?? '')
+    if (!['zomato', 'swiggy'].includes(agg)) { res.status(400).json({ error: 'bad aggregator' }); return }
+    if (!['accept', 'ready', 'reject'].includes(act)) { res.status(400).json({ error: 'bad action' }); return }
+    if (!b.method || !b.url_pattern) { res.status(400).json({ error: 'method + url_pattern required' }); return }
+    const row = {
+      tenant_id: (req as any).tenantId, aggregator: agg, action: act,
+      method: String(b.method), url_pattern: String(b.url_pattern),
+      body_pattern: b.body_pattern ?? null,
+      headers: b.headers ?? {},
+      sample_order_id: b.sample_order_id ?? null,
+      captured_by: String((req as any).user?.id ?? 'frequency_desktop'),
+      updated_at: new Date().toISOString(),
+    }
+    const { error } = await supabase.from('aggregator_decision_templates')
+      .upsert(row, { onConflict: 'tenant_id,aggregator,action' })
+    if (error) { res.status(500).json({ error: error.message }); return }
+    console.log(`[decision-template] ${agg} ${act} captured for tenant ${(req as any).tenantId}`)
+    res.json({ ok: true })
+  })
+
   r.post('/api/connectors/aggregator/history/ingest', ...guardEdit, async (req, res) => {
     const tenantId = (req as any).tenantId
     const outletRef = String(req.body?.outletRef ?? '')
