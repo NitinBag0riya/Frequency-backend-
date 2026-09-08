@@ -1417,7 +1417,14 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         // records last_action_result so the board shows the honest state.
         const mapping = String(b.result?.mapping ?? '')
         const pendingOrFailed = mapping === 'pending-mapping' || mapping === 'pending-live-order-mapping' || mapping === 'failed'
-        const executed = !!mapped && !b.result?.error && !pendingOrFailed
+        // `done` alone is NOT enough — 2026-09-08 the desktop replayed a Zomato analytics
+        // beacon (jumbo.zomato.com/event), got 200 from the telemetry collector, reported
+        // `done`, and we flipped the order to `ready` while Zomato never heard a thing.
+        // The desktop must now READ BACK the aggregator's own order state after the write
+        // and set result.verified=true only when the status actually moved. Anything
+        // unverified stays queued (retried next poll) and is recorded for the board.
+        const verified = b.result?.verified === true
+        const executed = !!mapped && !b.result?.error && !pendingOrFailed && verified
         await supabase.from('aggregator_orders').update({
           ...(executed
             ? { pending_action: null, pending_prep_time: null, pending_reason: null, pending_queued_at: null, status: mapped }
