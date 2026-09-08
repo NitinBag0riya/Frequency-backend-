@@ -81,6 +81,38 @@ async function pingOwnerWa(supabase: SupabaseClient, tag: string, tenantId: stri
   } catch (e: any) { console.warn(`${tag} WA ping error: ${e?.message ?? e}`) }
 }
 
+// Platform monitor CC — comma-separated numbers that get EVERY tenant's order.new
+// WhatsApp for cross-tenant monitoring by the platform admin (nitin). Independent
+// of the owner ping above so it fires even when the tenant has no wa_number.
+async function pingMonitors(tag: string, headline: string, summary: string): Promise<void> {
+  const list = (process.env.PLATFORM_MONITOR_WA || '').split(',').map(s => s.trim()).filter(Boolean)
+  if (!list.length) return
+  const phoneNumberId = process.env.FREQ_WA_PHONE_NUMBER_ID
+  const tok = process.env.FREQ_WA_ACCESS_TOKEN
+  if (!phoneNumberId || !tok) return
+  if (!(await isOwnerTemplateApproved())) return
+  for (const raw of list) {
+    const to = String(raw).replace(/\D/g, '')
+    if (!/^\d{10,15}$/.test(to)) continue
+    try {
+      const params = [headline, summary].map(x => ({ type: 'text', text: String(x).slice(0, 180) }))
+      const r = await fetch(`https://graph.facebook.com/v21.0/${phoneNumberId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+        body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'template',
+          template: { name: OWNER_ALERT_TEMPLATE, language: { code: OWNER_ALERT_LANG },
+            components: [{ type: 'body', parameters: params }] } }),
+      })
+      if (!r.ok) {
+        const j: any = await r.json().catch(() => ({}))
+        console.warn(`${tag} monitor WA failed to ${to.slice(0, 4)}…: ${j?.error?.message ?? r.status}`)
+        continue
+      }
+      console.log(`${tag} 📡 monitor WA → ${to.slice(0, 4)}… · ${headline}`)
+    } catch (e: any) { console.warn(`${tag} monitor WA error: ${e?.message ?? e}`) }
+  }
+}
+
 export function startOrderWatchdog(supabase: SupabaseClient, opts: { machineId?: string } = {}): void {
   const tag = `[watchdog${opts.machineId ? ':' + opts.machineId.slice(0, 6) : ''}]`
   let attempts = 0
@@ -103,6 +135,7 @@ export function startOrderWatchdog(supabase: SupabaseClient, opts: { machineId?:
           const headline = String(n.title ?? '').replace(/^New\s+/, '')
           const summary = String(d.summary ?? n.body ?? '')
           void pingOwnerWa(supabase, tag, String(n.tenant_id), headline || 'New order', summary)
+          void pingMonitors(tag, headline || 'New order', summary)
         }
       })
       .subscribe((status: string) => {

@@ -20,6 +20,11 @@ import { createListingsRouter } from './routes/listings'
 import { createAppointmentsRouter } from './routes/appointments'
 import { createTasksRouter } from './routes/tasks'
 import { createVendorsRouter } from './routes/vendors'
+import { createStaffRouter } from './routes/staff'
+import { createCampaignsRouter } from './routes/campaigns'
+import { startCatalogSync } from './workers/catalog-sync'
+import { startWastageSync } from './workers/wastage-sync'
+import { startCoinLedgerSync } from './workers/coin-ledger-sync'
 import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
@@ -1030,6 +1035,9 @@ const PERMISSION_KEY_ALIASES: Record<string, string[]> = {
   // Order-stock / suppliers reuse the leads/CRM permission for the RBAC matrix
   // (feature-gated separately via the `suppliers` entitlement), like khata/tasks.
   suppliers: ['leads', 'contacts'],
+  // Staff attendance + payroll piggyback on leads/CRM for RBAC (feature-gated
+  // separately). Same shape as tasks/complaints/suppliers.
+  staff: ['leads', 'contacts'],
 }
 
 function hasRolePermission(perms: any, feature: string, action: string): boolean {
@@ -6091,6 +6099,12 @@ app.use('/api', createListingsRouter(supabase, requireAuth, identifyTenant, chec
 app.use('/api', createAppointmentsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createTasksRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createVendorsRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use('/api', createStaffRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use('/api', createCampaignsRouter(supabase, requireAuth, identifyTenant, checkPermission))
+// HQ backfill mirrors — one setInterval each, self-gated by *_SYNC_DISABLED env vars.
+startCatalogSync(supabase)
+startWastageSync(supabase)
+startCoinLedgerSync(supabase)
 app.use('/api/admin', createAdminRouter(supabase, requireAuth, isPlatformUser))
 
 // ── Phase 3: campaigns, analytics, execution logs, activity ──────────────────
