@@ -81,12 +81,27 @@ async function pingOwnerWa(supabase: SupabaseClient, tag: string, tenantId: stri
   } catch (e: any) { console.warn(`${tag} WA ping error: ${e?.message ?? e}`) }
 }
 
-// Platform monitor CC — comma-separated numbers that get EVERY tenant's order.new
-// WhatsApp for cross-tenant monitoring by the platform admin (nitin). Independent
-// of the owner ping above so it fires even when the tenant has no wa_number.
-async function pingMonitors(tag: string, headline: string, summary: string): Promise<void> {
+// Platform monitor CC — comma-separated numbers that get order.new WhatsApps for
+// cross-tenant monitoring by the platform admin (nitin). Independent of the owner ping
+// above so it fires even when the tenant has no wa_number.
+//   PLATFORM_MONITOR_WA          numbers (E.164 digits, comma-separated)
+//   PLATFORM_MONITOR_WA_TENANTS  optional slug allowlist (comma-separated); unset = all
+//                                tenants. Set this before the tenant count makes the
+//                                monitor phone unusable.
+// Dedupe: a bounded in-process set of notification ids stops a Realtime redelivery from
+// double-sending. Cross-machine dedupe is NOT implemented (1 Fly machine today) — if the
+// app scales out, gate on a notification_delivery_log insert instead.
+const monitorSent = new Set<string>()
+async function pingMonitors(supabase: SupabaseClient, tag: string, notifId: string, tenantId: string, headline: string, summary: string): Promise<void> {
   const list = (process.env.PLATFORM_MONITOR_WA || '').split(',').map(s => s.trim()).filter(Boolean)
   if (!list.length) return
+  if (monitorSent.has(notifId)) return
+  monitorSent.add(notifId); if (monitorSent.size > 2000) monitorSent.delete(monitorSent.values().next().value as string)
+  const allow = (process.env.PLATFORM_MONITOR_WA_TENANTS || '').split(',').map(s => s.trim()).filter(Boolean)
+  if (allow.length) {
+    const { data: t } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+    if (!allow.includes(String((t as any)?.slug ?? ''))) return
+  }
   const phoneNumberId = process.env.FREQ_WA_PHONE_NUMBER_ID
   const tok = process.env.FREQ_WA_ACCESS_TOKEN
   if (!phoneNumberId || !tok) return
@@ -135,7 +150,7 @@ export function startOrderWatchdog(supabase: SupabaseClient, opts: { machineId?:
           const headline = String(n.title ?? '').replace(/^New\s+/, '')
           const summary = String(d.summary ?? n.body ?? '')
           void pingOwnerWa(supabase, tag, String(n.tenant_id), headline || 'New order', summary)
-          void pingMonitors(tag, headline || 'New order', summary)
+          void pingMonitors(supabase, tag, String(n.id), String(n.tenant_id), headline || 'New order', summary)
         }
       })
       .subscribe((status: string) => {
