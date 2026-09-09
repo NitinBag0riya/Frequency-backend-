@@ -530,11 +530,14 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           const { error: mErr } = await supabase.from('aggregator_orders')
             .upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })
           if (mErr) { console.error(`[aggregator/history→live] upsert failed ${o.external_order_id}: ${mErr.message}`); continue }
-          // Same recency override as the /orders/ingest path — a just-delivered fast-cycle
-          // Swiggy that we caught post-lifecycle still rings if placed_at < 15 min ago.
-          const placedTs = o.placed_at ? Date.parse(String(o.placed_at)) : Date.parse(now)
-          const isRecent = Number.isFinite(placedTs) && (Date.now() - placedTs) < 15 * 60_000
-          const isNew = isNewRow && (!TERMINAL_ON_ARRIVAL.has(status) || isRecent)
+          // RING gate: fire order.new (ring + WhatsApp) ONLY when the order is actually
+          // awaiting the operator's accept/reject — normalizeStatus === 'new'. An order
+          // first seen already 'preparing'/'accepted'/'ready'/'delivered' has NO pending
+          // decision (auto-accepted, or accepted on the aggregator side), so it lands on
+          // the board via order.status but must NOT ring. This kills the noise from
+          // already-accepted / already-delivered orders. (Dropped the 15-min recency
+          // override — that was exactly what made delivered orders ring.)
+          const isNew = isNewRow && status === 'new'
           void notifyOrder(tenantId, {
             isNew, channel, orderId: o.external_order_id, status,
             summary: orderSummary(o.item_count ?? 0, o.gross_amount ?? null),
@@ -1328,19 +1331,17 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           //   - RECENCY gate (30-min from placed_at) then killed every Swiggy that
           //     fast-cycled placed→delivered in <30min and was caught post-fulfilment.
           //     Result: 0 order.new events for 15+ days despite live orders.
-          // NEW gate: skip ONLY when the first-sighting is already terminal (delivered
-          // / cancelled / rejected — the operator can't act on those anyway; they're
-          // history backfill). Anything else rings, regardless of age — the operator
-          // needs to know for settlement, wastage, review-window kickoff.
-          // Recency override — a genuinely-just-delivered Swiggy order that we caught
-          // post-lifecycle (desktop poll cadence ≥ Swiggy 30-min flow → every row first-
-          // seen as `delivered`) still deserves a ring: the operator needs it for the
-          // wastage note + review-window kickoff. `placed_at` under 15 min means it can
-          // only be a live order, never a history backfill row (whose placed_at is hours+
-          // old). Falls back to the ingest-time row.updated_at when placed_at is null.
-          const placedTs = row.placed_at ? Date.parse(String(row.placed_at)) : Date.parse(row.updated_at)
-          const isRecent = Number.isFinite(placedTs) && (Date.now() - placedTs) < 15 * 60_000
-          const isNew = isNewRow && (!TERMINAL_ON_ARRIVAL.has(status) || isRecent)
+          // RING gate (2026-09-09): fire order.new — the ring + WhatsApp + accept/reject
+          // banner — ONLY when the order is actually awaiting the operator's decision, i.e.
+          // normalizeStatus === 'new'. Anything first seen as preparing/accepted/ready/
+          // picked_up/delivered has already been accepted (auto-accept, or accepted on the
+          // aggregator side) — there is NO decision to make, so it lands on the board via
+          // order.status but MUST NOT ring. Prior gates rang for every non-terminal state
+          // plus a 15-min recency override, which is exactly why already-accepted and
+          // just-delivered orders were pinging. Honest consequence: on a tenant with Zomato
+          // auto-accept on, we may never see 'new' → no ring, which is correct (nothing to
+          // decide). Status changes still update the board + fire the order-status trigger.
+          const isNew = isNewRow && status === 'new'
           void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross), outletRef: el.resId != null ? String(el.resId) : null })
           void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
             fireOrderTrigger(supabase, tenantId, {
