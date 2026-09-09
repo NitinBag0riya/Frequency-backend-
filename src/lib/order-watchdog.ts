@@ -51,15 +51,17 @@ setInterval(() => { ownerTemplateApproved = null }, 15 * 60_000).unref?.()
 // Send the owner-alert template via platform WABA (bypasses tenant WABA — a tenant that
 // hasn't linked its own WhatsApp still gets the owner ping). Best-effort, never throws.
 async function pingOwnerWa(supabase: SupabaseClient, tag: string, tenantId: string, headline: string, summary: string): Promise<void> {
+  // GLOBAL kill switch for owner order-WhatsApp. During the aggregator-write test phase we
+  // do NOT send order pings to any tenant owner — only PLATFORM_MONITOR_WA (the platform
+  // admin) gets them. Dashboard ring + OS toast + monitor WA are unaffected. Flip
+  // OWNER_WA_ENABLED=1 to turn per-tenant owner pings back on. (OWNER_WA_SUPPRESS_TENANTS
+  // still works as a per-tenant mute once globally enabled.)
+  if (process.env.OWNER_WA_ENABLED !== '1') return
   const phoneNumberId = process.env.FREQ_WA_PHONE_NUMBER_ID
   const tok = process.env.FREQ_WA_ACCESS_TOKEN
   if (!phoneNumberId || !tok) return
   if (!(await isOwnerTemplateApproved())) return
   try {
-    // Owner-WA suppression list (slugs). The tenant's order.new still rings the dashboard,
-    // OS toast, and the PLATFORM_MONITOR_WA number — only the OWNER's own WhatsApp is muted.
-    // Used while a tenant (e.g. la-fiamma during our live testing) shouldn't get order pings
-    // yet, but the platform admin still wants to watch them.
     const suppress = (process.env.OWNER_WA_SUPPRESS_TENANTS || '').split(',').map(s => s.trim()).filter(Boolean)
     if (suppress.length) {
       const { data: st } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
