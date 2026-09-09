@@ -88,20 +88,31 @@ async function pingOwnerWa(supabase: SupabaseClient, tag: string, tenantId: stri
 //   PLATFORM_MONITOR_WA_TENANTS  optional slug allowlist (comma-separated); unset = all
 //                                tenants. Set this before the tenant count makes the
 //                                monitor phone unusable.
-// Dedupe: a bounded in-process set of notification ids stops a Realtime redelivery from
-// double-sending. Cross-machine dedupe is NOT implemented (1 Fly machine today) — if the
-// app scales out, gate on a notification_delivery_log insert instead.
-const monitorSent = new Set<string>()
+// Dedupe: durable, cross-machine — claim the send by inserting a
+// notification_delivery_log row (channel 'wa_monitor') BEFORE sending; if the row
+// already exists (any Fly machine, or a Realtime redelivery), skip. Same table +
+// pattern the notification dispatcher already uses for its own channels. A bounded
+// in-process set short-circuits the common case without a round-trip.
+const monitorSeen = new Set<string>()
 async function pingMonitors(supabase: SupabaseClient, tag: string, notifId: string, tenantId: string, headline: string, summary: string): Promise<void> {
   const list = (process.env.PLATFORM_MONITOR_WA || '').split(',').map(s => s.trim()).filter(Boolean)
   if (!list.length) return
-  if (monitorSent.has(notifId)) return
-  monitorSent.add(notifId); if (monitorSent.size > 2000) monitorSent.delete(monitorSent.values().next().value as string)
+  if (monitorSeen.has(notifId)) return
+  monitorSeen.add(notifId); if (monitorSeen.size > 5000) monitorSeen.delete(monitorSeen.values().next().value as string)
   const allow = (process.env.PLATFORM_MONITOR_WA_TENANTS || '').split(',').map(s => s.trim()).filter(Boolean)
   if (allow.length) {
     const { data: t } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
     if (!allow.includes(String((t as any)?.slug ?? ''))) return
   }
+  // Cross-machine claim. A UNIQUE (notification_id, channel) index makes this atomic;
+  // without one it's still a strong best-effort (check-then-insert). Either way a second
+  // machine that already sent leaves a 'sent' row we detect here.
+  try {
+    const { data: prior } = await supabase.from('notification_delivery_log')
+      .select('id').eq('notification_id', notifId).eq('channel', 'wa_monitor').eq('status', 'sent').limit(1).maybeSingle()
+    if (prior) return
+    await supabase.from('notification_delivery_log').insert({ notification_id: notifId, channel: 'wa_monitor', status: 'sent', delivered_at: new Date().toISOString() })
+  } catch { /* log-table hiccup: fall through and send — a rare dup beats a missed monitor ping */ }
   const phoneNumberId = process.env.FREQ_WA_PHONE_NUMBER_ID
   const tok = process.env.FREQ_WA_ACCESS_TOKEN
   if (!phoneNumberId || !tok) return
