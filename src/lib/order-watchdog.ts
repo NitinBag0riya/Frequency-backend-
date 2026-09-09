@@ -56,6 +56,15 @@ async function pingOwnerWa(supabase: SupabaseClient, tag: string, tenantId: stri
   if (!phoneNumberId || !tok) return
   if (!(await isOwnerTemplateApproved())) return
   try {
+    // Owner-WA suppression list (slugs). The tenant's order.new still rings the dashboard,
+    // OS toast, and the PLATFORM_MONITOR_WA number — only the OWNER's own WhatsApp is muted.
+    // Used while a tenant (e.g. la-fiamma during our live testing) shouldn't get order pings
+    // yet, but the platform admin still wants to watch them.
+    const suppress = (process.env.OWNER_WA_SUPPRESS_TENANTS || '').split(',').map(s => s.trim()).filter(Boolean)
+    if (suppress.length) {
+      const { data: st } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+      if (suppress.includes(String((st as any)?.slug ?? ''))) { console.log(`${tag} owner WA suppressed for ${(st as any)?.slug}`); return }
+    }
     const { data: t } = await supabase.from('tenants').select('user_id').eq('id', tenantId).maybeSingle()
     const ownerId = (t as any)?.user_id
     if (!ownerId) return
