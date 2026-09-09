@@ -370,6 +370,12 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           }
         } catch { /* fail open — ring anyway */ }
       }
+      // A ring means one of two things now:
+      //   decision_needed=true  → status 'new', operator must accept/reject (loops till decided)
+      //   decision_needed=false → a FRESH order that arrived already accepted (auto-accept
+      //                            heads-up) — ring once, no accept/reject, informational.
+      // The FE (OrderAlertProvider) uses this to show the right banner + not loop a heads-up.
+      const decisionNeeded = ev.isNew && ev.status === 'new'
       await emitNotification(supabase, {
         tenant_id: tenantId,
         event_key: ev.isNew ? 'order.new' : 'order.status',
@@ -378,7 +384,10 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         data: {
           channel: ev.channel, channel_label: CHANNEL_LABEL[ev.channel], outlet_ref: ev.outletRef ?? null,
           order_id: ev.orderId, status: ev.status, status_label: STATUS_LABEL[ev.status] ?? ev.status,
-          summary: ev.isNew ? `${ev.summary} — accept now` : ev.summary,
+          decision_needed: decisionNeeded,
+          summary: ev.isNew
+            ? (decisionNeeded ? `${ev.summary} — accept now` : `${ev.summary} — auto-accepted (${STATUS_LABEL[ev.status] ?? ev.status})`)
+            : ev.summary,
           priority: ev.isNew ? 'high' : 'normal',
         },
       })
@@ -1331,17 +1340,14 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           //   - RECENCY gate (30-min from placed_at) then killed every Swiggy that
           //     fast-cycled placed→delivered in <30min and was caught post-fulfilment.
           //     Result: 0 order.new events for 15+ days despite live orders.
-          // RING gate (2026-09-09): fire order.new — the ring + WhatsApp + accept/reject
-          // banner — ONLY when the order is actually awaiting the operator's decision, i.e.
-          // normalizeStatus === 'new'. Anything first seen as preparing/accepted/ready/
-          // picked_up/delivered has already been accepted (auto-accept, or accepted on the
-          // aggregator side) — there is NO decision to make, so it lands on the board via
-          // order.status but MUST NOT ring. Prior gates rang for every non-terminal state
-          // plus a 15-min recency override, which is exactly why already-accepted and
-          // just-delivered orders were pinging. Honest consequence: on a tenant with Zomato
-          // auto-accept on, we may never see 'new' → no ring, which is correct (nothing to
-          // decide). Status changes still update the board + fire the order-status trigger.
-          const isNew = isNewRow && status === 'new'
+          // RING gate — LIVE relay path. This path is the desktop's in-window poll of the
+          // merchant's CURRENT orders, so a first-sighting here is genuinely just-happening.
+          // Ring when the order is awaiting a decision ('new' → accept/reject, loops) OR is a
+          // fresh auto-accepted arrival ('preparing' → heads-up, no decision). Everything
+          // past that — ready / picked_up / delivered / cancelled / rejected — is history,
+          // NOT a live event, so no ring (it still lands on the board via order.status).
+          // decision_needed (computed in notifyOrder from status==='new') tells the FE which.
+          const isNew = isNewRow && (status === 'new' || status === 'preparing')
           void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross), outletRef: el.resId != null ? String(el.resId) : null })
           void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
             fireOrderTrigger(supabase, tenantId, {
