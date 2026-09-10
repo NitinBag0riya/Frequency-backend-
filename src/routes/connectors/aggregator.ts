@@ -556,6 +556,41 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         }
       }
     }
+
+    // TERMINAL RECONCILE: a history row in a terminal status is the AUTHORITATIVE
+    // end-state. Zomato's live board only shows ACTIVE orders — once an order is
+    // handed to the rider it leaves the board, so if the terminal transition wasn't
+    // captured before that, the live aggregator_orders row freezes mid-flight
+    // (preparing/ready forever). History (get-all-v2) still carries the true
+    // 'delivered'/'cancelled'/… — advance the live row from it here. Never rings
+    // (a completion, not a new order); only ever moves non-terminal → terminal, and
+    // the status guard makes it a no-op once already terminal, so it's idempotent and
+    // writes nothing when nothing is stale. (Swiggy's fetchOrders poll returns full
+    // status so it self-heals already; this is belt-and-braces for both channels.)
+    if (parsed.length && channel) {
+      const doneByKey = new Map<string, string>()
+      for (const o of parsed) {
+        const s = normalizeStatus(o.status)
+        if (TERMINAL_ON_ARRIVAL.has(s)) doneByKey.set(o.external_order_id, s)
+      }
+      if (doneByKey.size) {
+        // Touch ONLY rows still non-terminal on the board — avoids rewriting settled
+        // rows on every sweep (write amplification) and never regresses a terminal row.
+        const { data: openRows } = await supabase.from('aggregator_orders')
+          .select('external_order_id, status').eq('tenant_id', tenantId).eq('channel', channel)
+          .in('external_order_id', [...doneByKey.keys()])
+          .not('status', 'in', '(delivered,cancelled,rejected,returned,refunded)')
+        for (const r of openRows ?? []) {
+          const ext = (r as any).external_order_id
+          const status = doneByKey.get(ext)!
+          const { error: rErr } = await supabase.from('aggregator_orders')
+            .update({ status, updated_at: now })
+            .eq('tenant_id', tenantId).eq('channel', channel).eq('external_order_id', ext)
+          if (rErr) { console.error(`[aggregator/history→reconcile] ${ext}: ${rErr.message}`); continue }
+          console.log(`[aggregator/history→reconcile] ${channel}:${ext} ${(r as any).status} → ${status}`)
+        }
+      }
+    }
   }
 
   // Ingest a Zomato/Swiggy customer-complaints snapshot → upsert into public.complaints
