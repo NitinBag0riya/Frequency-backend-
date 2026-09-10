@@ -226,6 +226,8 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
       // Precise food type + badges from the data blob (fall back to the veg bool).
       foodType: (ALLOWED_FOOD_TYPES.includes(String(d[FOOD_TYPE_KEY] || '')) ? String(d[FOOD_TYPE_KEY]) : undefined) as any,
       tags: parseTags(d[TAGS_KEY]),
+      isCombo: truthy(d[IS_COMBO_KEY]) || undefined,
+      comboItems: parseTags(d[COMBO_ITEMS_KEY]),
       soldOut,
       rewardEligible: (im as any).rewardEligible ? String(d[(im as any).rewardEligible] ?? '') !== 'false' : true,
       // D2C extras (null for HoReCa): strike-through compare-at price + SKU + stock.
@@ -447,6 +449,8 @@ export interface CatalogDish {
   veg?: boolean; soldOut?: boolean; rewardEligible?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
   // FSSAI food type + marketing badges — ride in the data blob (see TAGS_KEY below).
   foodType?: string; tags?: string[]
+  // Combo bundle: flag + component item ids (ride the data blob).
+  isCombo?: boolean; comboItems?: string[]
   // D2C product fields (written only when the vertical's map defines the role).
   compareAtPrice?: number | null; sku?: string | null; stock?: number | null; status?: string; gallery?: string[]
   // Per-location availability: outlet ids this item is served at (empty = everywhere).
@@ -470,6 +474,10 @@ const parseOutletIds = (v: unknown): string[] => {
 // but was silently dropped (the tables-catalog path had no `tags`/`foodType` role).
 const TAGS_KEY = '_tags'
 const FOOD_TYPE_KEY = '_foodType'
+// A combo bundles component dishes at its own price. isCombo + component ids ride the
+// data blob (no schema column), same as tags/foodType.
+const IS_COMBO_KEY = '_isCombo'
+const COMBO_ITEMS_KEY = '_comboItems'
 const ALLOWED_FOOD_TYPES = ['veg', 'nonveg', 'egg']
 const parseTags = (v: unknown): string[] => {
   if (Array.isArray(v)) return v.map(String)
@@ -509,6 +517,9 @@ function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string,
   if (dish.foodType && ALLOWED_FOOD_TYPES.includes(String(dish.foodType))) d[FOOD_TYPE_KEY] = String(dish.foodType)
   const tags = parseTags(dish.tags).filter(Boolean)
   if (tags.length) d[TAGS_KEY] = JSON.stringify([...new Set(tags)])
+  if (dish.isCombo) d[IS_COMBO_KEY] = 'true'
+  const combo = parseTags(dish.comboItems).filter(Boolean)
+  if (combo.length) d[COMBO_ITEMS_KEY] = JSON.stringify([...new Set(combo)])
   return d
 }
 async function categoryNameById(supabase: SupabaseClient, tenantId: string, config: CatalogConfig, categoryId?: string): Promise<string> {
