@@ -549,6 +549,59 @@ export async function catalogUpsertItem(supabase: SupabaseClient, tenantId: stri
   }
   await materializeCatalog(supabase, tenantId, slug)
 }
+// Sync each catalog item's per-outlet availability (_availableOutlets) from the live
+// aggregator menus. A dish a given Zomato/Swiggy outlet actually lists is marked available
+// at that Frequency outlet. A dish found at EVERY outlet (or at NONE — e.g. a storefront-only
+// combo or a bottle of water never on the aggregators) stays "everywhere" (empty list), so it
+// is never wrongly hidden. Name-matched (normalised, cheapest interpretation). Idempotent;
+// re-materialises the snapshot at the end so the dashboard filter + storefront both update.
+export async function syncOutletAvailability(supabase: SupabaseClient, tenantId: string, slug: string) {
+  const config = await getCatalogConfig(slug)
+  if (!config) return null
+  // res-id (zomato + swiggy) -> Frequency outlet id, from the storefront-api config.
+  let cfg: any = null
+  try { cfg = await sf('GET', '/admin/config', slug) } catch { cfg = null }
+  const outlets: any[] = Array.isArray(cfg?.outlets) ? cfg.outlets : []
+  const resToOutlet = new Map<string, string>()
+  for (const o of outlets) {
+    if (o?.swiggyResId) resToOutlet.set(String(o.swiggyResId), String(o.id))
+    if (o?.zomatoResId) resToOutlet.set(String(o.zomatoResId), String(o.id))
+  }
+  const outletIds = new Set([...resToOutlet.values()])
+  if (outletIds.size < 2) return { updated: 0, reason: 'need 2+ outlets bound to Zomato/Swiggy res-ids' }
+  // aggregator_menu (naked tenant uuid): dish name -> the set of outlet ids that list it.
+  const rawTenantId = String(tenantId).replace(/^t_/, '')
+  const { data: am } = await supabase.from('aggregator_menu')
+    .select('name, outlet_ref').eq('tenant_id', rawTenantId).eq('entity_type', 'item')
+  const norm = (s: any) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ')
+  const nameToOutlets = new Map<string, Set<string>>()
+  for (const r of (am ?? []) as any[]) {
+    const oid = resToOutlet.get(String(r.outlet_ref)); if (!oid) continue
+    const n = norm(r.name); if (!n) continue
+    if (!nameToOutlets.has(n)) nameToOutlets.set(n, new Set())
+    nameToOutlets.get(n)!.add(oid)
+  }
+  // Apply to each catalog row's data blob.
+  const nameKey = config.map.item.name
+  const { data: rows } = await supabase.from('lead_rows')
+    .select('id, data').eq('tenant_id', tenantId).eq('table_id', config.itemsTableId).eq('status', 'active')
+  let updated = 0, scopedCount = 0
+  for (const row of (rows ?? []) as any[]) {
+    const data = { ...((row as any).data || {}) }
+    const outs = nameToOutlets.get(norm(data[nameKey]))
+    // Scope only when the dish is listed at SOME but not ALL outlets; otherwise "everywhere".
+    const scoped = outs && outs.size > 0 && outs.size < outletIds.size ? [...outs].sort() : []
+    if (scoped.length) scopedCount++
+    const nextVal = scoped.length ? JSON.stringify(scoped) : undefined
+    if (String(data[AVAILABLE_OUTLETS_KEY] || '') === String(nextVal || '')) continue
+    if (nextVal) data[AVAILABLE_OUTLETS_KEY] = nextVal; else delete data[AVAILABLE_OUTLETS_KEY]
+    const { error } = await supabase.from('lead_rows').update({ data }).eq('id', (row as any).id)
+    if (!error) updated++
+  }
+  const counts = await materializeCatalog(supabase, tenantId, slug)
+  return { updated, scoped: scopedCount, outlets: outletIds.size, matchedDishes: nameToOutlets.size, ...(counts || {}) }
+}
+
 export async function catalogDeleteItem(supabase: SupabaseClient, tenantId: string, slug: string, rowId: string) {
   const config = await configOrThrow(slug)
   const { error } = await supabase.from('lead_rows').delete().eq('id', rowId).eq('tenant_id', tenantId).eq('table_id', config.itemsTableId)

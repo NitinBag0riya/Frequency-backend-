@@ -18,7 +18,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
 import { sendSmsOtp, sendSmsOrderUpdate } from '../lib/storefront-sms.js'
 import { resolveWaCreds } from '../lib/wa-creds.js'
-import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
+import { provisionCatalog, materializeCatalog, getCatalogConfig, syncOutletAvailability, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
 import { emitNotification, tenantNotifyRecipients } from './notifications.js'
 import { resolvePlatformRole } from '../lib/platform-guard.js'
 import { normalizeRole, can } from '../lib/platform-rbac.js'
@@ -652,6 +652,27 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       if (!counts) return res.status(400).json({ error: 'not Tables-backed' })
       res.json({ ok: true, slug, ...counts })
     } catch (e: any) { res.status(502).json({ error: e?.message || 'rematerialize failed' }) }
+  })
+
+  // Set each dish's per-outlet availability from the aggregator menus (a dish shows only
+  // where its Zomato/Swiggy outlet actually lists it). Operator-triggered.
+  r.post('/api/storefront/catalog/sync-outlet-availability', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const slug = await slugOf(req, res); if (!slug) return
+    try { const out = await syncOutletAvailability(supabase, tenantId, slug); res.json({ ok: true, ...(out || {}) }) }
+    catch (e: any) { res.status(502).json({ error: e?.message || 'sync failed' }) }
+  })
+  // Service-key variant (server-to-server), same as admin-rematerialize.
+  r.post('/api/storefront/catalog/admin-sync-outlet-availability', async (req, res) => {
+    const key = String(req.headers['x-service-key'] || '')
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY || key !== process.env.SUPABASE_SERVICE_ROLE_KEY) return res.status(403).json({ error: 'forbidden' })
+    const slug = String((req.body as any)?.slug || '').trim()
+    if (!slug) return res.status(400).json({ error: 'slug required' })
+    const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+    const tenantId = (t as any)?.id
+    if (!tenantId) return res.status(404).json({ error: 'unknown tenant' })
+    try { const out = await syncOutletAvailability(supabase, tenantId, slug); res.json({ ok: true, slug, ...(out || {}) }) }
+    catch (e: any) { res.status(502).json({ error: e?.message || 'sync failed' }) }
   })
 
   // Catalog item/category edits (UI→Table) — the dashboard's rich dish editor
