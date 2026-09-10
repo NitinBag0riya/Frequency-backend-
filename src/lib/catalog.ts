@@ -228,6 +228,7 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
       tags: parseTags(d[TAGS_KEY]),
       isCombo: truthy(d[IS_COMBO_KEY]) || undefined,
       comboItems: parseTags(d[COMBO_ITEMS_KEY]),
+      hideSavings: truthy(d[HIDE_SAVINGS_KEY]) || undefined,
       soldOut,
       rewardEligible: (im as any).rewardEligible ? String(d[(im as any).rewardEligible] ?? '') !== 'false' : true,
       // D2C extras (null for HoReCa): strike-through compare-at price + SKU + stock.
@@ -450,7 +451,7 @@ export interface CatalogDish {
   // FSSAI food type + marketing badges — ride in the data blob (see TAGS_KEY below).
   foodType?: string; tags?: string[]
   // Combo bundle: flag + component item ids (ride the data blob).
-  isCombo?: boolean; comboItems?: string[]
+  isCombo?: boolean; comboItems?: string[]; hideSavings?: boolean
   // D2C product fields (written only when the vertical's map defines the role).
   compareAtPrice?: number | null; sku?: string | null; stock?: number | null; status?: string; gallery?: string[]
   // Per-location availability: outlet ids this item is served at (empty = everywhere).
@@ -478,6 +479,7 @@ const FOOD_TYPE_KEY = '_foodType'
 // data blob (no schema column), same as tags/foodType.
 const IS_COMBO_KEY = '_isCombo'
 const COMBO_ITEMS_KEY = '_comboItems'
+const HIDE_SAVINGS_KEY = '_hideSavings'
 const ALLOWED_FOOD_TYPES = ['veg', 'nonveg', 'egg']
 const parseTags = (v: unknown): string[] => {
   if (Array.isArray(v)) return v.map(String)
@@ -520,6 +522,7 @@ function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string,
   if (dish.isCombo) d[IS_COMBO_KEY] = 'true'
   const combo = parseTags(dish.comboItems).filter(Boolean)
   if (combo.length) d[COMBO_ITEMS_KEY] = JSON.stringify([...new Set(combo)])
+  if (dish.hideSavings) d[HIDE_SAVINGS_KEY] = 'true'
   return d
 }
 async function categoryNameById(supabase: SupabaseClient, tenantId: string, config: CatalogConfig, categoryId?: string): Promise<string> {
