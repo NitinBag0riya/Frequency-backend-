@@ -1491,9 +1491,17 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         const failed = r.ok === false
           || !!(r.error || r.rejection)
           || (typeof r.status === 'number' && r.status >= 400)
-        await supabase.from('aggregator_menu_actions').update({
-          status: failed ? 'failed' : 'done', result: b.result ?? null, updated_at: new Date().toISOString(),
-        }).eq('tenant_id', tenantId).eq('id', b.id)
+        const { data: row } = await supabase.from('aggregator_menu_actions')
+          .update({ status: failed ? 'failed' : 'done', result: b.result ?? null, updated_at: new Date().toISOString() })
+          .eq('tenant_id', tenantId).eq('id', b.id).select('action, outlet_ref').maybeSingle()
+        // A CREATE that Swiggy accepted exists on the live menu but not in our captured
+        // replica yet — flag a full re-pull so the next menu-diff matches it by name and
+        // stops reporting it as "not on Swiggy". Same flag /menu/resync sets.
+        if (!failed && (row as any)?.action === 'create' && (row as any)?.outlet_ref) {
+          await supabase.from('aggregator_menu_sync').upsert(
+            { tenant_id: tenantId, outlet_ref: String((row as any).outlet_ref), pending_full_sync: true, updated_at: new Date().toISOString() },
+            { onConflict: 'tenant_id,outlet_ref' })
+        }
       } else {
         res.status(400).json({ error: "body needs { kind:'order', orderId, statusCode }, { kind:'stock', id } or { kind:'menuEdit', id }" }); return
       }
