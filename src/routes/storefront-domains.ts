@@ -634,6 +634,26 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     } catch (e: any) { res.status(502).json({ error: e?.message || 'Sync failed' }) }
   })
 
+  // Server-to-server re-materialize by slug — no user session. Gated by the Supabase
+  // service-role key (only trusted internals hold it). Lets ops force a tenant's
+  // Tables catalog to re-compose + push to storefront-api after a direct data edit
+  // (a raw row write does NOT auto-materialize — only the API edit path does). Safe:
+  // idempotent, reads the rows as the source of truth, writes nothing to them.
+  r.post('/api/storefront/catalog/admin-rematerialize', async (req, res) => {
+    const key = String(req.headers['x-service-key'] || '')
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY || key !== process.env.SUPABASE_SERVICE_ROLE_KEY) return res.status(403).json({ error: 'forbidden' })
+    const slug = String((req.body as any)?.slug || '').trim()
+    if (!slug) return res.status(400).json({ error: 'slug required' })
+    const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+    const tenantId = (t as any)?.id
+    if (!tenantId) return res.status(404).json({ error: 'unknown tenant' })
+    try {
+      const counts = await materializeCatalog(supabase, tenantId, slug)
+      if (!counts) return res.status(400).json({ error: 'not Tables-backed' })
+      res.json({ ok: true, slug, ...counts })
+    } catch (e: any) { res.status(502).json({ error: e?.message || 'rematerialize failed' }) }
+  })
+
   // Catalog item/category edits (UI→Table) — the dashboard's rich dish editor
   // writes through here when the menu is Tables-backed, so add-ons get the proper
   // group editor and each save re-materializes the storefront snapshot.
