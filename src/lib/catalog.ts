@@ -229,6 +229,7 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
       isCombo: truthy(d[IS_COMBO_KEY]) || undefined,
       comboItems: parseTags(d[COMBO_ITEMS_KEY]),
       hideSavings: truthy(d[HIDE_SAVINGS_KEY]) || undefined,
+      srcIds: parseSrcIds(d[SRC_IDS_KEY]),
       soldOut,
       rewardEligible: (im as any).rewardEligible ? String(d[(im as any).rewardEligible] ?? '') !== 'false' : true,
       // D2C extras (null for HoReCa): strike-through compare-at price + SKU + stock.
@@ -452,6 +453,8 @@ export interface CatalogDish {
   foodType?: string; tags?: string[]
   // Combo bundle: flag + component item ids (ride the data blob).
   isCombo?: boolean; comboItems?: string[]; hideSavings?: boolean
+  // Durable per-channel aggregator item-id link (see SRC_IDS_KEY).
+  srcIds?: { zomato?: string; swiggy?: string }
   // D2C product fields (written only when the vertical's map defines the role).
   compareAtPrice?: number | null; sku?: string | null; stock?: number | null; status?: string; gallery?: string[]
   // Per-location availability: outlet ids this item is served at (empty = everywhere).
@@ -480,6 +483,22 @@ const FOOD_TYPE_KEY = '_foodType'
 const IS_COMBO_KEY = '_isCombo'
 const COMBO_ITEMS_KEY = '_comboItems'
 const HIDE_SAVINGS_KEY = '_hideSavings'
+// Per-channel aggregator item-id link: { zomato?, swiggy? } = this dish's REAL item id
+// on each aggregator. THE durable cross-channel key. The old join was name-only, so a
+// rename on either side silently broke the link and every menu-write re-guessed by name;
+// with a stored id the link survives our-side renames and the write path targets the real
+// entity id. Auto-populated by syncOutletAvailability (first name-match); rides the jsonb
+// data blob like the other keys — no schema column, no migration.
+const SRC_IDS_KEY = '_srcIds'
+const parseSrcIds = (v: unknown): { zomato?: string; swiggy?: string } | undefined => {
+  let o: any = v
+  if (typeof v === 'string' && v.trim()) { try { o = JSON.parse(v) } catch { return undefined } }
+  if (!o || typeof o !== 'object') return undefined
+  const out: { zomato?: string; swiggy?: string } = {}
+  if (o.zomato) out.zomato = String(o.zomato)   // key order fixed (zomato, swiggy) so
+  if (o.swiggy) out.swiggy = String(o.swiggy)   // re-serialisation compares stably
+  return (out.zomato || out.swiggy) ? out : undefined
+}
 const ALLOWED_FOOD_TYPES = ['veg', 'nonveg', 'egg']
 const parseTags = (v: unknown): string[] => {
   if (Array.isArray(v)) return v.map(String)
@@ -523,6 +542,8 @@ function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string,
   const combo = parseTags(dish.comboItems).filter(Boolean)
   if (combo.length) d[COMBO_ITEMS_KEY] = JSON.stringify([...new Set(combo)])
   if (dish.hideSavings) d[HIDE_SAVINGS_KEY] = 'true'
+  const srcIds = parseSrcIds(dish.srcIds)
+  if (srcIds) d[SRC_IDS_KEY] = JSON.stringify(srcIds)
   return d
 }
 async function categoryNameById(supabase: SupabaseClient, tenantId: string, config: CatalogConfig, categoryId?: string): Promise<string> {
@@ -572,12 +593,20 @@ export async function syncOutletAvailability(supabase: SupabaseClient, tenantId:
   // aggregator_menu (naked tenant uuid): dish name -> the set of outlet ids that list it.
   const rawTenantId = String(tenantId).replace(/^t_/, '')
   const { data: am } = await supabase.from('aggregator_menu')
-    .select('name, outlet_ref').eq('tenant_id', rawTenantId).eq('entity_type', 'item')
+    .select('name, outlet_ref, channel, entity_id').eq('tenant_id', rawTenantId).eq('entity_type', 'item')
   const norm = (s: any) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ')
   const nameToOutlets = new Map<string, Set<string>>()
+  const nameToSrcId = new Map<string, { zomato?: string; swiggy?: string }>()
   for (const r of (am ?? []) as any[]) {
-    const oid = resToOutlet.get(String(r.outlet_ref)); if (!oid) continue
     const n = norm(r.name); if (!n) continue
+    // Real per-channel item id — captured regardless of whether the outlet is bound.
+    const ch = r.channel === 'zomato' || r.channel === 'swiggy' ? r.channel : null
+    if (ch && r.entity_id) {
+      const cur = nameToSrcId.get(n) || {}
+      if (!cur[ch as 'zomato' | 'swiggy']) { cur[ch as 'zomato' | 'swiggy'] = String(r.entity_id); nameToSrcId.set(n, cur) }
+    }
+    // Availability needs the res-id -> Frequency-outlet binding.
+    const oid = resToOutlet.get(String(r.outlet_ref)); if (!oid) continue
     if (!nameToOutlets.has(n)) nameToOutlets.set(n, new Set())
     nameToOutlets.get(n)!.add(oid)
   }
@@ -585,21 +614,30 @@ export async function syncOutletAvailability(supabase: SupabaseClient, tenantId:
   const nameKey = config.map.item.name
   const { data: rows } = await supabase.from('lead_rows')
     .select('id, data').eq('tenant_id', tenantId).eq('table_id', config.itemsTableId).eq('status', 'active')
-  let updated = 0, scopedCount = 0
+  let updated = 0, scopedCount = 0, linkedCount = 0
   for (const row of (rows ?? []) as any[]) {
     const data = { ...((row as any).data || {}) }
-    const outs = nameToOutlets.get(norm(data[nameKey]))
-    // Scope only when the dish is listed at SOME but not ALL outlets; otherwise "everywhere".
+    const nm = norm(data[nameKey])
+    // Availability: scope only when the dish is at SOME but not ALL outlets; else "everywhere".
+    const outs = nameToOutlets.get(nm)
     const scoped = outs && outs.size > 0 && outs.size < outletIds.size ? [...outs].sort() : []
     if (scoped.length) scopedCount++
     const nextVal = scoped.length ? JSON.stringify(scoped) : undefined
-    if (String(data[AVAILABLE_OUTLETS_KEY] || '') === String(nextVal || '')) continue
+    // Durable per-channel link: a stored id WINS over a fresh name-match, so once linked
+    // the join survives an our-side rename; missing channels are filled from the name-match.
+    const merged = parseSrcIds({ ...(nameToSrcId.get(nm) || {}), ...(parseSrcIds(data[SRC_IDS_KEY]) || {}) })
+    const srcVal = merged ? JSON.stringify(merged) : undefined
+    if (merged) linkedCount++
+    const availSame = String(data[AVAILABLE_OUTLETS_KEY] || '') === String(nextVal || '')
+    const srcSame = String(data[SRC_IDS_KEY] || '') === String(srcVal || '')
+    if (availSame && srcSame) continue
     if (nextVal) data[AVAILABLE_OUTLETS_KEY] = nextVal; else delete data[AVAILABLE_OUTLETS_KEY]
+    if (srcVal) data[SRC_IDS_KEY] = srcVal; else delete data[SRC_IDS_KEY]
     const { error } = await supabase.from('lead_rows').update({ data }).eq('id', (row as any).id)
     if (!error) updated++
   }
   const counts = await materializeCatalog(supabase, tenantId, slug)
-  return { updated, scoped: scopedCount, outlets: outletIds.size, matchedDishes: nameToOutlets.size, ...(counts || {}) }
+  return { updated, scoped: scopedCount, linked: linkedCount, outlets: outletIds.size, matchedDishes: nameToOutlets.size, ...(counts || {}) }
 }
 
 export async function catalogDeleteItem(supabase: SupabaseClient, tenantId: string, slug: string, rowId: string) {
