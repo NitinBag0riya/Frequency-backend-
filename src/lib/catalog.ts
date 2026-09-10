@@ -223,6 +223,9 @@ export function composeMenu(config: CatalogConfig, catRows: any[], itemRows: any
       // Roles below are optional per vertical (absent → sensible default).
       coins: (im as any).coins ? Math.max(0, Math.round(Number(d[(im as any).coins]) || 0)) : 0,
       veg: (im as any).veg ? truthy(d[(im as any).veg]) : false,
+      // Precise food type + badges from the data blob (fall back to the veg bool).
+      foodType: (ALLOWED_FOOD_TYPES.includes(String(d[FOOD_TYPE_KEY] || '')) ? String(d[FOOD_TYPE_KEY]) : undefined) as any,
+      tags: parseTags(d[TAGS_KEY]),
       soldOut,
       rewardEligible: (im as any).rewardEligible ? String(d[(im as any).rewardEligible] ?? '') !== 'false' : true,
       // D2C extras (null for HoReCa): strike-through compare-at price + SKU + stock.
@@ -442,6 +445,8 @@ async function backfillOutlets(supabase: SupabaseClient, tenantId: string, userI
 export interface CatalogDish {
   name: string; description?: string; priceInr?: number; coins?: number
   veg?: boolean; soldOut?: boolean; rewardEligible?: boolean; imageUrl?: string | null; categoryId?: string; options?: unknown
+  // FSSAI food type + marketing badges — ride in the data blob (see TAGS_KEY below).
+  foodType?: string; tags?: string[]
   // D2C product fields (written only when the vertical's map defines the role).
   compareAtPrice?: number | null; sku?: string | null; stock?: number | null; status?: string; gallery?: string[]
   // Per-location availability: outlet ids this item is served at (empty = everywhere).
@@ -453,6 +458,20 @@ export interface CatalogDish {
 // no schema migration. The grid simply ignores keys it has no column for.
 const AVAILABLE_OUTLETS_KEY = '_availableOutlets'
 const parseOutletIds = (v: unknown): string[] => {
+  if (Array.isArray(v)) return v.map(String)
+  if (typeof v === 'string' && v.trim()) { try { const p = JSON.parse(v); return Array.isArray(p) ? p.map(String) : [] } catch { return [] } }
+  return []
+}
+// Marketing badges (bestseller/spicy/chefs-special/jain/cold/new) + the precise FSSAI
+// food type (veg/nonveg/egg). Like AVAILABLE_OUTLETS_KEY these ride in the row's jsonb
+// data blob — NO schema column, NO migration — so a tenant whose Items table was
+// provisioned before badges existed still saves + serves them. The bug this fixes:
+// dishToRowData never wrote these, so a badge picked in the menu editor said "saved"
+// but was silently dropped (the tables-catalog path had no `tags`/`foodType` role).
+const TAGS_KEY = '_tags'
+const FOOD_TYPE_KEY = '_foodType'
+const ALLOWED_FOOD_TYPES = ['veg', 'nonveg', 'egg']
+const parseTags = (v: unknown): string[] => {
   if (Array.isArray(v)) return v.map(String)
   if (typeof v === 'string' && v.trim()) { try { const p = JSON.parse(v); return Array.isArray(p) ? p.map(String) : [] } catch { return [] } }
   return []
@@ -485,6 +504,11 @@ function dishToRowData(config: CatalogConfig, dish: CatalogDish): Record<string,
   // only when restricted, so unrestricted rows stay clean.
   const outletIds = parseOutletIds(dish.availableOutlets)
   if (outletIds.length) d[AVAILABLE_OUTLETS_KEY] = JSON.stringify(outletIds)
+  // Food type + badges ride in the data blob (no mapped column). Written only when set;
+  // the whole data object is replaced on update, so clearing them removes the key.
+  if (dish.foodType && ALLOWED_FOOD_TYPES.includes(String(dish.foodType))) d[FOOD_TYPE_KEY] = String(dish.foodType)
+  const tags = parseTags(dish.tags).filter(Boolean)
+  if (tags.length) d[TAGS_KEY] = JSON.stringify([...new Set(tags)])
   return d
 }
 async function categoryNameById(supabase: SupabaseClient, tenantId: string, config: CatalogConfig, categoryId?: string): Promise<string> {
