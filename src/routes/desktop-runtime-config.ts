@@ -18,6 +18,12 @@ export interface DesktopRuntimeConfig {
   authUrl: string
   apiUrl: string
   provisionUrl: string
+  /**
+   * Optional mandatory-update floor. When set (from the `desktop_release` flag's
+   * `minVersion`), any install running BELOW it force-installs the next update with
+   * no defer — the lever for pushing a critical fix. Absent → updates are optional.
+   */
+  minVersion?: string
 }
 
 const ENVS: Record<DesktopEnv, Omit<DesktopRuntimeConfig, 'env'>> = {

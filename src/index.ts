@@ -2395,22 +2395,31 @@ app.get('/api/naruto/desktop-health', requireSuperAdminOrLocal, async (_req, res
 app.get('/api/desktop/runtime-config', async (_req, res) => {
   let flagValue: unknown
   let bridge: unknown
+  let minVersion: string | undefined
   try {
     const { data } = await supabase
       .from('feature_flags').select('key, value_json')
-      .in('key', ['desktop_environment', 'desktop_bridge_rules'])
+      .in('key', ['desktop_environment', 'desktop_bridge_rules', 'desktop_release'])
     for (const row of data ?? []) {
       if (row.key === 'desktop_environment') flagValue = (row.value_json as any)?.value
       // DATA-DRIVEN bridge-rules override (Layer 1): the WHOLE value_json is the override
       // block the desktop merges over its baked defaults (portal URLs, isLoggedIn patterns,
       // response-shape matchers, status maps). No secrets — data only, validated app-side.
       else if (row.key === 'desktop_bridge_rules') bridge = row.value_json
+      // Mandatory-update floor rides the same desktop_release flag that feeds /download.
+      else if (row.key === 'desktop_release') {
+        const mv = (row.value_json as any)?.minVersion
+        if (typeof mv === 'string' && mv) minVersion = mv
+      }
     }
   } catch {
     /* unreachable DB → fall through to prod default, no bridge override */
   }
   const cfg = resolveDesktopRuntimeConfig(flagValue)
-  res.json(bridge && typeof bridge === 'object' ? { ...cfg, bridge } : cfg)
+  const out: Record<string, unknown> = { ...cfg }
+  if (minVersion) out.minVersion = minVersion
+  if (bridge && typeof bridge === 'object') out.bridge = bridge
+  res.json(out)
 })
 
 // ── Frequency Desktop download manifest ──────────────────────────────────────
