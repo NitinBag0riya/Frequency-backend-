@@ -21,6 +21,7 @@
 import express, { RequestHandler } from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { encrypt } from '../crypto'
+import { backfillPagesAndForms, syncCustomAudiences } from '../lib/meta-graph-sync'
 
 type Middleware = RequestHandler
 
@@ -30,7 +31,10 @@ interface Deps {
   identifyTenant: Middleware
 }
 
-const GRAPH = 'https://graph.facebook.com/v18.0'
+// Bumped v18 → v21 (2026-09-13). v18 sunsets Feb 2026; all endpoints we use
+// (adaccounts, pages, leadgen_forms, customaudiences, subscribed_apps,
+// dialog/oauth exchange) are supported unchanged in v21.
+const GRAPH = 'https://graph.facebook.com/v21.0'
 
 // Scope union across purposes — the actual scopes granted at auth time
 // live on the FBLfB configuration in the Meta App Dashboard, not here.
@@ -172,6 +176,24 @@ export function createMetaBusinessAssetsRouter(deps: Deps): express.Router {
           currency: a.currency ?? null,
           business_id: a.business?.id ?? null,
         }, { onConflict: 'ad_account_id' as any })
+      }
+
+      // Backfill pages + leadgen forms, and mirror existing Ads-Manager
+      // custom audiences into meta_audiences. Both are best-effort — a
+      // failure here shouldn't fail the whole connect (the merchant can
+      // hit /audiences/refresh manually and pages will backfill on any
+      // subsequent connect). Logged for observability.
+      try {
+        const pgRes = await backfillPagesAndForms(supabase, tenantId, userToken)
+        if (pgRes.errors.length) console.warn(`[meta_business_assets:ads] backfillPagesAndForms warnings:`, pgRes.errors)
+      } catch (e: any) {
+        console.warn(`[meta_business_assets:ads] backfillPagesAndForms failed (non-fatal): ${e?.message}`)
+      }
+      try {
+        const audRes = await syncCustomAudiences(supabase, tenantId)
+        if (audRes.errors.length) console.warn(`[meta_business_assets:ads] syncCustomAudiences warnings:`, audRes.errors)
+      } catch (e: any) {
+        console.warn(`[meta_business_assets:ads] syncCustomAudiences failed (non-fatal): ${e?.message}`)
       }
 
       return res.json({ ok: true, label: brandLabel })

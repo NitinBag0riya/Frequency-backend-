@@ -47,6 +47,7 @@ import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue 
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
+import { createMetaWebhookRouter } from './routes/meta-webhook'
 import { createMetaBusinessAssetsRouter } from './routes/meta-business-assets'
 import { createSuperAdminRouter }  from './routes/super-admin'
 import { createNarutoTenantsRouter }       from './routes/naruto-tenants'
@@ -395,6 +396,8 @@ app.use(WA_CALLS_WEBHOOK_PATH, express.raw({ type: 'application/json', limit: '1
 // express.json() parser.
 app.use('/webhook/whatsapp', express.raw({ type: 'application/json', limit: '5mb' }))
 app.use('/webhook/instagram', express.raw({ type: 'application/json', limit: '5mb' }))
+// Meta Lead Ads (Facebook Page `leadgen` field). See routes/meta-webhook.ts.
+app.use('/webhooks/meta', express.raw({ type: 'application/json', limit: '5mb' }))
 
 // P1 #11 — Shopify webhook. Same raw-body requirement: Shopify HMAC-signs the
 // exact byte sequence. We attach rawBody via the express.json `verify` hook
@@ -515,6 +518,7 @@ const SENSITIVE_LOG_PATHS = new Set([
   '/webhook/whatsapp',
   '/webhook/instagram',
   '/webhook/telegram',
+  '/webhooks/meta',
   '/api/billing/razorpay/webhook',
   // F9: OAuth callbacks carry `?code=...&state=...` — short-lived but
   // sensitive enough that a leaked log line within their TTL is exploitable.
@@ -6270,6 +6274,8 @@ app.use(createMetaAdsRouter({ supabase, requireAuth, identifyTenant, checkPermis
 // classic dialog/oauth "URL Blocked" error by using FB.login({config_id})
 // client-side. See routes/meta-business-assets.ts.
 app.use(createMetaBusinessAssetsRouter({ supabase, requireAuth, identifyTenant }))
+// Lead Ads webhook (Facebook Page `leadgen`). Raw-body parser mounted above.
+app.use(createMetaWebhookRouter({ supabase }))
 
 // ── Shopify (P1 #11) ────────────────────────────────────────────────────────
 // Three routers, deliberately split so the signature-verified write paths

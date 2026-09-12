@@ -15,6 +15,7 @@ import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { encrypt, decrypt } from '../crypto'
 import { signOauthState, verifyOauthState } from '../lib/oauth-state'
+import { backfillPagesAndForms, syncCustomAudiences } from '../lib/meta-graph-sync'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -25,7 +26,10 @@ interface Deps {
   checkPermission: (feature: string, action: 'view' | 'edit' | 'delete') => Middleware
 }
 
-const GRAPH = 'https://graph.facebook.com/v18.0'
+// Bumped v18 → v21 (2026-09-13). v18 sunsets Feb 2026; the campaigns,
+// adcreatives, customaudiences, leadgen_forms, adsets, adaccounts, insights,
+// and search endpoints we call are all supported unchanged in v21.
+const GRAPH = 'https://graph.facebook.com/v21.0'
 const SCOPES = [
   'ads_management', 'ads_read', 'leads_retrieval',
   'business_management', 'pages_show_list', 'pages_manage_ads',
@@ -50,7 +54,7 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
       client_id: appId, redirect_uri: redirectUri, response_type: 'code',
       scope: SCOPES, state,
     })
-    res.redirect(`https://www.facebook.com/v18.0/dialog/oauth?${params.toString()}`)
+    res.redirect(`https://www.facebook.com/v21.0/dialog/oauth?${params.toString()}`)
   })
 
   r.get('/api/auth/meta_ads/callback', async (req, res) => {
@@ -136,6 +140,23 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
           business_id: a.business?.id ?? null,
         }, { onConflict: 'ad_account_id' as any })
       }
+
+      // Backfill pages + leadgen forms + custom audiences. Best-effort so
+      // a Meta-side hiccup never blocks the popup close. Same pattern as
+      // routes/meta-business-assets.ts (FBLfB callback).
+      try {
+        const pgRes = await backfillPagesAndForms(supabase, parsed.tenantId, userToken)
+        if (pgRes.errors.length) console.warn('[meta_ads oauth-callback] backfillPagesAndForms warnings:', pgRes.errors)
+      } catch (e: any) {
+        console.warn(`[meta_ads oauth-callback] backfillPagesAndForms failed (non-fatal): ${e?.message}`)
+      }
+      try {
+        const audRes = await syncCustomAudiences(supabase, parsed.tenantId)
+        if (audRes.errors.length) console.warn('[meta_ads oauth-callback] syncCustomAudiences warnings:', audRes.errors)
+      } catch (e: any) {
+        console.warn(`[meta_ads oauth-callback] syncCustomAudiences failed (non-fatal): ${e?.message}`)
+      }
+
       res.type('html').send(closePopupHtml(`Connected ${accs.length} ad account${accs.length === 1 ? '' : 's'}`, true))
     } catch (err: any) {
       res.type('html').send(closePopupHtml(err.message ?? 'Meta Ads connect failed'))
@@ -286,6 +307,19 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
     const { data } = await supabase.from('meta_audiences')
       .select('*').eq('tenant_id', tenantId).order('created_at', { ascending: false })
     res.json(data ?? [])
+  })
+
+  // Mirror the tenant's existing Ads-Manager custom audiences into
+  // meta_audiences. Called automatically on connect; exposed manually here
+  // for the "Refresh" button in the audiences page. Idempotent.
+  r.post('/api/meta-ads/audiences/refresh', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    try {
+      const result = await syncCustomAudiences(supabase, tenantId)
+      res.json({ ok: true, ...result })
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message ?? 'sync failed' })
+    }
   })
 
   r.post('/api/meta-ads/audiences', ...guard, async (req, res) => {
