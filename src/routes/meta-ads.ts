@@ -322,6 +322,87 @@ export function createMetaAdsRouter(deps: Deps): express.Router {
     }
   })
 
+  // Pixel picker source for /ads/meta/capi. Enumerates adspixels on every
+  // ad account the tenant has connected. Merged + de-duped by pixel id
+  // because one pixel can be shared with several ad accounts.
+  r.get('/api/meta-ads/pixels', ...guardView, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    const { data: accounts } = await supabase.from('meta_ad_accounts')
+      .select('ad_account_id, name').eq('tenant_id', tenantId)
+    if (!accounts?.length) { res.json([]); return }
+    const seen = new Map<string, any>()
+    const errors: string[] = []
+    for (const a of accounts) {
+      try {
+        const j = await fetch(
+          `${GRAPH}/${a.ad_account_id}/adspixels?fields=id,name,last_fired_time,is_unavailable,owner_business&limit=100&access_token=${encodeURIComponent(conn.token)}`,
+        ).then(r => r.json()) as any
+        if (j?.error) { errors.push(`${a.ad_account_id}: ${j.error.message}`); continue }
+        for (const p of (Array.isArray(j?.data) ? j.data : [])) {
+          if (!p?.id || seen.has(p.id)) continue
+          seen.set(p.id, {
+            id: p.id,
+            name: p.name ?? `Pixel ${p.id}`,
+            last_fired_time: p.last_fired_time ?? null,
+            is_unavailable: !!p.is_unavailable,
+            ad_account_id: a.ad_account_id,
+            ad_account_name: a.name,
+          })
+        }
+      } catch (e: any) { errors.push(`${a.ad_account_id}: ${e?.message ?? e}`) }
+    }
+    res.json({ pixels: Array.from(seen.values()), errors })
+  })
+
+  // Full resync for tenants that connected BEFORE the pages/forms/audiences
+  // backfill shipped, or when Meta-side state has drifted (a new ad account
+  // added, a new page connected). Idempotent — safe to call any time.
+  // Also re-fetches /me/adaccounts so newly-authorised accounts flow in
+  // without asking the user to disconnect + reconnect.
+  r.post('/api/meta-ads/resync', ...guard, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const conn = await getMetaAdsConnection(supabase, tenantId)
+    if (!conn) { res.status(404).json({ error: 'Meta Ads not connected' }); return }
+    const errors: string[] = []
+    let adAccountCount = 0
+    // 1. ad accounts
+    try {
+      const j = await fetch(
+        `${GRAPH}/me/adaccounts?fields=id,name,currency,business&limit=200&access_token=${encodeURIComponent(conn.token)}`,
+      ).then(r => r.json()) as any
+      if (j?.error) errors.push(`me/adaccounts: ${j.error.message}`)
+      const accs = Array.isArray(j?.data) ? j.data : []
+      for (const a of accs) {
+        if (!a?.id) continue
+        const { error } = await supabase.from('meta_ad_accounts').upsert({
+          tenant_id: tenantId,
+          ad_account_id: a.id,
+          name: a.name ?? null,
+          currency: a.currency ?? null,
+          business_id: a.business?.id ?? null,
+        }, { onConflict: 'ad_account_id' as any })
+        if (error) errors.push(`upsert ${a.id}: ${error.message}`)
+        else adAccountCount += 1
+      }
+    } catch (e: any) { errors.push(`adaccounts: ${e?.message ?? e}`) }
+    // 2. pages + lead forms + subscribe
+    const pf = await backfillPagesAndForms(supabase, tenantId, conn.token)
+    errors.push(...pf.errors)
+    // 3. audiences
+    const au = await syncCustomAudiences(supabase, tenantId)
+    errors.push(...au.errors)
+    res.json({
+      ok: errors.length === 0,
+      ad_accounts: adAccountCount,
+      pages: pf.pages,
+      lead_forms: pf.forms,
+      audiences: au.count,
+      errors,
+    })
+  })
+
   r.post('/api/meta-ads/audiences', ...guard, async (req, res) => {
     const tenantId = (req as any).tenantId
     const { ad_account_id, name, source, type } = req.body
