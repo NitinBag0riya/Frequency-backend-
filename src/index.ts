@@ -4484,9 +4484,36 @@ async function mirrorWaReview(j: any, rating: number, review: string, phone: str
   } catch (e: any) { console.warn('[wa-feedback] review mirror failed:', e?.message ?? e) }
 }
 
+/** The reply the guest gets the moment they tap, by what they tapped. Three branches,
+ *  not two: "It was okay" is neither a rave nor a complaint, and answering it with an
+ *  apology read wrong. Free text inside the 24h session window — no template needed. */
+function feedbackReplyText(rating: number, j: any): string {
+  const name = j?.name && j.name !== 'there' ? `, ${j.name}` : ''
+  const store = j?.store || 'us'
+  if (rating <= 2) return `We're really sorry${name} — that's not the experience we want you to have. Our team is looking into what went wrong, and we'll make sure it doesn't happen next time. 🙏`
+  if (rating === 3) return `Thanks for the honest feedback${name}. "Okay" isn't what we're going for — we'll work on making your next order from ${store} a great one.`
+  return j?.reviewLink
+    ? `So glad you loved it${name}! 🎉 Would you leave a quick public review? It really helps ${store}: ${j.reviewLink}`
+    : `So glad you loved it${name}! 🎉 Thanks for ordering from ${store}.`
+}
+
+/** Reply on the SAME number the tap came in on. A tenant with its own WhatsApp number
+ *  answers from that number (and the reply lands in their inbox as a normal outbound
+ *  row); the shared platform number answers from the platform pair. */
+async function sendFeedbackReply(tenant: any | null, to: string, body: string): Promise<void> {
+  if (tenant?.phone_number_id && readSecretValue(tenant.access_token)) {
+    try { await sendTextMessage(tenant, String(to || '').replace(/\D/g, ''), body) }
+    catch (e: any) { console.warn('[wa-feedback] tenant reply send failed:', e?.message ?? e) }
+    return
+  }
+  await sendPlatformWaText(to, body)
+}
+
 /** If this inbound message is a recognised feedback-button reply, capture the rating via
- *  storefront-api and send the branch reply. No-op otherwise. */
-async function maybeHandleFeedbackReply(msg: any): Promise<void> {
+ *  storefront-api and send the branch reply. No-op otherwise. `tenant` is set when the
+ *  tap arrived on a tenant's own number — it scopes the phone→order match to that store
+ *  and picks the reply sender. */
+async function maybeHandleFeedbackReply(msg: any, tenant: any | null = null): Promise<void> {
   // Two shapes map to the same "record this rating" action:
   //  (a) quick-reply BUTTON tap  → rating from the button label (no written review)
   //  (b) FLOW completion (nfm_reply) → { rating:"1".."5", review } from response_json
@@ -4507,11 +4534,16 @@ async function maybeHandleFeedbackReply(msg: any): Promise<void> {
   try {
     const r = await fetch(`${base}/v1/feedback/by-phone`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': secret },
-      body: JSON.stringify({ phone: String(msg.from || ''), rating, ...(review ? { review } : {}) }),
+      body: JSON.stringify({ phone: String(msg.from || ''), rating, ...(review ? { review } : {}), ...(tenant?.slug ? { slug: tenant.slug } : {}) }),
     })
     const j: any = await r.json().catch(() => ({}))
-    if (!j?.found) return
-    const name = j.name && j.name !== 'there' ? `, ${j.name}` : ''
+    if (!j?.found) {
+      // The tap is real even when no recent order matches (older than the 3-day window,
+      // or a different number). Say so rather than leaving a tapped button hanging.
+      await sendFeedbackReply(tenant, String(msg.from || ''), 'Thanks for the feedback! We couldn\'t find a recent order on this number to attach it to — reply here and our team will pick it up.')
+      console.log(`[wa-feedback] ${rating}★ from ${msg.from} — no recent order to attach (tenant ${tenant?.slug ?? 'platform'})`)
+      return
+    }
 
     // Mirror into the unified Reviews inbox with the channel we actually know.
     // storefront-api mirrors this same order too (source 'storefront', fire-and-forget)
@@ -4521,13 +4553,8 @@ async function maybeHandleFeedbackReply(msg: any): Promise<void> {
     // storefront-api's ≤3★ → Complaints mirror is untouched: a low score lands in BOTH
     // places, which is correct — it is a review AND a complaint.
     await mirrorWaReview(j, rating, review, String(msg.from || ''))
-    const reply = j.low
-      ? `Thank you for the honest feedback${name} — sorry it wasn't great. Our team will look into it and make it right. 🙏`
-      : (j.reviewLink
-          ? `So glad you loved it${name}! 🎉 Would you leave a quick public review? It really helps ${j.store}: ${j.reviewLink}`
-          : `So glad you loved it${name}! 🎉 Thanks for ordering from ${j.store}.`)
-    await sendPlatformWaText(String(msg.from || ''), reply)
-    console.log(`[wa-feedback] ${rating}★ from ${msg.from} → order ${j.orderId} (${j.low ? 'complaint' : 'review'})`)
+    await sendFeedbackReply(tenant, String(msg.from || ''), feedbackReplyText(rating, j))
+    console.log(`[wa-feedback] ${rating}★ from ${msg.from} → order ${j.orderId} (${j.low ? 'complaint' : 'review'}, via ${tenant?.slug ?? 'platform'})`)
   } catch (e: any) { console.warn('[wa-feedback] capture failed:', e?.message ?? e) }
 }
 
@@ -4633,8 +4660,14 @@ async function handleWaWebhook(
           continue
         }
 
-        // Handle inbound messages
+        // Handle inbound messages. A feedback-button tap that arrived on THIS tenant's
+        // own number is captured here too (the platform-number branch above only sees
+        // taps on the shared number) — before it's filed as an ordinary inbox message,
+        // so the rating is recorded and the guest gets an answer. Skipped when the
+        // platform number itself belongs to a tenant row, or it would run twice.
+        const ownNumber = value?.metadata?.phone_number_id && value.metadata.phone_number_id !== process.env.FREQ_WA_PHONE_NUMBER_ID
         for (const msg of value.messages ?? []) {
+          if (ownNumber) await maybeHandleFeedbackReply(msg, tenant)
           await handleInboundMessage(tenant, msg, value.contacts?.[0])
         }
 
