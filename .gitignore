@@ -57,4 +57,5 @@ scripts/inspect-workflow-tables.ts
 /tg-info.ts
 # Local CLI/session state
 supabase/.temp/
-.claude/
+.claude/*
+!.claude/skills/
