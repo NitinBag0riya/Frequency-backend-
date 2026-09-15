@@ -39,6 +39,31 @@ import express from 'express'
 import crypto from 'crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { emitNotification, tenantNotifyRecipients } from './notifications'
+import { resolveWaCreds } from '../lib/wa-creds'
+
+const GRAPH = 'https://graph.facebook.com/v21.0'
+const WA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/** Free-text WhatsApp to the guest who rated, from the number the store talks on
+ *  (tenant's own → platform fallback, via resolveWaCreds). Valid ONLY inside Meta's 24h
+ *  customer-service window after the guest's tap — the caller checks that first.
+ *  'sent' is claimed only on a 200 carrying a message id. */
+async function sendWaReviewReply(supabase: SupabaseClient, tenantId: string, to: string, text: string): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const creds = await resolveWaCreds(supabase, tenantId)
+  if (!creds?.phoneNumberId || !creds.accessToken) return { ok: false, error: 'WhatsApp is not connected for this store' }
+  const num = String(to || '').replace(/\D/g, '')
+  if (!num) return { ok: false, error: 'No WhatsApp number on this review' }
+  try {
+    const r = await fetch(`${GRAPH}/${creds.phoneNumberId}/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.accessToken}` },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: num, type: 'text', text: { body: text.slice(0, 4000) } }),
+    })
+    const j: any = await r.json().catch(() => ({}))
+    const id = j?.messages?.[0]?.id
+    if (r.ok && id) return { ok: true, id: String(id) }
+    return { ok: false, error: j?.error?.message || `WhatsApp rejected the send (${r.status})` }
+  } catch (e: any) { return { ok: false, error: e?.message || 'WhatsApp send failed' } }
+}
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -48,16 +73,13 @@ const SOURCES = ['storefront', 'whatsapp', 'zomato', 'swiggy'] as const
  * Sources whose reply we cannot verifiably deliver → reply_status 'queued', never 'sent'.
  *
  * zomato/swiggy: reply endpoint contract not captured (§0 honesty rule).
- * whatsapp: we DO hold the guest's number, so a reply is technically possible — but
- *   only inside Meta's 24h customer-service window, which has almost always closed by
- *   the time an operator reads the review. Outside it a free-text send is rejected and
- *   only an APPROVED template may go out; no review-reply template exists (we ship
- *   order_placed / feedback / feedback_flow). Marking such a reply 'sent' without
- *   reading the Graph response would be exactly the false claim §0 forbids.
- *   Upgrade path: ship a `review_reply_v1` template, send it from the reply route, and
- *   flip to 'sent' ONLY on a 200 carrying a message id.
+ * whatsapp is NOT here any more: the reply route sends it as a free-text session
+ *   message inside Meta's 24h window after the guest's tap (source_meta.phone, the
+ *   number the store talks on), and flips to 'sent' ONLY on a 200 carrying a message
+ *   id. Outside the window it stays 'queued' with the reason — a `review_reply_v1`
+ *   template is the upgrade path for late replies.
  */
-const REPLY_UNSUPPORTED: Record<string, boolean> = { zomato: true, swiggy: true, whatsapp: true }
+const REPLY_UNSUPPORTED: Record<string, boolean> = { zomato: true, swiggy: true }
 const STATUSES = ['new', 'seen', 'actioned', 'ignored'] as const
 
 /**
@@ -373,23 +395,34 @@ export function createReviewsRouter(supabase: SupabaseClient, requireAuth: Mw, i
     const body = String((req.body as any)?.reply_text ?? '').trim().slice(0, 2000)
     if (!body) { res.status(400).json({ error: 'reply_text required' }); return }
     const { data: rev } = await supabase.from('reviews')
-      .select('id, source, is_aggregate').eq('tenant_id', tenantId).eq('id', String(req.params.id)).maybeSingle()
+      .select('id, source, is_aggregate, source_meta, review_at').eq('tenant_id', tenantId).eq('id', String(req.params.id)).maybeSingle()
     if (!rev) { res.status(404).json({ error: 'Review not found' }); return }
     if ((rev as any).is_aggregate) { res.status(422).json({ error: 'Aggregate ratings have no individual review to reply to' }); return }
 
-    const aggregator = REPLY_UNSUPPORTED[(rev as any).source]
-    const reply_status = aggregator ? 'queued' : 'sent'
+    const source = String((rev as any).source)
+    let reply_status: 'queued' | 'sent' = REPLY_UNSUPPORTED[source] ? 'queued' : 'sent'
+    let message = REPLY_UNSUPPORTED[source]
+      ? `Reply saved. It will post once the ${source} reply channel is verified.`
+      : 'Reply sent.'
+    if (source === 'whatsapp') {
+      // Deliver it to the guest — inside the 24h window that opened when they tapped.
+      const phone = String((rev as any).source_meta?.phone || '')
+      const tappedAt = new Date((rev as any).review_at || 0).getTime()
+      const inWindow = tappedAt > 0 && Date.now() - tappedAt < WA_REPLY_WINDOW_MS
+      if (!inWindow) {
+        reply_status = 'queued'
+        message = 'Saved here only — the 24-hour WhatsApp reply window after the guest\'s rating has closed, so it was not delivered.'
+      } else {
+        const r = await sendWaReviewReply(supabase, tenantId, phone, body)
+        if (r.ok) { reply_status = 'sent'; message = 'Reply sent to the guest on WhatsApp.' }
+        else { reply_status = 'queued'; message = `Saved, not delivered — ${r.error}.` }
+      }
+    }
     const { data, error } = await supabase.from('reviews')
       .update({ reply_text: body, reply_status, reply_at: new Date().toISOString(), reply_by: userId, updated_at: new Date().toISOString() })
       .eq('tenant_id', tenantId).eq('id', String(req.params.id)).select('*').single()
     if (error) { res.status(500).json({ error: error.message }); return }
-    res.json({
-      review: data,
-      queued: aggregator,
-      message: aggregator
-        ? `Reply saved. It will post once the ${(rev as any).source} reply channel is verified.`
-        : 'Reply sent.',
-    })
+    res.json({ review: data, queued: reply_status !== 'sent', message })
   })
 
   // ── Draft reply (recommendation only) ──────────────────────────────────────
