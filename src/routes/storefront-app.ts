@@ -130,11 +130,14 @@ export function createStorefrontAppRouter(deps: Deps): express.Router {
     const secret = process.env.EAS_WEBHOOK_SECRET
     const sig = String(req.headers['expo-signature'] || '')
     const raw = (req as any).rawBody as Buffer | undefined
-    if (secret && raw && sig) {
-      const expected = 'sha1=' + crypto.createHmac('sha1', secret).update(raw).digest('hex')
-      const ok = sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
-      if (!ok) { apiError(res, 401, 'bad_signature', 'signature mismatch'); return }
-    }
+    // Fail closed: without a configured secret this route is unauthenticated and
+    // any caller could flip a build row and set an attacker-controlled store_url
+    // (see security audit lead: eas-webhook-fail-open-when-secret-unset).
+    if (!secret) { apiError(res, 503, 'webhook_not_configured', 'EAS_WEBHOOK_SECRET is not set'); return }
+    if (!raw || !sig) { apiError(res, 401, 'bad_signature', 'missing signature'); return }
+    const expected = 'sha1=' + crypto.createHmac('sha1', secret).update(raw).digest('hex')
+    const ok = sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
+    if (!ok) { apiError(res, 401, 'bad_signature', 'signature mismatch'); return }
     const body = (req.body || {}) as any
     const easId = body.id
     if (!easId) { res.json({ ok: true, ignored: 'no build id' }); return }

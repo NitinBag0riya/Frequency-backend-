@@ -55,7 +55,7 @@ function parseArgs(): Args {
 }
 
 const ARGS = parseArgs()
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY!
 if (!SUPABASE_SERVICE_ROLE) {
   console.error('FATAL: SUPABASE_SERVICE_ROLE_KEY not set in env')

@@ -37,7 +37,7 @@ import { Q, connection, cronQueue } from '../queue'
 import { gmailListNewThreads } from '../google'
 import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 // 2 min prod · 15 min dev (each tick hits the Gmail API for every

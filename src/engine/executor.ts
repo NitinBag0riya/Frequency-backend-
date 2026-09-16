@@ -19,6 +19,7 @@ import {
   connection as redisConnection,
 } from '../queue'
 import { interpolate, interpolateDeep } from './interpolator'
+import { assertPublicUrl } from '../lib/ssrf-guard'
 import { resolveAiModel } from '../lib/plans'
 import {
   sheetsAppendRow, sheetsUpdateRange,
@@ -28,7 +29,7 @@ import {
   simulatedConnectorOutput, simulatedNodeOutput, wouldHaveDoneFor,
 } from './simulate'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const anthropic = process.env.ANTHROPIC_API_KEY
@@ -316,6 +317,20 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
           : undefined
         if (!url) return { kind: 'error', error: 'http_request: missing url' }
 
+        // SSRF guard: the URL is tenant-authored and the response is read back
+        // into a workflow variable, so an unguarded fetch is a full read-SSRF
+        // primitive against internal services and cloud metadata (see security
+        // audit lead: http_request-node-unrestricted-ssrf). Block private/
+        // loopback/link-local/metadata destinations before any network call. The
+        // simulate path below issues no network request, so it is exempt.
+        if (!isSim(ctx)) {
+          try {
+            await assertPublicUrl(url)
+          } catch (e: any) {
+            return { kind: 'error', error: `http_request: ${e?.message ?? 'blocked url'}` }
+          }
+        }
+
         if (isSim(ctx)) {
           // No network — return a synthetic 200 + the interpolated request shape.
           // If the workflow stores the response into a variable, seed it with
@@ -367,17 +382,39 @@ export async function executeNode(ctx: ExecCtx, node: any): Promise<NodeResult> 
       // ── CRM / lead update ───────────────────────────────────────────────────
       case 'update_crm': {
         // cfg: { table: 'lead_tables.id', updates: { field: 'value or {{var}}' } }
-        const updates = interpolateDeep(cfg.updates ?? {}, vars)
+        const rawUpdates = interpolateDeep(cfg.updates ?? {}, vars) as Record<string, any>
         if (isSim(ctx)) {
-          return simAdvance(ctx, node, { updates, target: cfg.target, table_id: cfg.table_id })
+          return simAdvance(ctx, node, { updates: rawUpdates, target: cfg.target, table_id: cfg.table_id })
         }
         const phone = `+${ctx.session.contact_phone}`.replace(/^\+\++/, '+')
         if (cfg.target === 'contact' || !cfg.table_id) {
+          // Column allowlist: tenant-authored config must not be able to set
+          // ownership/identity columns (e.g. tenant_id, id) and move a contact
+          // across tenants (see security audit lead: update_crm-lead_rows-
+          // missing-tenant-filter). Only these safe, user-editable fields pass.
+          const CONTACT_UPDATABLE = new Set([
+            'name', 'email', 'notes', 'status', 'tags', 'stage', 'source',
+            'company', 'city', 'attributes', 'custom_fields',
+          ])
+          const updates: Record<string, any> = {}
+          for (const [k, v] of Object.entries(rawUpdates)) {
+            if (CONTACT_UPDATABLE.has(k)) updates[k] = v
+          }
+          if (Object.keys(updates).length === 0) return advance(node)
           await supabase.from('contacts').update(updates)
             .eq('tenant_id', ctx.tenant.id).eq('phone', phone)
         } else {
-          // Lead row update (best-effort; assumes lead_rows table from leads module)
-          await supabase.from('lead_rows').update({ data: updates })
+          // The target lead table must belong to this tenant — lead_rows has no
+          // tenant_id column, so without this check a workflow could overwrite
+          // another tenant's rows by referencing a foreign table_id (same audit
+          // lead). lead_tables.tenant_id exists as of migration 013.
+          const { data: owned } = await supabase.from('lead_tables')
+            .select('id').eq('id', cfg.table_id).eq('tenant_id', ctx.tenant.id).maybeSingle()
+          if (!owned) {
+            console.warn(`[executor] update_crm: table_id ${cfg.table_id} not owned by tenant ${ctx.tenant.id} — skipping`)
+            return advance(node)
+          }
+          await supabase.from('lead_rows').update({ data: rawUpdates })
             .eq('table_id', cfg.table_id)
             .eq('data->>phone', phone)
         }

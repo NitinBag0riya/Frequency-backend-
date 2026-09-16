@@ -10,7 +10,7 @@ const sb = createClient(
 const ACME_SLUG = 'acme'
 const NEW_WABA_ID = '130541703478952'
 const NEW_PHONE_NUMBER_ID = '144958102028751'
-const NEW_TOKEN = 'EAAPv0ZAJjZA5oBO7g1wXF1W2BZCq43d6V2zOZAJYZAZBM3w5ZBoZCS1wRzPsz252zXZCRw7yqZCrz0cZAe05uWd8k8w4z6ZB9ZCbZAQ4g25zPZA42sZB8WZA2XZB78P93aZBn0rZB1o3e7g8c4'
+const NEW_TOKEN = process.env.META_TOKEN ?? ''
 
 async function main() {
   console.log(`Updating tenant '${ACME_SLUG}' in DB...`)

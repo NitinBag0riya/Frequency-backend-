@@ -32,7 +32,7 @@ import { shortenBody, extractUrls } from '../lib/link-shortener'
 
 const PUBLIC_BASE_URL = (process.env.PUBLIC_API_URL ?? 'http://localhost:3001').replace(/\/+$/, '')
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 export function startBroadcastWorker() {

@@ -28,7 +28,7 @@ import {
 } from '../queue'
 import { emitNotification } from '../routes/notifications'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 // State machine — keep in sync with ADR §4.

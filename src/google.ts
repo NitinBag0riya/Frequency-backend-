@@ -10,7 +10,7 @@ import { createClient } from '@supabase/supabase-js'
 // decrypt } from './google' and get GCM under the hood for free.
 import { encrypt as cryptoEncrypt, decrypt as cryptoDecrypt } from './crypto'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID!

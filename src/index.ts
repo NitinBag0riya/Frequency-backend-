@@ -605,20 +605,18 @@ app.use((req, res, next) => {
 // support engineer locked out mid-investigation. Detection is best-effort:
 // the X-Impersonate-Token header is the only signal available pre-auth.
 
-function isPlatformRequest(req: express.Request): boolean {
-  // Best-effort detection — the platform header is set by the Platform Console
-  // FE only. Forging it just shifts the user past the limit; they still need
-  // a valid bearer token to hit any authenticated endpoint downstream.
-  return !!req.headers['x-impersonate-token'] || !!req.headers['x-platform-console']
-}
-
 function makeLimiter(opts: { windowMs: number; max: number; perUser?: boolean }) {
   return rateLimit({
     windowMs: opts.windowMs,
     max: opts.max,
     standardHeaders: true,
     legacyHeaders: false,
-    skip: isPlatformRequest,
+    // No skip on an unauthenticated header: a forged `X-Platform-Console` /
+    // `X-Impersonate-Token` must NOT exempt a caller from rate limiting,
+    // otherwise anonymous clients bypass the auth-brute-force, copilot-spend and
+    // global limiters (see security audit finding: rate-limit-skip-on-unverified-
+    // platform-header). Platform-console traffic is low-volume and stays well
+    // under these ceilings.
     // Use the library's ipKeyGenerator helper so IPv6 addresses are collapsed
     // to /64 prefix — otherwise an attacker can rotate within their own /64
     // to bypass the limit (ERR_ERL_KEY_GEN_IPV6).
@@ -732,8 +730,15 @@ if (!process.env.ANTHROPIC_API_KEY) {
 }
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
-const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+// Fail closed: never fall back to a hard-coded production project. A missing
+// SUPABASE_URL or service-role key must stop the process, not silently point at
+// a baked-in project (which previously leaked the project ref into source).
+const SUPABASE_URL = process.env.SUPABASE_URL
+if (!SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('[startup] SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required')
+  process.exit(1)
+}
+const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
 
 // Keep the white-label dashboard CORS allowlist fresh — a connected 'dashboard' custom
 // domain calls this API cross-origin (Bearer auth, no cookies). Refreshed every 5 min;
@@ -818,9 +823,19 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
   //    (b) legacy:   user_roles row with role='super_admin' and tenant_id IS NULL
   const { data: platformAssignment } = await supabase
     .from('user_role_assignments')
-    .select('role_definitions ( key, scope )')
-    .eq('user_id', user.id).is('tenant_id', null).maybeSingle()
-  const platformRoleKey = (platformAssignment as any)?.role_definitions?.key as string | undefined
+    .select('disabled_at, role_definitions ( key, scope )')
+    .eq('user_id', user.id).is('tenant_id', null)
+    .is('disabled_at', null)              // revoked (disabled) assignments must NOT grant platform access
+    .maybeSingle()
+  // Only a non-disabled, platform-scoped assignment grants super-admin — this
+  // must match resolvePlatformRole() in src/lib/platform-guard.ts so the request
+  // path and the canonical resolver make the same decision (see security audit
+  // finding: identifyTenant-platform-check-ignores-disabled-and-scope).
+  const platformAssignmentRow = platformAssignment as any
+  const platformRoleKey =
+    platformAssignmentRow?.role_definitions?.scope === 'platform'
+      ? (platformAssignmentRow?.role_definitions?.key as string | undefined)
+      : undefined
   let isPlatform = !!platformRoleKey
 
   if (!isPlatform) {
@@ -1841,6 +1856,10 @@ const COPILOT_TOOLS = [
   },
 ]
 
+// Cap the whole-app capability map an unauthenticated caller may submit. 250
+// max-size intents assembled into ~876KB / ~227k tokens per request; 80 keeps
+// the prompt an order of magnitude smaller while covering real navigation needs.
+const COPILOT_MAX_INTENTS = 80
 // Tight rate limit — copilot is conversational so callers fire often.
 app.use('/api/copilot/', makeLimiter({ windowMs: 60_000, max: 20, perUser: true }))
 // Support tickets are a deliberate human action — a handful a minute is plenty,
@@ -1854,6 +1873,16 @@ app.post('/api/copilot/stream', async (req, res) => {
   }
   if (!Array.isArray(intents) || intents.length === 0) {
     res.status(400).json({ error: 'intents (non-empty array) required' }); return
+  }
+  // Bound anonymous request size: this endpoint is unauthenticated and assembles
+  // the intents into a model prompt, so an oversized payload is direct LLM-spend
+  // amplification (see security audit finding: copilot-stream-unauthenticated-
+  // llm-amplification). Reject clearly rather than clamp-and-bill.
+  if (Array.isArray(history) && history.length > 20) {
+    res.status(413).json({ error: 'history too long' }); return
+  }
+  if (intents.length > COPILOT_MAX_INTENTS) {
+    res.status(413).json({ error: `too many intents (max ${COPILOT_MAX_INTENTS})` }); return
   }
   if (!process.env.ANTHROPIC_API_KEY) {
     res.status(503).json({ error: 'Assistant is offline right now. Please try again.' }); return
@@ -1897,7 +1926,7 @@ app.post('/api/copilot/stream', async (req, res) => {
     // Clamp intents — strip anything we don't recognise.
     const safeIntents: CopilotIntentMeta[] = (intents as any[])
       .filter(i => i && typeof i.id === 'string' && typeof i.title === 'string' && typeof i.route === 'string')
-      .slice(0, 250)   // whole-app capability map — the system block is prompt-cached so the big catalogue stays cheap
+      .slice(0, COPILOT_MAX_INTENTS)   // bounded catalogue — the system block is prompt-cached; cap keeps anonymous prompt cost sane
       .map(i => ({
         id: String(i.id).slice(0, 60),
         title: String(i.title).slice(0, 120),

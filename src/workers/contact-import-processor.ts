@@ -47,7 +47,7 @@ import { Worker, Job, Queue } from 'bullmq'
 import { createClient } from '@supabase/supabase-js'
 import { connection } from '../queue'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 // Dedicated queue — separate from broadcast.batch so a heavy CSV doesn't

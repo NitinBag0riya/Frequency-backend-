@@ -28,7 +28,7 @@ import { listAllRecords } from '../lib/airtable'
 import { loadMapping, applyMappingToPayload } from '../lib/apply-mapping'
 import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollIntervalMs } from '../lib/poller-gate'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 // 5 min prod · 30 min dev.

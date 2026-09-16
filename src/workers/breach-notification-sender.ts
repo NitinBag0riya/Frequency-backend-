@@ -31,7 +31,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import { Q, connection, BreachNotificationJob } from '../queue'
 import { sendEmail } from '../lib/email'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase: SupabaseClient = createClient(
   SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY!,

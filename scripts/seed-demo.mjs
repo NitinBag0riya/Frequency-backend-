@@ -1,15 +1,20 @@
 // seed-demo.mjs — seeds 3 demo accounts with full realistic data
 // node scripts/seed-demo.mjs
 
-const SUPABASE_URL = 'https://yiicpndeggaedxobyopu.supabase.co'
-const SERVICE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlpaWNwbmRlZ2dhZWR4b2J5b3B1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzcxODU2OSwiZXhwIjoyMDkzMjk0NTY5fQ.lVLB6F3k7_MnPmqD55PNuRtIKDErF333ni94yGpwkS4'
+const SUPABASE_URL = process.env.SUPABASE_URL
+const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 
 // Demo accounts — share these with the user
 // admin@Frequency   / Demo@123456  → full admin
 // agent@Frequency   / Demo@123456  → agent (can view/reply, no settings)
 // viewer@Frequency  / Demo@123456  → read-only
 
-const META_TOKEN = 'EAAM7HgH6VvwBRE0ZCr2DxOjeQyVP6KiyVN93kaDasQiVKrwaTId1nFE0v8Sz3Y5VAQGvEGUGSzDNBXtTQeEgdMSKcOXxTdcjpqtW8GW8jq69hUZCmBNN1BLDiTNmrxQO4yjOLE4n8n3ZBZCCj76ieHYrg7rdYWtHlHHZBCZAlxWTN0MKZArqB78kGtzO8pngZDZD'
+const META_TOKEN = process.env.META_TOKEN
+
+if (!SUPABASE_URL || !SERVICE_KEY) {
+  console.error('[seed-demo] SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in the environment')
+  process.exit(1)
+}
 
 const REST = { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}`, 'Content-Type': 'application/json' }
 

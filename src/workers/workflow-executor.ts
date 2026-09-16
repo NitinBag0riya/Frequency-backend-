@@ -22,7 +22,7 @@ import { executeNode, findNode } from '../engine/executor'
 import { dispatchDownstreamForCompletedSession } from '../engine/chaining'
 import { redactOutputForLogging } from '../lib/redact-output'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 export function startWorkflowExecutorWorker() {

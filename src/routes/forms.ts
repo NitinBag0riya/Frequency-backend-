@@ -28,6 +28,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import { validateBody } from '../validation'
 import { apiError } from '../lib/api-error'
+import { safeRegexTest } from '../lib/safe-regex'
 import { messageQueue, enqueueWebhookOutbound, enqueueWorkflowExecution, enqueueSignedFormPdf } from '../queue'
 
 // ── Validators ──────────────────────────────────────────────────────────
@@ -894,17 +895,19 @@ export function createFormsRouter({ supabase, requireAuth, identifyTenant, check
             validationErrors.push({ field_id: f.id, field_label: f.label, reason: `max_length:${f.max_length}` })
           }
           if (typeof f.pattern === 'string' && f.pattern.length > 0) {
-            try {
-              if (!new RegExp(f.pattern).test(val)) {
-                validationErrors.push({
-                  field_id: f.id, field_label: f.label,
-                  reason: f.pattern_error || 'pattern_mismatch',
-                })
-              }
-            } catch {
-              // Schema-supplied regex is malformed — log + skip rather than
-              // blocking the submission on a builder bug.
-              console.warn(`[forms] invalid regex pattern on field ${f.id}: ${f.pattern}`)
+            // safeRegexTest bounds input length and refuses catastrophic-backtracking
+            // patterns, so a tenant-authored regex cannot stall the shared event loop
+            // (see security audit finding: tenant-regex-redos-on-public-submit).
+            // A null result means the pattern was skipped (unsafe/malformed) — do not
+            // block the submission on it, matching prior malformed-pattern behavior.
+            const patternOk = safeRegexTest(f.pattern, val)
+            if (patternOk === false) {
+              validationErrors.push({
+                field_id: f.id, field_label: f.label,
+                reason: f.pattern_error || 'pattern_mismatch',
+              })
+            } else if (patternOk === null) {
+              console.warn(`[forms] skipped unsafe/invalid regex pattern on field ${f.id}`)
             }
           }
         }

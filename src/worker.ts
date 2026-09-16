@@ -135,7 +135,7 @@ async function main() {
   // dispatch job, flip call_sessions.status='failed' so the agent's UI
   // doesn't sit on "Connecting…" forever.
   const dispatchFailureSb = createClient(
-    process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co',
+    process.env.SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
   )
   const dispatchFailureListener = attachCallDispatchFailureListener(async (_jobId, callSessionId, reason) => {

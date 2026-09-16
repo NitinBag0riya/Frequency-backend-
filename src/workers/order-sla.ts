@@ -21,7 +21,7 @@ import { isPollerEnabled, cleanRepeatablesByName, STUB_WORKER, logGate, pollInte
 import { emitNotification } from '../routes/notifications'
 import { runComplaintSlaTick } from './complaint-sla'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const TICK_INTERVAL_MS = pollIntervalMs('ORDER_SLA_INTERVAL_MS', { prod: 60_000, dev: 5 * 60_000 })

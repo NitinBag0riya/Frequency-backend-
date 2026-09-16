@@ -26,7 +26,7 @@
 import { createClient } from '@supabase/supabase-js'
 import { encryptSecret, decryptSecret } from './app-secrets'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 // GBP shares the SEO/Search Console OAuth client (the "Frequency Search Console"

@@ -24,7 +24,7 @@ import { emitNotification } from '../routes/notifications'
 import { isPollerEnabled, logGate } from '../lib/poller-gate'
 import { scheduleDaily, SCHEDULE_STUB, type ScheduleHandle } from '../lib/daily-scheduler'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const TICK_INTERVAL_MS = Number(process.env.TRIAL_ENDING_INTERVAL_MS ?? 6 * 60 * 60 * 1000)

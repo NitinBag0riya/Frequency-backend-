@@ -214,6 +214,13 @@ export async function retrieveChunks(
         .from('tenant_knowledge_chunks')
         .select('id, source_type, source_ref, chunk_text, metadata, created_at')
         .eq('tenant_id', tenantId)
+        // SECURITY: never blind-pad with `conversation` chunks. Those are raw
+        // end-customer messages learned back into the corpus; padding them into
+        // an unrelated customer's context by recency leaks one customer's PII and
+        // lets a customer plant instructions that steer replies to others (see
+        // security audit finding: learning-loop-cross-conversation-context-bleed).
+        // Only operator-authored knowledge is safe to surface without a match.
+        .neq('source_type', 'conversation')
         .order('created_at', { ascending: false })
         .limit(limit * 2)
       for (const r of (data ?? []) as any[]) {

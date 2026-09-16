@@ -29,7 +29,7 @@ import { createClient } from '@supabase/supabase-js'
 import { Q, CallDispatchJob, connection } from '../queue'
 import { readSecretValue } from '../lib/wa-creds'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const GRAPH_BASE = () => process.env.META_CALLS_API_BASE || 'https://graph.facebook.com/v18.0'

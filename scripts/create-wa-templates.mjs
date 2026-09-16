@@ -1,4 +1,5 @@
-const TOKEN = "EAAM7HgH6VvwBRE0ZCr2DxOjeQyVP6KiyVN93kaDasQiVKrwaTId1nFE0v8Sz3Y5VAQGvEGUGSzDNBXtTQeEgdMSKcOXxTdcjpqtW8GW8jq69hUZCmBNN1BLDiTNmrxQO4yjOLE4n8n3ZBZCCj76ieHYrg7rdYWtHlHHZBCZAlxWTN0MKYZArqB78kGtzO8pngZDZD"
+const TOKEN = process.env.META_TOKEN
+if (!TOKEN) { console.error("[create-wa-templates] META_TOKEN must be set in the environment"); process.exit(1) }
 const WABA_ID = "721735523894042"
 
 const templates = [

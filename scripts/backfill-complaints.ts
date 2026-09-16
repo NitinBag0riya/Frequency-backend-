@@ -21,7 +21,7 @@ import { normaliseStorefrontComplaint } from '../src/routes/complaints'
 
 dotenv.config()
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL
 const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 const DRY = process.argv.includes('--dry')
 

@@ -486,10 +486,13 @@ export function createTelegramRouter(deps: Deps): express.Router {
         res.status(401).json({ error: 'webhook_not_secured' }); return
       }
     } catch (e: any) {
-      // Could not READ the secret (e.g. tg_bots.webhook_secret column not yet
-      // migrated). This is an all-tenants infra state, not a per-bot one, so we
-      // accept-with-warn rather than break every bot at once — apply the migration.
-      console.warn(`[telegram-webhook] could not read webhook_secret (tenant=${tenantId}): ${e?.message}`)
+      // Fail closed: if we cannot read the per-bot secret we cannot prove the
+      // delivery came from Telegram, and the webhook URL + tenant_id are
+      // guessable, so accepting would let an attacker drive workflows with forged
+      // updates (see security audit lead: telegram-webhook-fail-open-on-secret-
+      // read-error). Reject rather than accept-with-warn.
+      console.warn(`[telegram-webhook] could not read webhook_secret (tenant=${tenantId}): ${e?.message} — rejecting`)
+      res.status(401).json({ error: 'webhook_not_verified' }); return
     }
 
     // ── Webhook queue handoff (migration 064) ──────────────────────────

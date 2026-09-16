@@ -42,6 +42,7 @@ import { z } from 'zod'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { validateBody } from '../validation'
 import { apiError } from '../lib/api-error'
+import { safeRegexTest } from '../lib/safe-regex'
 import { sendEmail } from '../lib/email'
 import { renderEmailHtml } from '../emails/render'
 import { NotificationEmail } from '../emails/templates/NotificationEmail'
@@ -894,8 +895,9 @@ export function createSitesRouter({
         if (typeof f.min_length === 'number' && val.length < f.min_length) errors.push({ field_id: f.id, field_label: f.label, reason: `min_length:${f.min_length}` })
         if (typeof f.max_length === 'number' && val.length > f.max_length) errors.push({ field_id: f.id, field_label: f.label, reason: `max_length:${f.max_length}` })
         if (typeof f.pattern === 'string' && f.pattern.length > 0) {
-          try { if (!new RegExp(f.pattern).test(val)) errors.push({ field_id: f.id, field_label: f.label, reason: f.pattern_error || 'pattern_mismatch' }) }
-          catch { /* invalid regex in schema — skip */ }
+          // ReDoS-safe: bounds input + refuses catastrophic patterns (see security
+          // audit finding: tenant-regex-redos-on-public-submit). null = skipped.
+          if (safeRegexTest(f.pattern, val) === false) errors.push({ field_id: f.id, field_label: f.label, reason: f.pattern_error || 'pattern_mismatch' })
         }
       }
     }

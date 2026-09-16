@@ -47,8 +47,9 @@ import '../env'
 import { Worker, Job, UnrecoverableError } from 'bullmq'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import { Q, connection, webhookRetryBackoff, WEBHOOK_RETRY_ATTEMPTS, webhookInboundDeadQueue, webhookOutboundDeadQueue, WebhookInboundJob, WebhookOutboundJob, enqueueVoiceNoteTranscribe } from '../queue'
+import { assertPublicUrl } from '../lib/ssrf-guard'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 // Stale-job guard. Meta won't replay a webhook after 24h; if a job has been
@@ -331,6 +332,16 @@ async function runOutbound(job: Job<WebhookOutboundJob>): Promise<{ ok: true; st
     ...(d.headers ?? {}),
   }
   if (d.idempotencyKey) headers['idempotency-key'] = d.idempotencyKey
+
+  // SSRF guard: outbound jobs carry a tenant-authored URL + headers. Block
+  // private/loopback/link-local/metadata destinations before the fetch (see
+  // security audit lead: http_request-node-unrestricted-ssrf). A blocked URL is
+  // a permanent failure — retrying will not make it public.
+  try {
+    await assertPublicUrl(d.url)
+  } catch (e: any) {
+    throw new UnrecoverableError(`outbound blocked: ${e?.message ?? 'unsafe url'}`)
+  }
 
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), timeoutMs)

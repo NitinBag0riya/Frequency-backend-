@@ -22,7 +22,7 @@ import { Q, MessageSendJob, connection } from '../queue'
 import { checkAndConsumeQuota, RateLimitExceededError } from '../lib/quota'
 import { readSecretValue } from '../lib/wa-creds'
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yiicpndeggaedxobyopu.supabase.co'
+const SUPABASE_URL = process.env.SUPABASE_URL!
 const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
 const GRAPH = 'https://graph.facebook.com/v18.0'
