@@ -756,13 +756,71 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       }
     }
 
+    // ── SIBLING-SLUG FAN-OUT (approver identity writes) ─────────────────
+    // A merchant can own multiple tenant slugs (multi-brand: e.g. La Fiamma +
+    // Sofastory + Maplemortar under one workspace, or accidental provisioning
+    // dupes like la-fiamma-2 + lafiamma.in). Their APPROVER identity (team +
+    // PINs used for refund/cancellation authorisation) MUST resolve on every
+    // slug, otherwise a PIN saved on one slug rejects on another — the exact
+    // "PIN not recognised" the owner just hit.
+    //
+    // Whitelist which paths fan out. Only identity-writes that a merchant
+    // should share across their brands. Menu items, outlets, orders — per
+    // brand, DON'T fan out.
+    const FAN_OUT_PATHS = new Set(['/admin/operators'])  // add more as needed
+    const shouldFanOut = method === 'PUT' && FAN_OUT_PATHS.has(upstreamPath.split('?')[0])
+
+    let siblingSlugs: string[] = []
+    if (shouldFanOut) {
+      const uid = (req as any).user?.id
+      if (uid) {
+        // Every tenant this user has access to via: direct ownership, new-RBAC
+        // assignment, or legacy user_roles. UNION, then subtract the current
+        // slug (we always write to it first, siblings after).
+        const [owned, assigned, legacy] = await Promise.all([
+          supabase.from('tenants').select('slug').eq('user_id', uid).eq('status', 'active'),
+          supabase.from('user_role_assignments').select('tenants!inner(slug,status)').eq('user_id', uid),
+          supabase.from('user_roles').select('tenants!inner(slug,status)').eq('user_id', uid),
+        ])
+        const set = new Set<string>()
+        for (const r of (owned.data as any[] | null) || []) if (r?.slug) set.add(r.slug)
+        for (const r of (assigned.data as any[] | null) || []) if (r?.tenants?.status === 'active' && r?.tenants?.slug) set.add(r.tenants.slug)
+        for (const r of (legacy.data as any[] | null) || []) if (r?.tenants?.status === 'active' && r?.tenants?.slug) set.add(r.tenants.slug)
+        set.delete(slug)
+        siblingSlugs = [...set]
+      }
+    }
+
     try {
+      // PRIMARY write — the response we return to the client.
       const up = await fetch(`${SF_API}${upstreamPath}`, {
         method,
         headers: { 'Content-Type': 'application/json', 'X-Tenant': slug, 'X-Admin-Secret': SF_SECRET, 'X-Operator-Email': String((req as any).user?.email || '') },
         body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
       })
       const text = await up.text()
+
+      // FAN-OUT — only fire on success, don't propagate a bad request. Errors
+      // logged but never fail the primary response: the user's action already
+      // succeeded on the visible tenant, sibling drift is a separately-fixable
+      // ops issue and the storefront-api's `siblings` field would rescue it
+      // on the next save anyway.
+      if (up.ok && siblingSlugs.length > 0) {
+        console.info('[storefront-proxy] fan-out %s to %d siblings for %s', upstreamPath, siblingSlugs.length, slug)
+        await Promise.all(siblingSlugs.map(async (sib) => {
+          try {
+            const r2 = await fetch(`${SF_API}${upstreamPath}`, {
+              method,
+              headers: { 'Content-Type': 'application/json', 'X-Tenant': sib, 'X-Admin-Secret': SF_SECRET, 'X-Operator-Email': String((req as any).user?.email || '') },
+              body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+            })
+            if (!r2.ok) console.warn('[storefront-proxy] fan-out FAILED slug=%s status=%d', sib, r2.status)
+          } catch (e: any) {
+            console.warn('[storefront-proxy] fan-out THREW slug=%s err=%s', sib, e?.message)
+          }
+        }))
+      }
+
       res.status(up.status)
       try { res.json(JSON.parse(text)) } catch { res.send(text) }
     } catch (e: any) {
