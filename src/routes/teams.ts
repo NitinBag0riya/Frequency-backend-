@@ -146,9 +146,8 @@ export function createTeamsRouter(deps: Deps): express.Router {
         }
       }
 
-      // Resolve role
-      const { data: role } = await supabase.from('role_definitions')
-        .select('id, scope, plan_min').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
+      // Resolve role (tenant-scoped — see resolveTenantRole)
+      const role = await resolveTenantRole(supabase, tenantId, role_key)
       if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
       // Role plan-gate check
       if (role.plan_min && plan && planRank(plan.plan_id) < planRank(role.plan_min)) {
@@ -256,8 +255,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
       }
 
       // Resolve + plan-gate the role (identical to email path)
-      const { data: role } = await supabase.from('role_definitions')
-        .select('id, scope, plan_min').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
+      const role = await resolveTenantRole(supabase, tenantId, role_key)
       if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
       if (role.plan_min && plan && planRank(plan.plan_id) < planRank(role.plan_min)) {
         res.status(402).json({ error: `Role "${role_key}" requires plan ${role.plan_min}` }); return
@@ -339,8 +337,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
         }
       }
 
-      const { data: role } = await supabase.from('role_definitions')
-        .select('id').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
+      const role = await resolveTenantRole(supabase, tenantId, role_key, 'id')
       if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
 
       const { data, error } = await supabase.from('user_role_assignments').insert({
@@ -480,13 +477,24 @@ export function createTeamsRouter(deps: Deps): express.Router {
     const { data: inv, error } = await supabase.from('pending_invites')
       .select('*').eq('token', token).maybeSingle()
     if (error || !inv) { res.status(404).json({ error: 'Invalid invite' }); return }
-    if (inv.status !== 'pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
-    if (new Date(inv.expires_at).getTime() < Date.now()) {
+
+    // Gate through the shared helper the PHONE path already uses. This route
+    // used to inline its own status/expiry checks and then deref
+    // `inv.email.toLowerCase()` with no channel check — so redeeming a PHONE
+    // invite (email IS NULL) here threw a TypeError and surfaced as an
+    // unhandled 500 instead of a usable message.
+    const state = inviteAcceptState(inv as any, 'email')
+    if (state === 'not-pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
+    if (state === 'expired') {
       await supabase.from('pending_invites').update({ status: 'expired' }).eq('id', inv.id)
       res.status(410).json({ error: 'Invite expired' }); return
     }
-    // Email match check (if available)
-    if (userEmail && userEmail.toLowerCase() !== inv.email.toLowerCase()) {
+    if (state === 'wrong-channel') {
+      res.status(400).json({ error: 'This is a phone invite — open it from the WhatsApp link to join.' }); return
+    }
+
+    // Email match check. `state === 'ok'` guarantees inv.email is non-null.
+    if (userEmail && userEmail.toLowerCase() !== String(inv.email).toLowerCase()) {
       res.status(403).json({ error: `Invite is for ${inv.email} but you are signed in as ${userEmail}` }); return
     }
 
@@ -635,8 +643,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
             res.status(403).json({ error: 'You cannot change your own role' }); return
           }
         }
-        const { data: role } = await supabase.from('role_definitions')
-          .select('id').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
+        const role = await resolveTenantRole(supabase, tenantId, role_key, 'id')
         if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
         patch.role_id = role.id
       }
@@ -796,7 +803,52 @@ export function createTeamsRouter(deps: Deps): express.Router {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function planRank(planId: string): number {
-  return ({ free: 0, starter: 1, growth: 2, scale: 3 } as Record<string, number>)[planId] ?? 0
+  // 'enterprise' is the TOP tier — it must outrank scale, not fall through the
+  // ?? 0 default and tie with free. It did, which meant every enterprise tenant
+  // (5 of them in prod on 2026-09-23) would be refused any role carrying a
+  // plan_min. Latent only because no role sets plan_min yet — the moment one
+  // does, the most expensive customers are the ones locked out.
+  return ({ free: 0, starter: 1, growth: 2, scale: 3, enterprise: 4 } as Record<string, number>)[planId] ?? 0
+}
+
+/**
+ * Resolve a tenant-scope role by key, honouring tenant OWNERSHIP.
+ *
+ * Built-in roles carry `tenant_id IS NULL`; a tenant's custom roles carry its
+ * own id. Every caller used to filter on `key` + `scope` ONLY, which produced
+ * two separate defects:
+ *   1. Tenant B could assign tenant A's custom role just by passing its key.
+ *   2. Two tenants owning the same custom key made `maybeSingle()` match >1 row
+ *      and error — breaking that role's invites for EVERY tenant. Not
+ *      hypothetical: the per-vertical templates in the dashboard's
+ *      `src/lib/roleTemplates.ts` are hardcoded key constants
+ *      ('horeca_cashier', 'salon_stylist', …), so the collision is guaranteed
+ *      as soon as a second tenant in the same vertical applies a template.
+ *
+ * A tenant's OWN role wins over a built-in sharing the key (`nullsFirst: false`
+ * sorts the tenant-owned row first), so a workspace can legitimately override a
+ * built-in without breaking anyone else's.
+ */
+async function resolveTenantRole(
+  supabase: SupabaseClient,
+  tenantId: string,
+  roleKey: string,
+  columns: string = 'id, scope, plan_min',
+): Promise<{ id: string; scope?: string; plan_min?: string | null } | null> {
+  // tenantId is interpolated into a PostgREST filter string, so refuse anything
+  // that isn't a UUID rather than trusting the middleware unconditionally.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(tenantId || ''))) {
+    return null
+  }
+  const { data } = await supabase.from('role_definitions')
+    .select(columns)
+    .eq('key', roleKey)
+    .eq('scope', 'tenant')
+    .or(`tenant_id.is.null,tenant_id.eq.${tenantId}`)
+    .order('tenant_id', { nullsFirst: false })
+    .limit(1)
+    .maybeSingle()
+  return (data as any) ?? null
 }
 
 /**
