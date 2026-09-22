@@ -121,7 +121,12 @@ insert into features (key, name, description, category, verticals, default_enabl
   ('multi_outlet',     'Multi-outlet',         'Per-outlet data isolation',                 'ops',        '{horeca,salon}', false, 'locked_teaser', 44),
   -- HoReCa
   ('menu',             'Menu / catalog',       'HoReCa menu catalogue',                     'commerce',   '{horeca}', true,  'hidden',        50),
-  ('pos',              'POS billing',          'Counter point-of-sale',                     'commerce',   '{horeca}', true,  'hidden',        51),
+  -- POS is horeca + SALON: a salon bills at a counter the same way a cafe does.
+  -- This row said '{horeca}' while three client layers already claimed salon
+  -- (feature-registry, the sidebar pack list, POSPage.posAllowedFor). The server
+  -- gate wins, so salon tenants silently lost the POS nav item. See
+  -- 20260923090000_pos_salon_vertical.sql for the forward fix to live DBs.
+  ('pos',              'POS billing',          'Counter point-of-sale',                     'commerce',   '{horeca,salon}', true,  'hidden',        51),
   ('kot',              'KOT',                  'Kitchen order ticket',                      'ops',        '{horeca}', true,  'hidden',        52),
   ('kds',              'KDS',                  'Kitchen display screen',                    'ops',        '{horeca}', false, 'locked_teaser', 53),
   ('scan_qr',          'Table QR / scan',      'Scan-to-order (on-premise)',                'commerce',   '{horeca}', false, 'locked_teaser', 54),
