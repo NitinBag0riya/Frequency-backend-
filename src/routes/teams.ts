@@ -195,8 +195,8 @@ export function createTeamsRouter(deps: Deps): express.Router {
 
       if (emailConfigured()) {
         try {
-          const { data: t } = await supabase.from('tenants').select('name').eq('id', tenantId).maybeSingle()
-          const tenantName = String(t?.name || 'a Frequency workspace')
+          const { data: t } = await supabase.from('tenants').select('business_name').eq('id', tenantId).maybeSingle()
+          const tenantName = String((t as any)?.business_name || 'a Frequency workspace')
           const esc = (s: string) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
           const logoUrl = process.env.EMAIL_LOGO_URL || 'https://getfrequency.app/email-logo.gif'
           const html = `<!doctype html><html><body style="margin:0;background:#f6f5f2;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a">
@@ -392,8 +392,8 @@ export function createTeamsRouter(deps: Deps): express.Router {
       }
       if (emailConfigured()) {
         try {
-          const { data: t } = await supabase.from('tenants').select('name').eq('id', tenantId).maybeSingle()
-          const tenantName = String(t?.name || 'a Frequency workspace')
+          const { data: t } = await supabase.from('tenants').select('business_name').eq('id', tenantId).maybeSingle()
+          const tenantName = String((t as any)?.business_name || 'a Frequency workspace')
           const esc = (s: string) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
           const logoUrl = process.env.EMAIL_LOGO_URL || 'https://getfrequency.app/email-logo.gif'
           const expiryStr = new Date(inv.expires_at).toDateString()
