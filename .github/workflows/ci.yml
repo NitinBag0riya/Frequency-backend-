@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   check:
-    name: typecheck + build
+    name: typecheck + selfchecks + build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,5 +26,15 @@ jobs:
         run: npx tsc --noEmit
       - name: Lint (if configured)
         run: npm run lint --if-present
+
+      # Was written but never wired — a blueprint doc flagged the gap.
+      - name: Manifest check
+        run: npm run manifest:check
+
+      # All *.selfcheck.ts under src/, discovered by walk (see
+      # scripts/run-selfchecks.mjs) so new ones are gated with no edit here.
+      # Pure assert-based invariant checks — no network, no credentials.
+      - name: Selfchecks
+        run: npm run selfcheck
       - name: Build (if configured)
         run: npm run build --if-present

@@ -10,7 +10,7 @@
     "start:worker": "node dist/worker.js",
     "build": "tsc",
     "manifest:check": "tsx scripts/manifest-check.ts",
-    "verify": "tsc && npm run manifest:check",
+    "verify": "tsc && npm run manifest:check && npm run selfcheck",
     "test:schedule-audience": "tsx tests/integration/schedule-audience.ts",
     "test:dedupe-guard": "tsx tests/integration/dedupe-guard.ts",
     "test:flow-submission": "tsx tests/integration/flow-submission.ts",
@@ -19,7 +19,8 @@
     "email:test": "tsx tests/email-previews/render-all.ts",
     "smoke": "tsx tests/smoke/runner.ts",
     "smoke:local": "SMOKE_BASE_URL=http://localhost:3000 tsx tests/smoke/runner.ts",
-    "smoke:stage": "SMOKE_BASE_URL=https://api.getfrequency.app tsx tests/smoke/runner.ts"
+    "smoke:stage": "SMOKE_BASE_URL=https://api.getfrequency.app tsx tests/smoke/runner.ts",
+    "selfcheck": "node scripts/run-selfchecks.mjs"
   },
   "keywords": [],
   "author": "",
