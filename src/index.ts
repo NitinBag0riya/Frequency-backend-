@@ -5974,89 +5974,17 @@ app.get('/api/team', requireAuth, identifyTenant, checkPermission('settings', 'v
   res.json({ success: true, team: data || [] })
 })
 
-app.post('/api/team/invite', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
-  const tenantId = (req as any).tenantId
-  const { email, role } = req.body ?? {}
-  // Defensive validation — inviteUserByEmail(undefined) throws inside the
-  // supabase admin SDK with an unhelpful 500. Caller must supply email + role.
-  if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    res.status(400).json({ error: 'valid email is required' })
-    return
-  }
-  if (typeof role !== 'string' || role.trim().length === 0) {
-    res.status(400).json({ error: 'role is required' })
-    return
-  }
-
-  // Two role systems live here: the legacy `user_roles` table has a Postgres
-  // CHECK constraint that only accepts { owner, admin, agent, member }, while
-  // the new RBAC uses `user_role_assignments` keyed by `role_definitions.key`
-  // (values like 'marketing_manager', 'support_agent', 'workspace_admin'…).
-  // A dashboard invite always sends the NEW role key. Naively writing that
-  // to user_roles.role trips the check constraint — the exact error the owner
-  // just hit ("user_roles_role_check"). Map the new key to a legacy bucket
-  // for the compat write AND resolve role_definitions.id for the new RBAC write.
-  const LEGACY_ROLE_MAP: Record<string, 'owner' | 'admin' | 'agent' | 'member'> = {
-    owner: 'owner', workspace_owner: 'owner',
-    admin: 'admin', workspace_admin: 'admin', super_admin: 'admin',
-    agent: 'agent', support_agent: 'agent', marketing_manager: 'agent',
-    member: 'member',
-  }
-  const legacyRole = LEGACY_ROLE_MAP[role] || 'member'
-  const { data: roleDef } = await supabase
-    .from('role_definitions')
-    .select('id, key')
-    .eq('key', role)
-    .maybeSingle()
-  const roleId = (roleDef as any)?.id ?? null
-
-  // Persist the invited user's role, in BOTH tables when the schema allows,
-  // so old and new readers both resolve them. Legacy is best-effort; new RBAC
-  // is the source of truth for anything shipped after 2026.
-  const upsertRoles = async (userId: string) => {
-    const legacy = await supabase.from('user_roles').upsert({ user_id: userId, tenant_id: tenantId, role: legacyRole })
-    if (legacy.error) return { error: legacy.error }
-    if (roleId) {
-      const rbac = await supabase.from('user_role_assignments').upsert(
-        { user_id: userId, tenant_id: tenantId, role_id: roleId, disabled_at: null },
-        { onConflict: 'user_id,tenant_id' },
-      )
-      // A missing user_role_assignments row is not fatal — legacy still works —
-      // but a hard error other than "unique_violation" is worth surfacing.
-      if (rbac.error && !/duplicate|unique/i.test(rbac.error.message || '')) return { error: rbac.error }
-    }
-    return { error: null as null | { message: string } }
-  }
-
-  try {
-    // 1. Trigger Supabase Invitation
-    const { data: invite, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(email, {
-      redirectTo: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/auth`
-    })
-
-    if (inviteError) {
-      // If user already exists, we'll just add the role instead of failing
-      if (inviteError.message.includes('already registered')) {
-        const { data: existingUser } = await supabase.auth.admin.listUsers()
-        const user = existingUser.users.find(u => u.email === email)
-        if (user) {
-          const { error } = await upsertRoles(user.id)
-          if (error) return res.status(500).json({ error: error.message })
-          return res.json({ success: true, message: `${email} is already on Frequency and has been added to your team.` })
-        }
-      }
-      return res.status(500).json({ error: inviteError.message })
-    }
-
-    // 2. Map the new role for the invited user ID (both legacy + new-RBAC)
-    const { error: roleError } = await upsertRoles(invite.user.id)
-    if (roleError) return res.status(500).json({ error: roleError.message })
-
-    res.json({ success: true, message: `Invitation sent to ${email}` })
-  } catch (err: any) {
-    res.status(500).json({ error: err.message })
-  }
-})
+// Legacy /api/team/invite handler REMOVED 2026-09-22 — it was shadowing the
+// correct handler in routes/teams.ts (mounted below via createTeamsRouter).
+// The correct handler:
+//   • expects `role_key` (matches dashboard client + all other new-RBAC code)
+//   • resolves role_definitions.id
+//   • inserts into pending_invites so the merchant sees the invite in the UI
+//   • enforces plan seat limits + owner-only-grants-owner
+//   • handles already-registered users gracefully
+// The legacy one here only wrote to user_roles (broken check constraint on new
+// role keys) and never populated pending_invites — the dashboard's "Pending"
+// tab always showed 0 even for successful invites.
 
 // ── Dev seed endpoint ─────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'production') {
