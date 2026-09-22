@@ -171,23 +171,39 @@ export function createTeamsRouter(deps: Deps): express.Router {
         res.status(500).json({ error: invErr.message }); return
       }
 
-      // Send the email via Supabase Auth admin (route flows through auth-email-hook → Brevo).
+      // Probe first: is this email an existing Supabase auth user? Two very
+      // different code paths follow. inviteUserByEmail is documented for NEW
+      // signups only — for a confirmed user it silently returns 200 without
+      // sending anything (no throw, no email), so a try/catch fallback never
+      // fires. We check auth.users directly so we know which branch to take.
       const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${token}`
       let existingUser = false
       try {
-        await (supabase as any).auth.admin.inviteUserByEmail(email, { redirectTo: acceptUrl })
+        // The Supabase JS client can't query the protected auth schema, so hit
+        // the Admin REST API directly. Service-role key required.
+        const url = `${process.env.SUPABASE_URL}/auth/v1/admin/users?email=${encodeURIComponent(email)}`
+        const r = await fetch(url, { headers: {
+          apikey: String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? ''),
+          Authorization: `Bearer ${String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? '')}`,
+        } })
+        if (r.ok) {
+          const j: any = await r.json().catch(() => ({}))
+          const users = Array.isArray(j?.users) ? j.users : []
+          existingUser = users.some((u: any) => String(u?.email || '').toLowerCase() === email.toLowerCase())
+        }
       } catch (e: any) {
-        // Supabase's inviteUserByEmail refuses to mail an address that ALREADY
-        // has an auth account — its own doc says use invite for new signups only.
-        // Before this fix we swallowed that with a comment about "sending a
-        // magic link separately" that was never wired, so existing-Frequency
-        // users invited to a NEW workspace got zero notification (owner tested
-        // 2026-09-23 → nitin.naruto@gmail.com row created, no email sent).
-        // Now: on "already exists", send our OWN Brevo mail with the accept link.
-        if (/already|registered|exists/i.test(e?.message ?? '')) {
-          existingUser = true
-        } else {
-          console.warn('[invite] Supabase auth email failed:', e?.message)
+        console.warn('[invite] auth.users probe failed:', e?.message)
+      }
+
+      if (!existingUser) {
+        // New user → Supabase Auth invite (fires auth-email-hook → Brevo).
+        try {
+          await (supabase as any).auth.admin.inviteUserByEmail(email, { redirectTo: acceptUrl })
+        } catch (e: any) {
+          // Rare race: user was created between our probe and the invite call.
+          // Fall through to the existing-user Brevo mail below.
+          if (/already|registered|exists/i.test(e?.message ?? '')) existingUser = true
+          else console.warn('[invite] Supabase auth email failed:', e?.message)
         }
       }
 
@@ -379,12 +395,30 @@ export function createTeamsRouter(deps: Deps): express.Router {
       if (inv.status !== 'pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
 
       const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${inv.token}`
+      // Same probe as /invite: Supabase silently no-ops for confirmed users, so
+      // check first and take the Brevo branch when the user already exists.
       let existingUser = false
       try {
-        await (supabase as any).auth.admin.inviteUserByEmail(inv.email, { redirectTo: acceptUrl })
+        const url = `${process.env.SUPABASE_URL}/auth/v1/admin/users?email=${encodeURIComponent(String(inv.email))}`
+        const r = await fetch(url, { headers: {
+          apikey: String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? ''),
+          Authorization: `Bearer ${String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? '')}`,
+        } })
+        if (r.ok) {
+          const j: any = await r.json().catch(() => ({}))
+          const users = Array.isArray(j?.users) ? j.users : []
+          existingUser = users.some((u: any) => String(u?.email || '').toLowerCase() === String(inv.email).toLowerCase())
+        }
       } catch (e: any) {
-        if (/already|registered|exists/i.test(e?.message ?? '')) existingUser = true
-        else console.warn('[invite resend] Supabase auth:', e?.message)
+        console.warn('[invite resend] auth.users probe failed:', e?.message)
+      }
+      if (!existingUser) {
+        try {
+          await (supabase as any).auth.admin.inviteUserByEmail(inv.email, { redirectTo: acceptUrl })
+        } catch (e: any) {
+          if (/already|registered|exists/i.test(e?.message ?? '')) existingUser = true
+          else console.warn('[invite resend] Supabase auth:', e?.message)
+        }
       }
       if (existingUser && emailConfigured()) {
         try {
