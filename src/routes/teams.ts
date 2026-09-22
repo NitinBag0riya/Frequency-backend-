@@ -171,43 +171,29 @@ export function createTeamsRouter(deps: Deps): express.Router {
         res.status(500).json({ error: invErr.message }); return
       }
 
-      // Probe first: is this email an existing Supabase auth user? Two very
-      // different code paths follow. inviteUserByEmail is documented for NEW
-      // signups only — for a confirmed user it silently returns 200 without
-      // sending anything (no throw, no email), so a try/catch fallback never
-      // fires. We check auth.users directly so we know which branch to take.
+      // Two deliveries, one belt-and-suspenders path:
+      //   1. inviteUserByEmail — creates the auth stub for a NEW address and
+      //      fires the auth-email-hook (Supabase's own invite mail). For a
+      //      confirmed user it silently no-ops (no throw, no email) — the
+      //      documented "invite is for new signups only" behaviour. That
+      //      silent branch was the whole bug: nothing landed for existing
+      //      Frequency users invited to a new workspace.
+      //   2. Our own Brevo mail with the accept-invite link — sent for EVERY
+      //      invite. A new user gets two mails (Supabase's stock invite +
+      //      ours); an existing user gets ours, which is what they were
+      //      missing. Better one duplicate than a silent black hole, and
+      //      probing auth.users directly is unreliable (the Admin API's
+      //      email filter is ignored and listUsers is paginated).
       const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${token}`
-      let existingUser = false
       try {
-        // The Supabase JS client can't query the protected auth schema, so hit
-        // the Admin REST API directly. Service-role key required.
-        const url = `${process.env.SUPABASE_URL}/auth/v1/admin/users?email=${encodeURIComponent(email)}`
-        const r = await fetch(url, { headers: {
-          apikey: String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? ''),
-          Authorization: `Bearer ${String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? '')}`,
-        } })
-        if (r.ok) {
-          const j: any = await r.json().catch(() => ({}))
-          const users = Array.isArray(j?.users) ? j.users : []
-          existingUser = users.some((u: any) => String(u?.email || '').toLowerCase() === email.toLowerCase())
-        }
+        await (supabase as any).auth.admin.inviteUserByEmail(email, { redirectTo: acceptUrl })
       } catch (e: any) {
-        console.warn('[invite] auth.users probe failed:', e?.message)
-      }
-
-      if (!existingUser) {
-        // New user → Supabase Auth invite (fires auth-email-hook → Brevo).
-        try {
-          await (supabase as any).auth.admin.inviteUserByEmail(email, { redirectTo: acceptUrl })
-        } catch (e: any) {
-          // Rare race: user was created between our probe and the invite call.
-          // Fall through to the existing-user Brevo mail below.
-          if (/already|registered|exists/i.test(e?.message ?? '')) existingUser = true
-          else console.warn('[invite] Supabase auth email failed:', e?.message)
+        if (!/already|registered|exists/i.test(e?.message ?? '')) {
+          console.warn('[invite] Supabase auth email failed:', e?.message)
         }
       }
 
-      if (existingUser && emailConfigured()) {
+      if (emailConfigured()) {
         try {
           const { data: t } = await supabase.from('tenants').select('name').eq('id', tenantId).maybeSingle()
           const tenantName = String(t?.name || 'a Frequency workspace')
@@ -218,7 +204,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#fff;border:1px solid #e6e4de;border-radius:14px;overflow:hidden">
       <tr><td style="padding:24px 28px 8px"><img src="${logoUrl}" alt="Frequency" height="28" style="display:block;height:28px"></td></tr>
       <tr><td style="padding:8px 28px 4px;font-size:18px;font-weight:700;line-height:1.35">You've been invited to <span style="color:#0a7">${esc(tenantName)}</span> on Frequency</td></tr>
-      <tr><td style="padding:8px 28px 20px;font-size:14px;line-height:1.55;color:#4a4a48">Since you already have a Frequency account, sign in with your existing email and password — then this workspace is added to your account.</td></tr>
+      <tr><td style="padding:8px 28px 20px;font-size:14px;line-height:1.55;color:#4a4a48">Click below to accept. If you already have a Frequency account, sign in with your existing password — the workspace is added to it. If not, you'll set a password on the same screen.</td></tr>
       <tr><td style="padding:0 28px 24px"><a href="${esc(acceptUrl)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:8px">Accept invite</a></td></tr>
       <tr><td style="padding:0 28px 24px;font-size:12px;color:#8a8a86;line-height:1.55">Or paste this link into your browser:<br><a href="${esc(acceptUrl)}" style="color:#4a4a48;word-break:break-all">${esc(acceptUrl)}</a><br><br>Expires ${expiresAt.toDateString()}. If you didn't expect this, ignore this email.</td></tr>
     </table>
@@ -230,13 +216,13 @@ export function createTeamsRouter(deps: Deps): express.Router {
             html,
             idempotency_key: `team_invite:${invite.id}`,
           })
-          console.log('[invite] existing-user mail sent →', email, 'tenant=', tenantName)
+          console.log('[invite] Brevo mail sent →', email, 'tenant=', tenantName)
         } catch (ee: any) {
-          console.warn('[invite] existing-user Brevo send failed:', ee?.message)
+          console.warn('[invite] Brevo send failed:', ee?.message)
         }
       }
 
-      res.json({ success: true, invite, accept_url: acceptUrl, existing_user: existingUser })
+      res.json({ success: true, invite, accept_url: acceptUrl })
     })
 
   // ─── Invite by phone (WhatsApp) ───────────────────────────────────────────
@@ -395,32 +381,16 @@ export function createTeamsRouter(deps: Deps): express.Router {
       if (inv.status !== 'pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
 
       const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${inv.token}`
-      // Same probe as /invite: Supabase silently no-ops for confirmed users, so
-      // check first and take the Brevo branch when the user already exists.
-      let existingUser = false
+      // Fire the Supabase invite (harmless no-op for a confirmed user) AND
+      // send our own Brevo mail — see the invite handler for the rationale.
       try {
-        const url = `${process.env.SUPABASE_URL}/auth/v1/admin/users?email=${encodeURIComponent(String(inv.email))}`
-        const r = await fetch(url, { headers: {
-          apikey: String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? ''),
-          Authorization: `Bearer ${String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? '')}`,
-        } })
-        if (r.ok) {
-          const j: any = await r.json().catch(() => ({}))
-          const users = Array.isArray(j?.users) ? j.users : []
-          existingUser = users.some((u: any) => String(u?.email || '').toLowerCase() === String(inv.email).toLowerCase())
-        }
+        await (supabase as any).auth.admin.inviteUserByEmail(inv.email, { redirectTo: acceptUrl })
       } catch (e: any) {
-        console.warn('[invite resend] auth.users probe failed:', e?.message)
-      }
-      if (!existingUser) {
-        try {
-          await (supabase as any).auth.admin.inviteUserByEmail(inv.email, { redirectTo: acceptUrl })
-        } catch (e: any) {
-          if (/already|registered|exists/i.test(e?.message ?? '')) existingUser = true
-          else console.warn('[invite resend] Supabase auth:', e?.message)
+        if (!/already|registered|exists/i.test(e?.message ?? '')) {
+          console.warn('[invite resend] Supabase auth:', e?.message)
         }
       }
-      if (existingUser && emailConfigured()) {
+      if (emailConfigured()) {
         try {
           const { data: t } = await supabase.from('tenants').select('name').eq('id', tenantId).maybeSingle()
           const tenantName = String(t?.name || 'a Frequency workspace')
@@ -432,7 +402,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#fff;border:1px solid #e6e4de;border-radius:14px;overflow:hidden">
       <tr><td style="padding:24px 28px 8px"><img src="${logoUrl}" alt="Frequency" height="28" style="display:block;height:28px"></td></tr>
       <tr><td style="padding:8px 28px 4px;font-size:18px;font-weight:700;line-height:1.35">You've been invited to <span style="color:#0a7">${esc(tenantName)}</span> on Frequency</td></tr>
-      <tr><td style="padding:8px 28px 20px;font-size:14px;line-height:1.55;color:#4a4a48">Since you already have a Frequency account, sign in with your existing email and password — then this workspace is added to your account.</td></tr>
+      <tr><td style="padding:8px 28px 20px;font-size:14px;line-height:1.55;color:#4a4a48">Click below to accept. If you already have a Frequency account, sign in with your existing password — the workspace is added to it. If not, you'll set a password on the same screen.</td></tr>
       <tr><td style="padding:0 28px 24px"><a href="${esc(acceptUrl)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:8px">Accept invite</a></td></tr>
       <tr><td style="padding:0 28px 24px;font-size:12px;color:#8a8a86;line-height:1.55">Or paste this link into your browser:<br><a href="${esc(acceptUrl)}" style="color:#4a4a48;word-break:break-all">${esc(acceptUrl)}</a><br><br>Expires ${expiryStr}. If you didn't expect this, ignore this email.</td></tr>
     </table>
@@ -444,12 +414,12 @@ export function createTeamsRouter(deps: Deps): express.Router {
             html,
             idempotency_key: `team_invite_resend:${inv.id}:${Date.now()}`,
           })
-          console.log('[invite resend] existing-user mail sent →', inv.email, 'tenant=', tenantName)
+          console.log('[invite resend] Brevo mail sent →', inv.email, 'tenant=', tenantName)
         } catch (ee: any) {
-          console.warn('[invite resend] existing-user Brevo send failed:', ee?.message)
+          console.warn('[invite resend] Brevo send failed:', ee?.message)
         }
       }
-      res.json({ success: true, accept_url: acceptUrl, existing_user: existingUser })
+      res.json({ success: true, accept_url: acceptUrl })
     })
 
   r.delete('/api/team/invites/:id',
