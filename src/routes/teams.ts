@@ -21,6 +21,7 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { emitNotification } from './notifications'
 import { sendTeamInviteWa } from '../lib/team-invite-wa'
 import { sendTeamInviteSms } from '../lib/storefront-sms.js'
+import { sendEmail, emailConfigured } from '../lib/email'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -170,19 +171,56 @@ export function createTeamsRouter(deps: Deps): express.Router {
         res.status(500).json({ error: invErr.message }); return
       }
 
-      // Send the email via Supabase Auth admin
+      // Send the email via Supabase Auth admin (route flows through auth-email-hook → Brevo).
       const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${token}`
+      let existingUser = false
       try {
         await (supabase as any).auth.admin.inviteUserByEmail(email, { redirectTo: acceptUrl })
       } catch (e: any) {
-        // If the user already exists, Supabase returns an error — that's OK,
-        // we still have a pending_invites row; the existing user can click the
-        // link from the in-app banner or we can send a magic link separately.
-        if (!/already/i.test(e?.message ?? '')) {
+        // Supabase's inviteUserByEmail refuses to mail an address that ALREADY
+        // has an auth account — its own doc says use invite for new signups only.
+        // Before this fix we swallowed that with a comment about "sending a
+        // magic link separately" that was never wired, so existing-Frequency
+        // users invited to a NEW workspace got zero notification (owner tested
+        // 2026-09-23 → nitin.naruto@gmail.com row created, no email sent).
+        // Now: on "already exists", send our OWN Brevo mail with the accept link.
+        if (/already|registered|exists/i.test(e?.message ?? '')) {
+          existingUser = true
+        } else {
           console.warn('[invite] Supabase auth email failed:', e?.message)
         }
       }
-      res.json({ success: true, invite, accept_url: acceptUrl })
+
+      if (existingUser && emailConfigured()) {
+        try {
+          const { data: t } = await supabase.from('tenants').select('name').eq('id', tenantId).maybeSingle()
+          const tenantName = String(t?.name || 'a Frequency workspace')
+          const esc = (s: string) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+          const logoUrl = process.env.EMAIL_LOGO_URL || 'https://getfrequency.app/email-logo.gif'
+          const html = `<!doctype html><html><body style="margin:0;background:#f6f5f2;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px">
+    <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#fff;border:1px solid #e6e4de;border-radius:14px;overflow:hidden">
+      <tr><td style="padding:24px 28px 8px"><img src="${logoUrl}" alt="Frequency" height="28" style="display:block;height:28px"></td></tr>
+      <tr><td style="padding:8px 28px 4px;font-size:18px;font-weight:700;line-height:1.35">You've been invited to <span style="color:#0a7">${esc(tenantName)}</span> on Frequency</td></tr>
+      <tr><td style="padding:8px 28px 20px;font-size:14px;line-height:1.55;color:#4a4a48">Since you already have a Frequency account, sign in with your existing email and password — then this workspace is added to your account.</td></tr>
+      <tr><td style="padding:0 28px 24px"><a href="${esc(acceptUrl)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:8px">Accept invite</a></td></tr>
+      <tr><td style="padding:0 28px 24px;font-size:12px;color:#8a8a86;line-height:1.55">Or paste this link into your browser:<br><a href="${esc(acceptUrl)}" style="color:#4a4a48;word-break:break-all">${esc(acceptUrl)}</a><br><br>Expires ${expiresAt.toDateString()}. If you didn't expect this, ignore this email.</td></tr>
+    </table>
+  </td></tr></table>
+</body></html>`
+          await sendEmail({
+            to: email,
+            subject: `You've been invited to join ${tenantName} on Frequency`,
+            html,
+            idempotency_key: `team_invite:${invite.id}`,
+          })
+          console.log('[invite] existing-user mail sent →', email, 'tenant=', tenantName)
+        } catch (ee: any) {
+          console.warn('[invite] existing-user Brevo send failed:', ee?.message)
+        }
+      }
+
+      res.json({ success: true, invite, accept_url: acceptUrl, existing_user: existingUser })
     })
 
   // ─── Invite by phone (WhatsApp) ───────────────────────────────────────────
