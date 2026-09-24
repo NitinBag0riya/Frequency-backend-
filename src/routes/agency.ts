@@ -33,6 +33,7 @@ import {
   ensureCustomer, createSubscription, cancelSubscription,
   createPlan, listSubscriptionPayments, createRefund,
 } from '../lib/razorpay'
+import { authUsersByIds } from '../lib/auth-users'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -659,12 +660,8 @@ export function createAgencyRouter(deps: Deps): express.Router {
     // to raw user_id if unavailable so the page still renders.
     let withEmails: any[] = data ?? []
     try {
-      const userIds = withEmails.map(m => m.user_id)
-      const { data: users } = await (supabase as any).auth.admin.listUsers({ perPage: 200 })
-      const map = new Map<string, string>()
-      for (const u of (users?.users ?? []) as any[]) map.set(u.id, u.email)
-      withEmails = withEmails.map(m => ({ ...m, email: map.get(m.user_id) ?? null }))
-      void userIds
+      const map = await authUsersByIds(supabase as any, withEmails.map(m => m.user_id))
+      withEmails = withEmails.map(m => ({ ...m, email: map.get(m.user_id)?.email ?? null }))
     } catch {
       // ignored — page still renders without emails
     }
