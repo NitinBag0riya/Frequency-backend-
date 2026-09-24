@@ -12,7 +12,7 @@
  * erasure.request, erasure.complete). Per DPDP §6 — 7-year retention.
  *
  * Row enrichment:
- *   actor_email  ← auth.users.email   (batched via auth.admin.listUsers)
+ *   actor_email  ← auth.users.email   (per-id via lib/auth-users)
  *   actor_name   ← public.profiles.full_name (batched via in() on actor_ids)
  *   payload      ← aliased from after_value so the FE's existing
  *                  read-models keep working without a new column.
@@ -35,6 +35,7 @@
 
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
+import { scanAuthUsers, authUsersByIds } from '../lib/auth-users'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -86,8 +87,7 @@ export function createTenantAuditRouter(deps: Deps): express.Router {
         // ── Filters ───────────────────────────────────────────────────────
         // `actor` accepts either a uuid (exact match on actor_id) OR an
         // email/name fragment — for the email case we resolve the matching
-        // user_ids upfront via auth.admin.listUsers (capped at 200, matches
-        // existing teams.ts pattern). Empty string → no filter.
+        // user_ids upfront via scanAuthUsers (all pages — lib/auth-users). Empty string → no filter.
         const actorFilter  = trimOr(req.query.actor,  null)
         const actionFilter = trimOr(req.query.action, null)
         const fromIso      = trimOr(req.query.from,   null)
@@ -100,12 +100,9 @@ export function createTenantAuditRouter(deps: Deps): express.Router {
           } else {
             // Email / name partial match — pull the auth.users batch and
             // filter client-side. 200-user cap covers all realistic tenants.
-            const { data: { users = [] } = {} as any } =
-              await (supabase as any).auth.admin.listUsers({ perPage: 200 })
             const needle = actorFilter.toLowerCase()
-            const matchingUserIds = (users as any[])
-              .filter(u => (u.email ?? '').toLowerCase().includes(needle))
-              .map(u => u.id)
+            const matchingUserIds = (await scanAuthUsers(supabase as any,
+              u => (u.email ?? '').toLowerCase().includes(needle))).map(u => u.id)
 
             // Also union profile.full_name matches so "priya" finds rows
             // whose actor has no email but a profile name.
@@ -177,16 +174,9 @@ export function createTenantAuditRouter(deps: Deps): express.Router {
             if (p.full_name) actorNameMap.set(p.id, p.full_name)
           }
 
-          // Emails from auth.users — auth.admin.listUsers is paginated; pull
-          // the first 200 (same realistic-tenant assumption as actor filter).
-          // If we later see tenants with >200 staff, swap to per-actor
-          // auth.admin.getUserById() in a Promise.all batch.
-          const { data: { users = [] } = {} as any } =
-            await (supabase as any).auth.admin.listUsers({ perPage: 200 })
-          for (const u of users as any[]) {
-            if (u.id && u.email && distinctActorIds.includes(u.id)) {
-              actorEmailMap.set(u.id, u.email)
-            }
+          // Emails from auth.users — per-id lookup (lib/auth-users), no page cap.
+          for (const [id, u] of await authUsersByIds(supabase as any, distinctActorIds)) {
+            if (u.email) actorEmailMap.set(id, u.email)
           }
         }
 
