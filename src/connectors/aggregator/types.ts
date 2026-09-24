@@ -52,7 +52,8 @@ export interface OrderDecision {
 export interface StockToggle {
   channel: AggregatorChannel
   outletRef: string
-  entityType: 'item' | 'category'
+  /** 'outlet' = whole-store online/offline; it rides this same queue (see /store-status). */
+  entityType: 'item' | 'category' | 'outlet'
   entityId: string
   inStock: boolean
 }
@@ -71,9 +72,14 @@ export interface AdapterCapabilities {
   variants: boolean        // add-ons / modifiers / variants
   offers: boolean          // promotions / ads
   // Per-channel "make item/category live/visible" — a stock-visibility write.
-  // 'live' = we can apply it now (Swiggy setStock); 'gated' = blocked on
-  // Zomato write path not yet mapped. The FE reads this to render "publish" vs
-  // "pending partner" per channel instead of hardcoding it.
+  // 'live' = we can apply it now; 'gated' = the write path isn't mapped yet.
+  // BOTH channels are 'live' since ce5118e (Swiggy setStock/vhc, Zomato
+  // update_stock_status captured 2026-08-29). The FE reads this to render
+  // "publish" vs "pending partner" per channel instead of hardcoding it.
+  //
+  // Scope: this is visibility of an EXISTING item only. Creating a new item on
+  // Zomato is still partner-gated and is enforced separately in storefront-api
+  // `menu-diff.js` ('zomato-create-uncaptured') — not by this flag.
   publish: Record<AggregatorChannel, 'live' | 'gated'>
 }
 

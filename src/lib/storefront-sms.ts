@@ -59,13 +59,15 @@ export async function smsAvailable(_supabase?: SupabaseClient, _slug?: string): 
  * Send one DLT flow. `vars` are the template variables in order (var1, var2, …).
  * Throws on any non-success so the caller can fall back to WhatsApp / on-screen.
  */
-async function postFlow(templateId: string, mobile: string, vars: Record<string, string>): Promise<SmsResult> {
+async function postFlow(templateId: string, mobile: string, vars: Record<string, string>, opts?: { shortUrl?: boolean }): Promise<SmsResult> {
   const key = authKey()
   if (!key) throw new Error('MSG91 SMS not configured (set MSG91_AUTH_KEY)')
   if (!templateId) throw new Error('MSG91 template_id not set (register the DLT content template + MSG91 flow)')
 
   const recipient: Record<string, string> = { mobiles: mobile, ...vars }
-  const payload: Record<string, unknown> = { template_id: templateId, short_url: '0', recipients: [recipient] }
+  // short_url '1' lets MSG91 shorten a URL var (used by the team-invite join link);
+  // OTP/order templates keep '0' (no link).
+  const payload: Record<string, unknown> = { template_id: templateId, short_url: opts?.shortUrl ? '1' : '0', recipients: [recipient] }
   const sender = senderId()
   if (sender) payload.sender = sender
 
@@ -100,6 +102,28 @@ export async function sendSmsOtp(
   if (!/^\d{4,8}$/.test(code)) throw new Error('Invalid OTP code')
   const store = (args.storeName || 'Frequency').trim().slice(0, 30) || 'Frequency'
   return postFlow(process.env.MSG91_OTP_TEMPLATE_ID || '', to, { var1: code, var2: store })
+}
+
+/**
+ * Send a TEAM-INVITE join link over MSG91 — the SAME gateway/rail as the login
+ * OTP (sendSmsOtp), so phone team-invites ride the proven DLT SMS path instead of
+ * needing a separate WhatsApp template. DLT template "Frequency Team Invite":
+ * "You're invited to join {#var#} on Frequency. Tap to accept: {#var#} - Frequency"
+ * → var1 = org/store name, var2 = accept link (MSG91 short_url shortens it).
+ * Register the content template on DLT + mirror as an MSG91 flow → its id in
+ * MSG91_TEAM_INVITE_TEMPLATE_ID. Throws on failure so the caller can fall back to
+ * WhatsApp / the on-screen accept link.
+ */
+export async function sendTeamInviteSms(
+  _supabase: SupabaseClient,
+  args: { phone: string; orgName?: string; acceptUrl: string },
+): Promise<SmsResult> {
+  const to = normRecipient(args.phone)
+  if (!/^\d{10,15}$/.test(to)) throw new Error(`Invalid phone for invite SMS: '${args.phone}'`)
+  const org = (args.orgName || 'Frequency').trim().slice(0, 30) || 'Frequency'
+  const url = String(args.acceptUrl).trim()
+  if (!url) throw new Error('Invite accept URL required')
+  return postFlow(process.env.MSG91_TEAM_INVITE_TEMPLATE_ID || '', to, { var1: org, var2: url }, { shortUrl: true })
 }
 
 /**

@@ -686,11 +686,31 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
         return
       }
 
+      // The FE needs a slug to land on ('/'+slug) and a name for the banner —
+      // it can no longer resolve either itself, since RLS denies a
+      // non-member's direct supabase-js read of `tenants` for this tenant
+      // (impersonation-tenant-view §BE-03). Service-role lookup here is the
+      // one place that's allowed to see it.
+      const { data: tenantRow } = await supabase
+        .from('tenants')
+        .select('slug, business_name')
+        .eq('id', entry.tenant_id)
+        .maybeSingle()
+      if (!tenantRow?.slug) {
+        // The handoff is already single-use consumed above; a missing tenant
+        // (deleted between start and claim) fails closed rather than handing
+        // back a token with nowhere safe for the FE to land.
+        res.status(404).json({ error: 'Tenant not found' })
+        return
+      }
+
       await audit(supabase, req, { action: 'impersonate.claim', target_tenant_id: entry.tenant_id })
       res.json({
         token: entry.token,
         expires_at: entry.expires_at,
         tenant_id: entry.tenant_id,
+        tenant_slug: tenantRow.slug,
+        tenant_name: tenantRow.business_name,
         read_only: entry.read_only,
       })
     })
@@ -820,7 +840,17 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       }
 
       // Non-downgrade → direct + audit (unchanged behaviour).
-      const { data, error } = await supabase.from('tenant_subscriptions').update(patch).eq('tenant_id', tenantId).select().single()
+      // Tenants created via /naruto without a planId (or via auto-signup) have NO
+      // tenant_subscriptions row — createTenant only inserts one when input.planId
+      // is set. A plain UPDATE therefore 404s on those tenants and the platform
+      // Change Plan modal fails. Same shape as createTenant / billing.ts / naruto-plans.ts:
+      // when a plan_id is being set, UPSERT so the first assignment CREATES the row.
+      // Status/trial-only changes still 404 on tenants with no sub (nothing to modify).
+      const useUpsert = !!plan_id
+      const query = useUpsert
+        ? supabase.from('tenant_subscriptions').upsert({ tenant_id: tenantId, ...patch }, { onConflict: 'tenant_id' })
+        : supabase.from('tenant_subscriptions').update(patch).eq('tenant_id', tenantId)
+      const { data, error } = await query.select().single()
       if (error) { res.status((error as any).code === 'PGRST116' ? 404 : 500).json({ error: (error as any).code === 'PGRST116' ? 'not found' : error.message }); return }
       await audit(supabase, req, { action: plan_id ? 'plan.change' : 'subscription.update', target_tenant_id: tenantId, payload: { changes: patch }, reason })
       res.json(data)

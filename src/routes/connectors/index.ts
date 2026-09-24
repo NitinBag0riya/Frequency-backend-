@@ -43,6 +43,7 @@ import { createLeadWebhookConnectors } from './lead-webhooks'
 import { createZomatoConnector } from './zomato'
 import { createAggregatorConnector } from './aggregator'
 import { createTenantAggregatorSessionRouter } from '../tenant-aggregator-session'
+import { createGbpConnector } from './gbp'
 import { signOauthState } from '../../lib/oauth-state'
 import { readSecretValue, writeSecretValue } from '../../lib/wa-creds'
 
@@ -1550,6 +1551,7 @@ export function createConnectorsRouter(deps: Deps): express.Router {
   r.use(createZomatoConnector(deps))
   r.use(createAggregatorConnector(deps))
   r.use(createTenantAggregatorSessionRouter({ supabase: deps.supabase, guardView: [deps.requireAuth, deps.identifyTenant, deps.checkPermission('integrations', 'view')], guardEdit: [deps.requireAuth, deps.identifyTenant, deps.checkPermission('integrations', 'edit')] }))
+  r.use(createGbpConnector(deps))
 
   // ── Google OAuth start routes — mounted inline (sub-router nesting causes
   // path-resolution quirks in Express when using full /api/auth/... paths) ────
@@ -1601,6 +1603,10 @@ export function createConnectorsRouter(deps: Deps): express.Router {
         res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`)
       })
   }
+
+  // Google Business Profile OAuth (start + callback) lives in its OWN router
+  // (routes/connectors/gbp.ts) because it runs under the GOOGLE_OAUTH /
+  // "Frequency Search Console" client — NOT the Gmail/Sheets client used above.
 
   return r
 }

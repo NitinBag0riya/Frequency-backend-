@@ -107,7 +107,9 @@ export const layout = {
 } as const
 
 /** Default app URL used when none is provided. */
-export const APP_URL = process.env.FRONTEND_URL ?? 'https://app.getfrequency.app'
+// Apex, not app.* — see nudge-engine: app.getfrequency.app resolves to Vercel but
+// no project claims it, so it 404s.
+export const APP_URL = process.env.FRONTEND_URL ?? 'https://getfrequency.app'
 
 /**
  * Frequency logo for email headers. MUST be an absolute https raster (PNG/JPG)

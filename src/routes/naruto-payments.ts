@@ -31,6 +31,7 @@ import express from 'express'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { requirePlatformCapability } from '../lib/platform-guard.js'
 import { withApproval, registerPlatformAction, BreakGlassDenied, type ActionExecutor } from './platform-approvals.js'
+import { recordPlatformAudit } from '../lib/platform-audit.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw }
@@ -210,6 +211,15 @@ async function sfConfigPatch(slug: string, body: unknown): Promise<void> {
   })
   if (!r.ok) throw new Error(`storefront-api config PATCH → ${r.status}: ${await r.text().catch(() => '')}`)
 }
+// Per-tenant config READ (X-Tenant slug) — for the Route/gateway card: reads back
+// the stored routeAccountId + online flag without a per-tenant operator session.
+async function sfConfigGet(slug: string): Promise<any> {
+  const r = await fetch(`${SF_API}/admin/config`, {
+    headers: { 'X-Tenant': slug, 'X-Admin-Secret': SF_SECRET },
+  })
+  if (!r.ok) throw new Error(`storefront-api config GET → ${r.status}`)
+  return r.json()
+}
 
 // slug → { vertical, plan, name } for the whole platform, one query. Verticals/plans
 // live in Supabase; storefront-api only knows name+slug. Keyed by slug (the ledger's join key).
@@ -374,6 +384,67 @@ export function createNarutoPaymentsRouter({ supabase, requireAuth }: Deps): exp
         if (e instanceof BreakGlassDenied) { res.status(403).json({ error: e.message }); return }
         res.status(502).json({ error: e?.message || 'kill switch failed' })
       }
+    })
+
+  // ── 5. Frequency gateway / Route split (per tenant) ────────────────────────
+  // Surfaces the Razorpay Route linked-account id (acc_…) + online-payment flag on
+  // /naruto so a platform admin can wire a tenant's 1% split here instead of opening
+  // that tenant's own Storefront Settings. The acc_… is MINTED in Razorpay (Route →
+  // Linked Accounts, KYC) — this only stores the id the storefront-api splits to.
+  const ACC_RE = /^acc_[A-Za-z0-9]+$/
+  const resolveSlug = async (tenantId: string): Promise<string | null> => {
+    const { data } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+    return (data as any)?.slug ?? null
+  }
+
+  // Cheap tenant list for the picker (one query, no storefront-api calls).
+  r.get('/api/super-admin/payments/gateway-tenants',
+    requireAuth, requirePlatformCapability(supabase, 'payments.read'),
+    async (_req, res) => {
+      try {
+        const meta = await tenantMetaBySlug(supabase)
+        const tenants = [...meta.entries()]
+          .map(([slug, m]) => ({ tenantId: m.tenantId, name: m.name, slug, vertical: m.vertical }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+        res.json({ tenants })
+      } catch (e: any) { res.status(502).json({ error: e?.message || 'tenant list unavailable' }) }
+    })
+
+  // Read one tenant's gateway config (lazy, on picker select).
+  r.get('/api/super-admin/payments/:tenantId/gateway',
+    requireAuth, requirePlatformCapability(supabase, 'payments.read'),
+    async (req, res) => {
+      try {
+        const slug = await resolveSlug(String(req.params.tenantId))
+        if (!slug) { res.status(404).json({ error: 'unknown tenant' }); return }
+        const cfg = await sfConfigGet(slug)
+        res.json({ slug, routeAccountId: cfg?.routeAccountId ?? null, online: !!cfg?.settings?.payments?.online })
+      } catch (e: any) { res.status(502).json({ error: e?.message || 'gateway config unavailable' }) }
+    })
+
+  // Set the Route account id and/or online flag (reason-free config write; audited).
+  r.patch('/api/super-admin/payments/:tenantId/gateway',
+    requireAuth, requirePlatformCapability(supabase, 'payments.killswitch.write'),
+    async (req, res) => {
+      const tenantId = String(req.params.tenantId)
+      const body = (req.body ?? {}) as { routeAccountId?: string | null; online?: boolean }
+      const hasAcc = Object.prototype.hasOwnProperty.call(body, 'routeAccountId')
+      const acc = hasAcc ? (String(body.routeAccountId ?? '').trim() || null) : undefined
+      if (acc && !ACC_RE.test(acc)) { res.status(400).json({ error: 'routeAccountId must look like acc_XXXXXXXX' }); return }
+      const slug = await resolveSlug(tenantId)
+      if (!slug) { res.status(404).json({ error: 'unknown tenant' }); return }
+      const patch: any = {}
+      if (acc !== undefined) patch.routeAccountId = acc
+      if (typeof body.online === 'boolean') patch.settings = { payments: { online: body.online } }
+      if (!Object.keys(patch).length) { res.status(400).json({ error: 'nothing to update' }); return }
+      try {
+        await sfConfigPatch(slug, patch)
+        await recordPlatformAudit(supabase, req, {
+          capability: 'payments.killswitch.write', action: 'payments.gateway.set', tenant_id: tenantId,
+          after: { ...(acc !== undefined ? { routeAccountId: acc } : {}), ...(typeof body.online === 'boolean' ? { online: body.online } : {}) },
+        })
+        res.json({ ok: true, ...(acc !== undefined ? { routeAccountId: acc } : {}), ...(typeof body.online === 'boolean' ? { online: body.online } : {}) })
+      } catch (e: any) { res.status(502).json({ error: e?.message || 'gateway update failed' }) }
     })
 
   return r

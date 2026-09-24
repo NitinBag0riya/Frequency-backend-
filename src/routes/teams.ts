@@ -19,6 +19,9 @@ import express from 'express'
 import crypto from 'crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { emitNotification } from './notifications'
+import { sendTeamInviteWa } from '../lib/team-invite-wa'
+import { sendTeamInviteSms } from '../lib/storefront-sms.js'
+import { sendEmail, emailConfigured } from '../lib/email'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -126,7 +129,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     async (req, res) => {
       const tenantId = (req as any).tenantId
       const inviterId = (req as any).user.id
-      const { email, role_key, department_id, message } = req.body
+      const { email, role_key, department_id, message, full_name } = req.body
       if (!email || !role_key) { res.status(400).json({ error: 'email + role_key required' }); return }
       if (role_key === 'owner' && (req as any).userRole !== 'owner') {
         res.status(403).json({ error: 'Only the owner can grant the owner role' }); return
@@ -143,9 +146,8 @@ export function createTeamsRouter(deps: Deps): express.Router {
         }
       }
 
-      // Resolve role
-      const { data: role } = await supabase.from('role_definitions')
-        .select('id, scope, plan_min').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
+      // Resolve role (tenant-scoped — see resolveTenantRole)
+      const role = await resolveTenantRole(supabase, tenantId, role_key)
       if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
       // Role plan-gate check
       if (role.plan_min && plan && planRank(plan.plan_id) < planRank(role.plan_min)) {
@@ -160,26 +162,148 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const { data: invite, error: invErr } = await supabase.from('pending_invites').insert({
         tenant_id: tenantId, email, role_id: role.id, department_id: department_id ?? null,
         invited_by: inviterId, expires_at: expiresAt.toISOString(),
-        message: message ?? null, token, status: 'pending',
+        message: message ?? null, full_name: (typeof full_name === 'string' ? full_name.trim().slice(0, 120) : null) || null,
+        token, status: 'pending',
       }).select().single()
       if (invErr) {
         if ((invErr as any).code === '23505') { res.status(409).json({ error: 'A pending invite already exists for this email' }); return }
         res.status(500).json({ error: invErr.message }); return
       }
 
-      // Send the email via Supabase Auth admin
+      // Two deliveries, one belt-and-suspenders path:
+      //   1. inviteUserByEmail — creates the auth stub for a NEW address and
+      //      fires the auth-email-hook (Supabase's own invite mail). For a
+      //      confirmed user it silently no-ops (no throw, no email) — the
+      //      documented "invite is for new signups only" behaviour. That
+      //      silent branch was the whole bug: nothing landed for existing
+      //      Frequency users invited to a new workspace.
+      //   2. Our own Brevo mail with the accept-invite link — sent for EVERY
+      //      invite. A new user gets two mails (Supabase's stock invite +
+      //      ours); an existing user gets ours, which is what they were
+      //      missing. Better one duplicate than a silent black hole, and
+      //      probing auth.users directly is unreliable (the Admin API's
+      //      email filter is ignored and listUsers is paginated).
       const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${token}`
       try {
         await (supabase as any).auth.admin.inviteUserByEmail(email, { redirectTo: acceptUrl })
       } catch (e: any) {
-        // If the user already exists, Supabase returns an error — that's OK,
-        // we still have a pending_invites row; the existing user can click the
-        // link from the in-app banner or we can send a magic link separately.
-        if (!/already/i.test(e?.message ?? '')) {
+        if (!/already|registered|exists/i.test(e?.message ?? '')) {
           console.warn('[invite] Supabase auth email failed:', e?.message)
         }
       }
+
+      if (emailConfigured()) {
+        try {
+          const { data: t } = await supabase.from('tenants').select('business_name').eq('id', tenantId).maybeSingle()
+          const tenantName = String((t as any)?.business_name || 'a Frequency workspace')
+          const esc = (s: string) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+          const logoUrl = process.env.EMAIL_LOGO_URL || 'https://getfrequency.app/email-logo.gif'
+          const html = `<!doctype html><html><body style="margin:0;background:#f6f5f2;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px">
+    <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#fff;border:1px solid #e6e4de;border-radius:14px;overflow:hidden">
+      <tr><td style="padding:24px 28px 8px"><img src="${logoUrl}" alt="Frequency" height="28" style="display:block;height:28px"></td></tr>
+      <tr><td style="padding:8px 28px 4px;font-size:18px;font-weight:700;line-height:1.35">You've been invited to <span style="color:#0a7">${esc(tenantName)}</span> on Frequency</td></tr>
+      <tr><td style="padding:8px 28px 20px;font-size:14px;line-height:1.55;color:#4a4a48">Click below to accept. If you already have a Frequency account, sign in with your existing password — the workspace is added to it. If not, you'll set a password on the same screen.</td></tr>
+      <tr><td style="padding:0 28px 24px"><a href="${esc(acceptUrl)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:8px">Accept invite</a></td></tr>
+      <tr><td style="padding:0 28px 24px;font-size:12px;color:#8a8a86;line-height:1.55">Or paste this link into your browser:<br><a href="${esc(acceptUrl)}" style="color:#4a4a48;word-break:break-all">${esc(acceptUrl)}</a><br><br>Expires ${expiresAt.toDateString()}. If you didn't expect this, ignore this email.</td></tr>
+    </table>
+  </td></tr></table>
+</body></html>`
+          await sendEmail({
+            to: email,
+            subject: `You've been invited to join ${tenantName} on Frequency`,
+            html,
+            idempotency_key: `team_invite:${invite.id}`,
+          })
+          console.log('[invite] Brevo mail sent →', email, 'tenant=', tenantName)
+        } catch (ee: any) {
+          console.warn('[invite] Brevo send failed:', ee?.message)
+        }
+      }
+
       res.json({ success: true, invite, accept_url: acceptUrl })
+    })
+
+  // ─── Invite by phone (WhatsApp) ───────────────────────────────────────────
+  // Mirrors the email invite's authz/plan/role guards exactly, but delivers an
+  // opaque join link over WhatsApp (reusing resolveWaCreds) instead of email.
+  // The invitee has no auth account yet — they create one at /accept-invite via
+  // POST /api/team/accept-invite-phone (see below).
+  r.post('/api/team/invite-phone',
+    requireAuth, identifyTenant, requireTenantPerm(supabase, 'team', 'edit'),
+    async (req, res) => {
+      const tenantId = (req as any).tenantId
+      const inviterId = (req as any).user.id
+      const { phone, role_key, department_id, message, full_name } = req.body
+      if (!role_key) { res.status(400).json({ error: 'phone + role_key required' }); return }
+      if (!isValidE164(phone)) { res.status(400).json({ error: 'phone must be E.164, e.g. +919876543210' }); return }
+      const e164 = String(phone).trim()
+      // Same owner-role clamp as the email path — no privilege escalation.
+      if (role_key === 'owner' && (req as any).userRole !== 'owner') {
+        res.status(403).json({ error: 'Only the owner can grant the owner role' }); return
+      }
+
+      // Plan gate: seats
+      const plan = await getTenantPlan(supabase, tenantId)
+      const teamMax = Number(plan?.limits?.team_size_max ?? -1)
+      if (teamMax > 0) {
+        const { count } = await supabase.from('user_role_assignments')
+          .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId)
+        if ((count ?? 0) >= teamMax) {
+          res.status(402).json({ error: `Plan limit: ${teamMax} seats. Upgrade to add more.` }); return
+        }
+      }
+
+      // Resolve + plan-gate the role (identical to email path)
+      const role = await resolveTenantRole(supabase, tenantId, role_key)
+      if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
+      if (role.plan_min && plan && planRank(plan.plan_id) < planRank(role.plan_min)) {
+        res.status(402).json({ error: `Role "${role_key}" requires plan ${role.plan_min}` }); return
+      }
+
+      const token = crypto.randomBytes(24).toString('base64url')
+      const ttl = await getFlag(supabase, 'invite_link_ttl_days', 7)
+      const expiresAt = new Date(Date.now() + Number(ttl) * 24 * 60 * 60 * 1000)
+
+      const { data: invite, error: invErr } = await supabase.from('pending_invites').insert({
+        tenant_id: tenantId, phone: e164, email: null, role_id: role.id,
+        department_id: department_id ?? null, invited_by: inviterId,
+        expires_at: expiresAt.toISOString(), message: message ?? null,
+        full_name: (typeof full_name === 'string' ? full_name.trim().slice(0, 120) : null) || null,
+        token, status: 'pending',
+      }).select().single()
+      if (invErr) {
+        if ((invErr as any).code === '23505') { res.status(409).json({ error: 'A pending invite already exists for this number' }); return }
+        res.status(500).json({ error: invErr.message }); return
+      }
+
+      const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${token}`
+
+      // Resolve org name for the template body.
+      const { data: t } = await supabase.from('tenants').select('business_name').eq('id', tenantId).maybeSingle()
+      const orgName = (t as any)?.business_name ?? 'a team'
+
+      // Delivery: WhatsApp is the PRIMARY channel — an APPROVED UTILITY template
+      // sent over resolveWaCreds (tenant's own number, else the FREQ_WA platform
+      // number). MSG91 SMS is the dormant fallback that lights up automatically
+      // once its DLT template lands. Best-effort: if both fail we STILL return the
+      // accept link so the admin can share it manually.
+      let sent_via: 'sms' | 'whatsapp' | null = null
+      let deliver_error: string | undefined
+      try {
+        await sendTeamInviteWa(supabase, { tenantId, phone: e164, token, orgName })
+        sent_via = 'whatsapp'
+      } catch (waErr: any) {
+        try {
+          await sendTeamInviteSms(supabase, { phone: e164, orgName, acceptUrl })
+          sent_via = 'sms'
+        } catch (smsErr: any) {
+          deliver_error = `wa="${waErr?.message}" sms="${smsErr?.message}"`
+          console.warn('[invite-phone] WhatsApp + SMS both failed:', deliver_error)
+        }
+      }
+      // wa_sent kept for back-compat with the existing FE toast.
+      res.json({ success: true, invite, accept_url: acceptUrl, sent_via, wa_sent: sent_via != null, deliver_error })
     })
 
   // ─── Add an existing platform user to this tenant ─────────────────────────
@@ -213,8 +337,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
         }
       }
 
-      const { data: role } = await supabase.from('role_definitions')
-        .select('id').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
+      const role = await resolveTenantRole(supabase, tenantId, role_key, 'id')
       if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
 
       const { data, error } = await supabase.from('user_role_assignments').insert({
@@ -237,7 +360,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     async (req, res) => {
       const tenantId = (req as any).tenantId
       const { data, error } = await supabase.from('pending_invites')
-        .select(`id, email, status, message, invited_at, expires_at, accepted_at,
+        .select(`id, email, phone, status, message, invited_at, expires_at, accepted_at,
                  role_definitions ( key, label )`)
         .eq('tenant_id', tenantId)
         .order('invited_at', { ascending: false })
@@ -255,10 +378,43 @@ export function createTeamsRouter(deps: Deps): express.Router {
       if (inv.status !== 'pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
 
       const acceptUrl = `${process.env.FRONTEND_URL ?? 'http://localhost:5173'}/accept-invite?token=${inv.token}`
+      // Fire the Supabase invite (harmless no-op for a confirmed user) AND
+      // send our own Brevo mail — see the invite handler for the rationale.
       try {
         await (supabase as any).auth.admin.inviteUserByEmail(inv.email, { redirectTo: acceptUrl })
       } catch (e: any) {
-        console.warn('[invite resend] Supabase auth:', e?.message)
+        if (!/already|registered|exists/i.test(e?.message ?? '')) {
+          console.warn('[invite resend] Supabase auth:', e?.message)
+        }
+      }
+      if (emailConfigured()) {
+        try {
+          const { data: t } = await supabase.from('tenants').select('business_name').eq('id', tenantId).maybeSingle()
+          const tenantName = String((t as any)?.business_name || 'a Frequency workspace')
+          const esc = (s: string) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+          const logoUrl = process.env.EMAIL_LOGO_URL || 'https://getfrequency.app/email-logo.gif'
+          const expiryStr = new Date(inv.expires_at).toDateString()
+          const html = `<!doctype html><html><body style="margin:0;background:#f6f5f2;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px">
+    <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#fff;border:1px solid #e6e4de;border-radius:14px;overflow:hidden">
+      <tr><td style="padding:24px 28px 8px"><img src="${logoUrl}" alt="Frequency" height="28" style="display:block;height:28px"></td></tr>
+      <tr><td style="padding:8px 28px 4px;font-size:18px;font-weight:700;line-height:1.35">You've been invited to <span style="color:#0a7">${esc(tenantName)}</span> on Frequency</td></tr>
+      <tr><td style="padding:8px 28px 20px;font-size:14px;line-height:1.55;color:#4a4a48">Click below to accept. If you already have a Frequency account, sign in with your existing password — the workspace is added to it. If not, you'll set a password on the same screen.</td></tr>
+      <tr><td style="padding:0 28px 24px"><a href="${esc(acceptUrl)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:8px">Accept invite</a></td></tr>
+      <tr><td style="padding:0 28px 24px;font-size:12px;color:#8a8a86;line-height:1.55">Or paste this link into your browser:<br><a href="${esc(acceptUrl)}" style="color:#4a4a48;word-break:break-all">${esc(acceptUrl)}</a><br><br>Expires ${expiryStr}. If you didn't expect this, ignore this email.</td></tr>
+    </table>
+  </td></tr></table>
+</body></html>`
+          await sendEmail({
+            to: inv.email,
+            subject: `You've been invited to join ${tenantName} on Frequency`,
+            html,
+            idempotency_key: `team_invite_resend:${inv.id}:${Date.now()}`,
+          })
+          console.log('[invite resend] Brevo mail sent →', inv.email, 'tenant=', tenantName)
+        } catch (ee: any) {
+          console.warn('[invite resend] Brevo send failed:', ee?.message)
+        }
       }
       res.json({ success: true, accept_url: acceptUrl })
     })
@@ -278,7 +434,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
     const token = String(req.query.token ?? '')
     if (!token) { res.status(400).json({ error: 'token required' }); return }
     const { data: inv } = await supabase.from('pending_invites')
-      .select(`email, status, expires_at, invited_by,
+      .select(`email, phone, status, expires_at, invited_by, full_name, message,
                role_definitions ( label ),
                tenants!inner ( business_name )`)
       .eq('token', token).maybeSingle()
@@ -294,12 +450,20 @@ export function createTeamsRouter(deps: Deps): express.Router {
       inviter_name = user?.user_metadata?.full_name ?? user?.email
     } catch {}
     res.json({
+      // `channel` drives which join form AcceptInvitePage shows. Returning the
+      // invitee's own phone/email to the token holder is symmetric with the
+      // email flow — the opaque token IS the secret gating this preview.
+      channel: inv.phone ? 'phone' : 'email',
       email: inv.email,
+      phone: inv.phone,
       status: inv.status,
       expires_at: inv.expires_at,
       org_name: (inv as any).tenants?.business_name ?? 'an organization',
       role_label: (inv as any).role_definitions?.label ?? 'Member',
       inviter_name,
+      // Inviter-typed name for the invitee (first-class). Falls back to
+      // legacy `message` for invites already in flight before the column landed.
+      full_name: (inv as any).full_name ?? (inv as any).message ?? null,
     })
   })
 
@@ -313,13 +477,24 @@ export function createTeamsRouter(deps: Deps): express.Router {
     const { data: inv, error } = await supabase.from('pending_invites')
       .select('*').eq('token', token).maybeSingle()
     if (error || !inv) { res.status(404).json({ error: 'Invalid invite' }); return }
-    if (inv.status !== 'pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
-    if (new Date(inv.expires_at).getTime() < Date.now()) {
+
+    // Gate through the shared helper the PHONE path already uses. This route
+    // used to inline its own status/expiry checks and then deref
+    // `inv.email.toLowerCase()` with no channel check — so redeeming a PHONE
+    // invite (email IS NULL) here threw a TypeError and surfaced as an
+    // unhandled 500 instead of a usable message.
+    const state = inviteAcceptState(inv as any, 'email')
+    if (state === 'not-pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
+    if (state === 'expired') {
       await supabase.from('pending_invites').update({ status: 'expired' }).eq('id', inv.id)
       res.status(410).json({ error: 'Invite expired' }); return
     }
-    // Email match check (if available)
-    if (userEmail && userEmail.toLowerCase() !== inv.email.toLowerCase()) {
+    if (state === 'wrong-channel') {
+      res.status(400).json({ error: 'This is a phone invite — open it from the WhatsApp link to join.' }); return
+    }
+
+    // Email match check. `state === 'ok'` guarantees inv.email is non-null.
+    if (userEmail && userEmail.toLowerCase() !== String(inv.email).toLowerCase()) {
       res.status(403).json({ error: `Invite is for ${inv.email} but you are signed in as ${userEmail}` }); return
     }
 
@@ -354,6 +529,97 @@ export function createTeamsRouter(deps: Deps): express.Router {
     res.json({ success: true, tenant_id: inv.tenant_id })
   })
 
+  // ─── Accept a PHONE / WhatsApp invite (public — invitee has no account yet) ─
+  //
+  // Authorization is the opaque token delivered to the invitee's WhatsApp number:
+  // only someone who received that message holds it. It is single-use, server-
+  // expiring, and channel-gated (inviteAcceptState) — and it is the ONLY thing
+  // that authorizes account creation here.
+  //
+  // NO Supabase phone provider is used (enabling Phone auth needs an SMS gateway
+  // the owner can't run). Instead we mint the account on the always-on EMAIL
+  // provider under a DETERMINISTIC internal identity derived from the phone
+  // (teammateEmailFromPhone → wa-<e164>@teammate.getfrequency.app — a domain we
+  // control that never receives mail), with the REAL phone kept in user_metadata,
+  // never in the auth `phone` field. The invitee CHOOSES A PASSWORD here: because
+  // there is no SMS/OTP fallback, that password is their only durable way to sign
+  // in again (the login page maps their phone back to this same internal email).
+  //
+  // FAIL CLOSED: if the account can't be created/resolved we do NOT consume the
+  // invite. The FE establishes the browser session itself via signInWithPassword
+  // — we never mint or hand out a session token here.
+  r.post('/api/team/accept-invite-phone', async (req, res) => {
+    const { token, password, full_name } = req.body ?? {}
+    if (!token || typeof token !== 'string') { res.status(400).json({ error: 'token required' }); return }
+    if (typeof password !== 'string' || password.length < 8) {
+      res.status(400).json({ error: 'Password must be at least 8 characters' }); return
+    }
+
+    const { data: inv, error } = await supabase.from('pending_invites')
+      .select('*').eq('token', token).maybeSingle()
+    if (error || !inv) { res.status(404).json({ error: 'Invalid invite' }); return }
+
+    const state = inviteAcceptState(inv as any, 'phone')
+    if (state === 'not-pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
+    if (state === 'expired') {
+      await supabase.from('pending_invites').update({ status: 'expired' }).eq('id', inv.id)
+      res.status(410).json({ error: 'Invite expired' }); return
+    }
+    if (state === 'wrong-channel') { res.status(400).json({ error: 'Not a phone invite — use the email flow' }); return }
+
+    const internalEmail = teammateEmailFromPhone(inv.phone)
+    if (!internalEmail) { res.status(400).json({ error: 'Invite has no valid phone' }); return }
+    const cleanName = typeof full_name === 'string' ? full_name.trim().slice(0, 80) || null : null
+
+    // Create the account on the EMAIL provider (email pre-confirmed — the invite
+    // token already proved control of the number, the same trust the email path
+    // places in magic-link possession).
+    const { data: created, error: cErr } = await (supabase as any).auth.admin.createUser({
+      email: internalEmail,
+      email_confirm: true,
+      password,
+      user_metadata: { full_name: cleanName, phone: inv.phone, source: 'team_invite_whatsapp' },
+    })
+    let userId: string | undefined = created?.user?.id
+    if (!userId) {
+      // Returning teammate: an account for this number already exists. Do NOT
+      // reset its password (they prove it at sign-in — no silent takeover); just
+      // resolve the id so the role can be (re)linked. generateLink is used purely
+      // as an id lookup here, its link discarded — the session stays password-based.
+      const dup = /already|registered|exists/i.test(cErr?.message ?? '')
+      if (!dup) { res.status(500).json({ error: cErr?.message ?? 'Could not create account' }); return }
+      const { data: link } = await (supabase as any).auth.admin.generateLink({ type: 'magiclink', email: internalEmail })
+      userId = link?.user?.id
+    }
+    if (!userId) { res.status(500).json({ error: 'Could not resolve account for this invite' }); return }
+
+    // Same linkage row the email accept path writes (idempotent on re-accept).
+    const { error: ae } = await supabase.from('user_role_assignments').insert({
+      user_id: userId, tenant_id: inv.tenant_id, role_id: inv.role_id,
+      department_id: inv.department_id, invited_by: inv.invited_by,
+      invited_at: inv.invited_at, accepted_at: new Date().toISOString(),
+    })
+    if (ae && (ae as any).code !== '23505') { res.status(500).json({ error: ae.message }); return }
+
+    // Consume the invite only after account + linkage both succeeded.
+    await supabase.from('pending_invites').update({ status: 'accepted', accepted_at: new Date().toISOString() }).eq('id', inv.id)
+
+    try {
+      const { data: role } = await supabase.from('role_definitions').select('label').eq('id', inv.role_id).maybeSingle()
+      await emitNotification(supabase, {
+        tenant_id: inv.tenant_id,
+        event_key: 'team.invite_accepted',
+        recipient_user_ids: [inv.invited_by],
+        data: { name: cleanName ?? inv.phone, role: role?.label ?? 'Member' },
+        link: '/settings/team',
+      })
+    } catch (e) { console.warn('[invite-phone accepted notif]', (e as any)?.message) }
+
+    // FE signs in with (login_email, password); future logins are phone+password
+    // mapped back to this same login_email by the dashboard login page.
+    res.json({ success: true, tenant_id: inv.tenant_id, login_email: internalEmail })
+  })
+
   // ─── Update / disable / remove team member ────────────────────────────────
   r.patch('/api/team/members/:assignmentId',
     requireAuth, identifyTenant, requireTenantPerm(supabase, 'team', 'edit'),
@@ -377,8 +643,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
             res.status(403).json({ error: 'You cannot change your own role' }); return
           }
         }
-        const { data: role } = await supabase.from('role_definitions')
-          .select('id').eq('key', role_key).eq('scope', 'tenant').maybeSingle()
+        const role = await resolveTenantRole(supabase, tenantId, role_key, 'id')
         if (!role) { res.status(400).json({ error: 'Unknown role' }); return }
         patch.role_id = role.id
       }
@@ -538,7 +803,98 @@ export function createTeamsRouter(deps: Deps): express.Router {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function planRank(planId: string): number {
-  return ({ free: 0, starter: 1, growth: 2, scale: 3 } as Record<string, number>)[planId] ?? 0
+  // 'enterprise' is the TOP tier — it must outrank scale, not fall through the
+  // ?? 0 default and tie with free. It did, which meant every enterprise tenant
+  // (5 of them in prod on 2026-09-23) would be refused any role carrying a
+  // plan_min. Latent only because no role sets plan_min yet — the moment one
+  // does, the most expensive customers are the ones locked out.
+  return ({ free: 0, starter: 1, growth: 2, scale: 3, enterprise: 4 } as Record<string, number>)[planId] ?? 0
+}
+
+/**
+ * Resolve a tenant-scope role by key, honouring tenant OWNERSHIP.
+ *
+ * Built-in roles carry `tenant_id IS NULL`; a tenant's custom roles carry its
+ * own id. Every caller used to filter on `key` + `scope` ONLY, which produced
+ * two separate defects:
+ *   1. Tenant B could assign tenant A's custom role just by passing its key.
+ *   2. Two tenants owning the same custom key made `maybeSingle()` match >1 row
+ *      and error — breaking that role's invites for EVERY tenant. Not
+ *      hypothetical: the per-vertical templates in the dashboard's
+ *      `src/lib/roleTemplates.ts` are hardcoded key constants
+ *      ('horeca_cashier', 'salon_stylist', …), so the collision is guaranteed
+ *      as soon as a second tenant in the same vertical applies a template.
+ *
+ * A tenant's OWN role wins over a built-in sharing the key (`nullsFirst: false`
+ * sorts the tenant-owned row first), so a workspace can legitimately override a
+ * built-in without breaking anyone else's.
+ */
+async function resolveTenantRole(
+  supabase: SupabaseClient,
+  tenantId: string,
+  roleKey: string,
+  columns: string = 'id, scope, plan_min',
+): Promise<{ id: string; scope?: string; plan_min?: string | null } | null> {
+  // tenantId is interpolated into a PostgREST filter string, so refuse anything
+  // that isn't a UUID rather than trusting the middleware unconditionally.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(tenantId || ''))) {
+    return null
+  }
+  const { data } = await supabase.from('role_definitions')
+    .select(columns)
+    .eq('key', roleKey)
+    .eq('scope', 'tenant')
+    .or(`tenant_id.is.null,tenant_id.eq.${tenantId}`)
+    .order('tenant_id', { nullsFirst: false })
+    .limit(1)
+    .maybeSingle()
+  return (data as any) ?? null
+}
+
+/**
+ * Strict-ish E.164: leading '+', country digit 1–9, 7–14 more digits.
+ * Pure + exported so the selfcheck can pin the trust-boundary validation.
+ */
+export function isValidE164(phone: unknown): phone is string {
+  return typeof phone === 'string' && /^\+[1-9]\d{7,14}$/.test(phone.trim())
+}
+
+/**
+ * Deterministic internal login identity for a WhatsApp-invited teammate.
+ *
+ * We never enable Supabase's Phone provider (it needs an SMS gateway the owner
+ * can't run), so a phone invitee is minted on the always-on EMAIL provider under
+ * this synthetic address. `@teammate.getfrequency.app` is a domain we control
+ * that never receives mail — nothing is ever delivered to it; it exists only as a
+ * stable primary key derived from the E.164 number, so the same phone always maps
+ * to the same account (account creation here + phone-login on the dashboard must
+ * agree byte-for-byte). Pure + exported for the selfcheck. Returns null for
+ * anything that isn't a valid E.164 number.
+ */
+export function teammateEmailFromPhone(phone: unknown): string | null {
+  if (!isValidE164(phone)) return null
+  const digits = phone.trim().replace(/\D/g, '')
+  return `wa-${digits}@teammate.getfrequency.app`
+}
+
+export type InviteAcceptState = 'ok' | 'not-pending' | 'expired' | 'wrong-channel'
+
+/**
+ * Single source of truth for "can this invite row be consumed right now" —
+ * used by both accept paths. `channel` asserts the row matches the accept flow
+ * (a phone-accept must land on a phone invite, never an email one), which is
+ * what keeps the token single-purpose. Pure + exported for the selfcheck.
+ */
+export function inviteAcceptState(
+  invite: { status: string; expires_at: string; phone?: string | null; email?: string | null },
+  channel: 'phone' | 'email',
+  now: number = Date.now(),
+): InviteAcceptState {
+  if (invite.status !== 'pending') return 'not-pending'
+  if (new Date(invite.expires_at).getTime() < now) return 'expired'
+  if (channel === 'phone' && !invite.phone) return 'wrong-channel'
+  if (channel === 'email' && !invite.email) return 'wrong-channel'
+  return 'ok'
 }
 
 async function getFlag(supabase: SupabaseClient, key: string, fallback: any): Promise<any> {

@@ -18,7 +18,7 @@ import AgencyMemberInvite from '../templates/AgencyMemberInvite'
 import { computeGst, renderInvoiceHtml } from '../../lib/gst-invoice'
 
 const TO = process.argv[2] || 'nitin.naruto@gmail.com'
-const APP = process.env.FRONTEND_URL || 'https://app.getfrequency.app'
+const APP = process.env.FRONTEND_URL || 'https://getfrequency.app'
 
 async function buildInvoiceHtml(): Promise<string> {
   // A real GST invoice (₹1,499 + 18% IGST, inter-state) via the legal renderer.

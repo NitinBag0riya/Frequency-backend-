@@ -18,8 +18,10 @@ import { SupabaseClient } from '@supabase/supabase-js'
 import { sendStorefrontOtp } from '../lib/storefront-otp.js'
 import { sendSmsOtp, sendSmsOrderUpdate } from '../lib/storefront-sms.js'
 import { resolveWaCreds } from '../lib/wa-creds.js'
-import { provisionCatalog, materializeCatalog, getCatalogConfig, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
+import { provisionCatalog, materializeCatalog, getCatalogConfig, syncOutletAvailability, catalogUpsertItem, catalogDeleteItem, catalogAddCategory, catalogDeleteCategory, catalogDecrementStock, syncOrderRow, syncCartRow, syncCustomerRow, syncOutletRow } from '../lib/catalog.js'
 import { emitNotification, tenantNotifyRecipients } from './notifications.js'
+import { resolvePlatformRole } from '../lib/platform-guard.js'
+import { normalizeRole, can } from '../lib/platform-rbac.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -80,17 +82,42 @@ async function notifyStorefrontOrder(supabase: SupabaseClient, tenantId: string,
     const isNew = !last
     const recipients = await tenantNotifyRecipients(supabase, tenantId)
     if (!recipients.length) return
+    // Channel from the ORDER, not hardcoded. This route is called by the desktop
+    // agent for BOTH storefront/counter orders AND aggregator (Swiggy/Zomato)
+    // orders it scrapes from the merchant's logged-in session. Hardcoding
+    // 'storefront' misidentified Swiggy/Zomato ingests, which then triggered
+    // OrderAlertProvider's POS-skip clause (posOwnsIt === true) → the operator's
+    // POS bell never rang for aggregator orders. Fixed 2026-09-05.
+    const rawCh = String(order?.source ?? order?.channel ?? '').toLowerCase()
+    const ch = rawCh === 'swiggy' || rawCh === 'zomato' ? rawCh
+      : rawCh === 'counter' ? 'counter'
+      : rawCh === 'miniapp' ? 'miniapp'
+      : 'storefront'
+    const chLabel = ch === 'swiggy' ? 'Swiggy' : ch === 'zomato' ? 'Zomato' : ch === 'counter' ? 'Counter' : 'Storefront'
+    // Owner ask 2026-09-05: a POS counter order is initiated BY the operator —
+    // ringing the alert on every other logged-in device is noise (they know
+    // they just made the order). Skip the counter path here entirely, so no
+    // realtime notification fans out. If someone still wants the ring for a
+    // counter order on other devices, remove this guard — but the default is
+    // 'operators don't ring themselves'.
+    if (ch === 'counter' && isNew) return
     const where = order?.table ? `Table ${order.table}` : (order?.mode === 'dinein' ? 'Dine-in' : 'Pickup')
     const items = Array.isArray(order?.lines) ? order.lines.reduce((n: number, l: any) => n + (Number(l?.qty) || 1), 0) : 0
+    // Summary reads the channel too: "New Swiggy order · #123… · 3 items — accept now"
+    // vs the generic mini-app "New order · Table 4 · 3 items — accept now".
+    const isAgg = ch === 'swiggy' || ch === 'zomato'
+    const newSummary = isAgg
+      ? `New ${chLabel} order · #${orderId.slice(-4)} · ${items} item${items === 1 ? '' : 's'} — accept now`
+      : `New order · ${where} · ${items} item${items === 1 ? '' : 's'} — accept now`
     await emitNotification(supabase, {
       tenant_id: tenantId,
       event_key: isNew ? 'order.new' : 'order.status',
       recipient_user_ids: recipients,
       link: '/settings/orders',   // canonical orders board (matches aggregator + OrderAlertProvider silence-on-view)
       data: {
-        channel: 'storefront', channel_label: 'Storefront',
+        channel: ch, channel_label: chLabel,
         order_id: orderId, status, status_label: status,
-        summary: isNew ? `New order · ${where} · ${items} item${items === 1 ? '' : 's'} — accept now` : `${where} · ${status}`,
+        summary: isNew ? newSummary : `${where} · ${status}`,
         priority: isNew ? 'high' : 'normal',
       },
     })
@@ -132,6 +159,43 @@ async function vercel(method: string, path: string, body?: unknown): Promise<{ o
   return { ok: r.ok, status: r.status, json }
 }
 
+// Ask Vercel for a domain's CURRENT state and make it true: force a re-verify, then
+// make sure a TLS cert actually exists. Shared by the operator's "Recheck status"
+// button and the background sweep below, so both can never drift apart.
+async function checkDomain(hostname: string, kind?: string): Promise<{ verified: boolean; ssl_status: string; cfg: any }> {
+  const project = projectFor(kind)
+  const enc = encodeURIComponent(hostname)
+  // verified = Vercel confirms ownership AND the DNS records are correctly set.
+  // A plain GET is a CACHED read — it replays the last check's result and never
+  // re-resolves DNS, so a domain added while its DNS was still wrong stays Pending
+  // forever no matter how often the operator clicks. POST /verify forces a fresh look.
+  const [ver, cfg] = await Promise.all([
+    vercel('POST', `/v9/projects/${project}/domains/${enc}/verify`),
+    vercel('GET', `/v6/domains/${enc}/config`),
+  ])
+  const dom = ver.ok ? ver : await vercel('GET', `/v9/projects/${project}/domains/${enc}`)
+  const verified = dom.ok && dom.json?.verified === true && cfg.ok && cfg.json?.misconfigured === false
+
+  // ssl_status is CHECK-constrained to 'pending' | 'issued' (+ error states) — NOT
+  // 'active'. Vercel USUALLY auto-issues once DNS verifies, but when the first attempt
+  // fails (domain added before DNS pointed at us) it does NOT retry on its own — the
+  // domain sits verified with no certificate and HTTPS hard-fails at the TLS handshake.
+  // So confirm a cert exists and request one if it doesn't, rather than optimistically
+  // recording 'issued' and lying to the operator about a store nobody can reach.
+  let ssl_status = 'pending'
+  if (verified) {
+    const have = await vercel('GET', `/v4/certs?domain=${enc}`)
+    let certOk = have.ok && Array.isArray(have.json?.certs) && have.json.certs.length > 0
+    if (!certOk) {
+      const made = await vercel('POST', '/v4/certs', { cns: [hostname] })
+      certOk = made.ok
+      if (!certOk) console.warn(`[storefront-domains] cert issue "${hostname}" → ${made.status}: ${made.json?.error?.message || 'failed'}`)
+    }
+    ssl_status = certOk ? 'issued' : 'pending'
+  }
+  return { verified, ssl_status, cfg: cfg.ok ? cfg.json : null }
+}
+
 function normalizeHostname(raw: string): string {
   return String(raw || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/\.$/, '')
 }
@@ -166,6 +230,30 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   } else {
     console.warn('[storefront-domains] VERCEL_API_TOKEN / VERCEL_TEAM_ID not set — custom domains will record only, no Vercel registration.')
   }
+
+  // Background sweep for domains that aren't fully live yet. Operators point DNS on
+  // their own schedule (often hours later, at their registrar, without telling us), and
+  // Vercel does not retry a failed cert issuance — so without this a domain only ever
+  // advances when a human happens to click "Recheck status". Same in-process
+  // setInterval pattern as the dashboard-origin refresh in index.ts: no extra worker,
+  // no queue, no cost. Bounded per tick so a backlog can't burst the Vercel API.
+  async function sweepPendingDomains(): Promise<void> {
+    try {
+      const { data } = await supabase.from('tenant_domains')
+        .select('id, hostname, kind, verified, ssl_status')
+        .or('verified.is.false,ssl_status.neq.issued')
+        .limit(25)
+      for (const row of (data || []) as any[]) {
+        try {
+          const { verified, ssl_status } = await checkDomain(row.hostname, row.kind)
+          if (verified === row.verified && ssl_status === row.ssl_status) continue   // no change → no write
+          await supabase.from('tenant_domains').update({ verified, ssl_status }).eq('id', row.id)
+          console.log(`[storefront-domains] sweep "${row.hostname}" → verified=${verified} ssl=${ssl_status}`)
+        } catch (e: any) { console.warn(`[storefront-domains] sweep "${row.hostname}" failed: ${e?.message}`) }
+      }
+    } catch (e: any) { console.warn('[storefront-domains] sweep query failed:', e?.message) }
+  }
+  if (vercelConfigured) setInterval(() => void sweepPendingDomains(), 10 * 60_000).unref()
 
   // Server-to-server: storefront-api asks us to deliver a login OTP over
   // WhatsApp (tenant's WABA, else Frequency fallback). Authenticated by the
@@ -373,6 +461,16 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
           // 403/forbidden often means the domain belongs to another Vercel account.
           res.status(502).json({ error: msg }); return
         }
+        // An apex also needs its `www.` twin registered, redirecting to the apex. Most
+        // registrars create a www CNAME by default and customers type it out of habit,
+        // but www is a SEPARATE hostname to Vercel: unregistered, it gets no route and
+        // no certificate, so https://www.<domain> dies at the TLS handshake while the
+        // apex works. Apex-ness comes from Vercel's own apexName (no public-suffix
+        // guessing); best-effort — a www failure must never block the real connect.
+        if (add.json?.apexName === hostname) {
+          const www = await vercel('POST', `/v10/projects/${project}/domains`, { name: `www.${hostname}`, redirect: hostname, redirectStatusCode: 308 })
+          if (!www.ok && www.status !== 409) console.warn(`[storefront-domains] www.${hostname} → ${www.status}: ${www.json?.error?.message || 'skipped'}`)
+        }
       }
 
       // 2. Record against the tenant. Unique on hostname → a domain belongs to exactly
@@ -415,7 +513,8 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
   })
 
   // Re-poll Vercel for a pending domain's DNS/verification state and persist it.
-  // The UI calls this from a "Recheck status" button — there is no background poller.
+  // The UI's "Recheck status" button is the impatient path; sweepPendingDomains()
+  // above does the same thing on a timer so nobody HAS to click it.
   r.post('/api/storefront/domains/:id/recheck', requireAuth, identifyTenant, async (req, res) => {
     const tenantId = (req as any).tenantId
     try {
@@ -425,23 +524,13 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
       if (!vercelConfigured) { res.json({ domain: row, dns: null, misconfigured: null }); return }
 
       const hostname = row.hostname as string
-      // verified = Vercel confirms ownership AND the DNS records are correctly set.
-      const [dom, cfg] = await Promise.all([
-        vercel('GET', `/v9/projects/${projectFor(row.kind as string)}/domains/${encodeURIComponent(hostname)}`),
-        vercel('GET', `/v6/domains/${encodeURIComponent(hostname)}/config`),
-      ])
-      const ownershipOk = dom.ok && dom.json?.verified === true
-      const dnsOk = cfg.ok && cfg.json?.misconfigured === false
-      const verified = ownershipOk && dnsOk
-      // ssl_status is CHECK-constrained to 'pending' | 'issued' (+ error states) —
-      // NOT 'active'. Vercel auto-issues the cert once DNS verifies.
-      const ssl_status = verified ? 'issued' : 'pending'
+      const { verified, ssl_status, cfg } = await checkDomain(hostname, row.kind as string)
 
       const { data: updated, error } = await supabase.from('tenant_domains')
         .update({ verified, ssl_status }).eq('id', row.id).eq('tenant_id', tenantId).select('*').single()
       if (error) { res.status(500).json({ error: error.message }); return }
-      console.log(`[storefront-domains] recheck "${hostname}" → verified=${verified} dnsOk=${dnsOk} ownershipOk=${ownershipOk}`)
-      res.json({ domain: updated, dns: cfg.ok ? cfg.json : null, misconfigured: cfg.json?.misconfigured ?? null })
+      console.log(`[storefront-domains] recheck "${hostname}" → verified=${verified} ssl=${ssl_status}`)
+      res.json({ domain: updated, dns: cfg, misconfigured: cfg?.misconfigured ?? null })
     } catch (e: any) {
       console.error(`[storefront-domains] recheck threw:`, e?.message)
       res.status(500).json({ error: e?.message || 'Could not check the domain status.' })
@@ -545,6 +634,47 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     } catch (e: any) { res.status(502).json({ error: e?.message || 'Sync failed' }) }
   })
 
+  // Server-to-server re-materialize by slug — no user session. Gated by the Supabase
+  // service-role key (only trusted internals hold it). Lets ops force a tenant's
+  // Tables catalog to re-compose + push to storefront-api after a direct data edit
+  // (a raw row write does NOT auto-materialize — only the API edit path does). Safe:
+  // idempotent, reads the rows as the source of truth, writes nothing to them.
+  r.post('/api/storefront/catalog/admin-rematerialize', async (req, res) => {
+    const key = String(req.headers['x-service-key'] || '')
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY || key !== process.env.SUPABASE_SERVICE_ROLE_KEY) return res.status(403).json({ error: 'forbidden' })
+    const slug = String((req.body as any)?.slug || '').trim()
+    if (!slug) return res.status(400).json({ error: 'slug required' })
+    const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+    const tenantId = (t as any)?.id
+    if (!tenantId) return res.status(404).json({ error: 'unknown tenant' })
+    try {
+      const counts = await materializeCatalog(supabase, tenantId, slug)
+      if (!counts) return res.status(400).json({ error: 'not Tables-backed' })
+      res.json({ ok: true, slug, ...counts })
+    } catch (e: any) { res.status(502).json({ error: e?.message || 'rematerialize failed' }) }
+  })
+
+  // Set each dish's per-outlet availability from the aggregator menus (a dish shows only
+  // where its Zomato/Swiggy outlet actually lists it). Operator-triggered.
+  r.post('/api/storefront/catalog/sync-outlet-availability', requireAuth, identifyTenant, async (req, res) => {
+    const tenantId = (req as any).tenantId
+    const slug = await slugOf(req, res); if (!slug) return
+    try { const out = await syncOutletAvailability(supabase, tenantId, slug); res.json({ ok: true, ...(out || {}) }) }
+    catch (e: any) { res.status(502).json({ error: e?.message || 'sync failed' }) }
+  })
+  // Service-key variant (server-to-server), same as admin-rematerialize.
+  r.post('/api/storefront/catalog/admin-sync-outlet-availability', async (req, res) => {
+    const key = String(req.headers['x-service-key'] || '')
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY || key !== process.env.SUPABASE_SERVICE_ROLE_KEY) return res.status(403).json({ error: 'forbidden' })
+    const slug = String((req.body as any)?.slug || '').trim()
+    if (!slug) return res.status(400).json({ error: 'slug required' })
+    const { data: t } = await supabase.from('tenants').select('id').eq('slug', slug).maybeSingle()
+    const tenantId = (t as any)?.id
+    if (!tenantId) return res.status(404).json({ error: 'unknown tenant' })
+    try { const out = await syncOutletAvailability(supabase, tenantId, slug); res.json({ ok: true, slug, ...(out || {}) }) }
+    catch (e: any) { res.status(502).json({ error: e?.message || 'sync failed' }) }
+  })
+
   // Catalog item/category edits (UI→Table) — the dashboard's rich dish editor
   // writes through here when the menu is Tables-backed, so add-ons get the proper
   // group editor and each save re-materializes the storefront snapshot.
@@ -598,13 +728,99 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     const upstreamPath = req.originalUrl.replace(/^\/api\/storefront/, '') // → /admin/... (keeps query string)
     const method = req.method.toUpperCase()
     const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'DELETE'
+
+    // ── OPS-ONLY GUARD ───────────────────────────────────────────────────────
+    // This proxy attaches the shared ADMIN_SECRET to whatever /admin/* path it is
+    // handed, and it builds the upstream headers FRESH — so storefront-api sees an
+    // identical request from a merchant and from a platform operator and cannot
+    // tell them apart. Every route it guards with that secret is therefore
+    // merchant-reachable, including ones whose comments say "OPS ONLY". This side
+    // is the only one that knows the caller's role, so the check has to live here.
+    //
+    // Two things a merchant must never do to themselves, because both make them
+    // self-serve for the PLATFORM gateway and so walk straight around payout KYC:
+    //   • resolve their own payout / settlement
+    //   • set their own Route payout account (routeAccountId)
+    // Without a verified linked account, prepaid orders collect real customer money
+    // into the platform account with nothing that can settle back to the merchant.
+    const OPS_ONLY = [/^\/admin\/payout\/status\b/, /^\/admin\/payout\/full\b/, /^\/admin\/payouts\//, /^\/admin\/settlement\/resolve\b/]
+    const touchesRouteAccount =
+      /^\/admin\/config\b/.test(upstreamPath) &&
+      hasBody && req.body && typeof req.body === 'object' &&
+      Object.prototype.hasOwnProperty.call(req.body, 'routeAccountId')
+    if (OPS_ONLY.some(re => re.test(upstreamPath)) || touchesRouteAccount) {
+      const role = normalizeRole(await resolvePlatformRole(supabase, (req as any).user?.id))
+      if (!role || !can('payments.route_account.write', role)) {
+        res.status(403).json({ error: 'This is set by Frequency ops, not from the merchant dashboard.' })
+        return
+      }
+    }
+
+    // ── SIBLING-SLUG FAN-OUT (approver identity writes) ─────────────────
+    // A merchant can own multiple tenant slugs (multi-brand: e.g. La Fiamma +
+    // Sofastory + Maplemortar under one workspace, or accidental provisioning
+    // dupes like la-fiamma-2 + lafiamma.in). Their APPROVER identity (team +
+    // PINs used for refund/cancellation authorisation) MUST resolve on every
+    // slug, otherwise a PIN saved on one slug rejects on another — the exact
+    // "PIN not recognised" the owner just hit.
+    //
+    // Whitelist which paths fan out. Only identity-writes that a merchant
+    // should share across their brands. Menu items, outlets, orders — per
+    // brand, DON'T fan out.
+    const FAN_OUT_PATHS = new Set(['/admin/operators'])  // add more as needed
+    const shouldFanOut = method === 'PUT' && FAN_OUT_PATHS.has(upstreamPath.split('?')[0])
+
+    let siblingSlugs: string[] = []
+    if (shouldFanOut) {
+      const uid = (req as any).user?.id
+      if (uid) {
+        // Every tenant this user has access to via: direct ownership, new-RBAC
+        // assignment, or legacy user_roles. UNION, then subtract the current
+        // slug (we always write to it first, siblings after).
+        const [owned, assigned, legacy] = await Promise.all([
+          supabase.from('tenants').select('slug').eq('user_id', uid).eq('status', 'active'),
+          supabase.from('user_role_assignments').select('tenants!inner(slug,status)').eq('user_id', uid),
+          supabase.from('user_roles').select('tenants!inner(slug,status)').eq('user_id', uid),
+        ])
+        const set = new Set<string>()
+        for (const r of (owned.data as any[] | null) || []) if (r?.slug) set.add(r.slug)
+        for (const r of (assigned.data as any[] | null) || []) if (r?.tenants?.status === 'active' && r?.tenants?.slug) set.add(r.tenants.slug)
+        for (const r of (legacy.data as any[] | null) || []) if (r?.tenants?.status === 'active' && r?.tenants?.slug) set.add(r.tenants.slug)
+        set.delete(slug)
+        siblingSlugs = [...set]
+      }
+    }
+
     try {
+      // PRIMARY write — the response we return to the client.
       const up = await fetch(`${SF_API}${upstreamPath}`, {
         method,
         headers: { 'Content-Type': 'application/json', 'X-Tenant': slug, 'X-Admin-Secret': SF_SECRET, 'X-Operator-Email': String((req as any).user?.email || '') },
         body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
       })
       const text = await up.text()
+
+      // FAN-OUT — only fire on success, don't propagate a bad request. Errors
+      // logged but never fail the primary response: the user's action already
+      // succeeded on the visible tenant, sibling drift is a separately-fixable
+      // ops issue and the storefront-api's `siblings` field would rescue it
+      // on the next save anyway.
+      if (up.ok && siblingSlugs.length > 0) {
+        console.info('[storefront-proxy] fan-out %s to %d siblings for %s', upstreamPath, siblingSlugs.length, slug)
+        await Promise.all(siblingSlugs.map(async (sib) => {
+          try {
+            const r2 = await fetch(`${SF_API}${upstreamPath}`, {
+              method,
+              headers: { 'Content-Type': 'application/json', 'X-Tenant': sib, 'X-Admin-Secret': SF_SECRET, 'X-Operator-Email': String((req as any).user?.email || '') },
+              body: hasBody ? JSON.stringify(req.body ?? {}) : undefined,
+            })
+            if (!r2.ok) console.warn('[storefront-proxy] fan-out FAILED slug=%s status=%d', sib, r2.status)
+          } catch (e: any) {
+            console.warn('[storefront-proxy] fan-out THREW slug=%s err=%s', sib, e?.message)
+          }
+        }))
+      }
+
       res.status(up.status)
       try { res.json(JSON.parse(text)) } catch { res.send(text) }
     } catch (e: any) {

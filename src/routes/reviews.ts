@@ -1,12 +1,21 @@
 /**
  * Reviews & Ratings — unified inbox + analytics + low-rating alert.
  *
- * One normalised table (public.reviews) fed by three sources:
+ * One normalised table (public.reviews) fed by four sources:
  *   • storefront — ours; real read + real reply (this app owns the surface).
+ *   • whatsapp   — ours too: the same guest rating, arriving via the feedback
+ *                  template button / Flow instead of the mini-app. Reply is
+ *                  QUEUED, not sent — see REPLY_UNSUPPORTED below for why.
  *   • zomato     — review LIST endpoint known; per-review ROW shape + reply
  *                  endpoint are capture-gated → reply is QUEUED, never faked.
  *   • swiggy     — only an AGGREGATE rating is exposed today → is_aggregate row;
  *                  per-review rows + reply stay disabled until captured.
+ *
+ * One order = one review row. storefront-api mirrors EVERY rating it records
+ * (source 'storefront'), and the WhatsApp webhook mirrors the same rating with
+ * the channel it actually knows — two concurrent fire-and-forget writes for one
+ * guest rating. ingestReview collapses them onto a single row keyed by
+ * (tenant, order_ref); see OWN_CHANNELS.
  *
  * Honesty rule (docs/reviews-ratings-design.md §0): NEVER claim an aggregator
  * reply posted that we didn't verify from a live capture. Aggregator reply →
@@ -30,12 +39,58 @@ import express from 'express'
 import crypto from 'crypto'
 import { SupabaseClient } from '@supabase/supabase-js'
 import { emitNotification, tenantNotifyRecipients } from './notifications'
+import { resolveWaCreds } from '../lib/wa-creds'
+
+const GRAPH = 'https://graph.facebook.com/v21.0'
+const WA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/** Free-text WhatsApp to the guest who rated, from the number the store talks on
+ *  (tenant's own → platform fallback, via resolveWaCreds). Valid ONLY inside Meta's 24h
+ *  customer-service window after the guest's tap — the caller checks that first.
+ *  'sent' is claimed only on a 200 carrying a message id. */
+async function sendWaReviewReply(supabase: SupabaseClient, tenantId: string, to: string, text: string): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const creds = await resolveWaCreds(supabase, tenantId)
+  if (!creds?.phoneNumberId || !creds.accessToken) return { ok: false, error: 'WhatsApp is not connected for this store' }
+  const num = String(to || '').replace(/\D/g, '')
+  if (!num) return { ok: false, error: 'No WhatsApp number on this review' }
+  try {
+    const r = await fetch(`${GRAPH}/${creds.phoneNumberId}/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${creds.accessToken}` },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: num, type: 'text', text: { body: text.slice(0, 4000) } }),
+    })
+    const j: any = await r.json().catch(() => ({}))
+    const id = j?.messages?.[0]?.id
+    if (r.ok && id) return { ok: true, id: String(id) }
+    return { ok: false, error: j?.error?.message || `WhatsApp rejected the send (${r.status})` }
+  } catch (e: any) { return { ok: false, error: e?.message || 'WhatsApp send failed' } }
+}
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
-const SOURCES = ['storefront', 'zomato', 'swiggy'] as const
+const SOURCES = ['storefront', 'whatsapp', 'zomato', 'swiggy'] as const
+
+/**
+ * Sources whose reply we cannot verifiably deliver → reply_status 'queued', never 'sent'.
+ *
+ * zomato/swiggy: reply endpoint contract not captured (§0 honesty rule).
+ * whatsapp is NOT here any more: the reply route sends it as a free-text session
+ *   message inside Meta's 24h window after the guest's tap (source_meta.phone, the
+ *   number the store talks on), and flips to 'sent' ONLY on a 200 carrying a message
+ *   id. Outside the window it stays 'queued' with the reason — a `review_reply_v1`
+ *   template is the upgrade path for late replies.
+ */
 const REPLY_UNSUPPORTED: Record<string, boolean> = { zomato: true, swiggy: true }
 const STATUSES = ['new', 'seen', 'actioned', 'ignored'] as const
+
+/**
+ * Our own channels — the mini-app and WhatsApp are two doors onto the SAME guest
+ * rating on the SAME order. Identity across them is (tenant_id, order_ref), not
+ * (tenant_id, source, source_review_id): a second row would double-count the avg,
+ * the distribution and the reply-rate the whole Reviews page is built on.
+ * 'whatsapp' wins the label whichever write lands first — the arrival order of two
+ * concurrent fire-and-forget writes must not decide what the operator sees.
+ */
+const OWN_CHANNELS = ['storefront', 'whatsapp']
 
 // HoReCa theme label set (§7). Keyword → theme; first-match, cheap, deterministic.
 const THEME_KEYWORDS: [string, RegExp][] = [
@@ -123,14 +178,25 @@ export async function ingestReview(supabase: SupabaseClient, input: ReviewInput)
   const theme = deriveThemes(text)
 
   // Was there already a row? (decides whether to emit — never re-alert a re-sync)
-  const { data: existing } = await supabase.from('reviews')
-    .select('id, reply_status')
-    .eq('tenant_id', input.tenantId).eq('source', input.source).eq('source_review_id', input.sourceReviewId)
-    .maybeSingle()
+  // For our own channels the match is by ORDER, so the mini-app mirror and the
+  // WhatsApp mirror of one rating find each other and update instead of doubling.
+  const byOrder = OWN_CHANNELS.includes(input.source) && !!input.orderRef
+  const { data: existing } = byOrder
+    ? await supabase.from('reviews')
+        .select('id, source, reply_status')
+        .eq('tenant_id', input.tenantId).eq('order_ref', input.orderRef!).in('source', OWN_CHANNELS)
+        .limit(1).maybeSingle()
+    : await supabase.from('reviews')
+        .select('id, source, reply_status')
+        .eq('tenant_id', input.tenantId).eq('source', input.source).eq('source_review_id', input.sourceReviewId)
+        .maybeSingle()
+  // 'whatsapp' is the more specific fact (we know how it came in) — it never gets
+  // demoted back to 'storefront' by the sibling mirror landing second.
+  const source = byOrder && (existing as any)?.source === 'whatsapp' ? 'whatsapp' : input.source
 
   const row: any = {
     tenant_id: input.tenantId,
-    source: input.source,
+    source,
     source_review_id: input.sourceReviewId,
     order_ref: input.orderRef ?? null,
     outlet_ref: input.outletRef ?? null,
@@ -152,9 +218,16 @@ export async function ingestReview(supabase: SupabaseClient, input: ReviewInput)
     updated_at: new Date().toISOString(),
   }
 
-  const { data: saved, error } = await supabase.from('reviews')
-    .upsert(row, { onConflict: 'tenant_id,source,source_review_id' })
-    .select('id').single()
+  // A sparser second write must never erase a richer first one: in an ingest a null
+  // (or an empty derived array) means "this channel didn't carry the field", never
+  // "clear it". Only ever applies on the update path — inserts keep the full shape.
+  if (existing) for (const [k, v] of Object.entries(row)) if (v === null || (Array.isArray(v) && !v.length)) delete row[k]
+
+  const { data: saved, error } = existing
+    ? await supabase.from('reviews').update(row).eq('id', (existing as any).id).select('id').single()
+    : await supabase.from('reviews')
+        .upsert(row, { onConflict: 'tenant_id,source,source_review_id' })
+        .select('id').single()
   if (error) { console.warn('[reviews] upsert failed:', error.message); return { ok: false, error: error.message } }
 
   // Real-time low-rating alert: only for a NEW, real (non-aggregate) ≤3★ review.
@@ -171,7 +244,7 @@ export async function ingestReview(supabase: SupabaseClient, input: ReviewInput)
           event_key: 'review.low',
           recipient_user_ids: gated,
           data: {
-            source: input.source, stars,
+            source, stars,
             text_snippet: snippet(text) || '(no comment)',
             customer_name: input.customerName || 'A customer',
             outlet: input.outletRef || (t as any)?.name || '',
@@ -322,23 +395,34 @@ export function createReviewsRouter(supabase: SupabaseClient, requireAuth: Mw, i
     const body = String((req.body as any)?.reply_text ?? '').trim().slice(0, 2000)
     if (!body) { res.status(400).json({ error: 'reply_text required' }); return }
     const { data: rev } = await supabase.from('reviews')
-      .select('id, source, is_aggregate').eq('tenant_id', tenantId).eq('id', String(req.params.id)).maybeSingle()
+      .select('id, source, is_aggregate, source_meta, review_at').eq('tenant_id', tenantId).eq('id', String(req.params.id)).maybeSingle()
     if (!rev) { res.status(404).json({ error: 'Review not found' }); return }
     if ((rev as any).is_aggregate) { res.status(422).json({ error: 'Aggregate ratings have no individual review to reply to' }); return }
 
-    const aggregator = REPLY_UNSUPPORTED[(rev as any).source]
-    const reply_status = aggregator ? 'queued' : 'sent'
+    const source = String((rev as any).source)
+    let reply_status: 'queued' | 'sent' = REPLY_UNSUPPORTED[source] ? 'queued' : 'sent'
+    let message = REPLY_UNSUPPORTED[source]
+      ? `Reply saved. It will post once the ${source} reply channel is verified.`
+      : 'Reply sent.'
+    if (source === 'whatsapp') {
+      // Deliver it to the guest — inside the 24h window that opened when they tapped.
+      const phone = String((rev as any).source_meta?.phone || '')
+      const tappedAt = new Date((rev as any).review_at || 0).getTime()
+      const inWindow = tappedAt > 0 && Date.now() - tappedAt < WA_REPLY_WINDOW_MS
+      if (!inWindow) {
+        reply_status = 'queued'
+        message = 'Saved here only — the 24-hour WhatsApp reply window after the guest\'s rating has closed, so it was not delivered.'
+      } else {
+        const r = await sendWaReviewReply(supabase, tenantId, phone, body)
+        if (r.ok) { reply_status = 'sent'; message = 'Reply sent to the guest on WhatsApp.' }
+        else { reply_status = 'queued'; message = `Saved, not delivered — ${r.error}.` }
+      }
+    }
     const { data, error } = await supabase.from('reviews')
       .update({ reply_text: body, reply_status, reply_at: new Date().toISOString(), reply_by: userId, updated_at: new Date().toISOString() })
       .eq('tenant_id', tenantId).eq('id', String(req.params.id)).select('*').single()
     if (error) { res.status(500).json({ error: error.message }); return }
-    res.json({
-      review: data,
-      queued: aggregator,
-      message: aggregator
-        ? `Reply saved. It will post once the ${(rev as any).source} reply channel is verified.`
-        : 'Reply sent.',
-    })
+    res.json({ review: data, queued: reply_status !== 'sent', message })
   })
 
   // ── Draft reply (recommendation only) ──────────────────────────────────────

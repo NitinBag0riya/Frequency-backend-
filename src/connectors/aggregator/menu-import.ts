@@ -34,6 +34,67 @@ export interface ParsedEntity {
   price: number | null
   category_ref: string | null
   raw: any
+  /** Add-on groups the aggregator attaches to this dish (Zomato modifier groups).
+   *  Maps 1:1 onto our OptionGroup — see zomatoOptionGroups(). */
+  options?: ParsedOptionGroup[]
+}
+
+export interface ParsedOptionGroup {
+  name: string
+  type: 'single' | 'multi'
+  choices: { name: string; priceDelta: number }[]
+}
+
+/**
+ * Zomato add-ons: dishes and modifiers share `catalogueWrappers`, and the binding is
+ *   catalogueWrappers[].mapModifierGroupOrder  → modifierGroupId(s) for that dish
+ *   modifierGroupWrappers[].variantModifierGroupMaps[] → variantId per group
+ *   mapVariantIdToCatalogueId                  → the modifier's own catalogue
+ * so a dish's options are its groups, each holding the non-root catalogues mapped to it.
+ * `max`/`maxSelectionsPerItem` gives single vs multi. Verified against the captured
+ * Sambar Sutra payload (__fixtures__/zomato-menu-modifiers.json).
+ */
+export function zomatoOptionGroups(mr: any): Map<string, ParsedOptionGroup[]> {
+  const out = new Map<string, ParsedOptionGroup[]>()
+  const groups: any[] = Array.isArray(mr?.modifierGroupWrappers) ? mr.modifierGroupWrappers : []
+  if (!groups.length) return out
+  const v2c: Record<string, any> = mr?.mapVariantIdToCatalogueId ?? {}
+  // every catalogue (root AND modifier) by id, with its resolved price
+  const cats = new Map<string, { name: string; price: number }>()
+  for (const w of (mr?.catalogueWrappers ?? [])) {
+    const c = w?.catalogue
+    if (c?.catalogueId == null) continue
+    cats.set(String(c.catalogueId), { name: String(c.name ?? ''), price: Number(zomatoWrapperPrice(w) ?? 0) || 0 })
+  }
+  const byGroupId = new Map<string, ParsedOptionGroup>()
+  for (const g of groups) {
+    const mg = g?.modifierGroup
+    if (mg?.modifierGroupId == null) continue
+    const max = Number(mg.maxSelectionsPerItem ?? mg.max ?? 0) || 0
+    const choices: { name: string; priceDelta: number }[] = []
+    const seen = new Set<string>()
+    for (const mp of (g?.variantModifierGroupMaps ?? [])) {
+      const cid = v2c[String(mp?.variantId)] ?? v2c[mp?.variantId]
+      const c = cid != null ? cats.get(String(cid)) : undefined
+      if (!c?.name || seen.has(c.name)) continue
+      seen.add(c.name)
+      choices.push({ name: c.name, priceDelta: c.price })
+    }
+    if (!choices.length) continue
+    byGroupId.set(String(mg.modifierGroupId), {
+      name: String(mg.displayName || mg.name || 'Options'),
+      type: max === 1 ? 'single' : 'multi',
+      choices,
+    })
+  }
+  for (const w of (mr?.catalogueWrappers ?? [])) {
+    const c = w?.catalogue
+    if (c?.catalogueId == null || c.isRootCatalogue !== true) continue
+    const order = w?.mapModifierGroupOrder ?? {}
+    const gs = Object.keys(order).map(id => byGroupId.get(String(id))).filter(Boolean) as ParsedOptionGroup[]
+    if (gs.length) out.set(String(c.catalogueId), gs)
+  }
+  return out
 }
 
 /**
@@ -87,9 +148,18 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
         in_stock: true, price: null, category_ref: null, raw: c,
       })
     }
+    // Zomato mixes DISHES and ADD-ONS in one catalogueWrappers array; `isRootCatalogue`
+    // is the discriminator (add-ons have category:[] and no root flag). We used to rely on
+    // add-ons having a null catalogueId — true on some listings, NOT on others, so a
+    // listing whose add-ons carry real ids imported 27 modifiers (Extra Sambhar, Burrata
+    // Cheese, Olives…) as sellable dishes. Only trust the flag when the payload actually
+    // uses it, so older/other shapes that never set it are untouched.
+    const usesRootFlag = mr.catalogueWrappers.some((w: any) => w?.catalogue?.isRootCatalogue === true)
+    const optionsByCatalogue = zomatoOptionGroups(mr)
     for (const w of mr.catalogueWrappers) {
       const cat = w?.catalogue
       if (cat?.catalogueId == null) continue
+      if (usesRootFlag && cat.isRootCatalogue !== true) continue   // an add-on, not a dish
       rows.push({
         entity_type: 'item', entity_id: String(cat.catalogueId), name: cat.name ?? null,
         in_stock: cat.inStock !== false,
@@ -98,8 +168,11 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
         // (service="delivery"). Resolve from there first (verified live 2026-08-11);
         // fall back to legacy catalogue shapes. null → flagged needs-review, never dropped.
         price: zomatoWrapperPrice(w),
+        options: optionsByCatalogue.get(String(cat.catalogueId)),
         category_ref: cat.category?.categoryId != null ? String(cat.category.categoryId) : null,
-        raw: cat,
+        // catalogueTags ("veg" | "non-veg" | "egg" | …) live on the WRAPPER, not the
+        // catalogue — carry them into raw so the dietary mark can read them. Additive.
+        raw: cat.catalogueTags ? cat : { ...cat, catalogueTags: w?.catalogueTags },
       })
     }
     if (rows.length) return rows
@@ -139,19 +212,78 @@ export function parseMenuSnapshot(body: any): ParsedEntity[] {
 export const normKey = (s: unknown): string => String(s ?? '').toLowerCase().normalize('NFKD')
   .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ')
 
-/** Best-effort veg flag across Swiggy (is_veg:"VEG"|"NON_VEG") + Zomato (veg/1|2). */
-export function vegOf(raw: any): boolean {
+/** Mirrors the storefront's FoodType — see storefront-api/food-type.js. */
+export type FoodType = 'veg' | 'nonveg' | 'egg' | 'unset'
+
+/**
+ * Best-effort dietary mark across Swiggy (is_veg:"VEG"|"NON_VEG") + Zomato (1=veg,
+ * 2=non-veg, 3=egg).
+ *
+ * Returns 'unset' when the payload does not say — which is common, because neither
+ * aggregator guarantees the field on every item. That is the whole point: the old
+ * boolean version fell back to `false`, so an unclassified import silently landed in
+ * OUR menu as non-veg, and a veg dish showed a red mark to the diner. Unknown must
+ * stay unknown until a human says otherwise.
+ *
+ * NOTE the asymmetry when pushing back the other way: Swiggy treats a MISSING food
+ * type as NON-VEG on their side, so an 'unset' item must never be published to them
+ * — resolve it with the operator first.
+ */
+/**
+ * Resolve a dietary mark from a list of free-text tags.
+ * ORDER MATTERS: "non-veg" contains "veg", so non-veg must be ruled out first.
+ */
+function fromTags(tags: unknown): FoodType | null {
+  if (!Array.isArray(tags)) return null
+  const list = tags.filter((t) => typeof t === 'string').map((t) => (t as string).toLowerCase().trim())
+  if (!list.length) return null
+  if (list.some((t) => t.includes('non') && t.includes('veg'))) return 'nonveg'
+  if (list.some((t) => t.includes('egg'))) return 'egg'
+  if (list.some((t) => t === 'veg' || t === 'vegetarian' || t === 'pure-veg')) return 'veg'
+  return null
+}
+
+/**
+ * Zomato's real get_content_menu payload states the dietary mark as a dish attribute
+ * (`dishAttributes[].attributes[]` with attributeKey "primary_dietary_tags"), NOT as
+ * an is_veg scalar. Verified against the captured La Fiamma snapshot.
+ */
+function dietaryAttributeTags(raw: any): string[] {
+  const out: string[] = []
+  for (const d of Array.isArray(raw?.dishAttributes) ? raw.dishAttributes : []) {
+    for (const a of Array.isArray(d?.attributes) ? d.attributes : []) {
+      if (String(a?.attributeKey ?? '').toLowerCase().includes('dietary')) {
+        for (const v of Array.isArray(a?.attributeValues) ? a.attributeValues : []) out.push(String(v))
+      }
+    }
+  }
+  return out
+}
+
+export function foodTypeOf(raw: any): FoodType {
   const v = raw?.is_veg ?? raw?.veg ?? raw?.isVeg ?? raw?.classifier ?? raw?.item_attribute
-  if (typeof v === 'boolean') return v
+  if (typeof v === 'boolean') return v ? 'veg' : 'nonveg'
   if (typeof v === 'string') {
     const s = v.toUpperCase()
-    if (s.includes('NON')) return false
-    if (s === 'VEG' || s === '1' || s === 'TRUE' || s === 'YES') return true
-    return false
+    if (s.includes('EGG')) return 'egg'
+    if (s.includes('NON')) return 'nonveg'   // must precede the VEG test — "NON_VEG" contains "VEG"
+    if (s === 'VEG' || s === '1' || s === 'TRUE' || s === 'YES') return 'veg'
+    if (s === '2' || s === 'FALSE' || s === 'NO') return 'nonveg'
+    return 'unset'
   }
-  if (v === 1) return true   // Zomato: 1 = veg
-  if (v === 2) return false  // Zomato: 2 = non-veg
-  return false
+  if (v === 1) return 'veg'      // Zomato: 1 = veg
+  if (v === 2) return 'nonveg'   // Zomato: 2 = non-veg
+  if (v === 3) return 'egg'      // Zomato: 3 = contains egg
+  // No scalar — fall back to the shapes the LIVE payloads actually use.
+  return fromTags(dietaryAttributeTags(raw))       // Zomato: primary_dietary_tags
+      ?? fromTags(raw?.catalogueTags)              // Zomato: wrapper-level tags
+      ?? fromTags(raw?.tags)                       // Swiggy / generic tag lists
+      ?? 'unset'                                   // told nothing → say nothing
+}
+
+/** Back-compat wrapper for callers that still want the bool. Only true veg is true. */
+export function vegOf(raw: any): boolean {
+  return foodTypeOf(raw) === 'veg'
 }
 
 /**
@@ -276,10 +408,13 @@ export interface MappedItem {
   name: string
   priceInr: number
   veg: boolean
+  foodType: FoodType
   soldOut: boolean
   description: string
   imageUrl: string | null
   catSourceId: string | null
+  /** Aggregator add-on groups → our OptionGroup shape (absent when it has none). */
+  options?: ParsedOptionGroup[]
 }
 
 /** Map normalised aggregator entities → storefront categories + items. */
@@ -297,10 +432,12 @@ export function mapEntities(entities: ParsedEntity[]): { categories: MappedCateg
         sourceId: e.entity_id,
         name,
         priceInr: Math.max(0, Math.round(Number(e.price) || 0)),
+        foodType: foodTypeOf(e.raw),
         veg: vegOf(e.raw),
         soldOut: !e.in_stock,
         description: String(e.raw?.description ?? e.raw?.desc ?? '').slice(0, 160),
         imageUrl: e.raw?.image_url ?? e.raw?.s3_image_url ?? e.raw?.imageUrl ?? e.raw?.image ?? null,
+        options: e.options,
         catSourceId: e.category_ref,
       })
     }
@@ -449,7 +586,10 @@ export async function importMenuToStorefront(
       const body: any = {
         name: it.name,
         priceInr: it.priceInr,
+        // foodType is the truth; veg rides along as the mirror older readers use.
+        foodType: it.foodType,
         veg: it.veg,
+        ...(it.options?.length ? { options: it.options } : {}),
         soldOut: it.soldOut,
         description: it.description,
         categoryId,
@@ -472,11 +612,19 @@ export async function importMenuToStorefront(
       continue
     }
 
-    // UPDATE — only fields we own: price + availability (soldOut) + outlet scope, plus a
-    // one-way image BACKFILL (fill a blank image only). Leave name/description/veg/coins/
-    // options — and any EXISTING image — as the merchant curated them.
+    // UPDATE — only fields we own: price + availability (soldOut) + outlet scope, plus
+    // one-way BACKFILLS (fill a blank only). Leave name/description/veg/coins — and any
+    // EXISTING image or option groups — as the merchant curated them.
     const patch: any = {}
     const changes: Record<string, { from: any; to: any }> = {}
+    // Add-on groups: backfill ONLY when the item has none. Items that predate add-on
+    // support carry no options, so without this every existing dish would stay without
+    // its aggregator modifiers forever (imports only ever created them). One-way: an
+    // operator's own groups are never touched.
+    if (it.options?.length && !(Array.isArray(existing.options) && existing.options.length)) {
+      patch.options = it.options
+      changes.options = { from: 0, to: it.options.length }
+    }
     // Storefront base = the HIGHER of the channels seen (Swiggy vs Zomato), so the
     // direct price is never below what an aggregator charges. Only ever raises to
     // match the top channel; a later cheaper channel never lowers it.

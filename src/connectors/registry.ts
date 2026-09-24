@@ -1404,6 +1404,52 @@ const GMAIL: ConnectorDef = {
   ],
 }
 
+// Google Business Profile — reputation surface (locations + reviews + replies).
+// Its OWN connect (own scope=business.manage, own tenants.gbp_refresh_token
+// column) but runs under the SAME OAuth client as the SEO/Search Console
+// connector (the "Frequency Search Console" app / GOOGLE_OAUTH_*), NOT the
+// Gmail/Sheets Google app. status='beta': OAuth works today, but the GBP API
+// needs a one-time per-project access grant from Google before accounts/
+// locations/reviews return data — until then /status reports apiAccess:'denied'.
+const GOOGLE_BUSINESS: ConnectorDef = {
+  key: 'google_business',
+  name: 'Google Business Profile',
+  category: 'crm',
+  tier: 1,
+  status: 'beta',
+  authMode: 'oauth',
+  brandColor: '#4285F4',
+  iconName: 'Store',
+  shortDescription: 'Read and reply to your Google reviews across your business locations.',
+  docsUrl: 'https://developers.google.com/my-business',
+  oauthScope: 'https://www.googleapis.com/auth/business.manage email profile',
+  requiresPartnerRegistration: true,
+  setupNote: 'Uses the same Google OAuth app as Search Console (GOOGLE_OAUTH_*). Owner actions in Google Cloud Console: (1) add the business.manage scope to that app’s consent screen, (2) register GBP’s redirect URI (GBP_OAUTH_REDIRECT_URI, default /api/connectors/gbp/callback) on that client, (3) request the one-time Business Profile API access grant. OAuth connects immediately; reviews appear once Google approves API access.',
+  capabilities: [
+    { key: 'list_reviews', label: 'Reviews', description: 'Star ratings + comments across a location, with your replies.', iconName: 'Star', apiPath: '/api/connectors/gbp/reviews', apiMethod: 'GET', uiKind: 'list', status: 'live',
+      outputSchema: { fields: [
+        { key: 'id',         label: 'Review ID',  type: 'string', sample: 'AbFvOq…' },
+        { key: 'reviewer',   label: 'Reviewer',   type: 'string', sample: 'Asha K.' },
+        { key: 'rating',     label: 'Rating',     type: 'number', sample: 5 },
+        { key: 'comment',    label: 'Comment',    type: 'string', sample: 'Great service, quick delivery.' },
+        { key: 'createTime', label: 'Left at',    type: 'string', sample: '2026-08-12T10:15:00Z' },
+        { key: 'reply',      label: 'Your reply', type: 'object', sample: { comment: 'Thanks Asha!', updateTime: '2026-08-12T11:00:00Z' } },
+      ] },
+    },
+    { key: 'reply_review', label: 'Reply to review', description: 'Post or update the business reply to a review.', iconName: 'CornerUpLeft', apiPath: '/api/connectors/gbp/reviews/reply', apiMethod: 'POST', uiKind: 'modal', status: 'live',
+      inputSchema: { fields: [
+        { key: 'reviewName', label: 'Review name', type: 'text', required: true,
+          placeholder: 'accounts/123/locations/456/reviews/abc',
+          description: 'Full GBP review resource name (from the Reviews list).' },
+        { key: 'comment',    label: 'Reply',       type: 'textarea', required: true, supportsVariables: true },
+      ] },
+      outputSchema: { fields: [
+        { key: 'ok', label: 'Result', type: 'boolean', sample: true },
+      ] },
+    },
+  ],
+}
+
 const RAZORPAY: ConnectorDef = {
   key: 'razorpay',
   name: 'Razorpay',
@@ -2494,6 +2540,8 @@ export const CONNECTOR_REGISTRY: ConnectorDef[] = [
   META_ADS,
   // Productivity / data
   GOOGLE_DRIVE, GOOGLE_SHEETS, GOOGLE_CALENDAR, GMAIL,
+  // Reputation
+  GOOGLE_BUSINESS,
   RAZORPAY, AIRTABLE, SHOPIFY,
   // India-first live: SMS/OTP rail
   MSG91,

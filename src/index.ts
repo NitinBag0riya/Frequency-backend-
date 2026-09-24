@@ -7,12 +7,12 @@ import cors from 'cors'
 import crypto from 'crypto'
 import helmet from 'helmet'
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
-import { createClient } from '@supabase/supabase-js'
+import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets, calendarCreateEvent, gmailSendEmail, getValidGoogleToken } from './google'
 import { createLeadsRouter } from './leads'
 import { createKhataRouter } from './routes/khata'
-import { createReviewsRouter } from './routes/reviews'
+import { createReviewsRouter, ingestReview } from './routes/reviews'
 import { createComplaintsRouter } from './routes/complaints'
 import { verifyAttestation, enrollInstall, EnrollSchema, makeInMemoryRateLimiter, type InstallRecord } from './routes/desktop-attestation'
 import { resolveDesktopRuntimeConfig, resolveDesktopManifest } from './routes/desktop-runtime-config'
@@ -20,6 +20,11 @@ import { createListingsRouter } from './routes/listings'
 import { createAppointmentsRouter } from './routes/appointments'
 import { createTasksRouter } from './routes/tasks'
 import { createVendorsRouter } from './routes/vendors'
+import { createStaffRouter } from './routes/staff'
+import { createCampaignsRouter } from './routes/campaigns'
+import { startCatalogSync } from './workers/catalog-sync'
+import { startWastageSync } from './workers/wastage-sync'
+import { startCoinLedgerSync } from './workers/coin-ledger-sync'
 import { createAdminRouter } from './admin'
 import { createPhase3Router } from './routes/phase3'
 import { createDataSourcesRouter } from './routes/data-sources'
@@ -42,14 +47,18 @@ import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue 
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
+import { createMetaWebhookRouter } from './routes/meta-webhook'
+import { createMetaBusinessAssetsRouter } from './routes/meta-business-assets'
 import { createSuperAdminRouter }  from './routes/super-admin'
 import { createNarutoTenantsRouter }       from './routes/naruto-tenants'
 import { createNarutoOnboardingRouter }    from './routes/naruto-onboarding'
 import { createNarutoCatalogImportRouter } from './routes/naruto-catalog-import'
 import { createNarutoStorefrontRouter }    from './routes/naruto-storefront'
 import { createNarutoSupportRouter }       from './routes/naruto-support'
+import { createSupportRouter }             from './routes/support'
 import { createNarutoPaymentsRouter }      from './routes/naruto-payments'
 import { createNarutoOrdersRouter }        from './routes/naruto-orders'
+import { createSeoGscRouter }              from './routes/seo-gsc'
 import { createPlatformApprovalsRouter }   from './routes/platform-approvals'
 import { createNarutoBulkEntitlementsRouter } from './routes/naruto-bulk-entitlements'
 import { createNarutoPlansRouter }         from './routes/naruto-plans'
@@ -57,6 +66,10 @@ import { createNarutoNudgesRouter }        from './routes/naruto-nudges'
 import { createNarutoGrowthRouter }        from './routes/naruto-growth'
 import { createNarutoTenantReportsRouter } from './routes/naruto-tenant-reports'
 import { touchLastActive }         from './lib/last-active'
+import { impersonationGate, resolveImpersonatedTenant } from './lib/platform-impersonation'
+import { resolvePlatformRole, resolvePlatformTenantAccess } from './lib/platform-guard'
+import { normalizeRole } from './lib/platform-rbac'
+import { recordPlatformAudit } from './lib/platform-audit'
 import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
 import { createTenantAuditRouter } from './routes/tenant-audit'
@@ -387,6 +400,8 @@ app.use(WA_CALLS_WEBHOOK_PATH, express.raw({ type: 'application/json', limit: '1
 // express.json() parser.
 app.use('/webhook/whatsapp', express.raw({ type: 'application/json', limit: '5mb' }))
 app.use('/webhook/instagram', express.raw({ type: 'application/json', limit: '5mb' }))
+// Meta Lead Ads (Facebook Page `leadgen` field). See routes/meta-webhook.ts.
+app.use('/webhooks/meta', express.raw({ type: 'application/json', limit: '5mb' }))
 
 // P1 #11 — Shopify webhook. Same raw-body requirement: Shopify HMAC-signs the
 // exact byte sequence. We attach rawBody via the express.json `verify` hook
@@ -507,6 +522,7 @@ const SENSITIVE_LOG_PATHS = new Set([
   '/webhook/whatsapp',
   '/webhook/instagram',
   '/webhook/telegram',
+  '/webhooks/meta',
   '/api/billing/razorpay/webhook',
   // F9: OAuth callbacks carry `?code=...&state=...` — short-lived but
   // sensitive enough that a leaked log line within their TTL is exploitable.
@@ -516,6 +532,9 @@ const SENSITIVE_LOG_PATHS = new Set([
   '/api/auth/airtable/callback',
   '/api/auth/shopify/callback',
   '/api/auth/razorpay/callback',
+  // FBLfB (Instagram + Meta Ads + Leads via FB.login({config_id})).
+  // Body carries the one-time `code` — same sensitivity as query-based OAuth callbacks.
+  '/api/auth/meta_business_assets/callback',
   // P1 #11 — Shopify direct OAuth callback + inbound webhook. Both carry
   // signed payloads (state HMAC and Shopify HMAC respectively).
   '/api/shopify/callback',
@@ -661,6 +680,18 @@ app.use('/api/wa-calling/dispatch',  sendLimiter)
 const authLimiter = makeLimiter({ windowMs: 60_000, max: 10, perUser: false })
 app.use('/api/auth/',     authLimiter)
 app.use('/api/onboarding', authLimiter)
+// Phone team invites: creating one sends a WhatsApp (Meta credit) → sendLimiter;
+// accepting one is unauthenticated + creates an auth account (brute-force
+// surface) → authLimiter, IP-keyed like the other account-creation flows.
+app.use('/api/team/invite-phone',         sendLimiter)
+app.use('/api/team/accept-invite-phone',  authLimiter)
+
+// ── Impersonation gate ────────────────────────────────────────────────────
+// Global, ahead of every route. No `X-Impersonate-Token` header → no-op, so
+// every existing caller is byte-identical. A present token is verified and,
+// if it verifies, pins the request read-only server-side (impersonation-
+// tenant-view §BE-01/02) — the FE banner alone was never enforcement.
+app.use(impersonationGate)
 
 app.get('/api/ping', (req, res) => res.json({ pong: true }))
 
@@ -766,6 +797,39 @@ async function requireAuth(req: express.Request, res: express.Response, next: ex
 
 // ── RBAC Middlewares ──────────────────────────────────────────────────────────
 
+// Cheap membership probe used only by identifyTenant's platform branch (R2,
+// platform-tenant-bypass §Option C) to decide "is this platform-role caller
+// ALSO a real member of the header tenant" — mirrors the three membership
+// paths section 1 below checks (new-RBAC assignment, legacy user_roles,
+// direct ownership) plus agency sub-account access. Intentionally not the
+// single source of truth for membership (section 1 remains that); this only
+// needs a boolean to route platform vs. member, and section 1 re-resolves
+// the real role/tenant for the `member` outcome.
+async function isRealTenantMember(supabase: SupabaseClient, userId: string, tenantId: string): Promise<boolean> {
+  const [{ data: assignment }, { data: legacyRole }, { data: owned }] = await Promise.all([
+    supabase.from('user_role_assignments').select('id').eq('user_id', userId).eq('tenant_id', tenantId).maybeSingle(),
+    supabase.from('user_roles').select('id').eq('user_id', userId).eq('tenant_id', tenantId).maybeSingle(),
+    supabase.from('tenants').select('id').eq('id', tenantId).eq('user_id', userId).eq('status', 'active').maybeSingle(),
+  ])
+  if (assignment || legacyRole || owned) return true
+
+  const { data: memberships } = await supabase
+    .from('agency_members')
+    .select('agency_id')
+    .eq('user_id', userId)
+    .not('accepted_at', 'is', null)
+  const agencyIds = (memberships ?? []).map((m: any) => m.agency_id)
+  if (!agencyIds.length) return false
+  const { data: subLink } = await supabase
+    .from('agency_sub_accounts')
+    .select('agency_id')
+    .eq('tenant_id', tenantId)
+    .is('removed_at', null)
+    .in('agency_id', agencyIds)
+    .maybeSingle()
+  return !!subLink
+}
+
 async function identifyTenant(req: express.Request, res: express.Response, next: express.NextFunction) {
   const user = (req as any).user
   if (!user) { apiError(res, 401, 'unauthorized', 'Authentication required.'); return }
@@ -793,33 +857,106 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
   logger.debug(`[identifyTenant] user=${user.id}, header_tenant=${headerTenantId || '(none)'}`)
 
   // 0. Platform-scoped role check — runs first so Platform Console actions
-  //    bypass per-tenant permission checks entirely. Two paths:
-  //    (a) new RBAC: a row in user_role_assignments with tenant_id IS NULL
-  //    (b) legacy:   user_roles row with role='super_admin' and tenant_id IS NULL
-  const { data: platformAssignment } = await supabase
-    .from('user_role_assignments')
-    .select('role_definitions ( key, scope )')
-    .eq('user_id', user.id).is('tenant_id', null).maybeSingle()
-  const platformRoleKey = (platformAssignment as any)?.role_definitions?.key as string | undefined
-  let isPlatform = !!platformRoleKey
+  //    bypass per-tenant permission checks entirely. resolvePlatformRole is
+  //    the single source of truth for "is this a platform user" (new RBAC
+  //    user_role_assignments row, tenant_id IS NULL, honouring disabled_at +
+  //    scope==='platform'; falls back to the legacy user_roles super_admin
+  //    row) — same helper requirePlatformCapability uses, so a disabled
+  //    platform assignment is consistently NOT platform everywhere, not just
+  //    on /naruto routes (R2, platform-tenant-bypass).
+  const platformRoleKey = (await resolvePlatformRole(supabase, user.id)) ?? undefined
+  const isPlatform = !!platformRoleKey
 
-  if (!isPlatform) {
-    const { data: legacySuper } = await supabase
-      .from('user_roles')
-      .select('role')
-      .eq('user_id', user.id).is('tenant_id', null).maybeSingle()
-    if (legacySuper?.role === 'super_admin') isPlatform = true
+  // Impersonation pins the tenant BEFORE the general platform branch below —
+  // an impersonated request must never fall through to "trusted at the
+  // platform layer, accept any X-Tenant-ID" (impersonation-tenant-view
+  // §BE-02). impersonatorId is only ever set by impersonationGate, which has
+  // already verified the token's signature/expiry; this resolves who may use
+  // it and for which tenant.
+  const impersonatorId = (req as any).impersonatorId as string | undefined
+  if (impersonatorId) {
+    const resolved = resolveImpersonatedTenant({
+      isPlatform,
+      userId: user.id,
+      impersonatorId,
+      impersonatedTenantId: (req as any).impersonatedTenantId,
+      headerTenantId,
+    })
+    if (!resolved.ok) {
+      logger.warn(`[identifyTenant] SECURITY: impersonation resolution failed for user=${user.id} code=${resolved.code}`)
+      apiError(res, resolved.status, resolved.code, 'Impersonation session is not valid for this request.')
+      return
+    }
+    // Root-cause fix (reviewer, 2026-09-24): do NOT grant the blanket
+    // isSuperAdmin bypass here. isSuperAdmin means "trusted at the platform
+    // layer, may target any tenant" — dozens of downstream consumers key off
+    // it to skip their own tenant/path-id check entirely (checkPermission,
+    // nav-config.ts, teams.ts, wa-calling.ts, and the `!isSuperAdmin &&
+    // req.params.id !== tenantId` guards on GET/PATCH /api/tenants/:id...).
+    // An impersonated request is pinned to exactly the ONE tenant resolved
+    // above and must be treated like a normal member of it — a distinct
+    // `impersonating` flag plus the R1-approved `viewer` role, never
+    // `isSuperAdmin` — so a request impersonating tenant A can never read or
+    // act on tenant B by supplying a different :id in the URL.
+    ;(req as any).impersonating = true
+    ;(req as any).userRole = 'viewer'
+    ;(req as any).userRoleKey = 'viewer'
+    ;(req as any).tenantId = resolved.tenantId
+    // Impersonated browsing must not touch the tenant's own last-active
+    // signal — it isn't the tenant's activity. Call the wrapped _next
+    // directly so the touchLastActive side effect in `next` is skipped.
+    _next()
+    return
   }
 
   if (isPlatform) {
-    ;(req as any).isSuperAdmin = true
-    ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
-    // Platform users may still target a specific tenant via header (e.g. when
-    // viewing tenant-scoped data from the admin console). If a header is
-    // present, accept it as-is — they're trusted at the platform layer.
-    if (headerTenantId) (req as any).tenantId = headerTenantId
-    next()
-    return
+    if (!headerTenantId) {
+      // No X-Tenant-ID to target — nothing to bypass. The vulnerability this
+      // chokepoint closes (R2, platform-tenant-bypass) is specifically a
+      // forged header claiming another tenant; a header-less platform call
+      // is unaffected and keeps its previous behaviour.
+      ;(req as any).isSuperAdmin = true
+      ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
+      next()
+      return
+    }
+
+    // Real member of the header tenant -> treat like any other member, not
+    // a platform bypass (Option C). Falls through to section 1 below, which
+    // re-resolves role/tenant the normal way.
+    const isMember = await isRealTenantMember(supabase, user.id, headerTenantId)
+
+    const access = resolvePlatformTenantAccess({
+      role: platformRoleKey ?? null,
+      method: req.method,
+      path: req.path,
+      isMember,
+    })
+
+    if (access.kind === 'deny') {
+      logger.warn(`[identifyTenant] SECURITY: platform role=${platformRoleKey} user=${user.id} denied on tenant=${headerTenantId} method=${req.method} path=${req.path} code=${access.code}`)
+      apiError(res, access.status, access.code, access.code === 'platform_tenant_read_denied'
+        ? 'Your platform role cannot read this tenant.'
+        : 'Platform writes on another tenant require an explicit approved endpoint.')
+      return
+    }
+
+    if (access.kind === 'platform') {
+      ;(req as any).isSuperAdmin = true
+      ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
+      ;(req as any).platformRole = normalizeRole(platformRoleKey) ?? undefined
+      ;(req as any).tenantId = headerTenantId
+      if (access.audit) {
+        await recordPlatformAudit(supabase, req, {
+          capability: access.audit.capability,
+          action: access.audit.action,
+          tenant_id: headerTenantId,
+        })
+      }
+      next()
+      return
+    }
+    // access.kind === 'member' -> fall through to section 1 below.
   }
 
   // 1. If header provides a tenant ID, verify the user has access to it
@@ -1016,7 +1153,12 @@ const PERMISSION_KEY_ALIASES: Record<string, string[]> = {
   // role that manages leads can manage internal tasks (feature-gated separately).
   tasks: ['leads', 'contacts'],
   complaints: ['leads', 'contacts'],
+  // Order-stock / suppliers reuse the leads/CRM permission for the RBAC matrix
+  // (feature-gated separately via the `suppliers` entitlement), like khata/tasks.
   suppliers: ['leads', 'contacts'],
+  // Staff attendance + payroll piggyback on leads/CRM for RBAC (feature-gated
+  // separately). Same shape as tasks/complaints/suppliers.
+  staff: ['leads', 'contacts'],
 }
 
 function hasRolePermission(perms: any, feature: string, action: string): boolean {
@@ -1637,46 +1779,135 @@ type CopilotIntentMeta = {
   title: string
   route: string
   event?: string
-  hint?: string  // short product fact the model can quote (`answer` from FE)
+  hint?: string     // short product fact the model can quote (`answer` from FE)
+  steps?: string[]  // the verified click path — control labels copied from the live UI
+}
+
+/** Per-vertical vocabulary. Frequency is sold per business type, so the same
+ *  screen is a different word to each merchant — a café fires a KOT for a
+ *  table, a salon prints a ticket for a chair. Mirrors verticalVocab() in the
+ *  FE (src/lib/storefront.ts); keep the two in step. */
+const COPILOT_VERTICAL: Record<string, { name: string; vocab: string; surface: string }> = {
+  horeca: {
+    name: 'a restaurant / café / cloud kitchen (HoReCa)',
+    vocab: 'Say Menu, dish, table, KOT, guest, outlet. Money is ₹ (INR).',
+    surface: 'POS billing + day close, KOT and the Kitchen display (KDS), a unified Orders board covering their own mini-app plus Zomato and Swiggy (connected through Frequency Desktop, where the merchant logs into their OWN partner accounts), Menu with per-dish recipes, Inventory with wastage and days-of-cover, Order stock from suppliers over WhatsApp, Khata for customer and supplier dues, Reports with channel/tender/tax breakdown, table QR scan-to-order, loyalty, coupons, reviews and complaints.',
+  },
+  salon: {
+    name: 'a salon / spa',
+    vocab: 'Say Services, service, chair, client, appointment — never Menu, dish, table or KOT. Money is ₹ (INR).',
+    surface: 'the Appointments calendar, a services catalogue, POS billing at the front desk, Khata for client dues, loyalty and packages.',
+  },
+  d2c: {
+    name: 'a D2C / e-commerce brand',
+    vocab: 'Say Products, product, customer, order. Money is ₹ (INR).',
+    surface: 'the storefront mini-app, product catalogue with variants and add-ons, the Orders board, coupons, payments and shipping.',
+  },
+  real_estate: {
+    name: 'a real-estate business',
+    vocab: 'Say listing, lead, site visit, deal. Money is ₹ (INR).',
+    surface: 'Listings, the lead pipeline and WhatsApp nurture.',
+  },
+  other: {
+    name: 'a small business',
+    vocab: 'Money is ₹ (INR).',
+    surface: 'the unified inbox, contacts, workflows and broadcasts.',
+  },
+}
+
+/** Seniority of the caller, so the assistant pitches the answer at the person
+ *  actually holding the phone. This does NOT grant or deny anything — the
+ *  catalogue arrives already filtered by the client's RBAC/vertical gate. */
+const COPILOT_ROLE_NOTE: Record<string, string> = {
+  viewer: 'They have read-only access. Explain where to look; do not tell them to change settings.',
+  agent: 'They are floor / counter / kitchen staff, not the owner. Answer in terms of the shift in front of them. If something needs an owner or manager (pricing, plan, team, settings), say so plainly and tell them to ask their manager instead of walking them through it.',
+  admin: 'They are the owner or a manager. Setup and configuration answers are fair game.',
+  super_admin: 'They are the owner or a manager. Setup and configuration answers are fair game.',
 }
 
 function buildCopilotSystemPrompt(opts: {
   persona: 'authed' | 'public'
   pagePath: string
   intents: CopilotIntentMeta[]
+  businessGroup?: string
+  role?: string
 }): string {
   const { persona, pagePath, intents } = opts
+  const vertical = COPILOT_VERTICAL[opts.businessGroup ?? ''] ?? null
+  const roleNote = COPILOT_ROLE_NOTE[opts.role ?? ''] ?? ''
   const intentList = intents
     .map(i => {
       const parts = [`- "${i.title}" → ${i.route}`]
       if (i.event) parts.push(`(also fires dialog event: ${i.event})`)
       if (i.hint) parts.push(`\n    fact: ${i.hint}`)
+      // The click path, pre-verified against the rendered UI. Given to the
+      // model as data precisely so it never has to guess a button name.
+      if (i.steps?.length) parts.push(`\n    steps: ${i.steps.map((st, n) => `${n + 1}) ${st}`).join(' ')}`)
       return parts.join(' ')
     })
     .join('\n')
 
+  const contextBlock = persona !== 'authed' ? '' : [
+    vertical ? `\nTHIS WORKSPACE IS ${vertical.name.toUpperCase()}.\nWhat they run on Frequency: ${vertical.surface}\nVocabulary: ${vertical.vocab}\nNever describe another vertical's tools to them — the catalogue below is already filtered to what this workspace and this person can actually open, so anything not in it does not exist for them.` : '',
+    roleNote ? `\nWho you're talking to: ${roleNote}` : '',
+  ].filter(Boolean).join('\n')
+
   const personaBlock = persona === 'authed'
-    ? `You are talking to a logged-in user inside the Frequency app. They're currently on the page: ${pagePath}.
-Your job is to help them find features AND set them up to start working — not just point. For "how/where do I X" answer in 1-3 short sentences using the catalogue facts. For "do X / create X / import X / set up X", briefly confirm, then use the navigate tool to take them to the exact page for that action, and in your text tell them the precise next control to click (e.g. "I've opened Tables — click **New Table** to start"). If the catalogue lists a dialog event for that action, also call open_dialog so the modal opens for them. Prefer the MOST specific matching capability. You know the whole app — only say you're unsure if the catalogue truly has nothing relevant. Never recommend signing up — they're already in.`
+    ? `You are talking to a logged-in user inside the Frequency app. They're currently on the page: ${pagePath}.${contextBlock}
+You are walking them through the app the way a support executive would on a phone call — click here, then go there, then tap this. Not a description of the screen: the actual sequence.
+
+HOW TO ANSWER A "how do I X" QUESTION:
+1. One short opening line telling them where they're going and what will happen.
+2. Then the NUMBERED STEPS from that catalogue entry's "steps:" — every one of them, in order, one action per line, as a "1. 2. 3." list.
+3. Then call navigate to actually open the first screen for them, and say you've opened it.
+
+The steps are the answer. Do NOT compress six steps into one sentence, do NOT stop at "go to POS and settle the bill", and do NOT drop the later steps because the reply is getting long — the person is standing at a counter with a queue and needs every tap.
+
+USE THE STEPS EXACTLY AS GIVEN. They are copied from the live interface, so the control names must survive word for word — **KOT**, **Settle · ₹…**, **Add dish**, **Update what came**, **Cash counted**. Never rename a button, never merge two steps, never invent one that isn't listed. Translate the sentence around a control label; never translate the label itself.
+
+If the catalogue entry has no "steps:", answer in 1-3 short sentences from its "fact:" instead, then navigate. If the catalogue lists a dialog event, also call open_dialog so the modal opens for them.
+
+Prefer the MOST specific matching capability. Never recommend signing up — they're already in.`
     : `You are talking to a visitor on the Frequency marketing site. They're currently on the page: ${pagePath}. You haven't talked to them before.
 Your job is sales-grade Q&A: answer their question in 2-4 short sentences with real product facts (use the facts under "fact:" below — don't invent), then use the navigate tool to send them to /auth to start a free trial when it's a natural next step. Use external_link for "talk to sales" / mailto: requests.`
 
-  return `You are the Frequency in-app assistant. Frequency is a conversation OS for Indian SMBs — one tool that bundles WhatsApp Business API + Instagram DMs + Telegram, AI-built workflow automation, Razorpay payments, broadcasts, and a unified CRM. Pricing is INR-only with GST invoices; pricing starts at ₹999/month with a 7-day free trial (no card needed).
+  return `You are the Frequency in-app assistant — think of yourself as a support executive who knows this exact workspace, not a generic chatbot.
+
+Frequency is a customer-engagement and commerce platform for Indian SMBs, sold PER BUSINESS VERTICAL. One product, but what a merchant gets depends on their vertical:
+- HoReCa (restaurant / café / cloud kitchen): POS billing, KOT + Kitchen display, a unified Orders board across their own mini-app and Zomato/Swiggy, Menu with recipes, Inventory and wastage, supplier stock orders over WhatsApp, Khata (dues), Reports, table-QR ordering, loyalty and coupons.
+- Salon & Spa: appointments, a services catalogue, front-desk POS, dues, packages.
+- D2C / e-commerce: storefront mini-app, product catalogue, orders, coupons, payments.
+- Real estate: listings and a lead pipeline.
+Across all of them: WhatsApp Business API, Instagram DMs, Telegram, a unified inbox, AI-built workflow automation, broadcasts and payments. Pricing is INR-only with GST invoices; from ₹999/month with a 7-day free trial (no card needed).
 
 ${personaBlock}
 
+LANGUAGE — get this right before anything else:
+Mirror BOTH the user's language AND the alphabet they typed it in. The alphabet is a separate decision from the language and it is the one most often got wrong, so check it explicitly before you write:
+- They typed Latin/Roman letters → you reply in Latin/Roman letters. ALWAYS. Even when the language is Hindi.
+- They typed Devanagari (or Tamil/Bengali/Gujarati/Gurmukhi/Kannada/Telugu/Malayalam) script → reply in that same script.
+Worked examples, follow them exactly:
+- "KOT print kaise kare?" → Roman letters in, so Roman letters out: "POS mein items add karo, phir KOT button dabao." NOT "POS में items add करो" — that is the same language but the wrong alphabet, and it is wrong.
+- "बिल कैसे बनाऊं?" → Devanagari in, Devanagari out: "POS खोलिए, टेबल चुनिए…"
+- "How do I print a KOT?" → English in, English out.
+Never "upgrade" romanised Hindi into Devanagari, and never flip someone to English because the topic is technical. If they change language or script mid-conversation, change with them from that turn on.
+Keep product nouns exactly as they appear on screen (POS, KOT, Khata, Menu, Reports, Zomato, Swiggy) in every language — that is the label they are looking for in the interface, and translating it makes the instruction impossible to follow. Only the words around those nouns get translated.
+
 Rules:
-1. Answer first (1-4 sentences). Only then call a tool.
+1. Answer first, then call a tool. For a "how do I" question that has steps, the answer is the opening line PLUS the full numbered list — length is fine there. For everything else keep it to 1-4 sentences.
 2. NEVER call a tool without first writing a short text reply explaining what you're doing.
-3. Use ONLY the routes in the catalogue below. Do not invent paths.
-4. If the user asks something you don't have a fact for, say "I'm not sure — email hello@getfrequency.app and we'll get back to you" instead of guessing.
-5. Tone: warm, direct, no marketing fluff. Indian SMB audience — talk in clear short sentences, no jargon.
+3. Use ONLY the routes in the catalogue below. Do not invent paths. The catalogue has ALREADY been filtered to this user's vertical, plan and role — if something isn't listed, they cannot open it, so never tell them to "go to" it. If they ask for something that isn't there, say it isn't available on their workspace / their access and, when it's a permissions matter, tell them to ask the workspace owner.
+4. If the user asks something you don't have a fact for, say "I'm not sure — email hello@getfrequency.app and we'll get back to you" instead of guessing. Never invent a button, a screen, a price, a limit or a setting.
+5. A page does ONLY what its "fact:" line says. Describe it in those words and stop — never round a page up into the thing they asked for. If they asked for two things and the catalogue covers one, give them that one and name the missing half in a short clause: "…— profit/P&L sits in Reports, which needs your manager's login." Substituting the nearest page and stretching it to fit is worse than no answer, because they will go there and not find it. When nothing covers it, say "that needs owner/manager access — ask your manager" or "that isn't available on your workspace".
+6. You cannot read their live data — you don't know today's sales figure, their stock counts, or whether Zomato is connected right now. When they ask for a number, take them to the screen that shows it and say what they'll see there. Never make a number up.
+7. Tone: warm, direct, no marketing fluff. Indian SMB audience — clear short sentences, no jargon. Answer the question that was asked; if a step needs a manager's access, say that plainly rather than apologising at length.
 
 Formatting (the UI renders a small subset of markdown):
 - Use **bold** for key facts: prices, numbers, product names. Use it sparingly — 1-3 bolds per reply max.
 - Use \`backticks\` for routes, event names, or technical terms.
 - Use a blank line (\\n\\n) between paragraphs when the reply is more than 2 sentences.
-- Use "- " bullets ONLY for genuine lists of 2-4 items. Don't bullet single facts.
+- Numbered steps ("1. ", "2. ", …) are the right shape for a walkthrough — use as many as the catalogue entry lists, one action per line, and never truncate the list.
+- Use "- " bullets ONLY for genuine non-step lists of 2-4 items. Don't bullet single facts.
 - DO NOT use headings (#, ##), tables, or links — they won't render.
 
 Catalogue of places you can navigate them to (use the navigate tool):
@@ -1729,9 +1960,12 @@ const COPILOT_TOOLS = [
 
 // Tight rate limit — copilot is conversational so callers fire often.
 app.use('/api/copilot/', makeLimiter({ windowMs: 60_000, max: 20, perUser: true }))
+// Support tickets are a deliberate human action — a handful a minute is plenty,
+// and the cap keeps a retry loop (or a frustrated merchant) from flooding Slack.
+app.use('/api/support/', makeLimiter({ windowMs: 60_000, max: 5, perUser: true }))
 
 app.post('/api/copilot/stream', async (req, res) => {
-  const { message, history = [], persona = 'public', page_path = '/', intents = [] } = req.body ?? {}
+  const { message, history = [], persona = 'public', page_path = '/', intents = [], business_group, role } = req.body ?? {}
   if (!message || typeof message !== 'string' || message.length > 1000) {
     res.status(400).json({ error: 'message (string, 1-1000 chars) required' }); return
   }
@@ -1787,12 +2021,22 @@ app.post('/api/copilot/stream', async (req, res) => {
         route: String(i.route).slice(0, 200),
         event: typeof i.event === 'string' ? String(i.event).slice(0, 60) : undefined,
         hint: typeof i.hint === 'string' ? String(i.hint).slice(0, 600) : undefined,
+        steps: Array.isArray(i.steps)
+          ? i.steps.filter((st: unknown) => typeof st === 'string').slice(0, 10).map((st: string) => st.slice(0, 240))
+          : undefined,
       }))
 
     const system = buildCopilotSystemPrompt({
       persona: persona === 'authed' ? 'authed' : 'public',
       pagePath: typeof page_path === 'string' ? page_path.slice(0, 200) : '/',
       intents: safeIntents,
+      // Both are grounding hints only, and both are clamped to a known key —
+      // an unknown value falls back to no vertical / no role note rather than
+      // being interpolated into the prompt. Authorisation never depends on
+      // them: the client sends an already-gated catalogue, and every mutating
+      // route behind it re-checks permissions server-side.
+      businessGroup: COPILOT_VERTICAL[String(business_group ?? '')] ? String(business_group) : undefined,
+      role: COPILOT_ROLE_NOTE[String(role ?? '')] ? String(role) : undefined,
     })
 
     const stream = anthropic.messages.stream({
@@ -2272,22 +2516,31 @@ app.get('/api/naruto/desktop-health', requireSuperAdminOrLocal, async (_req, res
 app.get('/api/desktop/runtime-config', async (_req, res) => {
   let flagValue: unknown
   let bridge: unknown
+  let minVersion: string | undefined
   try {
     const { data } = await supabase
       .from('feature_flags').select('key, value_json')
-      .in('key', ['desktop_environment', 'desktop_bridge_rules'])
+      .in('key', ['desktop_environment', 'desktop_bridge_rules', 'desktop_release'])
     for (const row of data ?? []) {
       if (row.key === 'desktop_environment') flagValue = (row.value_json as any)?.value
       // DATA-DRIVEN bridge-rules override (Layer 1): the WHOLE value_json is the override
       // block the desktop merges over its baked defaults (portal URLs, isLoggedIn patterns,
       // response-shape matchers, status maps). No secrets — data only, validated app-side.
       else if (row.key === 'desktop_bridge_rules') bridge = row.value_json
+      // Mandatory-update floor rides the same desktop_release flag that feeds /download.
+      else if (row.key === 'desktop_release') {
+        const mv = (row.value_json as any)?.minVersion
+        if (typeof mv === 'string' && mv) minVersion = mv
+      }
     }
   } catch {
     /* unreachable DB → fall through to prod default, no bridge override */
   }
   const cfg = resolveDesktopRuntimeConfig(flagValue)
-  res.json(bridge && typeof bridge === 'object' ? { ...cfg, bridge } : cfg)
+  const out: Record<string, unknown> = { ...cfg }
+  if (minVersion) out.minVersion = minVersion
+  if (bridge && typeof bridge === 'object') out.bridge = bridge
+  res.json(out)
 })
 
 // ── Frequency Desktop download manifest ──────────────────────────────────────
@@ -2306,6 +2559,58 @@ app.get('/api/desktop/download-manifest', async (_req, res) => {
   }
   res.json(resolveDesktopManifest(flagValue))
 })
+
+// ── electron-updater YAML shims ─────────────────────────────────────────────
+// Existing 1.0.6+ installs poll `updates.getfrequency.app/desktop/latest-mac.yml`
+// (and `.../latest.yml` for Windows) — the URL baked into the app at build time.
+// That Vercel project got deleted at some point, so every existing install has
+// been silently failing to auto-update. Health check on 2026-09-05 confirms
+// La Fiamma's outlet is stuck on 1.0.8 while the manifest advertises 1.0.10.
+//
+// Fix: serve the YAML files from THIS server. Point `updates.getfrequency.app`
+// (Vercel alias or DNS CNAME) at `api.getfrequency.app` and the routes below
+// answer. Content is pulled fresh from the GitHub Release for the version in
+// the `desktop_release` feature flag (single source of truth), URLs are
+// rewritten from relative → absolute GitHub Release URLs so electron-updater
+// resolves them without needing a static asset host of our own. 60s cache so
+// GitHub rate limits are respected.
+const YAML_CACHE_MS = 60_000
+const _ymlCache = new Map<string, { at: number; text: string }>()
+async function serveElectronYaml(res: any, ymlName: 'latest-mac.yml' | 'latest.yml' | 'latest-linux.yml'): Promise<void> {
+  try {
+    const { data } = await supabase
+      .from('feature_flags').select('value_json').eq('key', 'desktop_release').maybeSingle()
+    const version = (data?.value_json as any)?.version
+    if (typeof version !== 'string' || !version) { res.status(503).type('text/plain').send('no version configured'); return }
+    const key = `${version}:${ymlName}`
+    const cached = _ymlCache.get(key)
+    if (cached && Date.now() - cached.at < YAML_CACHE_MS) {
+      res.type('text/yaml').set('Cache-Control', 'public, max-age=60').send(cached.text); return
+    }
+    const base = `https://github.com/NitinBag0riya/frequency-desktop-releases/releases/download/v${version}`
+    const r = await fetch(`${base}/${ymlName}`)
+    if (!r.ok) { res.status(502).type('text/plain').send(`GitHub Release fetch: ${r.status}`); return }
+    let text = await r.text()
+    // Rewrite bare filenames on `url:` lines to absolute GitHub Release URLs so
+    // electron-updater fetches binaries directly from GitHub, not from THIS host.
+    text = text.replace(/(\n\s*-?\s*url:\s*)([^\s].*)$/gm, (_m, prefix, val) => {
+      const v = String(val).trim()
+      if (/^https?:\/\//i.test(v)) return `${prefix}${v}`
+      return `${prefix}${base}/${v}`
+    })
+    _ymlCache.set(key, { at: Date.now(), text })
+    res.type('text/yaml').set('Cache-Control', 'public, max-age=60').send(text)
+  } catch (e: any) {
+    res.status(500).type('text/plain').send(`shim failed: ${e?.message || 'unknown'}`)
+  }
+}
+app.get('/desktop/latest-mac.yml', (_req, res) => { void serveElectronYaml(res, 'latest-mac.yml') })
+app.get('/desktop/latest.yml', (_req, res) => { void serveElectronYaml(res, 'latest.yml') })
+app.get('/desktop/latest-linux.yml', (_req, res) => { void serveElectronYaml(res, 'latest-linux.yml') })
+// Also serve at the /api prefix in case anything else fetches it there.
+app.get('/api/desktop/latest-mac.yml', (_req, res) => { void serveElectronYaml(res, 'latest-mac.yml') })
+app.get('/api/desktop/latest.yml', (_req, res) => { void serveElectronYaml(res, 'latest.yml') })
+app.get('/api/desktop/latest-linux.yml', (_req, res) => { void serveElectronYaml(res, 'latest-linux.yml') })
 
 // ── Frequency Desktop enrolment ──────────────────────────────────────────────
 // First launch: the install registers its Ed25519 public key against a self-minted
@@ -2711,7 +3016,7 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
 
   // 1. Tenants the user owns
   const { data: ownedTenants, error: e1 } = await supabase.from('tenants')
-    .select('id,slug,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
+    .select('id,slug,waba_id,phone_number_id,business_name,legal_name,billing_address,business_type,display_phone,status,google_email,created_at')
     .eq('user_id', user.id)
   if (e1) { res.status(500).json({ error: e1.message }); return }
 
@@ -2733,7 +3038,7 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
   let teamTenants: any[] = []
   if (memberTenantIds.length > 0) {
     const { data: extra } = await supabase.from('tenants')
-      .select('id,slug,waba_id,phone_number_id,business_name,display_phone,status,google_email,created_at')
+      .select('id,slug,waba_id,phone_number_id,business_name,legal_name,billing_address,business_type,display_phone,status,google_email,created_at')
       .in('id', memberTenantIds)
     teamTenants = extra ?? []
   }
@@ -2741,6 +3046,31 @@ app.get('/api/tenants', requireAuth, async (req, res) => {
   const all = [...(ownedTenants ?? []), ...teamTenants]
   console.log(`[/api/tenants] user=${user.id}, found ${all.length} tenant(s)`)
   res.json(all)
+})
+
+// Admin/owner-only workspace edit — business name + basic details. Server-side
+// authz (checkPermission gates it to roles with settings:edit; owner/super_admin
+// short-circuit). business_type/vertical is LOCKED (see sanitizeTenantPatch).
+app.patch('/api/tenants/:id', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
+  const tenantId = (req as any).tenantId
+  // identifyTenant already resolved the caller's tenant authoritatively; reject
+  // a path id that doesn't match so a member of tenant A can't edit tenant B.
+  // Super-admins legitimately target any tenant via X-Tenant-ID and bypass.
+  if (!(req as any).isSuperAdmin && req.params.id !== tenantId) {
+    res.status(403).json({ error: 'Forbidden' }); return
+  }
+
+  const { sanitizeTenantPatch } = await import('./lib/tenant-patch')
+  const { patch, error: vErr } = sanitizeTenantPatch(req.body ?? {})
+  if (vErr) { res.status(400).json({ error: vErr }); return }
+
+  patch.updated_at = new Date().toISOString()
+  const { data, error } = await supabase.from('tenants')
+    .update(patch).eq('id', tenantId)
+    .select('id,slug,business_name,legal_name,display_phone,billing_address,business_type,status')
+    .single()
+  if (error) { res.status(500).json({ error: error.message }); return }
+  res.json(data)
 })
 
 app.delete('/api/tenants/:id', requireAuth, async (req, res) => {
@@ -4229,7 +4559,9 @@ app.get('/webhook/whatsapp/:token', async (req, res) => {
 // as an inbound message. On the PLATFORM number no tenant resolves by waba_id (platform-
 // fallback tenants have none), so we handle it CROSS-TENANT via storefront-api (which owns
 // the orders): it maps phone→recent unrated order, records the rating, mirrors to Reviews,
-// and routes a low score to Complaints. We then reply on the still-open 24h session.
+// and routes a low score to Complaints. We then re-mirror the review under source
+// 'whatsapp' (only WE know the channel; ingestReview collapses the pair onto one row)
+// and reply on the still-open 24h session.
 // WhatsApp quick-reply buttons can't contain emojis — plain text only.
 const FEEDBACK_BUTTON_RATING: Record<string, number> = { 'Loved it': 5, 'It was okay': 3, 'Not great': 2 }
 
@@ -4247,9 +4579,58 @@ async function sendPlatformWaText(to: string, body: string): Promise<void> {
   } catch (e: any) { console.warn('[wa-feedback] reply send failed:', e?.message ?? e) }
 }
 
+/** Mirror a captured WhatsApp rating into the unified Reviews inbox under source
+ *  'whatsapp'. Best-effort: the rating is already persisted on the order regardless. */
+async function mirrorWaReview(j: any, rating: number, review: string, phone: string): Promise<void> {
+  if (!j?.slug || !j?.orderId) return
+  try {
+    const { data: t } = await supabase.from('tenants').select('id').eq('slug', String(j.slug)).maybeSingle()
+    const tenantId = (t as any)?.id
+    if (!tenantId) { console.warn(`[wa-feedback] no tenant for slug ${j.slug} — review not mirrored`); return }
+    await ingestReview(supabase, {
+      tenantId,
+      source: 'whatsapp',
+      sourceReviewId: String(j.orderId),   // one review per order → re-rating updates
+      orderRef: String(j.orderId),
+      rating,
+      text: review || null,
+      customerName: j.name && j.name !== 'there' ? String(j.name) : null,
+      sourceMeta: { channel: 'whatsapp', phone },
+      reviewAt: new Date().toISOString(),
+    })
+  } catch (e: any) { console.warn('[wa-feedback] review mirror failed:', e?.message ?? e) }
+}
+
+/** The reply the guest gets the moment they tap, by what they tapped. Three branches,
+ *  not two: "It was okay" is neither a rave nor a complaint, and answering it with an
+ *  apology read wrong. Free text inside the 24h session window — no template needed. */
+function feedbackReplyText(rating: number, j: any): string {
+  const name = j?.name && j.name !== 'there' ? `, ${j.name}` : ''
+  const store = j?.store || 'us'
+  if (rating <= 2) return `We're really sorry${name} — that's not the experience we want you to have. Our team is looking into what went wrong, and we'll make sure it doesn't happen next time. 🙏`
+  if (rating === 3) return `Thanks for the honest feedback${name}. "Okay" isn't what we're going for — we'll work on making your next order from ${store} a great one.`
+  return j?.reviewLink
+    ? `So glad you loved it${name}! 🎉 Would you leave a quick public review? It really helps ${store}: ${j.reviewLink}`
+    : `So glad you loved it${name}! 🎉 Thanks for ordering from ${store}.`
+}
+
+/** Reply on the SAME number the tap came in on. A tenant with its own WhatsApp number
+ *  answers from that number (and the reply lands in their inbox as a normal outbound
+ *  row); the shared platform number answers from the platform pair. */
+async function sendFeedbackReply(tenant: any | null, to: string, body: string): Promise<void> {
+  if (tenant?.phone_number_id && readSecretValue(tenant.access_token)) {
+    try { await sendTextMessage(tenant, String(to || '').replace(/\D/g, ''), body) }
+    catch (e: any) { console.warn('[wa-feedback] tenant reply send failed:', e?.message ?? e) }
+    return
+  }
+  await sendPlatformWaText(to, body)
+}
+
 /** If this inbound message is a recognised feedback-button reply, capture the rating via
- *  storefront-api and send the branch reply. No-op otherwise. */
-async function maybeHandleFeedbackReply(msg: any): Promise<void> {
+ *  storefront-api and send the branch reply. No-op otherwise. `tenant` is set when the
+ *  tap arrived on a tenant's own number — it scopes the phone→order match to that store
+ *  and picks the reply sender. */
+async function maybeHandleFeedbackReply(msg: any, tenant: any | null = null): Promise<void> {
   // Two shapes map to the same "record this rating" action:
   //  (a) quick-reply BUTTON tap  → rating from the button label (no written review)
   //  (b) FLOW completion (nfm_reply) → { rating:"1".."5", review } from response_json
@@ -4270,18 +4651,27 @@ async function maybeHandleFeedbackReply(msg: any): Promise<void> {
   try {
     const r = await fetch(`${base}/v1/feedback/by-phone`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': secret },
-      body: JSON.stringify({ phone: String(msg.from || ''), rating, ...(review ? { review } : {}) }),
+      body: JSON.stringify({ phone: String(msg.from || ''), rating, ...(review ? { review } : {}), ...(tenant?.slug ? { slug: tenant.slug } : {}) }),
     })
     const j: any = await r.json().catch(() => ({}))
-    if (!j?.found) return
-    const name = j.name && j.name !== 'there' ? `, ${j.name}` : ''
-    const reply = j.low
-      ? `Thank you for the honest feedback${name} — sorry it wasn't great. Our team will look into it and make it right. 🙏`
-      : (j.reviewLink
-          ? `So glad you loved it${name}! 🎉 Would you leave a quick public review? It really helps ${j.store}: ${j.reviewLink}`
-          : `So glad you loved it${name}! 🎉 Thanks for ordering from ${j.store}.`)
-    await sendPlatformWaText(String(msg.from || ''), reply)
-    console.log(`[wa-feedback] ${rating}★ from ${msg.from} → order ${j.orderId} (${j.low ? 'complaint' : 'review'})`)
+    if (!j?.found) {
+      // The tap is real even when no recent order matches (older than the 3-day window,
+      // or a different number). Say so rather than leaving a tapped button hanging.
+      await sendFeedbackReply(tenant, String(msg.from || ''), 'Thanks for the feedback! We couldn\'t find a recent order on this number to attach it to — reply here and our team will pick it up.')
+      console.log(`[wa-feedback] ${rating}★ from ${msg.from} — no recent order to attach (tenant ${tenant?.slug ?? 'platform'})`)
+      return
+    }
+
+    // Mirror into the unified Reviews inbox with the channel we actually know.
+    // storefront-api mirrors this same order too (source 'storefront', fire-and-forget)
+    // — ingestReview collapses both onto ONE row keyed by (tenant, order) and keeps the
+    // 'whatsapp' label whichever of the two lands first. The order id is the
+    // sourceReviewId, so a guest re-rating UPDATES rather than duplicating.
+    // storefront-api's ≤3★ → Complaints mirror is untouched: a low score lands in BOTH
+    // places, which is correct — it is a review AND a complaint.
+    await mirrorWaReview(j, rating, review, String(msg.from || ''))
+    await sendFeedbackReply(tenant, String(msg.from || ''), feedbackReplyText(rating, j))
+    console.log(`[wa-feedback] ${rating}★ from ${msg.from} → order ${j.orderId} (${j.low ? 'complaint' : 'review'}, via ${tenant?.slug ?? 'platform'})`)
   } catch (e: any) { console.warn('[wa-feedback] capture failed:', e?.message ?? e) }
 }
 
@@ -4387,8 +4777,14 @@ async function handleWaWebhook(
           continue
         }
 
-        // Handle inbound messages
+        // Handle inbound messages. A feedback-button tap that arrived on THIS tenant's
+        // own number is captured here too (the platform-number branch above only sees
+        // taps on the shared number) — before it's filed as an ordinary inbox message,
+        // so the rating is recorded and the guest gets an answer. Skipped when the
+        // platform number itself belongs to a tenant row, or it would run twice.
+        const ownNumber = value?.metadata?.phone_number_id && value.metadata.phone_number_id !== process.env.FREQ_WA_PHONE_NUMBER_ID
         for (const msg of value.messages ?? []) {
+          if (ownNumber) await maybeHandleFeedbackReply(msg, tenant)
           await handleInboundMessage(tenant, msg, value.contacts?.[0])
         }
 
@@ -5695,58 +6091,17 @@ app.get('/api/team', requireAuth, identifyTenant, checkPermission('settings', 'v
   res.json({ success: true, team: data || [] })
 })
 
-app.post('/api/team/invite', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
-  const tenantId = (req as any).tenantId
-  const { email, role } = req.body ?? {}
-  // Defensive validation — inviteUserByEmail(undefined) throws inside the
-  // supabase admin SDK with an unhelpful 500. Caller must supply email + role.
-  if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    res.status(400).json({ error: 'valid email is required' })
-    return
-  }
-  if (typeof role !== 'string' || role.trim().length === 0) {
-    res.status(400).json({ error: 'role is required' })
-    return
-  }
-
-  try {
-    // 1. Trigger Supabase Invitation
-    const { data: invite, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(email, {
-      redirectTo: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/auth`
-    })
-
-    if (inviteError) {
-      // If user already exists, we'll just add the role instead of failing
-      if (inviteError.message.includes('already registered')) {
-        // Find user ID by email (hacky but effective for development)
-        const { data: existingUser } = await supabase.auth.admin.listUsers()
-        const user = existingUser.users.find(u => u.email === email)
-        if (user) {
-          await supabase.from('user_roles').upsert({
-            user_id: user.id,
-            tenant_id: tenantId,
-            role
-          })
-          return res.json({ success: true, message: `${email} is already on Frequency and has been added to your team.` })
-        }
-      }
-      return res.status(500).json({ error: inviteError.message })
-    }
-
-    // 2. Map the new role for the invited user ID
-    const { error: roleError } = await supabase.from('user_roles').upsert({
-      user_id: invite.user.id,
-      tenant_id: tenantId,
-      role
-    })
-
-    if (roleError) return res.status(500).json({ error: roleError.message })
-    
-    res.json({ success: true, message: `Invitation sent to ${email}` })
-  } catch (err: any) {
-    res.status(500).json({ error: err.message })
-  }
-})
+// Legacy /api/team/invite handler REMOVED 2026-09-22 — it was shadowing the
+// correct handler in routes/teams.ts (mounted below via createTeamsRouter).
+// The correct handler:
+//   • expects `role_key` (matches dashboard client + all other new-RBAC code)
+//   • resolves role_definitions.id
+//   • inserts into pending_invites so the merchant sees the invite in the UI
+//   • enforces plan seat limits + owner-only-grants-owner
+//   • handles already-registered users gracefully
+// The legacy one here only wrote to user_roles (broken check constraint on new
+// role keys) and never populated pending_invites — the dashboard's "Pending"
+// tab always showed 0 even for successful invites.
 
 // ── Dev seed endpoint ─────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'production') {
@@ -5866,6 +6221,12 @@ app.use('/api', createListingsRouter(supabase, requireAuth, identifyTenant, chec
 app.use('/api', createAppointmentsRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createTasksRouter(supabase, requireAuth, identifyTenant, checkPermission))
 app.use('/api', createVendorsRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use('/api', createStaffRouter(supabase, requireAuth, identifyTenant, checkPermission))
+app.use('/api', createCampaignsRouter(supabase, requireAuth, identifyTenant, checkPermission))
+// HQ backfill mirrors — one setInterval each, self-gated by *_SYNC_DISABLED env vars.
+startCatalogSync(supabase)
+startWastageSync(supabase)
+startCoinLedgerSync(supabase)
 app.use('/api/admin', createAdminRouter(supabase, requireAuth, isPlatformUser))
 
 // ── Phase 3: campaigns, analytics, execution logs, activity ──────────────────
@@ -5875,6 +6236,8 @@ app.use(createPhase3Router({ supabase, requireAuth, identifyTenant, checkPermiss
 app.use(createDataSourcesRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createStorefrontDomainsRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createStorefrontAppRouter({ supabase, requireAuth, identifyTenant }))
+// Connect Google Search Console (ship-dormant: inert until GOOGLE_OAUTH_* env is set).
+app.use(createSeoGscRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createAuthEmailHookRouter())  // Supabase Send-Email hook → Brevo (auth emails)
 
 // ── Connector registry + per-app OAuth, capabilities ─────────────────────────
@@ -6016,6 +6379,12 @@ app.use(createDataDeletionRouter({ supabase }))
 app.use(createTelegramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createInstagramRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 app.use(createMetaAdsRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
+// Unified FBLfB callback for Instagram / Meta Ads / FB Leads. Bypasses the
+// classic dialog/oauth "URL Blocked" error by using FB.login({config_id})
+// client-side. See routes/meta-business-assets.ts.
+app.use(createMetaBusinessAssetsRouter({ supabase, requireAuth, identifyTenant }))
+// Lead Ads webhook (Facebook Page `leadgen`). Raw-body parser mounted above.
+app.use(createMetaWebhookRouter({ supabase }))
 
 // ── Shopify (P1 #11) ────────────────────────────────────────────────────────
 // Three routers, deliberately split so the signature-verified write paths
@@ -6055,6 +6424,9 @@ app.use(createNarutoCatalogImportRouter({ supabase, requireAuth }))
 app.use(createNarutoStorefrontRouter({ supabase, requireAuth }))
 // Platform-OS (/naruto) wave 3: support console, payments/revenue, order oversight.
 app.use(createNarutoSupportRouter({ supabase, requireAuth }))
+// Merchant-facing support intake (Copilot → Slack). Distinct from the naruto
+// support console above, which is the platform team looking IN at a tenant.
+app.use(createSupportRouter({ supabase, requireAuth, identifyTenant }))
 app.use(createNarutoPaymentsRouter({ supabase, requireAuth }))
 app.use(createNarutoOrdersRouter({ supabase, requireAuth }))
 // Platform-OS (/naruto) wave 4: approval rules, bulk entitlement ops, plan matrix + limits.
@@ -6284,6 +6656,12 @@ const server = app.listen(PORT, () => {
   console.log(`Frequency server running on http://localhost:${PORT}`)
   console.log(`  → Bull Board: http://localhost:${PORT}/admin/queues`)
   void seedPlatformWaTemplates()
+  // 24/7 realtime tap on the order-notifications bus — every order.* event lands
+  // in Fly logs so `flyctl logs -a frequency-api-prod | grep watchdog` shows the
+  // exact same signal the dashboard subscribes to. If this line isn't in the logs,
+  // no client ring is possible.
+  void import('./lib/order-watchdog').then(({ startOrderWatchdog }) =>
+    startOrderWatchdog(supabase, { machineId: process.env.FLY_MACHINE_ID }))
 })
 
 // One-time platform WhatsApp template seed. When SEED_WA_TEMPLATES=1 AND the FREQ_WA
@@ -6337,6 +6715,35 @@ async function seedPlatformWaTemplates(): Promise<void> {
         { type: 'QUICK_REPLY', text: 'It was okay' },
         { type: 'QUICK_REPLY', text: 'Not great' },
       ] },
+    ] },
+    // ── the moments the guest is actually WAITING on ──────────────────────────
+    // Push already covers eight lifecycle events; WhatsApp covered only the two the
+    // guest already knows about (just ordered, just ate). These are the ones they are
+    // sitting there wondering about.
+    //
+    // ALL BODY-ONLY, deliberately. `send-whatsapp` builds only a `body` component, so a
+    // template with a dynamic URL button would APPROVE and then fail on every send.
+    // Quick-reply buttons need no send-time component (proven by feedback_rating above),
+    // which is why the rating template can have them and these cannot have links.
+    //
+    // The param COUNT here is a contract: sending a different number of values than the
+    // approved body declares makes Meta reject the send, and notifyCustomerWa only logs
+    // NETWORK errors — so a rejection looks exactly like a guest who never opted in.
+    // Every one of these is 3 params ({{1}} name · {{2}} store · {{3}} order#) to match
+    // the existing sends, except refund_issued which needs the amount.
+    { name: 'order_ready', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, your order at {{2}} (#{{3}}) is ready. Please collect it at the counter.', example: { body_text: ex } },
+    ] },
+    { name: 'order_on_the_way', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, your order from {{2}} (#{{3}}) is on the way. It will reach you shortly.', example: { body_text: ex } },
+    ] },
+    { name: 'order_cancelled', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, your order at {{2}} (#{{3}}) has been cancelled. If you have paid, the amount will be returned to you. Please contact the store if you need help.', example: { body_text: ex } },
+    ] },
+    // FOUR params: the amount is the whole point of this message.
+    { name: 'refund_issued', language: LANG, category: 'UTILITY', components: [
+      { type: 'BODY', text: 'Hi {{1}}, a refund of {{4}} for your order at {{2}} (#{{3}}) has been processed. It usually reaches your account in 5 to 7 working days.',
+        example: { body_text: [['Aarav', 'La Fiamma', '8291', 'Rs 450']] } },
     ] },
   ]
   for (const t of tpls) {

@@ -142,3 +142,80 @@ export function impersonationWriteGuard(req: express.Request, res: express.Respo
   }
   next()
 }
+
+/**
+ * The one path exempt from the global write block: ending the session must
+ * work even though the session is read-only (impersonation-tenant-view §BE-01).
+ */
+const IMPERSONATION_STOP_PATH = '/api/super-admin/impersonate/stop'
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+
+/**
+ * Global gate — mount with `app.use(impersonationGate)` ahead of every route.
+ * No `X-Impersonate-Token` header: no-op, byte-identical behaviour for every
+ * existing caller. A present header is verified (invalid → 401, expired →
+ * 401, no HMAC secret configured → 503) and, if it verifies, the request is
+ * pinned read-only: any method other than GET/HEAD/OPTIONS is refused with
+ * 403 `impersonation_read_only`, except the stop endpoint itself (a session
+ * must be able to end itself). This is the server-side enforcement that
+ * `attachImpersonation` alone does not provide (it populates the flags but
+ * never consulted the HTTP method).
+ */
+export function impersonationGate(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const raw = req.headers['x-impersonate-token'] as string | undefined
+  if (!raw) { next(); return }
+  const v = verifyImpersonationToken(raw)
+  if (!v.ok) {
+    const status = v.code === 'misconfigured' ? 503 : 401
+    res.status(status).json({ error: `impersonation_token_${v.code}`, code: `impersonation_token_${v.code}` })
+    return
+  }
+  ;(req as any).impersonatorId        = String(v.payload.actor)
+  ;(req as any).impersonatedTenantId  = String(v.payload.tenant_id)
+  ;(req as any).impersonationReadOnly = v.payload.read_only !== false
+
+  const isStop = req.method === 'POST' && req.path === IMPERSONATION_STOP_PATH
+  if ((req as any).impersonationReadOnly && !SAFE_METHODS.has(req.method) && !isStop) {
+    res.status(403).json({
+      error: 'Read-only impersonation session — writes are blocked.',
+      code: 'impersonation_read_only',
+    })
+    return
+  }
+  next()
+}
+
+/** Result of pinning an impersonated request to its tenant — see resolveImpersonatedTenant. */
+export type ImpersonatedTenantResolution =
+  | { ok: true; tenantId: string }
+  | { ok: false; status: number; code: string }
+
+/**
+ * Pure resolver for `identifyTenant`'s impersonation branch. No express, no
+ * DB — the caller passes in what it already looked up so this stays testable
+ * without mocking Supabase. Three ways to fail closed, checked in order:
+ *   1. the caller must actually be a platform user (`isPlatform`) — a support
+ *      session can never inherit impersonation privileges for a non-platform
+ *      account,
+ *   2. the token's `actor` must be the signed-in caller (`userId`) — stops a
+ *      stolen/leaked token being replayed by a different platform account,
+ *   3. an explicit `X-Tenant-ID` header, if the client still sent one, must
+ *      agree with the token's tenant — never silently prefer one over the
+ *      other.
+ * On success the token's tenant wins outright — impersonation always pins to
+ * exactly the tenant it was minted for.
+ */
+export function resolveImpersonatedTenant(args: {
+  isPlatform: boolean
+  userId: string
+  impersonatorId: string
+  impersonatedTenantId: string
+  headerTenantId?: string
+}): ImpersonatedTenantResolution {
+  if (!args.isPlatform) return { ok: false, status: 403, code: 'impersonation_not_platform' }
+  if (args.impersonatorId !== args.userId) return { ok: false, status: 403, code: 'impersonation_actor_mismatch' }
+  if (args.headerTenantId && args.headerTenantId !== args.impersonatedTenantId) {
+    return { ok: false, status: 403, code: 'impersonation_tenant_mismatch' }
+  }
+  return { ok: true, tenantId: args.impersonatedTenantId }
+}

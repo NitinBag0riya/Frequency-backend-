@@ -49,6 +49,17 @@ export interface ExpoPushPayload {
    * a follow-up.
    */
   channel?: 'inbox' | 'broadcast' | 'system'
+  /**
+   * Notification sound. 'default' → OS default (existing behaviour).
+   * A custom string (e.g. 'order_ready') references a file the mobile
+   * app must bundle: Android `res/raw/<name>.mp3` + iOS `<name>.caf` in
+   * the bundle root. If the app doesn't ship the file, Expo falls back
+   * to the OS default — so passing this here is always safe.
+   * TODO(mobile-app @ ~/Desktop/frequency-hq): bundle order_ready.mp3 (Android)
+   * and order_ready.caf (iOS) — until shipped, custom sounds silently
+   * degrade to the OS default and this whole hop is a no-op on native.
+   */
+  sound?: string
 }
 
 interface ExpoPushMessage {
@@ -58,7 +69,8 @@ interface ExpoPushMessage {
   data?: Record<string, unknown>
   priority: 'high' | 'default'
   channelId?: string
-  sound?: 'default'
+  // Expo accepts 'default' or a bundled file name (without extension) — no enum.
+  sound?: string
 }
 
 interface ExpoTicket {
@@ -99,7 +111,7 @@ export async function sendExpoPush(
     data:      payload.data ?? {},
     priority:  'high',
     channelId,
-    sound:     'default',
+    sound:     payload.sound ?? 'default',
   }))
 
   // Map token → device row id for stale-token reaping below.

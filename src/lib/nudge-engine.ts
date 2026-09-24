@@ -61,7 +61,10 @@ export interface SendOutcome {
 // Kept tiny + inline — these are transactional operator nudges, not marketing
 // campaigns. Reuse the merchant dashboard link; no brand chrome needed.
 interface Template { subject: (c: Candidate) => string; text: (c: Candidate) => string }
-const DASH = process.env.DASHBOARD_URL || 'https://app.getfrequency.app'
+// Fallback is the APEX. `app.getfrequency.app` is not a Vercel domain on this
+// account (frequency-fe serves getfrequency.app + www only), so it 404s —
+// which meant an unset DASHBOARD_URL silently mailed merchants dead links.
+const DASH = process.env.DASHBOARD_URL || 'https://getfrequency.app'
 
 export const TEMPLATES: Record<string, Template> = {
   catalog_done_payments_pending: {

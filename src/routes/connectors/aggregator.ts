@@ -30,7 +30,7 @@ import { resolveAdapter, normalizeStatus, AggregatorChannel } from '../../connec
 import { parseMenuSnapshot, importMenuToStorefront, ParsedEntity, sf } from '../../connectors/aggregator/menu-import'
 import { inventoryActionForStatus, externalOrderKey, extractOrderLines } from './aggregator-inventory.js'
 import { rehostImageToAssets } from '../assets.js'
-import { channelIsLive, channelConnected } from './aggregator-health.js'
+import { channelIsLive, channelConnected, orderRecent, DESKTOP_HB_WINDOW_MS } from './aggregator-health.js'
 import { emitNotification, tenantNotifyRecipients } from '../notifications'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
@@ -55,6 +55,10 @@ function chan(...vals: unknown[]): AggregatorChannel {
   return 'zomato'
 }
 const CHANNEL_LABEL: Record<AggregatorChannel, string> = { zomato: 'Zomato', swiggy: 'Swiggy' }
+// First-sighting statuses we do NOT ring for — history backfill of already-finished
+// orders that the operator can't act on. Anything else (placed/new/preparing/ready/
+// accepted) rings as a fresh order, regardless of ingestion age.
+const TERMINAL_ON_ARRIVAL = new Set(['delivered', 'cancelled', 'rejected', 'returned', 'refunded'])
 const STATUS_LABEL: Record<string, string> = {
   new: 'New', preparing: 'Preparing', ready: 'Ready', picked_up: 'Picked up',
   delivered: 'Delivered', rejected: 'Rejected', cancelled: 'Cancelled',
@@ -292,18 +296,35 @@ function extractSummary(data: any): { name: string | null; phone: string | null;
 // storefront-api keys applySale/applyRestock on the namespaced orderId — so it is safe
 // to call on every status transition and it NEVER blocks or fails order ingest.
 const HORECA_INV_TYPES = new Set(['horeca', 'restaurant', 'cafe', 'hotel'])
-async function syncOrderInventory(slug: string, channel: AggregatorChannel, externalId: string, status: string, data: any): Promise<void> {
+// Returns an operator-facing coverage-gap summary (for a low-priority notification)
+// when a depletion silently no-ops on some lines, else null. Never throws into ingest.
+async function syncOrderInventory(slug: string, channel: AggregatorChannel, externalId: string, status: string, data: any): Promise<string | null> {
   const action = inventoryActionForStatus(status)
-  if (action === 'none') return
+  if (action === 'none') return null
   const orderId = externalOrderKey(channel, externalId)
   try {
     if (action === 'deplete') {
       const lines = extractOrderLines(data)
-      if (lines.length) await sf('POST', '/admin/inventory/apply-external-sale', slug, { orderId, source: channel, lines })
+      if (!lines.length) return null
+      const resp = await sf('POST', '/admin/inventory/apply-external-sale', slug, { orderId, source: channel, lines })
+      // Depletion is best-effort per line. The endpoint reports lines that matched no dish
+      // (unmatched), matched a dish with no recipe (missing), or whose recipe points at a
+      // removed ingredient (orphan) — each deplete NOTHING. Silently dropping these hides a
+      // renamed/unmapped Zomato/Swiggy dish, so surface the total as an operator signal.
+      const r = (resp && typeof resp === 'object') ? (resp.result ?? resp) : {}
+      const unmatched = Number(r?.unmatched) || 0
+      const missing = Number(r?.missing) || 0
+      const orphan = Number(r?.orphan) || 0
+      const gaps = unmatched + missing + orphan
+      if (gaps > 0) {
+        console.warn(`[aggregator/inv] coverage gap — ${orderId}: unmatched=${unmatched} missing=${missing} orphan=${orphan}`)
+        return `${CHANNEL_LABEL[channel]} order ${externalId}: ${gaps} item(s) didn't deplete stock (unmapped/no recipe) — check Recipe coverage`
+      }
     } else {
       await sf('POST', '/admin/inventory/reverse-external-sale', slug, { orderId })
     }
   } catch (e: any) { console.warn(`[aggregator/inv] ${orderId} ${status}: ${e?.message}`) }
+  return null
 }
 
 // A "detection marker" ping (Swiggy activity sensed, no order captured) that the desktop
@@ -325,20 +346,48 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // Ring the bell: emit an in-app notification for an order event. Fire-and-forget.
   const notifyOrder = async (
     tenantId: string,
-    ev: { isNew: boolean; channel: AggregatorChannel; orderId: string; status: string; summary: string },
+    ev: { isNew: boolean; channel: AggregatorChannel; orderId: string; status: string; summary: string; outletRef?: string | null },
   ) => {
     try {
       const recipients = await tenantRecipients(tenantId)
       if (!recipients.length) return
+      // Per-outlet channel pause: the operator switched this channel off in POS, so
+      // don't ring for it. The ORDER is still ingested and still lands on the board —
+      // only the alert is suppressed. Fails OPEN: any lookup hiccup rings as normal,
+      // because a missed ring costs a real order and a stray ring costs nothing.
+      if (ev.isNew && ev.outletRef) {
+        try {
+          const { data: t } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+          const slug = (t as any)?.slug
+          if (slug) {
+            const cfg = await sf('GET', '/admin/config', slug)
+            const outlet = (Array.isArray(cfg?.outlets) ? cfg.outlets : []).find((x: any) =>
+              String(x?.swiggyResId ?? '') === String(ev.outletRef) || String(x?.zomatoResId ?? '') === String(ev.outletRef))
+            if (outlet?.orderChannels?.[ev.channel] === false) {
+              console.log(`[aggregator] ${ev.channel} paused at ${outlet.name} — order ingested, ring suppressed`)
+              return
+            }
+          }
+        } catch { /* fail open — ring anyway */ }
+      }
+      // A ring means one of two things now:
+      //   decision_needed=true  → status 'new', operator must accept/reject (loops till decided)
+      //   decision_needed=false → a FRESH order that arrived already accepted (auto-accept
+      //                            heads-up) — ring once, no accept/reject, informational.
+      // The FE (OrderAlertProvider) uses this to show the right banner + not loop a heads-up.
+      const decisionNeeded = ev.isNew && ev.status === 'new'
       await emitNotification(supabase, {
         tenant_id: tenantId,
         event_key: ev.isNew ? 'order.new' : 'order.status',
         recipient_user_ids: recipients,
         link: '/settings/orders',   // the real orders-board route (org slug is added client-side)
         data: {
-          channel: ev.channel, channel_label: CHANNEL_LABEL[ev.channel],
+          channel: ev.channel, channel_label: CHANNEL_LABEL[ev.channel], outlet_ref: ev.outletRef ?? null,
           order_id: ev.orderId, status: ev.status, status_label: STATUS_LABEL[ev.status] ?? ev.status,
-          summary: ev.isNew ? `${ev.summary} — accept now` : ev.summary,
+          decision_needed: decisionNeeded,
+          summary: ev.isNew
+            ? (decisionNeeded ? `${ev.summary} — accept now` : `${ev.summary} — auto-accepted (${STATUS_LABEL[ev.status] ?? ev.status})`)
+            : ev.summary,
           priority: ev.isNew ? 'high' : 'normal',
         },
       })
@@ -381,14 +430,26 @@ export function createAggregatorConnector(deps: Deps): express.Router {
   // then clear the outlet's pending_full_sync flag.
   const ingestMenu = async (tenantId: string, outletRef: string, body: any) => {
     const entities = parseMenuSnapshot(body)
-    const channel = await channelForOutlet(tenantId, outletRef)
+    // Trust the channel the desktop actually scraped; only fall back to inferring it
+    // from a prior order. The inference alone is a chicken-and-egg: an outlet that has
+    // synced its menu but never taken an order got channel=null on every row, which
+    // left its dishes unattributable in the menu views.
+    const declared = String(body?.channel ?? '').toLowerCase()
+    const channel = (declared === 'zomato' || declared === 'swiggy')
+      ? declared
+      : await channelForOutlet(tenantId, outletRef)
     const now = new Date().toISOString()
     if (entities.length) {
       const rows = entities.map(e => ({
         tenant_id: tenantId, source: 'frequency_desktop', channel, outlet_ref: outletRef,
         entity_type: e.entity_type, entity_id: e.entity_id, name: e.name,
         in_stock: e.in_stock, price: e.price, category_ref: e.category_ref,
-        raw: e.raw, last_synced_at: now, updated_at: now,
+        // Add-on groups are resolved from the WHOLE snapshot (modifierGroupWrappers +
+        // the variant→catalogue maps), so they can't be re-derived from a single stored
+        // row later. Stash them alongside the raw entity — import-to-pos reads the DB,
+        // not the snapshot, and would otherwise silently drop every option group.
+        raw: e.options?.length ? { ...e.raw, _optionGroups: e.options } : e.raw,
+        last_synced_at: now, updated_at: now,
       }))
       const { error } = await supabase.from('aggregator_menu')
         .upsert(rows, { onConflict: 'tenant_id,outlet_ref,entity_type,entity_id' })
@@ -444,6 +505,92 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       { tenant_id: tenantId, outlet_ref: outletRef, pending_full_sync: false, last_synced_at: now, updated_at: now },
       { onConflict: 'tenant_id,outlet_ref' })
     console.log(`[aggregator/history] ingested ${parsed.length} past order(s) for outlet ${outletRef}`)
+
+    // LIVE-MIRROR: parsed rows in a non-terminal status (placed/new/accepted/
+    // preparing/ready) are LIVE orders that came in through the wrong door — the
+    // desktop's Zomato bridge routes many active orders through /history/ingest
+    // instead of /orders/ingest, which is silent (no notifyOrder → no ring).
+    // Mirror them into aggregator_orders + fire the ring so the operator hears
+    // the order regardless of which endpoint the desktop chose. Idempotent:
+    // aggregator_orders is upsert-by-natural-key, and isNew is gated on
+    // first-sighting-and-not-terminal so a re-relayed same-status row is silent.
+    if (parsed.length && channel) {
+      const live = parsed.filter(o => !TERMINAL_ON_ARRIVAL.has(normalizeStatus(o.status)))
+      if (live.length) {
+        const priorByKey = new Map<string, string>()
+        try {
+          const { data: prior } = await supabase.from('aggregator_orders')
+            .select('external_order_id, status').eq('tenant_id', tenantId).eq('channel', channel)
+            .in('external_order_id', live.map(o => o.external_order_id))
+          for (const p of prior ?? []) priorByKey.set((p as any).external_order_id, (p as any).status)
+        } catch { /* fail open — false re-ring beats a dropped order */ }
+        for (const o of live) {
+          const status = normalizeStatus(o.status)
+          const prior = priorByKey.get(o.external_order_id)
+          const isNewRow = prior === undefined
+          if (!isNewRow && prior === status) continue   // unchanged re-push — no bell
+          const row = {
+            tenant_id: tenantId, source: 'frequency_desktop', channel, external_order_id: o.external_order_id,
+            outlet_ref: outletRef, status, status_identifier: String(o.status ?? ''),
+            customer_name: o.customer_name ?? null, customer_phone_masked: null,
+            item_count: o.item_count ?? 0, gross_amount: o.gross_amount ?? null,
+            placed_at: o.placed_at ?? null, payload: o.raw ?? {}, updated_at: now,
+          }
+          const { error: mErr } = await supabase.from('aggregator_orders')
+            .upsert(row, { onConflict: 'tenant_id,channel,external_order_id' })
+          if (mErr) { console.error(`[aggregator/history→live] upsert failed ${o.external_order_id}: ${mErr.message}`); continue }
+          // RING gate: fire order.new (ring + WhatsApp) ONLY when the order is actually
+          // awaiting the operator's accept/reject — normalizeStatus === 'new'. An order
+          // first seen already 'preparing'/'accepted'/'ready'/'delivered' has NO pending
+          // decision (auto-accepted, or accepted on the aggregator side), so it lands on
+          // the board via order.status but must NOT ring. This kills the noise from
+          // already-accepted / already-delivered orders. (Dropped the 15-min recency
+          // override — that was exactly what made delivered orders ring.)
+          const isNew = isNewRow && status === 'new'
+          void notifyOrder(tenantId, {
+            isNew, channel, orderId: o.external_order_id, status,
+            summary: orderSummary(o.item_count ?? 0, o.gross_amount ?? null),
+            outletRef,
+          })
+          console.log(`[aggregator/history→live] mirrored ${channel}:${o.external_order_id} status=${status} isNew=${isNew}`)
+        }
+      }
+    }
+
+    // TERMINAL RECONCILE: a history row in a terminal status is the AUTHORITATIVE
+    // end-state. Zomato's live board only shows ACTIVE orders — once an order is
+    // handed to the rider it leaves the board, so if the terminal transition wasn't
+    // captured before that, the live aggregator_orders row freezes mid-flight
+    // (preparing/ready forever). History (get-all-v2) still carries the true
+    // 'delivered'/'cancelled'/… — advance the live row from it here. Never rings
+    // (a completion, not a new order); only ever moves non-terminal → terminal, and
+    // the status guard makes it a no-op once already terminal, so it's idempotent and
+    // writes nothing when nothing is stale. (Swiggy's fetchOrders poll returns full
+    // status so it self-heals already; this is belt-and-braces for both channels.)
+    if (parsed.length && channel) {
+      const doneByKey = new Map<string, string>()
+      for (const o of parsed) {
+        const s = normalizeStatus(o.status)
+        if (TERMINAL_ON_ARRIVAL.has(s)) doneByKey.set(o.external_order_id, s)
+      }
+      if (doneByKey.size) {
+        // Touch ONLY rows still non-terminal on the board — avoids rewriting settled
+        // rows on every sweep (write amplification) and never regresses a terminal row.
+        const { data: openRows } = await supabase.from('aggregator_orders')
+          .select('external_order_id, status').eq('tenant_id', tenantId).eq('channel', channel)
+          .in('external_order_id', [...doneByKey.keys()])
+          .not('status', 'in', '(delivered,cancelled,rejected,returned,refunded)')
+        for (const r of openRows ?? []) {
+          const ext = (r as any).external_order_id
+          const status = doneByKey.get(ext)!
+          const { error: rErr } = await supabase.from('aggregator_orders')
+            .update({ status, updated_at: now })
+            .eq('tenant_id', tenantId).eq('channel', channel).eq('external_order_id', ext)
+          if (rErr) { console.error(`[aggregator/history→reconcile] ${ext}: ${rErr.message}`); continue }
+          console.log(`[aggregator/history→reconcile] ${channel}:${ext} ${(r as any).status} → ${status}`)
+        }
+      }
+    }
   }
 
   // Ingest a Zomato/Swiggy customer-complaints snapshot → upsert into public.complaints
@@ -536,23 +683,26 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       const at    = String(r?.review_at ?? r?.created_at ?? r?.date ?? r?.reviewed_on ?? '').slice(0, 40) || now
       return {
         tenant_id: tenantId, outlet_ref: outletRef, source: channel,
-        external_id: `${channel}:${externalId}`, order_ref: String(r?.order_id ?? r?.orderId ?? '') || null,
-        stars, review: text, customer_name: name, review_at: at,
+        // Column names must match public.reviews EXACTLY. This block previously wrote
+        // `external_id`, `review` and `raw` — none of which exist on the table — so every
+        // aggregator review insert failed with an unknown-column error that was only
+        // console.error'd, while the route still returned ok. That is why production held
+        // 18 Zomato complaints (correct columns) and ZERO aggregator reviews.
+        source_review_id: `${channel}:${externalId}`,
+        order_ref: String(r?.order_id ?? r?.orderId ?? '') || null,
+        stars, rating: stars, text, customer_name: name, review_at: at,
         reply_status: 'unsupported',   // flip to 'queued'/'sent' once reply endpoint wired
-        raw: r, updated_at: now,
+        source_meta: r, updated_at: now,
       }
     }).filter(Boolean) as any[]
     if (!rows.length) return
-    const { data: existing } = await supabase.from('reviews')
-      .select('external_id').eq('tenant_id', tenantId).eq('source', channel)
-      .in('external_id', rows.map((r: any) => r.external_id))
-    const have = new Set((existing ?? []).map((x: any) => x.external_id))
-    const fresh = rows.filter((r: any) => !have.has(r.external_id))
-    if (fresh.length) {
-      const { error } = await supabase.from('reviews').insert(fresh)
-      if (error) console.error(`[aggregator/reviews] insert failed: ${error.message}`)
-      else console.log(`[aggregator/reviews] ingested ${fresh.length} new ${channel} review(s)`)
-    }
+    // Upsert on the table's own UNIQUE (tenant_id, source, source_review_id) instead of
+    // read-then-filter: the old select/compare could not dedupe at all (it keyed on a
+    // column that does not exist) and raced two concurrent ingests besides.
+    const { error } = await supabase.from('reviews')
+      .upsert(rows, { onConflict: 'tenant_id,source,source_review_id', ignoreDuplicates: true })
+    if (error) console.error(`[aggregator/reviews] upsert failed: ${error.message}`)
+    else console.log(`[aggregator/reviews] ingested up to ${rows.length} ${channel} review(s)`)
   }
 
   // Whether the next orders poll should request a one-shot history backfill.
@@ -706,6 +856,45 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
+  // Whole-outlet online/offline ("store open-close"). Reuses the SAME
+  // aggregator_stock_actions queue + pull/result path as item stock, with
+  // entity_type='outlet' — a store toggle IS a visibility write, so it needs no
+  // second queue, no migration (entity_type is free text) and no FE plumbing
+  // (pending-actions already surfaces it under `stock`).
+  //
+  // Honesty: the desktop applies Swiggy in both directions and Zomato online-only;
+  // Zomato go-offline reports back gated (endpoint not captured yet), so the row
+  // terminates in 'gated' rather than a fake 'done'.
+  //
+  // NOTE going offline has a real commercial cost — Swiggy penalises outlets for
+  // it (`is_penalised` in their availability payload) — so callers should confirm
+  // before sending open:false. Deliberately no aggregator_menu write here: an
+  // outlet has no menu row.
+  const StoreStatusBody = z.object({
+    channel:   z.enum(['zomato', 'swiggy']),
+    outletRef: z.string().min(1),
+    open:      z.boolean(),
+  })
+  r.post('/api/connectors/aggregator/store-status', ...guardEdit, validateBody(StoreStatusBody), async (req, res) => {
+    try {
+      const tenantId = (req as any).tenantId
+      const adapter = await resolveAdapter(supabase, tenantId)
+      if (!adapter.capabilities().stock) { res.status(422).json({ error: `${adapter.source} cannot toggle store status` }); return }
+      const b = req.body as z.infer<typeof StoreStatusBody>
+      const out = await adapter.submitStockToggle(
+        { tenantId, source: adapter.source },
+        { channel: b.channel, outletRef: b.outletRef, entityType: 'outlet', entityId: b.outletRef, inStock: b.open },
+      )
+      const gated = b.channel === 'zomato' && !b.open
+      res.json({
+        ok: true, ...out, channel: b.channel, open: b.open, gated,
+        note: gated
+          ? 'Queued, but Zomato go-offline is not mapped yet — it will report back as gated and the outlet will NOT be taken offline.'
+          : `Queued — the merchant client takes the outlet ${b.open ? 'online' : 'offline'} on its next poll (~30s).`,
+      })
+    } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
+  })
+
   // Publish / make-visible an item or category on a channel. This is the
   // menu-visibility surface: "publish to Swiggy" is a REAL stock-visibility
   // write (setStock on the merchant's session); "publish to Zomato" is
@@ -758,7 +947,27 @@ export function createAggregatorConnector(deps: Deps): express.Router {
       if (error) { res.status(500).json({ error: error.message }); return }
       // Distinct outlets for the FE outlet selector.
       const outlets = Array.from(new Set((data ?? []).map((m: any) => m.outlet_ref)))
-      res.json({ menu: data ?? [], outlets })
+      // …and their human names, so the picker doesn't read "21949044" vs "22340216".
+      // Sourced from the STOREFRONT outlets (swiggyResId/zomatoResId) — the same
+      // mapping order attribution resolves through — and not from the provision
+      // metadata, so a picker label can never disagree with which outlet an order
+      // is actually filed under. Additive: `outlets` keeps its shape, and a ref with
+      // no outlet claiming it is simply absent (the FE falls back to the raw id).
+      const outletLabels: Record<string, string> = {}
+      try {
+        const { data: t } = await supabase.from('tenants')
+          .select('slug').eq('id', (req as any).tenantId).maybeSingle()
+        const slug = (t as any)?.slug
+        if (slug) {
+          const cfg = await sf('GET', '/admin/config', slug)
+          for (const o of (Array.isArray(cfg?.outlets) ? cfg.outlets : [])) {
+            for (const ref of [o?.swiggyResId, o?.zomatoResId]) {
+              if (ref && o?.name) outletLabels[String(ref)] = String(o.name)
+            }
+          }
+        }
+      } catch { /* labels are cosmetic — never fail the menu read over them */ }
+      res.json({ menu: data ?? [], outlets, outletLabels })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
@@ -933,6 +1142,7 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         entities = (data ?? []).map((m: any) => ({
           entity_type: m.entity_type, entity_id: String(m.entity_id), name: m.name,
           in_stock: m.in_stock !== false, price: m.price, category_ref: m.category_ref, raw: m.raw ?? {},
+          options: (m.raw as any)?._optionGroups,          // restored from ingest
         }))
       }
       if (!entities.length) {
@@ -984,13 +1194,15 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
-  // Connection health — is the merchant's Frequency Desktop app polling us?
-  // Also reports PER-CHANNEL status so both the web dashboard and the desktop
-  // shell can show "Zomato connected" / "Swiggy connected" durably, instead of the
-  // desktop-only, in-memory signal that never reached the server. A channel counts
-  // as connected when the desktop is live (fresh heartbeat) AND we have ingested
-  // that channel's orders at least once (i.e. the merchant logged in and it pulled
-  // data). Derived from existing rows — no new desktop reporting required.
+  // Connection health — is the merchant's Frequency Desktop app polling us, and is
+  // each channel actually RECEIVING orders right now? A channel is only reported
+  // `connected` on server-verifiable proof of liveness: the desktop is live AND a
+  // real order arrived on it within the recent window (see aggregator-health.ts).
+  // We do NOT use lifetime order history — that shows green forever after one old
+  // order even while the channel is logged out and no orders flow (a lie that makes
+  // merchants miss orders). `everLinked` + `lastOrderAt` are returned as honest
+  // context, never as the connected signal. The exact needs_login truth needs the
+  // desktop to report per-channel state on its authed poll; wired to consume it here.
   r.get('/api/connectors/aggregator/health', ...guardView, async (req, res) => {
     try {
       const tenantId = (req as any).tenantId
@@ -998,17 +1210,53 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         .select('last_seen_at, source').eq('tenant_id', tenantId).maybeSingle()
       const lastSeen = (data as any)?.last_seen_at ?? null
       const online = channelIsLive(lastSeen)
-      const channels: Record<AggregatorChannel, { connected: boolean; everSeen: boolean }> =
-        { zomato: { connected: false, everSeen: false }, swiggy: { connected: false, everSeen: false } }
+      // AUTHORITATIVE per-channel truth: the Frequency Desktop app reports each channel's
+      // real login state ('connected'|'needs_login') in its signed heartbeat →
+      // desktop_installs.health, attributed by tenant_slug. Pull the freshest install for
+      // this tenant. When present + fresh it beats the order-flow proxy (which only exists
+      // as a fallback for older apps that don't yet send an attributed slug).
+      let deskState: Partial<Record<AggregatorChannel, string>> = {}
+      let deskFresh = false
+      // The desktop build the merchant is actually RUNNING. The dashboard needs this to
+      // avoid offering a control the installed app cannot execute — a store on/off switch
+      // on a pre-1.0.7 install would animate, save, and silently do nothing, because
+      // setStoreStatus does not exist there. A UI that lies is worse than no UI.
+      let deskVersion: string | null = null
+      try {
+        const { data: t } = await supabase.from('tenants').select('slug').eq('id', tenantId).maybeSingle()
+        const slug = (t as any)?.slug
+        if (slug) {
+          const { data: inst } = await supabase.from('desktop_installs')
+            .select('health, last_heartbeat_at, app_version').eq('tenant_slug', slug)
+            .order('last_heartbeat_at', { ascending: false }).limit(1).maybeSingle()
+          const hbAt = (inst as any)?.last_heartbeat_at ?? null
+          deskFresh = hbAt ? (Date.now() - new Date(hbAt).getTime()) < DESKTOP_HB_WINDOW_MS : false
+          deskState = ((inst as any)?.health?.aggregators ?? {}) as Partial<Record<AggregatorChannel, string>>
+          deskVersion = (inst as any)?.app_version ?? null
+        }
+      } catch { /* fall back to order-flow */ }
+      const channels: Record<AggregatorChannel, { connected: boolean; state: string | null; everLinked: boolean; receiving: boolean; lastOrderAt: string | null }> =
+        { zomato: { connected: false, state: null, everLinked: false, receiving: false, lastOrderAt: null }, swiggy: { connected: false, state: null, everLinked: false, receiving: false, lastOrderAt: null } }
       await Promise.all((Object.keys(channels) as AggregatorChannel[]).map(async ch => {
-        const { count } = await supabase.from('aggregator_orders')
-          .select('id', { count: 'exact', head: true }).eq('tenant_id', tenantId).eq('channel', ch)
-        const everSeen = !!count && count > 0
-        channels[ch] = { everSeen, connected: channelConnected(online, everSeen) }
+        const { data: last } = await supabase.from('aggregator_orders')
+          .select('created_at').eq('tenant_id', tenantId).eq('channel', ch)
+          .order('created_at', { ascending: false }).limit(1).maybeSingle()
+        const lastOrderAt = (last as any)?.created_at ?? null
+        const receiving = orderRecent(lastOrderAt)
+        const reported = deskFresh ? (deskState[ch] ?? null) : null   // real login state, only when fresh
+        // connected = the desktop confirms this channel is logged in NOW, OR (fallback) a
+        // real order arrived recently. Lifetime history never counts.
+        const connected = reported === 'connected' || channelConnected(online, receiving)
+        channels[ch] = { connected, state: reported, everLinked: !!lastOrderAt, lastOrderAt, receiving }
       }))
       // `channel` lets the dashboard subscribe to the realtime liveness pings
       // without needing to know its own tenant id.
-      res.json({ online, lastSeenAt: lastSeen, source: (data as any)?.source ?? null, channels, channel: AGG_STATUS_TOPIC(tenantId) })
+      res.json({
+        online, lastSeenAt: lastSeen, source: (data as any)?.source ?? null, channels,
+        // null when no fresh heartbeat — callers must treat unknown as "cannot", never as "can".
+        desktopVersion: deskFresh ? deskVersion : null,
+        channel: AGG_STATUS_TOPIC(tenantId),
+      })
     } catch (err: any) { res.status(err?.status ?? 500).json({ error: err.message }) }
   })
 
@@ -1115,19 +1363,27 @@ export function createAggregatorConnector(deps: Deps): express.Router {
           // Off-platform sale → inventory: deplete on accept, reverse on cancel/reject.
           // Only on a status transition; idempotent + best-effort, never blocks ingest.
           if (changed && invSlug) void syncOrderInventory(invSlug, channel, externalOrderId, status, el.data)
+            .then(gap => { if (gap) void notifyOrder(tenantId, { isNew: false, channel, orderId: externalOrderId, status, summary: gap }) })
 
           if (!changed) continue   // unchanged re-push — no bell, no trigger
           notified++
-          // Ring for a freshly-SEEN order in any early (pre-fulfilment) state, not only
-          // exact 'new'. Zomato orders routinely leave NEW before our ~8s poll catches them
-          // (they're accepted fast), so they're first seen at 'accepted'/'preparing' — still
-          // a brand-new order that must ring. Recency-gated (30 min) + first-seen-only so a
-          // late history backfill of old/delivered orders never false-rings.
-          const EARLY_STATES = new Set(['new', 'accepted', 'preparing', 'ready'])
-          const placedMs = row.placed_at ? Date.parse(row.placed_at) : NaN
-          const recentEnough = !Number.isFinite(placedMs) || (Date.now() - placedMs) < 30 * 60 * 1000
-          const isNew = isNewRow && EARLY_STATES.has(status) && recentEnough
-          void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross) })
+          // First sighting of an order (isNewRow) IS a "new order" from the operator's
+          // point of view. Widened gate 2026-09-05 after the audit found La Fiamma
+          // getting zero aggregator rings since Aug 20:
+          //   - EARLIER gate (EARLY_STATES only) killed every Swiggy that entered
+          //     post-'new' status. Widened to recency-only.
+          //   - RECENCY gate (30-min from placed_at) then killed every Swiggy that
+          //     fast-cycled placed→delivered in <30min and was caught post-fulfilment.
+          //     Result: 0 order.new events for 15+ days despite live orders.
+          // RING gate — LIVE relay path. This path is the desktop's in-window poll of the
+          // merchant's CURRENT orders, so a first-sighting here is genuinely just-happening.
+          // Ring when the order is awaiting a decision ('new' → accept/reject, loops) OR is a
+          // fresh auto-accepted arrival ('preparing' → heads-up, no decision). Everything
+          // past that — ready / picked_up / delivered / cancelled / rejected — is history,
+          // NOT a live event, so no ring (it still lands on the board via order.status).
+          // decision_needed (computed in notifyOrder from status==='new') tells the FE which.
+          const isNew = isNewRow && (status === 'new' || status === 'preparing')
+          void notifyOrder(tenantId, { isNew, channel, orderId: externalOrderId, status, summary: orderSummary(s.items, s.gross), outletRef: el.resId != null ? String(el.resId) : null })
           void import('../../engine/inbound-router').then(({ fireOrderTrigger }) =>
             fireOrderTrigger(supabase, tenantId, {
               kind: isNew ? 'new_order' : 'order_status', channel, status,
@@ -1203,7 +1459,14 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         // records last_action_result so the board shows the honest state.
         const mapping = String(b.result?.mapping ?? '')
         const pendingOrFailed = mapping === 'pending-mapping' || mapping === 'pending-live-order-mapping' || mapping === 'failed'
-        const executed = !!mapped && !b.result?.error && !pendingOrFailed
+        // `done` alone is NOT enough — 2026-09-08 the desktop replayed a Zomato analytics
+        // beacon (jumbo.zomato.com/event), got 200 from the telemetry collector, reported
+        // `done`, and we flipped the order to `ready` while Zomato never heard a thing.
+        // The desktop must now READ BACK the aggregator's own order state after the write
+        // and set result.verified=true only when the status actually moved. Anything
+        // unverified stays queued (retried next poll) and is recorded for the board.
+        const verified = b.result?.verified === true
+        const executed = !!mapped && !b.result?.error && !pendingOrFailed && verified
         await supabase.from('aggregator_orders').update({
           ...(executed
             ? { pending_action: null, pending_prep_time: null, pending_reason: null, pending_queued_at: null, status: mapped }
@@ -1219,10 +1482,26 @@ export function createAggregatorConnector(deps: Deps): express.Router {
         }).eq('tenant_id', tenantId).eq('id', b.id)
       } else if (b.kind === 'menuEdit' && b.id != null) {
         // Swiggy menu edit is async QC — 'done' = accepted into QC, 'failed' = errored/rejected.
-        const failed = !!(b.result?.error || b.result?.rejection)
-        await supabase.from('aggregator_menu_actions').update({
-          status: failed ? 'failed' : 'done', result: b.result ?? null, updated_at: new Date().toISOString(),
-        }).eq('tenant_id', tenantId).eq('id', b.id)
+        // This used to key ONLY on error/rejection, so a hard reject that reports
+        // { ok:false, status:400, message:"Bad request for CreateOrEditItem" } — no
+        // `error`, no `rejection` — was recorded as DONE. Proven live 2026-08-30: two
+        // pushes Swiggy refused outright both read as successful. A bulk push would look
+        // like it worked while changing nothing. Trust ok/status too.
+        const r: any = b.result ?? {}
+        const failed = r.ok === false
+          || !!(r.error || r.rejection)
+          || (typeof r.status === 'number' && r.status >= 400)
+        const { data: row } = await supabase.from('aggregator_menu_actions')
+          .update({ status: failed ? 'failed' : 'done', result: b.result ?? null, updated_at: new Date().toISOString() })
+          .eq('tenant_id', tenantId).eq('id', b.id).select('action, outlet_ref').maybeSingle()
+        // A CREATE that Swiggy accepted exists on the live menu but not in our captured
+        // replica yet — flag a full re-pull so the next menu-diff matches it by name and
+        // stops reporting it as "not on Swiggy". Same flag /menu/resync sets.
+        if (!failed && (row as any)?.action === 'create' && (row as any)?.outlet_ref) {
+          await supabase.from('aggregator_menu_sync').upsert(
+            { tenant_id: tenantId, outlet_ref: String((row as any).outlet_ref), pending_full_sync: true, updated_at: new Date().toISOString() },
+            { onConflict: 'tenant_id,outlet_ref' })
+        }
       } else {
         res.status(400).json({ error: "body needs { kind:'order', orderId, statusCode }, { kind:'stock', id } or { kind:'menuEdit', id }" }); return
       }
@@ -1240,6 +1519,43 @@ export function createAggregatorConnector(deps: Deps): express.Router {
     catch (e: any) { console.error(`[aggregator/menu] ingest error: ${e?.message}`) }
     res.json({ ok: true })
   })
+  // ─── Decision templates (learned accept/ready/reject POST shapes) ─────────
+  // The desktop's decisionLearner captures the REAL Zomato/Swiggy request the
+  // merchant fires when they click Accept/Ready/Reject on the aggregator dashboard.
+  // Storing per-tenant on the server (was: per-desktop local JSON file) means every
+  // desktop for a tenant reuses the same learned template — one merchant clicks once,
+  // every operator surface can then fire from Frequency. Also survives desktop
+  // reinstalls and cross-device.
+  r.get('/api/connectors/aggregator/decision-templates', ...guardView, async (req, res) => {
+    const { data, error } = await supabase.from('aggregator_decision_templates')
+      .select('aggregator,action,method,url_pattern,body_pattern,headers,sample_order_id,captured_at')
+      .eq('tenant_id', (req as any).tenantId)
+    if (error) { res.status(500).json({ error: error.message }); return }
+    res.json(data ?? [])
+  })
+  r.post('/api/connectors/aggregator/decision-templates', ...guardEdit, async (req, res) => {
+    const b = req.body || {}
+    const agg = String(b.aggregator ?? '')
+    const act = String(b.action ?? '')
+    if (!['zomato', 'swiggy'].includes(agg)) { res.status(400).json({ error: 'bad aggregator' }); return }
+    if (!['accept', 'ready', 'reject'].includes(act)) { res.status(400).json({ error: 'bad action' }); return }
+    if (!b.method || !b.url_pattern) { res.status(400).json({ error: 'method + url_pattern required' }); return }
+    const row = {
+      tenant_id: (req as any).tenantId, aggregator: agg, action: act,
+      method: String(b.method), url_pattern: String(b.url_pattern),
+      body_pattern: b.body_pattern ?? null,
+      headers: b.headers ?? {},
+      sample_order_id: b.sample_order_id ?? null,
+      captured_by: String((req as any).user?.id ?? 'frequency_desktop'),
+      updated_at: new Date().toISOString(),
+    }
+    const { error } = await supabase.from('aggregator_decision_templates')
+      .upsert(row, { onConflict: 'tenant_id,aggregator,action' })
+    if (error) { res.status(500).json({ error: error.message }); return }
+    console.log(`[decision-template] ${agg} ${act} captured for tenant ${(req as any).tenantId}`)
+    res.json({ ok: true })
+  })
+
   r.post('/api/connectors/aggregator/history/ingest', ...guardEdit, async (req, res) => {
     const tenantId = (req as any).tenantId
     const outletRef = String(req.body?.outletRef ?? '')

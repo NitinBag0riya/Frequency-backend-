@@ -42,11 +42,12 @@ export class FrequencyDesktopAdapter implements AggregatorAdapter {
       variants:    false,
       offers:      false,
       // Publishing = flipping an item/category visible via the STOCK endpoint.
-      // Swiggy stock-status is live (setStock), Zomato stock is still gated because
-      // its setStock endpoint hasn't been captured yet — Zomato uses a different
-      // path than editItem. Flip zomato to 'live' when the Zomato item-stock
-      // toggle POST is captured and setStock's zomato branch is wired.
-      publish:     { swiggy: 'live', zomato: 'gated' },
+      // BOTH channels live: Swiggy via setStock (vhc), Zomato via setStock's
+      // update_stock_status branch (captured 2026-08-29, item-level confirmed;
+      // category entity_type still assumed 'CATEGORY' until separately captured).
+      // The desktop reports the REAL result, so any build/endpoint mismatch fails
+      // honestly (reported gated/error) rather than faking a success.
+      publish:     { swiggy: 'live', zomato: 'live' },
     }
   }
 
