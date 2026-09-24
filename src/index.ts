@@ -7,7 +7,7 @@ import cors from 'cors'
 import crypto from 'crypto'
 import helmet from 'helmet'
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
-import { createClient } from '@supabase/supabase-js'
+import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 import { sheetsAppendRow, sheetsUpdateRange, sheetsReadRange, sheetsGetMetadata, listSpreadsheets, calendarCreateEvent, gmailSendEmail, getValidGoogleToken } from './google'
 import { createLeadsRouter } from './leads'
@@ -67,6 +67,9 @@ import { createNarutoGrowthRouter }        from './routes/naruto-growth'
 import { createNarutoTenantReportsRouter } from './routes/naruto-tenant-reports'
 import { touchLastActive }         from './lib/last-active'
 import { impersonationGate, resolveImpersonatedTenant } from './lib/platform-impersonation'
+import { resolvePlatformRole, resolvePlatformTenantAccess } from './lib/platform-guard'
+import { normalizeRole } from './lib/platform-rbac'
+import { recordPlatformAudit } from './lib/platform-audit'
 import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
 import { createTenantAuditRouter } from './routes/tenant-audit'
@@ -794,6 +797,39 @@ async function requireAuth(req: express.Request, res: express.Response, next: ex
 
 // ── RBAC Middlewares ──────────────────────────────────────────────────────────
 
+// Cheap membership probe used only by identifyTenant's platform branch (R2,
+// platform-tenant-bypass §Option C) to decide "is this platform-role caller
+// ALSO a real member of the header tenant" — mirrors the three membership
+// paths section 1 below checks (new-RBAC assignment, legacy user_roles,
+// direct ownership) plus agency sub-account access. Intentionally not the
+// single source of truth for membership (section 1 remains that); this only
+// needs a boolean to route platform vs. member, and section 1 re-resolves
+// the real role/tenant for the `member` outcome.
+async function isRealTenantMember(supabase: SupabaseClient, userId: string, tenantId: string): Promise<boolean> {
+  const [{ data: assignment }, { data: legacyRole }, { data: owned }] = await Promise.all([
+    supabase.from('user_role_assignments').select('id').eq('user_id', userId).eq('tenant_id', tenantId).maybeSingle(),
+    supabase.from('user_roles').select('id').eq('user_id', userId).eq('tenant_id', tenantId).maybeSingle(),
+    supabase.from('tenants').select('id').eq('id', tenantId).eq('user_id', userId).eq('status', 'active').maybeSingle(),
+  ])
+  if (assignment || legacyRole || owned) return true
+
+  const { data: memberships } = await supabase
+    .from('agency_members')
+    .select('agency_id')
+    .eq('user_id', userId)
+    .not('accepted_at', 'is', null)
+  const agencyIds = (memberships ?? []).map((m: any) => m.agency_id)
+  if (!agencyIds.length) return false
+  const { data: subLink } = await supabase
+    .from('agency_sub_accounts')
+    .select('agency_id')
+    .eq('tenant_id', tenantId)
+    .is('removed_at', null)
+    .in('agency_id', agencyIds)
+    .maybeSingle()
+  return !!subLink
+}
+
 async function identifyTenant(req: express.Request, res: express.Response, next: express.NextFunction) {
   const user = (req as any).user
   if (!user) { apiError(res, 401, 'unauthorized', 'Authentication required.'); return }
@@ -821,23 +857,15 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
   logger.debug(`[identifyTenant] user=${user.id}, header_tenant=${headerTenantId || '(none)'}`)
 
   // 0. Platform-scoped role check — runs first so Platform Console actions
-  //    bypass per-tenant permission checks entirely. Two paths:
-  //    (a) new RBAC: a row in user_role_assignments with tenant_id IS NULL
-  //    (b) legacy:   user_roles row with role='super_admin' and tenant_id IS NULL
-  const { data: platformAssignment } = await supabase
-    .from('user_role_assignments')
-    .select('role_definitions ( key, scope )')
-    .eq('user_id', user.id).is('tenant_id', null).maybeSingle()
-  const platformRoleKey = (platformAssignment as any)?.role_definitions?.key as string | undefined
-  let isPlatform = !!platformRoleKey
-
-  if (!isPlatform) {
-    const { data: legacySuper } = await supabase
-      .from('user_roles')
-      .select('role')
-      .eq('user_id', user.id).is('tenant_id', null).maybeSingle()
-    if (legacySuper?.role === 'super_admin') isPlatform = true
-  }
+  //    bypass per-tenant permission checks entirely. resolvePlatformRole is
+  //    the single source of truth for "is this a platform user" (new RBAC
+  //    user_role_assignments row, tenant_id IS NULL, honouring disabled_at +
+  //    scope==='platform'; falls back to the legacy user_roles super_admin
+  //    row) — same helper requirePlatformCapability uses, so a disabled
+  //    platform assignment is consistently NOT platform everywhere, not just
+  //    on /naruto routes (R2, platform-tenant-bypass).
+  const platformRoleKey = (await resolvePlatformRole(supabase, user.id)) ?? undefined
+  const isPlatform = !!platformRoleKey
 
   // Impersonation pins the tenant BEFORE the general platform branch below —
   // an impersonated request must never fall through to "trusted at the
@@ -882,14 +910,53 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
   }
 
   if (isPlatform) {
-    ;(req as any).isSuperAdmin = true
-    ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
-    // Platform users may still target a specific tenant via header (e.g. when
-    // viewing tenant-scoped data from the admin console). If a header is
-    // present, accept it as-is — they're trusted at the platform layer.
-    if (headerTenantId) (req as any).tenantId = headerTenantId
-    next()
-    return
+    if (!headerTenantId) {
+      // No X-Tenant-ID to target — nothing to bypass. The vulnerability this
+      // chokepoint closes (R2, platform-tenant-bypass) is specifically a
+      // forged header claiming another tenant; a header-less platform call
+      // is unaffected and keeps its previous behaviour.
+      ;(req as any).isSuperAdmin = true
+      ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
+      next()
+      return
+    }
+
+    // Real member of the header tenant -> treat like any other member, not
+    // a platform bypass (Option C). Falls through to section 1 below, which
+    // re-resolves role/tenant the normal way.
+    const isMember = await isRealTenantMember(supabase, user.id, headerTenantId)
+
+    const access = resolvePlatformTenantAccess({
+      role: platformRoleKey ?? null,
+      method: req.method,
+      path: req.path,
+      isMember,
+    })
+
+    if (access.kind === 'deny') {
+      logger.warn(`[identifyTenant] SECURITY: platform role=${platformRoleKey} user=${user.id} denied on tenant=${headerTenantId} method=${req.method} path=${req.path} code=${access.code}`)
+      apiError(res, access.status, access.code, access.code === 'platform_tenant_read_denied'
+        ? 'Your platform role cannot read this tenant.'
+        : 'Platform writes on another tenant require an explicit approved endpoint.')
+      return
+    }
+
+    if (access.kind === 'platform') {
+      ;(req as any).isSuperAdmin = true
+      ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
+      ;(req as any).platformRole = normalizeRole(platformRoleKey) ?? undefined
+      ;(req as any).tenantId = headerTenantId
+      if (access.audit) {
+        await recordPlatformAudit(supabase, req, {
+          capability: access.audit.capability,
+          action: access.audit.action,
+          tenant_id: headerTenantId,
+        })
+      }
+      next()
+      return
+    }
+    // access.kind === 'member' -> fall through to section 1 below.
   }
 
   // 1. If header provides a tenant ID, verify the user has access to it
