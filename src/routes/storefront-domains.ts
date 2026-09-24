@@ -22,6 +22,7 @@ import { provisionCatalog, materializeCatalog, getCatalogConfig, syncOutletAvail
 import { emitNotification, tenantNotifyRecipients } from './notifications.js'
 import { resolvePlatformRole } from '../lib/platform-guard.js'
 import { normalizeRole, can } from '../lib/platform-rbac.js'
+import { hasFeature } from '../lib/entitlements.js'
 
 type Mw = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 interface Deps { supabase: SupabaseClient; requireAuth: Mw; identifyTenant: Mw }
@@ -728,6 +729,21 @@ export function createStorefrontDomainsRouter(deps: Deps): express.Router {
     const upstreamPath = req.originalUrl.replace(/^\/api\/storefront/, '') // → /admin/... (keeps query string)
     const method = req.method.toUpperCase()
     const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'DELETE'
+
+    // ── POS ENTITLEMENT GUARD (T0.3) ────────────────────────────────────────
+    // /admin/pos/* is the live billing/KOT surface (settle, void, transfer,
+    // merge, split, order create). storefront-api's own check on this path is
+    // business-type only (UX-shaped, not authoritative) — a tenant whose plan
+    // doesn't actually grant `pos` must still be blocked SERVER-SIDE. This proxy
+    // is the one place that already knows the caller's tenant id, so it's the
+    // right place to enforce it, on top of (not instead of) that check.
+    if (/^\/admin\/pos(\/|$)/.test(upstreamPath)) {
+      const posEnabled = await hasFeature(supabase, tenantId, 'pos')
+      if (!posEnabled) {
+        res.status(403).json({ error: 'POS billing is not enabled for this workspace.' })
+        return
+      }
+    }
 
     // ── OPS-ONLY GUARD ───────────────────────────────────────────────────────
     // This proxy attaches the shared ADMIN_SECRET to whatever /admin/* path it is
