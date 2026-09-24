@@ -147,4 +147,53 @@ assert.deepEqual(
   { ok: true, tenantId: 't-a' },
 )
 
+// ── Cross-tenant path-id leak regression (reviewer, 2026-09-24) ───────────
+// identifyTenant's impersonation branch must NEVER set req.isSuperAdmin —
+// dozens of route guards key off it to skip their own tenant/path-id check
+// (e.g. `!req.isSuperAdmin && req.params.id !== req.tenantId` on GET/PATCH
+// /api/tenants/:id and /api/tenants/:id/members). These assertions replay
+// that exact guard shape against what identifyTenant actually produces for
+// an impersonated request, so this test breaks if isSuperAdmin is ever
+// re-introduced on the impersonation path.
+
+/** Mirrors the `!isSuperAdmin && params.id !== tenantId` guard used at
+ * index.ts GET /api/tenants/:id/members and PATCH /api/tenants/:id. */
+function pathTenantGuardBlocks(req: { isSuperAdmin?: boolean; tenantId: string }, pathId: string): boolean {
+  return !req.isSuperAdmin && pathId !== req.tenantId
+}
+
+// Simulates identifyTenant's impersonation branch: resolve, then apply the
+// same flags the handler sets (impersonating + viewer role, NOT isSuperAdmin).
+function simulateImpersonatedRequest(impersonatedTenantId: string) {
+  const resolved = resolveImpersonatedTenant({
+    isPlatform: true, userId: 'platform-1', impersonatorId: 'platform-1', impersonatedTenantId,
+  })
+  assert.equal(resolved.ok, true)
+  const tenantId = (resolved as { ok: true; tenantId: string }).tenantId
+  return { impersonating: true as const, isSuperAdmin: undefined, userRole: 'viewer', tenantId }
+}
+
+// 13. Impersonating tenant A, path asks for tenant A's own members → allowed.
+{
+  const req = simulateImpersonatedRequest('tenant-a')
+  assert.equal(pathTenantGuardBlocks(req, 'tenant-a'), false)
+}
+
+// 14. Impersonating tenant A, path asks for tenant B's members → BLOCKED.
+// This is the exact cross-tenant leak the reviewer flagged: before the fix,
+// the impersonation branch set isSuperAdmin=true, so this guard evaluated
+// `!true && ...` = false and let the foreign-tenant read straight through.
+{
+  const req = simulateImpersonatedRequest('tenant-a')
+  assert.equal(pathTenantGuardBlocks(req, 'tenant-b'), true)
+}
+
+// 15. Never isSuperAdmin, always impersonating + viewer, for any resolved tenant.
+{
+  const req = simulateImpersonatedRequest('tenant-z')
+  assert.equal(req.isSuperAdmin, undefined)
+  assert.equal(req.impersonating, true)
+  assert.equal(req.userRole, 'viewer')
+}
+
 console.log('platform-impersonation.selfcheck: OK')

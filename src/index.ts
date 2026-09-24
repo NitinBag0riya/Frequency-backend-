@@ -859,8 +859,20 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
       apiError(res, resolved.status, resolved.code, 'Impersonation session is not valid for this request.')
       return
     }
-    ;(req as any).isSuperAdmin = true
-    ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
+    // Root-cause fix (reviewer, 2026-09-24): do NOT grant the blanket
+    // isSuperAdmin bypass here. isSuperAdmin means "trusted at the platform
+    // layer, may target any tenant" — dozens of downstream consumers key off
+    // it to skip their own tenant/path-id check entirely (checkPermission,
+    // nav-config.ts, teams.ts, wa-calling.ts, and the `!isSuperAdmin &&
+    // req.params.id !== tenantId` guards on GET/PATCH /api/tenants/:id...).
+    // An impersonated request is pinned to exactly the ONE tenant resolved
+    // above and must be treated like a normal member of it — a distinct
+    // `impersonating` flag plus the R1-approved `viewer` role, never
+    // `isSuperAdmin` — so a request impersonating tenant A can never read or
+    // act on tenant B by supplying a different :id in the URL.
+    ;(req as any).impersonating = true
+    ;(req as any).userRole = 'viewer'
+    ;(req as any).userRoleKey = 'viewer'
     ;(req as any).tenantId = resolved.tenantId
     // Impersonated browsing must not touch the tenant's own last-active
     // signal — it isn't the tenant's activity. Call the wrapped _next

@@ -94,6 +94,15 @@ declare global {
       // layer. Lets support diagnose without changing anything.
       impersonationReadOnly?: boolean
 
+      // True for a request resolved via resolveImpersonatedTenant —
+      // DISTINCT from isSuperAdmin on purpose (impersonation-tenant-view,
+      // 2026-09-24). isSuperAdmin means "trusted at the platform layer, may
+      // target any tenant"; many consumers key off it to skip their own
+      // tenant/path-id check. Impersonation is pinned to exactly one
+      // tenant, so it must never set isSuperAdmin — it falls back to
+      // normal tenant-scoped checks under the `viewer` role (R1) instead.
+      impersonating?: boolean
+
       // Raw request body, populated by the Razorpay webhook verifier
       // (express.json with verify option). Needed because HMAC signature
       // verification must run against the EXACT bytes the upstream sent —
