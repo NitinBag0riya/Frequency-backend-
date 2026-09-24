@@ -66,6 +66,7 @@ import { createNarutoNudgesRouter }        from './routes/naruto-nudges'
 import { createNarutoGrowthRouter }        from './routes/naruto-growth'
 import { createNarutoTenantReportsRouter } from './routes/naruto-tenant-reports'
 import { touchLastActive }         from './lib/last-active'
+import { impersonationGate, resolveImpersonatedTenant } from './lib/platform-impersonation'
 import { createNavConfigRouter }   from './routes/nav-config'
 import { createTeamsRouter }       from './routes/teams'
 import { createTenantAuditRouter } from './routes/tenant-audit'
@@ -682,6 +683,13 @@ app.use('/api/onboarding', authLimiter)
 app.use('/api/team/invite-phone',         sendLimiter)
 app.use('/api/team/accept-invite-phone',  authLimiter)
 
+// ── Impersonation gate ────────────────────────────────────────────────────
+// Global, ahead of every route. No `X-Impersonate-Token` header → no-op, so
+// every existing caller is byte-identical. A present token is verified and,
+// if it verifies, pins the request read-only server-side (impersonation-
+// tenant-view §BE-01/02) — the FE banner alone was never enforcement.
+app.use(impersonationGate)
+
 app.get('/api/ping', (req, res) => res.json({ pong: true }))
 
 // Public catalogue of available plans — the SINGLE SOURCE OF TRUTH for the
@@ -829,6 +837,36 @@ async function identifyTenant(req: express.Request, res: express.Response, next:
       .select('role')
       .eq('user_id', user.id).is('tenant_id', null).maybeSingle()
     if (legacySuper?.role === 'super_admin') isPlatform = true
+  }
+
+  // Impersonation pins the tenant BEFORE the general platform branch below —
+  // an impersonated request must never fall through to "trusted at the
+  // platform layer, accept any X-Tenant-ID" (impersonation-tenant-view
+  // §BE-02). impersonatorId is only ever set by impersonationGate, which has
+  // already verified the token's signature/expiry; this resolves who may use
+  // it and for which tenant.
+  const impersonatorId = (req as any).impersonatorId as string | undefined
+  if (impersonatorId) {
+    const resolved = resolveImpersonatedTenant({
+      isPlatform,
+      userId: user.id,
+      impersonatorId,
+      impersonatedTenantId: (req as any).impersonatedTenantId,
+      headerTenantId,
+    })
+    if (!resolved.ok) {
+      logger.warn(`[identifyTenant] SECURITY: impersonation resolution failed for user=${user.id} code=${resolved.code}`)
+      apiError(res, resolved.status, resolved.code, 'Impersonation session is not valid for this request.')
+      return
+    }
+    ;(req as any).isSuperAdmin = true
+    ;(req as any).userRoleKey = platformRoleKey || 'super_admin'
+    ;(req as any).tenantId = resolved.tenantId
+    // Impersonated browsing must not touch the tenant's own last-active
+    // signal — it isn't the tenant's activity. Call the wrapped _next
+    // directly so the touchLastActive side effect in `next` is skipped.
+    _next()
+    return
   }
 
   if (isPlatform) {
