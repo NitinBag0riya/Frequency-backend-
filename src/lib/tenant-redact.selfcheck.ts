@@ -97,16 +97,21 @@ assert.strictEqual((bare as any).wa_byo_configured, false)
 assert.strictEqual(toAdminTenant(null), null)
 assert.strictEqual(toAdminTenant(undefined), null)
 
-// ── 5. Source-pin: the three leaking routes must call toAdminTenant(. ──────
+// ── 5. Source-pin: pin the call COUNT per file, not just presence. A file
+// that drops one of two call sites (e.g. the export wrap) still "contains"
+// the string once, so presence alone would miss a partial revert.
+// super-admin.ts needs 2 (detail :255 + export :351), the other two need 1.
 const root = path.join(__dirname, '..')
-const mustCall = [
-  'routes/super-admin.ts',
-  'admin.ts',
-  'routes/naruto-tenants.ts',
+const mustCall: Array<[string, number]> = [
+  ['routes/super-admin.ts', 2],
+  ['admin.ts', 1],
+  ['routes/naruto-tenants.ts', 1],
 ]
-for (const rel of mustCall) {
+for (const [rel, minCalls] of mustCall) {
   const src = fs.readFileSync(path.join(root, rel), 'utf8')
-  assert.ok(src.includes('toAdminTenant('), `${rel} no longer calls toAdminTenant(...) — secret leak regression`)
+  const calls = (src.match(/toAdminTenant\(/g) ?? []).length
+  assert.ok(calls >= minCalls,
+    `${rel} calls toAdminTenant( only ${calls}x, need >=${minCalls} — secret leak regression (partial revert?)`)
 }
 
 console.log('tenant-redact.selfcheck: OK')
