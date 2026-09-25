@@ -48,4 +48,18 @@ const CTRL = new RegExp('[\\u0000-\\u001F\\u007F]')
   assert.equal(patch.billing_address, null)
 }
 
-console.log('✓ tenant-patch selfcheck passed (5 cases)')
+// 6. gstin persists (same cap/trim treatment as legal_name — 20 chars, matching
+//    the creation-time CreateTenantSchema.gstin cap in naruto-tenants.ts).
+{
+  const { patch, error } = sanitizeTenantPatch({
+    business_name: 'Acme', gstin: '  27AAACR1234A1Z5  ',
+  })
+  assert.equal(error, undefined)
+  assert.equal(patch.gstin, '27AAACR1234A1Z5', 'gstin trimmed and persisted')
+  assert.ok('gstin' in patch, 'gstin must be in the allow-list')
+
+  const overlong = sanitizeTenantPatch({ business_name: 'Acme', gstin: 'X'.repeat(30) })
+  assert.equal((overlong.patch.gstin as string).length, 20, 'gstin bounded to 20 chars')
+}
+
+console.log('✓ tenant-patch selfcheck passed (6 cases)')

@@ -41,6 +41,8 @@ export function sanitizeTenantPatch(body: Record<string, unknown>): TenantPatchR
   if ('legal_name' in body)      patch.legal_name      = clean(body.legal_name, 120)
   if ('display_phone' in body)   patch.display_phone   = clean(body.display_phone, 20)
   if ('billing_address' in body) patch.billing_address = clean(body.billing_address, 400)
+  // Same 20-char cap as tenant-creation (naruto-tenants.ts CreateTenantSchema.gstin).
+  if ('gstin' in body)           patch.gstin            = clean(body.gstin, 20)
 
   // NOTE: business_type is intentionally NOT read here. It's locked.
 
