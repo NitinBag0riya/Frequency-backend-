@@ -5,8 +5,13 @@
 # app. Sharing the same Docker image keeps deploys atomic (web + worker
 # always ship the same code) and the build cache hot.
 #
-# Region: bom (Mumbai) — closest Fly region to Indian SMB users; saves
-# 60-90ms RTT vs Singapore for every WhatsApp / Razorpay / Supabase call.
+# Region: sin (Singapore). All frequency-api-prod machines run in sin, and
+# the static egress IP (209.71.80.109) that Brevo's Authorised-IPs allowlist
+# is keyed on is sin-only — a machine created in bom would get rotating
+# shared egress instead and every transactional email would 401. The bom
+# static egress IPs carry zero traffic (checked 2026-09-25) and are being
+# released separately; this line is what stops Fly from ever placing a NEW
+# machine in bom (autoscale burst, a future process group) again.
 #
 # Auto-scaling (May-2026 update):
 #   web    1→5 machines, concurrency-driven (soft 80, hard 200). Spikes
@@ -36,7 +41,7 @@
 # Suggested naming: <project>-api-<env>. Pick this once; renaming requires
 # `fly apps move`.
 app = "frequency-api-prod"
-primary_region = "bom"
+primary_region = "sin"
 kill_signal = "SIGTERM"
 kill_timeout = "30s"
 

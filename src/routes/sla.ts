@@ -8,8 +8,10 @@
  *   DELETE /api/sla/config/:id         — remove a policy row
  *   GET    /api/sla/breaches?active=1  — list open breaches
  *
- * The worker (workers/sla-monitor.ts) is the WRITER; this router is
- * read-mostly for tenant admins and managers.
+ * The worker (workers/sla-monitor.ts) is the WRITER; GET is read-only for
+ * any tenant member, and POST/DELETE are gated to settings.edit (owner +
+ * workspace_admin, see checkPermission in ../index.ts) — writing SLA policy
+ * is a workspace-settings action, not a general team action.
  *
  * Hardening notes (audit fixes shipped with this file):
  *   - Every Zod schema is .strict() so foreign keys (tenant_id, id)
@@ -32,6 +34,7 @@ type Deps = {
   supabase: SupabaseClient
   requireAuth: express.RequestHandler
   identifyTenant: express.RequestHandler
+  checkPermission: (resource: string, action: string) => express.RequestHandler
 }
 
 // Tight, capped shape — avoids DoS through unbounded JSON. The worker
@@ -71,7 +74,7 @@ function respond500(res: express.Response, scope: string, error: unknown): void 
 }
 
 export function createSlaRouter(deps: Deps): express.Router {
-  const { supabase, requireAuth, identifyTenant } = deps
+  const { supabase, requireAuth, identifyTenant, checkPermission } = deps
   const r = express.Router()
 
   // GET /api/sla/config — all policy rows for this tenant.
@@ -88,7 +91,7 @@ export function createSlaRouter(deps: Deps): express.Router {
   // POST /api/sla/config — upsert a row by (team_id, channel).
   // NULLS NOT DISTINCT constraint (migration 098) means team_id IS NULL
   // rows behave like a real key, so tenant-default rules update in place.
-  r.post('/api/sla/config', requireAuth, identifyTenant, async (req, res) => {
+  r.post('/api/sla/config', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const parsed = ConfigBody.safeParse(req.body)
     if (!parsed.success) { res.status(400).json({ error: 'invalid_body', issues: parsed.error.issues }); return }
@@ -118,7 +121,7 @@ export function createSlaRouter(deps: Deps): express.Router {
     res.json({ data })
   })
 
-  r.delete('/api/sla/config/:id', requireAuth, identifyTenant, async (req, res) => {
+  r.delete('/api/sla/config/:id', requireAuth, identifyTenant, checkPermission('settings', 'edit'), async (req, res) => {
     const tenantId = (req as any).tenantId as string
     const { error } = await supabase.from('sla_configs')
       .delete()
