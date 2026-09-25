@@ -550,10 +550,29 @@ export async function enqueueWebhookInbound(payload: WebhookInboundJob) {
   })
 }
 
-export async function enqueueWebhookOutbound(payload: WebhookOutboundJob) {
+export async function enqueueWebhookOutbound(
+  payload: WebhookOutboundJob,
+  opts: { delayMs?: number; jobId?: string } = {},
+) {
   return webhookOutboundQueue.add(payload.source, payload, {
     priority: 2, // outbound is lower-priority than inbound
+    // Same durable BullMQ delay + custom-jobId mechanism enqueueMessageSend
+    // uses below for the POS reservation reminder. Used by the POS advance-
+    // order KOT scheduler (P5-INT-SCHED): fires (scheduledFor - prepMins)
+    // after enqueue. jobId lets a cancelled advance order pull the still-
+    // pending fire job before it runs (removeWebhookOutboundJob below).
+    delay: opts.delayMs && opts.delayMs > 0 ? opts.delayMs : undefined,
+    jobId: opts.jobId,
   })
+}
+
+/** Best-effort remove of a still-pending (delayed, not yet processed) webhook
+ *  outbound job by its jobId. No-op if the job already fired or never existed
+ *  — a cancellation must never throw. Used to cancel a scheduled advance-order
+ *  KOT fire. Mirrors removeMessageSendJob. */
+export async function removeWebhookOutboundJob(jobId: string): Promise<void> {
+  const job = await webhookOutboundQueue.getJob(jobId)
+  if (job) await job.remove()
 }
 
 // ── Breach notification enqueue helper ─────────────────────────────────────

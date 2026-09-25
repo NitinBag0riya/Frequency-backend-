@@ -46,6 +46,7 @@ import { createWaConnectionRouter, createDataDeletionRouter } from './routes/wa-
 import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue } from './lib/wa-creds'
 import { dispatchPosApprovalRequest, verifyInternalSecret } from './lib/pos-approval-notify'
 import { dispatchReservationCreated, cancelReservationReminder, type ReservationEventBody } from './lib/pos-reservation-wa'
+import { dispatchAdvanceOrderCreated, cancelAdvanceKotFire, type AdvanceOrderEventBody } from './lib/pos-advance-kot'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
@@ -137,7 +138,7 @@ import {
 import { composeNodeCatalogPromptSection } from './engine/node-types'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import { syncTenant as syncTenantTemplates } from './workers/template-sync'
-import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, voiceNoteTranscribeQueue, webhookInboundQueue, webhookOutboundQueue, webhookInboundDeadQueue, webhookOutboundDeadQueue, breachNotificationQueue, signedFormPdfQueue, attachDebugListeners, connection as redisConnection, enqueueMessageSend, removeMessageSendJob } from './queue'
+import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, voiceNoteTranscribeQueue, webhookInboundQueue, webhookOutboundQueue, webhookInboundDeadQueue, webhookOutboundDeadQueue, breachNotificationQueue, signedFormPdfQueue, attachDebugListeners, connection as redisConnection, enqueueMessageSend, removeMessageSendJob, enqueueWebhookOutbound, removeWebhookOutboundJob } from './queue'
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
 import { ExpressAdapter } from '@bull-board/express'
@@ -2499,6 +2500,51 @@ app.post('/api/internal/pos-reservation-event', async (req, res) => {
     ).catch(() => {})
   } else {
     void cancelReservationReminder(String(reservation.reservationId), removeMessageSendJob).catch(() => {})
+  }
+})
+
+// ── Internal: POS advance-order event → schedule/cancel the advance KOT fire ─
+//
+// storefront-api POSTs here (POS Upgrade Phase 5, P5-BE-5.3) when an advance
+// (Schedule for) pickup/delivery order is:
+//   kind='created'   — schedules a one-shot callback for (scheduledAt -
+//                      prepMins) that tells storefront-api to fire that
+//                      order's KOT round. See lib/pos-advance-kot.ts for the
+//                      full callback contract (POST {STOREFRONT_API_URL}
+//                      /internal/pos-advance-kot, x-internal-secret, tiny
+//                      {slug,orderId} body — storefront-api re-reads the
+//                      order at fire time).
+//   kind='cancelled' — pulls a still-pending fire job so a cancelled advance
+//                      order never fires a KOT the kitchen never asked for.
+//
+// Same server-to-server shared-secret seam as the three internal routes
+// above — fail-closed when INTERNAL_TRIGGER_SECRET is unset.
+//
+// Ack immediately; scheduling/cancelling runs async in pos-advance-kot.ts so
+// a slow/failed enqueue never blocks storefront-api's response.
+app.post('/api/internal/pos-advance-order-event', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const b = (req.body ?? {}) as Partial<AdvanceOrderEventBody>
+  const kind = b.kind === 'cancelled' ? 'cancelled' : b.kind === 'created' ? 'created' : null
+  const order = b.order
+  if (!b.slug || !kind || !order?.orderId) {
+    res.status(400).json({ error: 'slug, kind, and order.orderId are required' }); return
+  }
+  res.json({ ok: true })
+  if (kind === 'created') {
+    if (!order.scheduledAt || typeof order.prepMins !== 'number') {
+      console.warn(`[pos-advance-kot] created event missing scheduledAt/prepMins for order ${order.orderId}`)
+      return
+    }
+    void dispatchAdvanceOrderCreated(
+      { slug: String(b.slug), kind, order } as AdvanceOrderEventBody,
+      (job, opts) => enqueueWebhookOutbound(job as any, opts),
+    ).catch(() => {})
+  } else {
+    void cancelAdvanceKotFire(String(order.orderId), removeWebhookOutboundJob).catch(() => {})
   }
 })
 
