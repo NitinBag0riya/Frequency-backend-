@@ -1,5 +1,6 @@
 import express from 'express'
 import { SupabaseClient } from '@supabase/supabase-js'
+import { toAdminTenant } from './lib/tenant-redact'
 
 /**
  * Mounts the legacy /api/admin/* router (tenants list, stats, feature
@@ -36,7 +37,7 @@ export function createAdminRouter(
       .order('created_at', { ascending: false })
       
     if (error) return res.status(500).json({ error: error.message })
-    res.json(data || [])
+    res.json((data || []).map((row) => toAdminTenant(row)))
   })
 
   // Get platform-wide stats

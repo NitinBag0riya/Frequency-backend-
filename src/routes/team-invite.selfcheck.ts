@@ -15,6 +15,7 @@
  */
 import assert from 'node:assert/strict'
 import { isValidE164, inviteAcceptState, teammateEmailFromPhone } from './teams.js'
+import { findAuthUserByEmail, scanAuthUsers, authUsersByIds, inviteStubClaimable } from '../lib/auth-users.js'
 
 // ── Internal-email derivation ────────────────────────────────────────────────
 assert.equal(teammateEmailFromPhone('+919876543210'), 'wa-919876543210@teammate.getfrequency.app')
@@ -56,4 +57,51 @@ assert.equal(inviteAcceptState({ status: 'pending', expires_at: future, email: '
 assert.equal(inviteAcceptState({ status: 'pending', expires_at: future, email: 'a@b.com' }, 'email'), 'ok')
 assert.equal(inviteAcceptState({ status: 'pending', expires_at: future, phone: PHONE }, 'email'), 'wrong-channel')
 
-console.log('team-invite.selfcheck: OK')
+// ── Email-invite password claim: never on a used account (no takeover) ───────
+const T = '2026-09-24T00:00:00Z'
+assert.equal(inviteStubClaimable({ invited_at: T, last_sign_in_at: null }), true)  // fresh invite stub
+assert.equal(inviteStubClaimable({ invited_at: T, last_sign_in_at: T }), false)    // someone signed in
+assert.equal(inviteStubClaimable({ invited_at: null, last_sign_in_at: null }), false) // plain signup, not an invite
+assert.equal(inviteStubClaimable({ last_sign_in_at: T }), false)                   // OAuth / real user
+assert.equal(inviteStubClaimable(null), false)
+
+// ── auth.users lookups page past 200 (prod had ~349; page-1-only = "not found") ─
+function fakeSb(n: number) {
+  const users = Array.from({ length: n }, (_, i) => ({ id: `u${i}`, email: `user${i}@x.com` }))
+  const calls = { list: 0, byId: 0 }
+  const sb = { auth: { admin: {
+    async listUsers({ page, perPage }: { page: number; perPage: number }) {
+      calls.list++
+      return { data: { users: users.slice((page - 1) * perPage, page * perPage) }, error: null }
+    },
+    async getUserById(id: string) {
+      calls.byId++
+      return { data: { user: users.find(u => u.id === id) ?? null }, error: null }
+    },
+  } } }
+  return { sb, calls }
+}
+
+;(async () => {
+  // 2,349 users → target on page 3 of 1000 is still found, case-insensitively.
+  const big = fakeSb(2349)
+  assert.equal((await findAuthUserByEmail(big.sb, 'USER2300@X.com'))?.id, 'u2300')
+  assert.equal(big.calls.list, 3)
+  // Missing email → null after the short last page (no infinite loop).
+  big.calls.list = 0
+  assert.equal(await findAuthUserByEmail(big.sb, 'nobody@x.com'), null)
+  assert.equal(big.calls.list, 3)
+  assert.equal(await findAuthUserByEmail(big.sb, ''), null)
+  // Prod-sized (349): user #300 was invisible to perPage:200 — now found in one call.
+  const prod = fakeSb(349)
+  assert.equal((await findAuthUserByEmail(prod.sb, 'user300@x.com'))?.id, 'u300')
+  assert.equal(prod.calls.list, 1)
+  // Substring scan spans all pages.
+  assert.equal((await scanAuthUsers(big.sb, u => u.email.startsWith('user234'))).length, 10) // 234 + 2340..2348
+  // By-id: one getUserById per UNIQUE id; unknown ids skipped.
+  const m = await authUsersByIds(prod.sb, ['u1', 'u300', 'u1', 'ghost'])
+  assert.equal(prod.calls.byId, 3)
+  assert.deepEqual([...m.keys()].sort(), ['u1', 'u300'])
+
+  console.log('team-invite.selfcheck: OK')
+})().catch(e => { console.error(e); process.exit(1) })

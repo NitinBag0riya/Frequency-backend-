@@ -51,6 +51,7 @@ import express from 'express'
 import { randomUUID } from 'crypto'   // one-time handoff IDs
 import { SupabaseClient } from '@supabase/supabase-js'
 import { sanitizeSearch } from '../lib/safe-key'
+import { toAdminTenant } from '../lib/tenant-redact'
 // Naruto Platform OS §1 — capability model. New endpoints gate on capability
 // strings via requirePlatformCapability + audit through recordPlatformAudit.
 import { requirePlatformCapability, resolvePlatformRole } from '../lib/platform-guard'
@@ -252,7 +253,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
           .gte('period_start', new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10)),
       ])
 
-      res.json({ tenant, users: users ?? [], audit: auditRows ?? [], usage: usage ?? [] })
+      res.json({ tenant: toAdminTenant(tenant), users: users ?? [], audit: auditRows ?? [], usage: usage ?? [] })
     })
 
   r.post('/api/super-admin/tenants/:id/suspend',
@@ -348,7 +349,7 @@ export function createSuperAdminRouter(deps: Deps): express.Router {
       ])
       const bundle = {
         exported_at: new Date().toISOString(),
-        tenant,
+        tenant: toAdminTenant(tenant),
         branding: branding.data ?? null,
         subscription: sub.data ?? null,
         entitlements: ents.data ?? [],

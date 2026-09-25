@@ -22,6 +22,7 @@ import { emitNotification } from './notifications'
 import { sendTeamInviteWa } from '../lib/team-invite-wa'
 import { sendTeamInviteSms } from '../lib/storefront-sms.js'
 import { sendEmail, emailConfigured } from '../lib/email'
+import { findAuthUserByEmail, authUsersByIds, inviteStubClaimable } from '../lib/auth-users'
 
 type Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => void | Promise<void>
 
@@ -99,9 +100,8 @@ export function createTeamsRouter(deps: Deps): express.Router {
       const ids = (data ?? []).map(r => r.user_id)
       const userMap: Record<string, { email: string; name?: string }> = {}
       if (ids.length > 0) {
-        const { data: { users = [] } = {} as any } = await (supabase as any).auth.admin.listUsers({ perPage: 200 })
-        for (const u of users as any[]) if (ids.includes(u.id)) {
-          userMap[u.id] = { email: u.email ?? '', name: u.user_metadata?.full_name }
+        for (const [id, u] of await authUsersByIds(supabase as any, ids)) {
+          userMap[id] = { email: u.email ?? '', name: u.user_metadata?.full_name }
         }
       }
 
@@ -321,8 +321,7 @@ export function createTeamsRouter(deps: Deps): express.Router {
       // Resolve user
       let resolvedUserId = user_id
       if (!resolvedUserId && email) {
-        const { data: { users = [] } = {} as any } = await (supabase as any).auth.admin.listUsers({ perPage: 200 })
-        const u = (users as any[]).find(u => u.email === email)
+        const u = await findAuthUserByEmail(supabase as any, email)
         if (!u) { res.status(404).json({ error: 'No platform user with that email. Use /api/team/invite instead.' }); return }
         resolvedUserId = u.id
       }
@@ -618,6 +617,64 @@ export function createTeamsRouter(deps: Deps): express.Router {
     // FE signs in with (login_email, password); future logins are phone+password
     // mapped back to this same login_email by the dashboard login page.
     res.json({ success: true, tenant_id: inv.tenant_id, login_email: internalEmail })
+  })
+
+  // ─── Accept an EMAIL invite with a password (public — invitee not signed in) ─
+  //
+  // inviteUserByEmail (POST /api/team/invite) pre-creates a PASSWORDLESS auth
+  // stub, so a client-side signUp for that email returns no session and the
+  // invitee loops forever. Instead, the invite token (pending, unexpired, email
+  // channel) authorizes setting the password here — on inv.email only, never an
+  // email from the client. We only write to a never-signed-in invite stub
+  // (inviteStubClaimable); a real account is left untouched and the invitee must
+  // prove its password at sign-in. Does NOT consume the invite: the FE signs in,
+  // then calls the existing /api/team/accept-invite (email match + role link).
+  // Lives under /api/auth/ so the IP-keyed authLimiter covers it.
+  r.post('/api/auth/accept-invite-email', async (req, res) => {
+    const { token, password, full_name } = req.body ?? {}
+    if (!token || typeof token !== 'string') { res.status(400).json({ error: 'token required' }); return }
+    if (typeof password !== 'string' || password.length < 8) {
+      res.status(400).json({ error: 'Password must be at least 8 characters' }); return
+    }
+
+    const { data: inv, error } = await supabase.from('pending_invites')
+      .select('*').eq('token', token).maybeSingle()
+    if (error || !inv) { res.status(404).json({ error: 'Invalid invite' }); return }
+
+    const state = inviteAcceptState(inv as any, 'email')
+    if (state === 'not-pending') { res.status(400).json({ error: `Invite is ${inv.status}` }); return }
+    if (state === 'expired') {
+      await supabase.from('pending_invites').update({ status: 'expired' }).eq('id', inv.id)
+      res.status(410).json({ error: 'Invite expired' }); return
+    }
+    if (state === 'wrong-channel') { res.status(400).json({ error: 'Not an email invite' }); return }
+
+    const email = String(inv.email).trim().toLowerCase()
+    const cleanName = typeof full_name === 'string' ? full_name.trim().slice(0, 80) || null : null
+
+    try {
+      const u = await findAuthUserByEmail(supabase as any, email)
+      if (!u) {
+        const { error: cErr } = await (supabase as any).auth.admin.createUser({
+          email, password, email_confirm: true,
+          user_metadata: { full_name: cleanName, source: 'team_invite_email' },
+        })
+        if (cErr) { res.status(500).json({ error: cErr.message }); return }
+        res.json({ login_email: email, existing: false }); return
+      }
+      if (inviteStubClaimable(u)) {
+        const { error: uErr } = await (supabase as any).auth.admin.updateUserById(u.id, {
+          password, email_confirm: true,
+          user_metadata: { ...(u.user_metadata ?? {}), ...(cleanName ? { full_name: cleanName } : {}) },
+        })
+        if (uErr) { res.status(500).json({ error: uErr.message }); return }
+        res.json({ login_email: email, existing: false }); return
+      }
+      // Real account — no write. FE signs in with whatever password they typed.
+      res.json({ login_email: email, existing: true })
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message ?? 'Could not prepare account' })
+    }
   })
 
   // ─── Update / disable / remove team member ────────────────────────────────

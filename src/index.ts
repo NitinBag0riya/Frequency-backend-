@@ -44,6 +44,11 @@ import { createWaFeaturesRouter }  from './routes/wa-features'
 import { createWaTemplatesRouter } from './routes/wa-templates'
 import { createWaConnectionRouter, createDataDeletionRouter } from './routes/wa-connection'
 import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue } from './lib/wa-creds'
+import { dispatchPosApprovalRequest, verifyInternalSecret } from './lib/pos-approval-notify'
+import { dispatchReservationCreated, cancelReservationReminder, type ReservationEventBody } from './lib/pos-reservation-wa'
+import { dispatchAdvanceOrderCreated, cancelAdvanceKotFire, type AdvanceOrderEventBody } from './lib/pos-advance-kot'
+import { syncPosGuestToContacts, type PosGuestSyncBody } from './lib/pos-guest-bridge'
+import { dispatchEBill, type EBillEventBody } from './lib/pos-ebill-wa'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
@@ -135,7 +140,7 @@ import {
 import { composeNodeCatalogPromptSection } from './engine/node-types'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import { syncTenant as syncTenantTemplates } from './workers/template-sync'
-import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, voiceNoteTranscribeQueue, webhookInboundQueue, webhookOutboundQueue, webhookInboundDeadQueue, webhookOutboundDeadQueue, breachNotificationQueue, signedFormPdfQueue, attachDebugListeners, connection as redisConnection } from './queue'
+import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, voiceNoteTranscribeQueue, webhookInboundQueue, webhookOutboundQueue, webhookInboundDeadQueue, webhookOutboundDeadQueue, breachNotificationQueue, signedFormPdfQueue, attachDebugListeners, connection as redisConnection, enqueueMessageSend, removeMessageSendJob, enqueueWebhookOutbound, removeWebhookOutboundJob } from './queue'
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
 import { ExpressAdapter } from '@bull-board/express'
@@ -2431,6 +2436,176 @@ app.post('/api/internal/storefront-order', async (req, res) => {
       orderId:      String(order_id),
       order:        order ?? {},
     })).catch(() => {})
+})
+
+// ── Internal: POS approval-request → notify the PIN-holder ──────────────────
+//
+// storefront-api POSTs here (POS Upgrade Phase 3, P3-BE-APPROVAL) when a POS
+// PIN gate — cancel bill, free bill, discount-over-limit, waive-off, reprint
+// — is blocked and the operator taps "Notify manager". Same server-to-server,
+// shared-secret seam as /api/internal/storefront-order above — fail-closed
+// when INTERNAL_TRIGGER_SECRET is unset, so it's inert until configured.
+//
+// Ack immediately; the push + WhatsApp fan-out to each eligible manager runs
+// async in dispatchPosApprovalRequest so the till's request is never blocked
+// on it. Push (sendExpoPush) has no Meta gate. WhatsApp (sendWaNotification)
+// REUSES the already-approved `frequency_notification` utility template — no
+// new Meta template authored or submitted by this endpoint.
+app.post('/api/internal/pos-approval-request', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const { tenantId, action, context, managerEmails } = (req.body ?? {}) as any
+  if (!tenantId || !action || !Array.isArray(managerEmails) || managerEmails.length === 0) {
+    res.status(400).json({ error: 'tenantId, action and managerEmails[] are required' }); return
+  }
+  // Ack immediately; dispatch is best-effort and must never block storefront-api.
+  res.json({ ok: true })
+  void dispatchPosApprovalRequest(supabase, {
+    tenantId: String(tenantId),
+    action:   String(action),
+    context:  context ?? {},
+    managerEmails: managerEmails.filter((e: unknown): e is string => typeof e === 'string'),
+  }).catch(() => {})
+})
+
+// ── Internal: POS reservation event → guest WhatsApp confirm/reminder ───────
+//
+// storefront-api POSTs here (POS Upgrade Phase 4, P4-BE-4.9) on:
+//   kind='created'   — a reservation was just booked (reuses the fireFreqTrigger
+//                      seam pattern, same shared-secret guard as the two routes
+//                      above; fail-closed until INTERNAL_TRIGGER_SECRET is set).
+//   kind='cancelled' — the reservation was cancelled; pulls a still-pending
+//                      reminder job so a cancelled table never pings the guest.
+//
+// Ack immediately; dispatch runs async in pos-reservation-wa.ts so a slow/failed
+// WhatsApp send never blocks storefront-api's response. See that file's header
+// for why this is NOT sendWaNotification (app-user path) and reuses the
+// `frequency_notification` approved utility template (no new Meta template).
+app.post('/api/internal/pos-reservation-event', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const b = (req.body ?? {}) as Partial<ReservationEventBody>
+  const kind = b.kind === 'cancelled' ? 'cancelled' : b.kind === 'created' ? 'created' : null
+  const reservation = b.reservation
+  if (!b.tenantId || !kind || !reservation?.reservationId || !reservation.at) {
+    res.status(400).json({ error: 'tenantId, kind, and reservation.{reservationId,at} are required' }); return
+  }
+  res.json({ ok: true })
+  if (kind === 'created') {
+    void dispatchReservationCreated(
+      { ...b, tenantId: String(b.tenantId), kind, reservation } as ReservationEventBody,
+      (job, opts) => enqueueMessageSend(job as any, opts),
+    ).catch(() => {})
+  } else {
+    void cancelReservationReminder(String(reservation.reservationId), removeMessageSendJob).catch(() => {})
+  }
+})
+
+// ── Internal: POS advance-order event → schedule/cancel the advance KOT fire ─
+//
+// storefront-api POSTs here (POS Upgrade Phase 5, P5-BE-5.3) when an advance
+// (Schedule for) pickup/delivery order is:
+//   kind='created'   — schedules a one-shot callback for (scheduledAt -
+//                      prepMins) that tells storefront-api to fire that
+//                      order's KOT round. See lib/pos-advance-kot.ts for the
+//                      full callback contract (POST {STOREFRONT_API_URL}
+//                      /internal/pos-advance-kot, x-internal-secret, tiny
+//                      {slug,orderId} body — storefront-api re-reads the
+//                      order at fire time).
+//   kind='cancelled' — pulls a still-pending fire job so a cancelled advance
+//                      order never fires a KOT the kitchen never asked for.
+//
+// Same server-to-server shared-secret seam as the three internal routes
+// above — fail-closed when INTERNAL_TRIGGER_SECRET is unset.
+//
+// Ack immediately; scheduling/cancelling runs async in pos-advance-kot.ts so
+// a slow/failed enqueue never blocks storefront-api's response.
+app.post('/api/internal/pos-advance-order-event', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const b = (req.body ?? {}) as Partial<AdvanceOrderEventBody>
+  const kind = b.kind === 'cancelled' ? 'cancelled' : b.kind === 'created' ? 'created' : null
+  const order = b.order
+  if (!b.slug || !kind || !order?.orderId) {
+    res.status(400).json({ error: 'slug, kind, and order.orderId are required' }); return
+  }
+  res.json({ ok: true })
+  if (kind === 'created') {
+    if (!order.scheduledAt || typeof order.prepMins !== 'number') {
+      console.warn(`[pos-advance-kot] created event missing scheduledAt/prepMins for order ${order.orderId}`)
+      return
+    }
+    void dispatchAdvanceOrderCreated(
+      { slug: String(b.slug), kind, order } as AdvanceOrderEventBody,
+      (job, opts) => enqueueWebhookOutbound(job as any, opts),
+    ).catch(() => {})
+  } else {
+    void cancelAdvanceKotFire(String(order.orderId), removeWebhookOutboundJob).catch(() => {})
+  }
+})
+
+// ── Internal: POS guest → contacts/consent bridge ───────────────────────────
+//
+// storefront-api POSTs here (POS Upgrade Phase 6, P6-bridge) whenever a
+// counter bill captures/updates a guest's name/phone/birthday/anniversary/
+// address, plus the WhatsApp-consent checkbox state read at billing (6.4 —
+// default UNTICKED, H3/DPDPA). Same server-to-server shared-secret seam as
+// the internal routes above — fail-closed when INTERNAL_TRIGGER_SECRET is
+// unset.
+//
+// This is the missing write path: `/api/storefront/customer-sync` mirrors a
+// signed-in storefront guest into the tables-backed `lead_rows` Customers
+// table only — it never touches `contacts` / `contact_consent_state`, which
+// is what the 6.2 birthday sweep (workers/birthday-wish-sweep.ts) reads. See
+// lib/pos-guest-bridge.ts for the full DPDPA contract: consent===true is the
+// ONLY signal that ever grants marketing consent; anything else leaves
+// existing consent state untouched (never inferred as an opt-out).
+app.post('/api/internal/pos-guest-sync', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const b = (req.body ?? {}) as Partial<PosGuestSyncBody>
+  if (!b.tenantId || !b.guest?.phone) {
+    res.status(400).json({ error: 'tenantId and guest.phone are required' }); return
+  }
+  const result = await syncPosGuestToContacts(supabase, b as PosGuestSyncBody)
+  if (!result.contactId) { res.status(400).json({ ok: false, error: result.skippedReason }); return }
+  res.json({ ok: true, contactId: result.contactId, consentRecorded: result.consentRecorded })
+})
+
+// ── Internal: POS e-bill event → guest WhatsApp receipt (WA-API upgrade) ────
+//
+// storefront-api POSTs here (POS Upgrade Phase 6, P6-5wa) on settle when the
+// Business & bill "E-bill rule" (settings.pos.eBill) fires a send. Same
+// server-to-server shared-secret seam as the internal routes above.
+//
+// The wa.me click-to-chat path (Phase-0 sendEBill) already ships
+// unconditionally and is NOT this endpoint — this is the server-side WA-API
+// upgrade (no manual tap), gated on an approved e-bill UTILITY template
+// existing (WA_EBILL_TEMPLATE_NAME — not present today, Meta-gated, see
+// lib/pos-ebill-wa.ts). Ack immediately; dispatch is best-effort and must
+// never block storefront-api's settle response.
+app.post('/api/internal/pos-ebill-event', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const b = (req.body ?? {}) as Partial<EBillEventBody>
+  if (!b.tenantId || !b.orderId || !b.billUrl) {
+    res.status(400).json({ error: 'tenantId, orderId and billUrl are required' }); return
+  }
+  res.json({ ok: true })
+  void dispatchEBill(
+    b as EBillEventBody,
+    (job) => enqueueMessageSend(job as any),
+  ).catch(() => {})
 })
 
 // ── Frequency Desktop per-install attestation store ──────────────────────────

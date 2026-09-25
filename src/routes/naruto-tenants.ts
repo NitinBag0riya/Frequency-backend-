@@ -29,6 +29,7 @@ import express from 'express'
 import { z } from 'zod'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { ensureUniqueSlug } from '../lib/slug'
+import { toAdminTenant } from '../lib/tenant-redact'
 import { requirePlatformCapability } from '../lib/platform-guard'
 import { recordPlatformAudit } from '../lib/platform-audit'
 import { recomputeTenantLifecycle, gatherSignals, computeLifecycleState } from '../lib/tenant-lifecycle'
@@ -216,7 +217,7 @@ export function createNarutoTenantsRouter(deps: Deps): express.Router {
             reason: parsed.data.reason ?? null,
           })
         }
-        res.status(created ? 201 : 200).json({ tenant, ownerUserId, created })
+        res.status(created ? 201 : 200).json({ tenant: toAdminTenant(tenant), ownerUserId, created })
       } catch (e: any) {
         console.error('[naruto-create] failed:', e?.message ?? e)
         res.status(500).json({ error: e?.message ?? 'Create failed' })
