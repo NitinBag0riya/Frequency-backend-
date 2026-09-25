@@ -6353,7 +6353,7 @@ app.use(createComposerToolsRouter({ supabase, requireAuth, identifyTenant }))
 // init above.
 app.use(createPiiRouter({ supabase, requireAuth, identifyTenant }))
 // SLA tracking (Phase 3 — migration 095).
-app.use(createSlaRouter({ supabase, requireAuth, identifyTenant }))
+app.use(createSlaRouter({ supabase, requireAuth, identifyTenant, checkPermission }))
 
 // ── Billing (Razorpay subscriptions + webhook) ───────────────────────────────
 // NOTE: the webhook route inside this router uses express.raw() to bypass the
