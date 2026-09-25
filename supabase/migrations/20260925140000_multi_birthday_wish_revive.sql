@@ -1,0 +1,101 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration 20260925140000 — Revive 'multi-birthday-wish' workflow template (Phase 6, 6.2)
+--
+-- CONTEXT (see docs/state/pos-upgrade.md Phase 6 §6.2):
+--   * 090_workflow_templates_expand.sql:299-330 seeded slug='multi-birthday-wish'
+--     (vertical='generic', channel='multi') with a `trigger` node of
+--     type='scheduled_per_contact' (relative_to_attr:'birthday', recurring:'yearly').
+--   * 091_workflow_templates_repair.sql:143-164 set status='deprecated' on it
+--     (and 10 siblings) because `scheduled_per_contact` was never registered in
+--     src/connectors/registry.ts / src/engine/node-types.ts and no daily-sweep
+--     worker existed to fire it. 091's own comment anticipates this migration:
+--     "when we ship those triggers, a future migration can flip them back to
+--     status='live'".
+--   * Phase 6 task graph: P6-2trig (integrations) registers the
+--     `scheduled_per_contact` trigger type in the connector registry / node
+--     types; P6-2sweep (integrations) builds the birthday/anniversary daily
+--     sweep worker (flowgpt-server/src/workers/birthday-wish-sweep.ts,
+--     modelled on consent-expiry-sweep.ts) that actually fires the workflow
+--     for opted-in contacts whose `contacts.attributes->>'birthday'` matches
+--     today (MM-DD). THIS migration (P6-mig, `data` seat) only flips the
+--     template's catalog status; it depends on P6-2trig having landed.
+--
+-- DEPENDENCY CHECK — round 1 (authoring time, 2026-09-25, worktree
+-- flowgpt-server-customer-wa-wt @ 22e61cc):
+--   $ grep -rn "scheduled_per_contact" src/                     -> no matches
+--   $ find src/workers -iname "*birthday*"                       -> no file
+--   ⇒ P6-2trig / P6-2sweep NOT landed yet. Status flip left commented (see
+--   git history of this file for that state).
+--
+-- DEPENDENCY CHECK — round 2 (re-verified 2026-09-25, same worktree, same
+-- HEAD 22e61cc, after integrations landed uncommitted on top of it):
+--   $ grep -n "scheduled_per_contact" src/engine/node-types.ts
+--     99:  'scheduled_per_contact',
+--     136: scheduled_per_contact: 'Start once a year on a date stored in a
+--          contact attribute … Requires opted-in marketing consent — an
+--          opted-out contact is never matched, even on their birthday.'
+--   $ find src -iname "*birthday-wish-sweep*"   -> src/workers/birthday-wish-sweep.ts
+--   $ grep -n isPollerEnabled src/workers/birthday-wish-sweep.ts
+--     43: import { isPollerEnabled, logGate } from '../lib/poller-gate'
+--     62: const enabled = isPollerEnabled('BIRTHDAY_WISH_SWEEP')
+--   ⇒ BOTH conditions met: (a) 'scheduled_per_contact' registered in
+--   src/engine/node-types.ts (+ src/worker.ts wiring), (b) the sweep worker
+--   exists, poller-gated, with a matching-logic selfcheck
+--   (src/lib/birthday-wish-match.selfcheck.ts). The status flip below is now
+--   UNCOMMENTED. Reviewer (RV-6) should re-run the same two greps + the
+--   selfcheck before treating this file as safe to hand to chief-of-staff.
+--
+-- NOTE — trigger types are NOT a DB-seeded catalog. `scheduled_per_contact`
+-- would be registered purely in code (src/connectors/registry.ts +
+-- src/engine/node-types.ts NODE_TYPES array), same pattern as every other
+-- trigger_* type (grepped: no `trigger_type` / `triggerType` column or table
+-- in supabase/migrations/*.sql). So this migration adds NO row for the
+-- trigger type itself — only the template-catalog status flip (once gated
+-- above) belongs here.
+--
+-- STILL META-GATED REGARDLESS OF THIS MIGRATION: the template's `send_wa`
+-- node uses WA template 'birthday_wish' (MARKETING category — carries a
+-- discount code). That template is not present in code/env today (P6-2meta,
+-- BLOCKED: needs research — integrations must confirm/submit+get it APPROVED
+-- at Meta; do not invent the template name/vars). Flipping this catalog row
+-- to 'live' only makes the *workflow template* clonable again — it does NOT
+-- cause any WhatsApp send; sends are additionally gated by (1) the Meta
+-- template approval above, and (2) per-contact marketing consent
+-- (contact_consent_state, source 'pos') enforced by the sweep + defense-in-
+-- depth in message-sender.ts. Storefront "Birthday rewards" switch also
+-- defaults Off (H9) until both gates clear.
+--
+-- Idempotent: guarded by slug + current status (only touches a row that is
+-- currently 'deprecated'; re-running after it is already 'live' matches zero
+-- rows, no error). ON CONFLICT-safe pattern consistent with 090/091 (single
+-- UPDATE keyed on slug). Not applied. No `supabase db push` run
+-- (R4 — owner runs it).
+--
+-- CATALOG-LIVE ≠ SEND-LIVE — flipping this row only makes the workflow
+-- template clonable/visible in the catalog again. It does NOT, by itself,
+-- cause any WhatsApp message to go out. The actual send stays gated by:
+--   (1) Meta template approval — 'birthday_wish' (MARKETING, carries a
+--       discount code) is not yet submitted/approved (P6-2meta, BLOCKED:
+--       needs research — integrations confirms/submits; never invent the
+--       template name/vars here);
+--   (2) per-contact marketing consent (contact_consent_state, source 'pos',
+--       opted_in) enforced inside the birthday-wish-sweep query itself, plus
+--       defense-in-depth in message-sender.ts;
+--   (3) the sweep's own poller gate (isPollerEnabled('BIRTHDAY_WISH_SWEEP'));
+--   (4) Storefront → Loyalty & rewards "Birthday rewards" switch, default Off
+--       (H9) — a tenant must opt in even once the above all clear.
+-- This migration changes none of (1)-(4); it only unhides the template.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+update public.workflow_templates set
+  status = 'live',
+  updated_at = now()
+where slug = 'multi-birthday-wish'
+  and status = 'deprecated';
+
+-- ── DOWN (rollback) ─────────────────────────────────────────────────────────
+-- update public.workflow_templates set
+--   status = 'deprecated',
+--   updated_at = now()
+-- where slug = 'multi-birthday-wish'
+--   and status = 'live';

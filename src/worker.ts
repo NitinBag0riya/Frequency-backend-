@@ -22,6 +22,9 @@ import { startTemplateSyncWorker }     from './workers/template-sync'
 import { startDataSourceSyncWorker }   from './workers/data-source-sync'
 import { startTrialEndingWorker }      from './workers/trial-ending'
 import { startConsentExpirySweepWorker } from './workers/consent-expiry-sweep'
+// POS Upgrade Phase 6, 6.2 — birthday/anniversary daily sweep (opted-in only;
+// inert "would send" logging until WA_BIRTHDAY_WISH_TEMPLATE_NAME is set)
+import { startBirthdayWishSweepWorker } from './workers/birthday-wish-sweep'
 import { startGmailPollerWorker }      from './workers/gmail-poller'
 import { startLookalikeRefreshWorker } from './workers/lookalike-refresh'
 // Naruto §6/§16 — nudge engine + platform notifications (daily 6h tick, NUDGE_EVALUATOR gate)
@@ -73,6 +76,7 @@ async function main() {
   const ds  = await startDataSourceSyncWorker()
   const te  = await startTrialEndingWorker()
   const ces = await startConsentExpirySweepWorker()
+  const bws = await startBirthdayWishSweepWorker()
   const gp  = await startGmailPollerWorker()
   const lr  = await startLookalikeRefreshWorker()
   const igp = await startInstagramCommentPollerWorker()
@@ -154,7 +158,7 @@ async function main() {
     console.log(`[worker] received ${signal} — draining…`)
     await Promise.allSettled([
       wf.close(), ms.close(), bw.close(),
-      sp.close(), ts.close(), ds.close(), te.close(), ces.close(), gp.close(), lr.close(), igp.close(), bns.close(), nudge.close(),
+      sp.close(), ts.close(), ds.close(), te.close(), ces.close(), bws.close(), gp.close(), lr.close(), igp.close(), bns.close(), nudge.close(),
       // WA Calling
       cd.close(), ce.close(), ca.close(), ct.close(),
       dispatchFailureListener.close(),

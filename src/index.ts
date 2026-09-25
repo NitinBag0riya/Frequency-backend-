@@ -47,6 +47,8 @@ import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue 
 import { dispatchPosApprovalRequest, verifyInternalSecret } from './lib/pos-approval-notify'
 import { dispatchReservationCreated, cancelReservationReminder, type ReservationEventBody } from './lib/pos-reservation-wa'
 import { dispatchAdvanceOrderCreated, cancelAdvanceKotFire, type AdvanceOrderEventBody } from './lib/pos-advance-kot'
+import { syncPosGuestToContacts, type PosGuestSyncBody } from './lib/pos-guest-bridge'
+import { dispatchEBill, type EBillEventBody } from './lib/pos-ebill-wa'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
@@ -2546,6 +2548,64 @@ app.post('/api/internal/pos-advance-order-event', async (req, res) => {
   } else {
     void cancelAdvanceKotFire(String(order.orderId), removeWebhookOutboundJob).catch(() => {})
   }
+})
+
+// ── Internal: POS guest → contacts/consent bridge ───────────────────────────
+//
+// storefront-api POSTs here (POS Upgrade Phase 6, P6-bridge) whenever a
+// counter bill captures/updates a guest's name/phone/birthday/anniversary/
+// address, plus the WhatsApp-consent checkbox state read at billing (6.4 —
+// default UNTICKED, H3/DPDPA). Same server-to-server shared-secret seam as
+// the internal routes above — fail-closed when INTERNAL_TRIGGER_SECRET is
+// unset.
+//
+// This is the missing write path: `/api/storefront/customer-sync` mirrors a
+// signed-in storefront guest into the tables-backed `lead_rows` Customers
+// table only — it never touches `contacts` / `contact_consent_state`, which
+// is what the 6.2 birthday sweep (workers/birthday-wish-sweep.ts) reads. See
+// lib/pos-guest-bridge.ts for the full DPDPA contract: consent===true is the
+// ONLY signal that ever grants marketing consent; anything else leaves
+// existing consent state untouched (never inferred as an opt-out).
+app.post('/api/internal/pos-guest-sync', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const b = (req.body ?? {}) as Partial<PosGuestSyncBody>
+  if (!b.tenantId || !b.guest?.phone) {
+    res.status(400).json({ error: 'tenantId and guest.phone are required' }); return
+  }
+  const result = await syncPosGuestToContacts(supabase, b as PosGuestSyncBody)
+  if (!result.contactId) { res.status(400).json({ ok: false, error: result.skippedReason }); return }
+  res.json({ ok: true, contactId: result.contactId, consentRecorded: result.consentRecorded })
+})
+
+// ── Internal: POS e-bill event → guest WhatsApp receipt (WA-API upgrade) ────
+//
+// storefront-api POSTs here (POS Upgrade Phase 6, P6-5wa) on settle when the
+// Business & bill "E-bill rule" (settings.pos.eBill) fires a send. Same
+// server-to-server shared-secret seam as the internal routes above.
+//
+// The wa.me click-to-chat path (Phase-0 sendEBill) already ships
+// unconditionally and is NOT this endpoint — this is the server-side WA-API
+// upgrade (no manual tap), gated on an approved e-bill UTILITY template
+// existing (WA_EBILL_TEMPLATE_NAME — not present today, Meta-gated, see
+// lib/pos-ebill-wa.ts). Ack immediately; dispatch is best-effort and must
+// never block storefront-api's settle response.
+app.post('/api/internal/pos-ebill-event', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const b = (req.body ?? {}) as Partial<EBillEventBody>
+  if (!b.tenantId || !b.orderId || !b.billUrl) {
+    res.status(400).json({ error: 'tenantId, orderId and billUrl are required' }); return
+  }
+  res.json({ ok: true })
+  void dispatchEBill(
+    b as EBillEventBody,
+    (job) => enqueueMessageSend(job as any),
+  ).catch(() => {})
 })
 
 // ── Frequency Desktop per-install attestation store ──────────────────────────

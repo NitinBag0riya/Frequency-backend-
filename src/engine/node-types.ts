@@ -86,6 +86,17 @@ export const TRIGGER_NODE_TYPES = [
   // this trigger STARTS a workflow for flows submitted with no session waiting.
   // See routeFlowSubmission in engine/inbound-router.ts.
   'trigger_flow_response',
+  // Date-in-contact-field recurring start (e.g. birthday/anniversary). Config:
+  // relative_to_attr (contacts.attributes key, e.g. 'birthday'), offset_days
+  // (fire N days before/after), recurring ('yearly'). Unlike trigger_schedule
+  // (time+audience), this fires once per matching contact per calendar year.
+  // No always-on worker beyond the existing daily poller: a dedicated
+  // consent-gated daily sweep (workers/birthday-wish-sweep.ts, POS Upgrade
+  // Phase 6, 6.2) scans contacts.attributes for today's match, restricted to
+  // opted-in marketing/whatsapp consent, and starts the workflow per match.
+  // Revives migration 090's `multi-birthday-wish` template, deprecated in 091
+  // pending this trigger's runtime.
+  'scheduled_per_contact',
 ] as const
 
 export const NODE_TYPES = [
@@ -122,6 +133,7 @@ export const NODE_DESCRIPTIONS: Record<string, string> = {
   trigger_schedule:        'Recurring/cron start — daily/weekly at a time, or every N minutes. Either a 1:1 reminder (set contact_id) OR fan out to an audience (set segment_id or audience.tags → one run per matching contact). Powers digests, reminders, stale-lead scans, scheduled broadcasts.',
   trigger_payment:         'Start on a tenant CUSTOMER payment event (Razorpay/Cashfree): paid / failed / refunded.',
   trigger_flow_response:   'Start when a contact SUBMITS a WhatsApp Flow / interactive form (config: flow_id to scope to one flow). Submitted fields are in {{trigger.*}}. If a workflow already sent the flow and is waiting, the submission resumes that flow instead.',
+  scheduled_per_contact:   'Start once a year on a date stored in a contact attribute (config: relative_to_attr, e.g. "birthday" or "anniversary"; offset_days; recurring="yearly"). Powers birthday/anniversary wishes. Requires opted-in marketing consent — an opted-out contact is never matched, even on their birthday.',
   // ── Core actions ──
   send_text:               'Send a free-form WhatsApp text (only valid inside the 24h window; outside it use send_template).',
   send_template:           'Send an approved WhatsApp template (required outside the 24h window). Supports buttons defined on the template.',
