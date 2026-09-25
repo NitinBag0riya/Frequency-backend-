@@ -449,10 +449,25 @@ export async function enqueueWorkflowExecution(payload: WorkflowExecuteJob, dela
   })
 }
 
-export async function enqueueMessageSend(payload: MessageSendJob) {
+export async function enqueueMessageSend(payload: MessageSendJob, opts: { delayMs?: number; jobId?: string } = {}) {
   return messageQueue.add('send', payload, {
     // Per-tenant rate limit is configured on the Worker side (limiter groupKey).
+    // delay: same BullMQ mechanism enqueueWorkflowExecution already uses above —
+    // a durable, Redis-backed hold (survives a process restart), not setTimeout.
+    // Used by the POS reservation reminder (P4-INT-RES-WA): fires slot-holdMins
+    // after enqueue with no new scheduler/table. jobId lets a cancellation
+    // (`removeReservationReminderJob` in pos-reservation-wa.ts) pull it before it fires.
+    delay: opts.delayMs && opts.delayMs > 0 ? opts.delayMs : undefined,
+    jobId: opts.jobId,
   })
+}
+
+/** Best-effort remove of a still-pending (delayed, not yet processed) message.send
+ *  job by its jobId. No-op if the job already fired or never existed — a
+ *  cancellation must never throw. Used to cancel a reservation reminder. */
+export async function removeMessageSendJob(jobId: string): Promise<void> {
+  const job = await messageQueue.getJob(jobId)
+  if (job) await job.remove()
 }
 
 export async function enqueueBroadcast(broadcastId: string) {

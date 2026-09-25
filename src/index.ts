@@ -45,6 +45,7 @@ import { createWaTemplatesRouter } from './routes/wa-templates'
 import { createWaConnectionRouter, createDataDeletionRouter } from './routes/wa-connection'
 import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue } from './lib/wa-creds'
 import { dispatchPosApprovalRequest, verifyInternalSecret } from './lib/pos-approval-notify'
+import { dispatchReservationCreated, cancelReservationReminder, type ReservationEventBody } from './lib/pos-reservation-wa'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
@@ -136,7 +137,7 @@ import {
 import { composeNodeCatalogPromptSection } from './engine/node-types'
 import { enqueueContactImport }       from './workers/contact-import-processor'
 import { syncTenant as syncTenantTemplates } from './workers/template-sync'
-import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, voiceNoteTranscribeQueue, webhookInboundQueue, webhookOutboundQueue, webhookInboundDeadQueue, webhookOutboundDeadQueue, breachNotificationQueue, signedFormPdfQueue, attachDebugListeners, connection as redisConnection } from './queue'
+import { workflowQueue, messageQueue, broadcastQueue, cronQueue, callDispatchQueue, callEventIngestQueue, callRecordingArchiveQueue, callTranscribeQueue, voiceNoteTranscribeQueue, webhookInboundQueue, webhookOutboundQueue, webhookInboundDeadQueue, webhookOutboundDeadQueue, breachNotificationQueue, signedFormPdfQueue, attachDebugListeners, connection as redisConnection, enqueueMessageSend, removeMessageSendJob } from './queue'
 import { createBullBoard } from '@bull-board/api'
 import { BullMQAdapter } from '@bull-board/api/bullMQAdapter'
 import { ExpressAdapter } from '@bull-board/express'
@@ -2464,6 +2465,41 @@ app.post('/api/internal/pos-approval-request', async (req, res) => {
     context:  context ?? {},
     managerEmails: managerEmails.filter((e: unknown): e is string => typeof e === 'string'),
   }).catch(() => {})
+})
+
+// ── Internal: POS reservation event → guest WhatsApp confirm/reminder ───────
+//
+// storefront-api POSTs here (POS Upgrade Phase 4, P4-BE-4.9) on:
+//   kind='created'   — a reservation was just booked (reuses the fireFreqTrigger
+//                      seam pattern, same shared-secret guard as the two routes
+//                      above; fail-closed until INTERNAL_TRIGGER_SECRET is set).
+//   kind='cancelled' — the reservation was cancelled; pulls a still-pending
+//                      reminder job so a cancelled table never pings the guest.
+//
+// Ack immediately; dispatch runs async in pos-reservation-wa.ts so a slow/failed
+// WhatsApp send never blocks storefront-api's response. See that file's header
+// for why this is NOT sendWaNotification (app-user path) and reuses the
+// `frequency_notification` approved utility template (no new Meta template).
+app.post('/api/internal/pos-reservation-event', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const b = (req.body ?? {}) as Partial<ReservationEventBody>
+  const kind = b.kind === 'cancelled' ? 'cancelled' : b.kind === 'created' ? 'created' : null
+  const reservation = b.reservation
+  if (!b.tenantId || !kind || !reservation?.reservationId || !reservation.at) {
+    res.status(400).json({ error: 'tenantId, kind, and reservation.{reservationId,at} are required' }); return
+  }
+  res.json({ ok: true })
+  if (kind === 'created') {
+    void dispatchReservationCreated(
+      { ...b, tenantId: String(b.tenantId), kind, reservation } as ReservationEventBody,
+      (job, opts) => enqueueMessageSend(job as any, opts),
+    ).catch(() => {})
+  } else {
+    void cancelReservationReminder(String(reservation.reservationId), removeMessageSendJob).catch(() => {})
+  }
 })
 
 // ── Frequency Desktop per-install attestation store ──────────────────────────
