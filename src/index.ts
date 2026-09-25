@@ -44,6 +44,7 @@ import { createWaFeaturesRouter }  from './routes/wa-features'
 import { createWaTemplatesRouter } from './routes/wa-templates'
 import { createWaConnectionRouter, createDataDeletionRouter } from './routes/wa-connection'
 import { resolveWaCreds, verifyMetaSignature, readSecretValue, writeSecretValue } from './lib/wa-creds'
+import { dispatchPosApprovalRequest, verifyInternalSecret } from './lib/pos-approval-notify'
 import { createTelegramRouter }    from './routes/telegram'
 import { createInstagramRouter }   from './routes/instagram'
 import { createMetaAdsRouter }     from './routes/meta-ads'
@@ -2431,6 +2432,38 @@ app.post('/api/internal/storefront-order', async (req, res) => {
       orderId:      String(order_id),
       order:        order ?? {},
     })).catch(() => {})
+})
+
+// ── Internal: POS approval-request → notify the PIN-holder ──────────────────
+//
+// storefront-api POSTs here (POS Upgrade Phase 3, P3-BE-APPROVAL) when a POS
+// PIN gate — cancel bill, free bill, discount-over-limit, waive-off, reprint
+// — is blocked and the operator taps "Notify manager". Same server-to-server,
+// shared-secret seam as /api/internal/storefront-order above — fail-closed
+// when INTERNAL_TRIGGER_SECRET is unset, so it's inert until configured.
+//
+// Ack immediately; the push + WhatsApp fan-out to each eligible manager runs
+// async in dispatchPosApprovalRequest so the till's request is never blocked
+// on it. Push (sendExpoPush) has no Meta gate. WhatsApp (sendWaNotification)
+// REUSES the already-approved `frequency_notification` utility template — no
+// new Meta template authored or submitted by this endpoint.
+app.post('/api/internal/pos-approval-request', async (req, res) => {
+  const provided = String(req.headers['x-internal-secret'] ?? '')
+  if (!verifyInternalSecret(process.env.INTERNAL_TRIGGER_SECRET, provided)) {
+    res.status(401).json({ error: 'unauthorized' }); return
+  }
+  const { tenantId, action, context, managerEmails } = (req.body ?? {}) as any
+  if (!tenantId || !action || !Array.isArray(managerEmails) || managerEmails.length === 0) {
+    res.status(400).json({ error: 'tenantId, action and managerEmails[] are required' }); return
+  }
+  // Ack immediately; dispatch is best-effort and must never block storefront-api.
+  res.json({ ok: true })
+  void dispatchPosApprovalRequest(supabase, {
+    tenantId: String(tenantId),
+    action:   String(action),
+    context:  context ?? {},
+    managerEmails: managerEmails.filter((e: unknown): e is string => typeof e === 'string'),
+  }).catch(() => {})
 })
 
 // ── Frequency Desktop per-install attestation store ──────────────────────────
